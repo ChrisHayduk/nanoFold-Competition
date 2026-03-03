@@ -3,12 +3,18 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
-from Bio import pairwise2
+from Bio.Align import PairwiseAligner
 from tqdm import tqdm
+
+# Allow running as `python scripts/preprocess.py` from repo root (or via absolute script path).
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from nanofold.a3m import read_a3m
 from nanofold.mmcif import extract_chain_ca, aatype_from_sequence
@@ -92,27 +98,63 @@ def _candidate_templates_from_hhr(hhr_path: Path) -> List[Tuple[str, str]]:
     return out
 
 
+def _make_global_aligner() -> PairwiseAligner:
+    aligner = PairwiseAligner(mode="global")
+    aligner.match_score = 2.0
+    aligner.mismatch_score = -1.0
+    aligner.open_gap_score = -4.0
+    aligner.extend_gap_score = -1.0
+    return aligner
+
+
+_GLOBAL_ALIGNER = _make_global_aligner()
+
+
 def _global_alignment_pairs(query_seq: str, template_seq: str) -> List[Tuple[int, int]]:
-    aln = pairwise2.align.globalms(query_seq, template_seq, 2.0, -1.0, -4.0, -1.0, one_alignment_only=True)
-    if not aln:
+    if not query_seq or not template_seq:
         return []
 
-    q_aln = aln[0].seqA
-    t_aln = aln[0].seqB
+    try:
+        aln = _GLOBAL_ALIGNER.align(query_seq, template_seq)[0]
+    except Exception:
+        return []
 
+    q_segments, t_segments = aln.aligned
     pairs: List[Tuple[int, int]] = []
-    qi = 0
-    ti = 0
-    for qch, tch in zip(q_aln, t_aln):
-        q_has = qch != "-"
-        t_has = tch != "-"
-        if q_has and t_has:
-            pairs.append((qi, ti))
-        if q_has:
-            qi += 1
-        if t_has:
-            ti += 1
+    for (q_start, q_end), (t_start, t_end) in zip(q_segments, t_segments):
+        seg_len = min(int(q_end) - int(q_start), int(t_end) - int(t_start))
+        if seg_len <= 0:
+            continue
+        q0 = int(q_start)
+        t0 = int(t_start)
+        for off in range(seg_len):
+            pairs.append((q0 + off, t0 + off))
     return pairs
+
+
+def _project_structure_to_query(
+    query_seq: str,
+    structure_seq: str,
+    structure_ca_coords: np.ndarray,
+    structure_ca_mask: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Map structure coordinates onto query positions via global sequence alignment."""
+    pairs = _global_alignment_pairs(query_seq=query_seq, template_seq=structure_seq)
+    if not pairs:
+        raise ValueError("Could not align structure sequence to query sequence")
+
+    qL = len(query_seq)
+    out_ca = np.zeros((qL, 3), dtype=np.float32)
+    out_mask = np.zeros((qL,), dtype=bool)
+    for qi, si in pairs:
+        if qi < 0 or qi >= qL:
+            continue
+        if si < 0 or si >= len(structure_seq):
+            continue
+        if bool(structure_ca_mask[si]):
+            out_ca[qi] = structure_ca_coords[si]
+            out_mask[qi] = True
+    return out_ca, out_mask
 
 
 def _extract_template_features(
@@ -251,37 +293,54 @@ def main() -> None:
                 require_full_match=args.strict,
             )
 
-            if len(chain_struct.sequence) != msa.shape[1]:
-                # MSA aligned length should match structure-derived length if strict & no missing residues.
-                # In practice, you may need alignment; for the benchmark, we recommend filtering out mismatches.
-                raise ValueError(
-                    f"Length mismatch for {cid}: msa L={msa.shape[1]} vs structure L={len(chain_struct.sequence)}"
+            if args.strict:
+                if len(chain_struct.sequence) != msa.shape[1]:
+                    raise ValueError(
+                        f"Length mismatch for {cid}: msa L={msa.shape[1]} vs structure L={len(chain_struct.sequence)}"
+                    )
+                target_seq = chain_struct.sequence
+                target_ca_coords = chain_struct.ca_coords.astype(np.float32)
+                target_ca_mask = chain_struct.ca_mask.astype(bool)
+            else:
+                # Non-strict mode: always align structure residues onto query positions so
+                # minor sequence-length discrepancies do not discard the sample.
+                target_seq = query_aligned
+                target_ca_coords, target_ca_mask = _project_structure_to_query(
+                    query_seq=query_aligned,
+                    structure_seq=chain_struct.sequence,
+                    structure_ca_coords=chain_struct.ca_coords,
+                    structure_ca_mask=chain_struct.ca_mask,
                 )
+                if int(target_ca_mask.sum()) == 0:
+                    raise ValueError(f"No aligned C-alpha positions for {cid} after sequence projection")
 
             out = {
-                "aatype": aatype_from_sequence(chain_struct.sequence),
+                "aatype": aatype_from_sequence(target_seq),
                 "msa": msa.astype(np.int32),
                 "deletions": deletions.astype(np.int32),
-                "ca_coords": chain_struct.ca_coords.astype(np.float32),
-                "ca_mask": chain_struct.ca_mask.astype(bool),
+                "ca_coords": target_ca_coords.astype(np.float32),
+                "ca_mask": target_ca_mask.astype(bool),
             }
 
             if args.disable_templates:
-                out.update(_empty_template_features(len(chain_struct.sequence)))
+                out.update(_empty_template_features(len(target_seq)))
             else:
                 tpl = _extract_template_features(
                     chain_dir=chain_dir,
                     mmcif_root=mmcif_root,
                     target_pdb_id=pdb_id,
                     target_chain_id=chain_id,
-                    target_seq=chain_struct.sequence,
-                    target_L=len(chain_struct.sequence),
+                    target_seq=target_seq,
+                    target_L=len(target_seq),
                     template_hhr_name=args.template_hhr_name,
                     max_templates=int(args.max_templates),
                 )
                 out.update(tpl)
 
             np.savez_compressed(processed_dir / f"{cid}.npz", **out)
+            err_marker = processed_dir / f"{cid}.error.txt"
+            if err_marker.exists():
+                err_marker.unlink()
             n_ok += 1
         except Exception as e:
             n_fail += 1

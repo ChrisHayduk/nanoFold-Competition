@@ -79,10 +79,10 @@ def extract_chain_ca(
     ca_mask: List[bool] = []
 
     for res in chain:
-        if res.is_water():
-            continue
-        if res.het_flag != " ":
-            # skip hetero residues (ligands)
+        # Keep only polymer residues for sequence/structure extraction.
+        # In mmCIF, standard polymer residues can have het_flag='A', so filtering
+        # on het_flag would incorrectly drop valid amino acids.
+        if res.entity_type != gemmi.EntityType.Polymer:
             continue
         aa = one_letter_from_resname(res.name)
         seq_letters.append(aa)
@@ -95,6 +95,9 @@ def extract_chain_ca(
             pos = atom.pos
             ca_coords.append(np.array([pos.x, pos.y, pos.z], dtype=np.float32))
             ca_mask.append(True)
+
+    if not ca_coords:
+        raise ValueError(f"No polymer residues with C-alpha slots found for {pdb_id}_{chain_id} in {mmcif_path}")
 
     seq = "".join(seq_letters)
     if expected_sequence is not None:

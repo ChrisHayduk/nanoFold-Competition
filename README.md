@@ -35,6 +35,8 @@ bash scripts/setup_competition_data.sh \
   --data-root data/openproteinset \
   --train-size 10000 \
   --val-size 500 \
+  --download-retries 5 \
+  --download-retry-delay-seconds 3 \
   --seed 0
 # for a quick local smoke run, start with:
 # bash scripts/setup_competition_data.sh --train-size 1000 --val-size 100
@@ -44,6 +46,59 @@ python train.py --config configs/baseline.yaml
 
 # 4) evaluate
 python eval.py --config configs/baseline.yaml --ckpt runs/baseline/checkpoints/ckpt_last.pt
+```
+
+## Data Flow (Detailed)
+
+Use this if you want explicit control of setup/resume behavior.
+
+1. Run full subset setup (safe to rerun if interrupted):
+```bash
+bash scripts/setup_competition_data.sh \
+  --data-root data/openproteinset \
+  --train-size 10000 \
+  --val-size 500 \
+  --seed 0 \
+  --download-retries 5 \
+  --download-retry-delay-seconds 3
+```
+
+2. If setup fails at step `[6/6]` (preprocessing), rerun only preprocessing:
+```bash
+python scripts/preprocess.py \
+  --raw-root data/openproteinset \
+  --mmcif-root data/openproteinset/pdb_data/mmcif_files \
+  --processed-dir data/processed \
+  --msa-name uniref90_hits.a3m \
+  --template-hhr-name pdb70_hits.hhr \
+  --manifest data/manifests/train.txt
+
+python scripts/preprocess.py \
+  --raw-root data/openproteinset \
+  --mmcif-root data/openproteinset/pdb_data/mmcif_files \
+  --processed-dir data/processed \
+  --msa-name uniref90_hits.a3m \
+  --template-hhr-name pdb70_hits.hhr \
+  --manifest data/manifests/val.txt
+```
+
+3. If you regenerate manifests, redownload only those manifest chains:
+```bash
+cat data/manifests/train.txt data/manifests/val.txt | sort -u > data/manifests/all.txt
+python scripts/prepare_data.py \
+  --data-root data/openproteinset \
+  --manifest data/manifests/all.txt \
+  --duplicate-chains-file data/openproteinset/pdb_data/duplicate_pdb_chains.txt \
+  --msa-name uniref90_hits.a3m \
+  --template-hits-name pdb70_hits.hhr \
+  --download-retries 5 \
+  --download-retry-delay-seconds 3
+```
+
+4. Optional quick health checks:
+```bash
+ls data/processed/*.npz | wc -l
+ls data/processed/*.error.txt | wc -l
 ```
 
 ## Seed Runs
