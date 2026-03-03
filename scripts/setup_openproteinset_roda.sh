@@ -53,8 +53,9 @@ fi
 ALIGN_RODA_DIR="$DATA_ROOT/alignment_data/alignment_dir_roda"
 ALIGN_DIR="$DATA_ROOT/alignment_data/alignments"
 PDB_DIR="$DATA_ROOT/pdb_data"
+DATA_CACHES_DIR="$PDB_DIR/data_caches"
 
-mkdir -p "$ALIGN_RODA_DIR" "$PDB_DIR"
+mkdir -p "$ALIGN_RODA_DIR" "$PDB_DIR" "$DATA_CACHES_DIR"
 
 echo "[1/6] Downloading alignment directories from RODA..."
 aws s3 cp s3://openfold/pdb/ "$ALIGN_RODA_DIR/" --recursive --no-sign-request
@@ -78,7 +79,7 @@ python "$EXPAND_SCRIPT" \
   "$PDB_DIR/duplicate_pdb_chains.txt"
 
 echo "[6/6] Downloading OpenFold data caches (mmcif_cache + chain_data_cache)..."
-aws s3 cp s3://openfold/data_caches/ "$PDB_DIR/" --recursive --no-sign-request
+aws s3 cp s3://openfold/data_caches/ "$DATA_CACHES_DIR/" --recursive --no-sign-request
 
 echo ""
 echo "OpenProteinSet setup complete."

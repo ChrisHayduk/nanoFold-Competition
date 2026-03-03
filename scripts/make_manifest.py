@@ -4,7 +4,7 @@ import argparse
 import json
 import random
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 """Create train/val manifests from an OpenFold/OpenProteinSet chain_data_cache.
 
@@ -18,7 +18,8 @@ We filter by:
 - monomer chains
 - length range
 - resolution cutoff
-and then sample a fixed number of chains.
+and then sample fixed-size train/val chain sets with protein-disjoint splits:
+- no PDB ID is allowed to appear in both train and val
 
 NOTE: The exact schema of chain_data_cache.json can vary across OpenFold versions.
 This script is intentionally conservative and will likely need small tweaks once you inspect the cache file.
@@ -36,6 +37,12 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--max-resolution", type=float, default=3.0)
     ap.add_argument("--seed", type=int, default=0)
     return ap.parse_args()
+
+
+def _pdb_id(chain_id: str) -> str:
+    if "_" not in chain_id:
+        raise ValueError(f"Invalid chain id (expected <pdb>_<chain>): {chain_id}")
+    return chain_id.split("_", 1)[0].lower()
 
 
 def main() -> None:
@@ -82,15 +89,37 @@ def main() -> None:
         raise ValueError(f"Not enough candidates after filtering: {len(candidates)}")
 
     random.shuffle(candidates)
-    train_ids = candidates[: args.train_size]
-    val_ids = candidates[args.train_size : args.train_size + args.val_size]
+
+    # Sample val first, then restrict train to proteins not present in val.
+    val_ids = candidates[: args.val_size]
+    val_pdbs = {_pdb_id(cid) for cid in val_ids}
+
+    train_pool = [cid for cid in candidates[args.val_size :] if _pdb_id(cid) not in val_pdbs]
+    if len(train_pool) < args.train_size:
+        raise ValueError(
+            "Not enough protein-disjoint train candidates after selecting val: "
+            f"need {args.train_size}, have {len(train_pool)}. "
+            "Try reducing --val-size or adjusting filters."
+        )
+
+    random.shuffle(train_pool)
+    train_ids = train_pool[: args.train_size]
+
+    # Safety check to enforce split contract.
+    train_pdbs = {_pdb_id(cid) for cid in train_ids}
+    overlap = train_pdbs & val_pdbs
+    if overlap:
+        raise RuntimeError(f"Internal error: train/val protein overlap detected for {len(overlap)} PDB IDs")
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "train.txt").write_text("\n".join(train_ids) + "\n")
     (out_dir / "val.txt").write_text("\n".join(val_ids) + "\n")
 
-    print(f"Wrote {len(train_ids)} train + {len(val_ids)} val chains to {out_dir}")
+    print(
+        f"Wrote {len(train_ids)} train + {len(val_ids)} val chains to {out_dir} "
+        f"(protein-disjoint: {len(overlap)} overlaps)"
+    )
 
 
 if __name__ == "__main__":
