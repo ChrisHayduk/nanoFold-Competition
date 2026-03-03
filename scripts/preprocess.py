@@ -16,7 +16,9 @@ from nanofold.mmcif import extract_chain_ca, aatype_from_sequence
 """Preprocess raw OpenProteinSet/OpenFold data into compact per-chain .npz files.
 
 Input assumptions (adjust as needed):
-- raw_root/roda_pdb/<chain_id>/ contains subdirectories for alignment files (A3M/HHR/etc)
+- Either:
+  - raw_root/roda_pdb/<chain_id>/ contains subdirectories for alignment files (A3M/HHR/etc), or
+  - alignments_root/<chain_id>/ contains flattened OpenFold alignments from flatten_roda.sh
 - mmcif_root contains mmCIF files named like <pdb_id>.cif (lowercase)
 
 Output:
@@ -35,6 +37,12 @@ Output:
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser()
     ap.add_argument("--raw-root", type=str, default="data/raw", help="Root from scripts/prepare_data.py")
+    ap.add_argument(
+        "--alignments-root",
+        type=str,
+        default="",
+        help="Optional flattened alignments dir (OpenFold layout): <root>/<chain_id>/...",
+    )
     ap.add_argument("--mmcif-root", type=str, default="data/mmcif", help="Directory containing mmCIF files")
     ap.add_argument("--manifest", type=str, required=True, help="train.txt or val.txt listing chain IDs")
     ap.add_argument("--processed-dir", type=str, default="data/processed", help="Output directory")
@@ -196,6 +204,7 @@ def main() -> None:
     args = parse_args()
 
     raw_root = Path(args.raw_root)
+    alignments_root = Path(args.alignments_root) if args.alignments_root else None
     mmcif_root = Path(args.mmcif_root)
     processed_dir = Path(args.processed_dir)
     processed_dir.mkdir(parents=True, exist_ok=True)
@@ -211,8 +220,12 @@ def main() -> None:
             pdb_id, chain_id = cid.split("_")
             pdb_id = pdb_id.lower()
 
-            # Resolve paths
-            chain_dir = raw_root / "roda_pdb" / cid
+            # Resolve alignment path:
+            # - OpenFold flattened layout: <alignments_root>/<chain_id>/
+            # - Legacy layout from scripts/prepare_data.py: <raw_root>/roda_pdb/<chain_id>/
+            chain_dir = (alignments_root / cid) if alignments_root is not None else (raw_root / "roda_pdb" / cid)
+            if not chain_dir.exists():
+                raise FileNotFoundError(f"Missing alignment directory: {chain_dir}")
             # Find the msa file somewhere under chain_dir/*
             msa_path = None
             for p in chain_dir.rglob(args.msa_name):

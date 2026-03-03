@@ -25,19 +25,59 @@ Given an input protein (sequence + its MSA + optional templates), predict a 3D s
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
-# 2) download / prepare data (set --manifest and data paths for your setup)
-python scripts/prepare_data.py --help
+# 2) canonical OpenProteinSet setup from RODA (requires awscli + unzip)
+bash scripts/setup_openproteinset_roda.sh data/openproteinset
 
-# 3) preprocess into a compact .npz format
-# (includes optional template feature extraction from pdb70_hits.hhr by default)
-python scripts/preprocess.py --help
+# 3) create fixed manifests from chain_data_cache.json
+python scripts/make_manifest.py \
+  --chain-data-cache data/openproteinset/pdb_data/data_caches/chain_data_cache.json \
+  --out-dir data/manifests \
+  --seed 0
 
-# 4) train baseline
+# 4) preprocess train/val into compact .npz files
+python scripts/preprocess.py \
+  --alignments-root data/openproteinset/alignment_data/alignments \
+  --mmcif-root data/openproteinset/pdb_data/mmcif_files \
+  --manifest data/manifests/train.txt \
+  --processed-dir data/processed
+python scripts/preprocess.py \
+  --alignments-root data/openproteinset/alignment_data/alignments \
+  --mmcif-root data/openproteinset/pdb_data/mmcif_files \
+  --manifest data/manifests/val.txt \
+  --processed-dir data/processed
+
+# 5) train baseline
 python train.py --config configs/baseline.yaml
 
-# 5) evaluate
+# 6) evaluate
 python eval.py --config configs/baseline.yaml --ckpt runs/baseline/checkpoints/ckpt_last.pt
 ```
+
+## Seed Runs
+
+```bash
+# Seed ESMFold-style model
+python train.py --config submissions/seed_esmfold/config.yaml
+python eval.py --config submissions/seed_esmfold/config.yaml \
+  --ckpt runs/seed_esmfold_v1/checkpoints/ckpt_last.pt
+
+# Seed OpenFold-style model (uses MSA + template features)
+python train.py --config submissions/seed_openfold/config.yaml
+python eval.py --config submissions/seed_openfold/config.yaml \
+  --ckpt runs/seed_openfold_v1/checkpoints/ckpt_last.pt
+```
+
+## OpenProteinSet Setup Notes
+
+- The setup script follows the official OpenFold RODA flow:
+  - downloads `s3://openfold/pdb/` alignments + `pdb_mmcif.zip`
+  - runs local `scripts/flatten_roda.sh`
+  - expands duplicates with local `scripts/expand_alignment_duplicates.py`
+  - downloads `data_caches/` (including `chain_data_cache.json`)
+- Optional OpenFold steps like alignment DB shards and MMSeqs cluster-file generation are only required for training with upstream `train_openfold.py`; they are not required for this benchmark's `train.py`.
+- For this benchmark, preprocessing currently expects the flattened **alignment directory** format (`alignment_data/alignments`), not alignment DB shards.
+- `scripts/prepare_data.py` is still available as a minimal downloader, but the canonical path is `scripts/setup_openproteinset_roda.sh`.
+- `scripts/setup_openproteinset_roda.sh` also checks for `python` + `tqdm` because duplicate expansion runs `scripts/expand_alignment_duplicates.py`.
 
 ## Submitting
 
