@@ -18,13 +18,6 @@ Given an input protein (sequence + its MSA + optional templates), predict a 3D s
 
 **Primary metric:** mean lDDT-Cα on the validation set (higher is better).
 
-## Tracks
-
-- **Limited compute (default):** fixed number of optimization steps + fixed sample budget (recommended for fairness).
-- **Unlimited compute (optional):** no compute cap, fixed data (research toy track).
-
-(Tracks are just conventions; you can keep only one if you prefer.)
-
 ## Quickstart
 
 ```bash
