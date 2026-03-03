@@ -1,0 +1,37 @@
+# Baseline config for the limited-compute track.
+# This is intentionally tiny & simple: it trains a Transformer that predicts Cα coordinates,
+# optimized with a distance-matrix regression loss.
+
+run_name: baseline
+seed: 0
+
+submission:
+  module: nanofold.baseline_submission
+
+data:
+  processed_dir: data/processed   # created by scripts/preprocess.py
+  train_manifest: data/manifests/train.txt
+  val_manifest: data/manifests/val.txt
+
+  crop_size: 256
+  msa_depth: 128          # number of MSA rows sampled per example
+  batch_size: 1
+  num_workers: 2
+
+model:
+  d_model: 256
+  n_layers: 6
+  n_heads: 8
+  dropout: 0.1
+
+optim:
+  lr: 1.0e-4
+  weight_decay: 1.0e-2
+  grad_clip_norm: 1.0
+
+train:
+  max_steps: 7000
+  log_every: 50
+  eval_every: 500
+  save_every: 500
+  amp: true

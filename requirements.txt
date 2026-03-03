@@ -1,0 +1,6 @@
+torch>=2.1
+numpy>=1.24
+tqdm>=4.66
+pyyaml>=6.0
+gemmi>=0.6
+biopython>=1.81

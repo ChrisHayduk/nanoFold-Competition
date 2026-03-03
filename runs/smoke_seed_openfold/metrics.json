@@ -1,0 +1,67 @@
+{
+  "run_name": "smoke_seed_openfold",
+  "seed": 0,
+  "n_params": 297717,
+  "config": {
+    "run_name": "smoke_seed_openfold",
+    "seed": 0,
+    "submission": {
+      "path": "/Users/christopherhayduk/Desktop/nanoFold-Competition/submissions/seed_openfold/submission.py"
+    },
+    "data": {
+      "processed_dir": "/tmp/nanofold_seed_openfold_smoke/processed",
+      "train_manifest": "/tmp/nanofold_seed_openfold_smoke/manifests/train.txt",
+      "val_manifest": "/tmp/nanofold_seed_openfold_smoke/manifests/val.txt",
+      "crop_size": 24,
+      "msa_depth": 8,
+      "batch_size": 1,
+      "num_workers": 0
+    },
+    "model": {
+      "c_m": 64,
+      "c_z": 32,
+      "c_s": 64,
+      "n_evoformer_blocks": 2,
+      "n_structure_blocks": 2,
+      "n_heads_msa": 4,
+      "n_heads_pair": 4,
+      "n_heads_structure": 4,
+      "relpos_bins": 32,
+      "template_dist_bins": 39,
+      "template_dist_min": 3.0,
+      "template_dist_max": 50.0,
+      "distogram_bins": 64,
+      "plddt_bins": 50,
+      "dropout": 0.1
+    },
+    "optim": {
+      "name": "adamw",
+      "lr": 0.0001,
+      "weight_decay": 0.01,
+      "grad_clip_norm": 1.0
+    },
+    "loss": {
+      "coord_weight": 1.0,
+      "distogram_weight": 0.3,
+      "plddt_weight": 0.1,
+      "coord_cutoff": 15.0,
+      "distogram_min_bin": 2.0,
+      "distogram_max_bin": 22.0
+    },
+    "train": {
+      "max_steps": 1,
+      "log_every": 1,
+      "eval_every": 1,
+      "save_every": 1,
+      "amp": false
+    }
+  },
+  "history": [
+    {
+      "val_loss": 6.824808120727539,
+      "val_lddt_ca": 0.4483695328235626,
+      "step": 1,
+      "train_loss": 7.033123016357422
+    }
+  ]
+}

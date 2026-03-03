@@ -1,0 +1,18 @@
+[
+  {
+    "rank": 1,
+    "score_lddt_ca": 0.0,
+    "track": "limited",
+    "date": "2026-03-03",
+    "commit": "seedesm",
+    "description": "Seed submission: ESMFold-inspired trunk (pending official benchmark run)"
+  },
+  {
+    "rank": 2,
+    "score_lddt_ca": 0.0,
+    "track": "limited",
+    "date": "2026-03-03",
+    "commit": "seedopen",
+    "description": "Seed submission: OpenFold-style Evoformer + template stack (pending official benchmark run)"
+  }
+]
