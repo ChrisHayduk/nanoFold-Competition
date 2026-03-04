@@ -19,10 +19,12 @@ from nanofold.competition_policy import (
     DEFAULT_TRACK_ID,
     OFFICIAL_DATASET_FINGERPRINT_PATH,
     TrackSpec,
-    assert_config_matches_track,
+    apply_track_policy,
     compute_effective_batch_size,
     compute_residue_budget,
+    enforce_model_param_limit,
     load_track_spec,
+    assert_track_policy,
 )
 from nanofold.data import ProcessedNPZDataset, collate_batch
 from nanofold.dataset_integrity import verify_dataset_against_fingerprint
@@ -30,7 +32,6 @@ from nanofold.metrics import lddt_ca
 from nanofold.submission_runtime import (
     load_submission_hooks,
     run_submission_batch,
-    strip_supervision_from_batch,
 )
 from nanofold.utils import (
     RunPaths,
@@ -117,11 +118,14 @@ def make_loader(
     cfg: Dict[str, Any],
     split: str,
     *,
+    include_labels: bool,
+    fail_if_labels_present: bool,
     allow_missing: bool,
     generator_seed: int,
 ) -> DataLoader:
     data_cfg = cfg["data"]
-    processed_dir = data_cfg["processed_dir"]
+    processed_features_dir = data_cfg["processed_features_dir"]
+    processed_labels_dir = data_cfg.get("processed_labels_dir")
     manifest_path = data_cfg["train_manifest"] if split == "train" else data_cfg["val_manifest"]
     if split == "train":
         crop_mode = str(data_cfg.get("train_crop_mode", "random"))
@@ -130,7 +134,14 @@ def make_loader(
         crop_mode = str(data_cfg.get("val_crop_mode", "center"))
         msa_sample_mode = str(data_cfg.get("val_msa_sample_mode", "top"))
 
-    ds = ProcessedNPZDataset(processed_dir=processed_dir, manifest_path=manifest_path, allow_missing=allow_missing)
+    ds = ProcessedNPZDataset(
+        processed_features_dir=processed_features_dir,
+        processed_labels_dir=processed_labels_dir,
+        include_labels=include_labels,
+        fail_if_labels_present=fail_if_labels_present,
+        manifest_path=manifest_path,
+        allow_missing=allow_missing,
+    )
     if getattr(ds, "missing_chain_ids", None):
         print(
             f"[{split}] Skipping {len(ds.missing_chain_ids)} missing preprocessed chains "
@@ -218,32 +229,42 @@ def _verify_dataset(
     cfg: Dict[str, Any],
     fingerprint_path: str,
     require_no_missing: bool,
+    track_id: str | None = None,
 ) -> None:
     data_cfg = cfg["data"]
     verify_dataset_against_fingerprint(
-        processed_dir=data_cfg["processed_dir"],
+        processed_features_dir=data_cfg["processed_features_dir"],
+        processed_labels_dir=data_cfg.get("processed_labels_dir"),
         train_manifest=data_cfg["train_manifest"],
         val_manifest=data_cfg["val_manifest"],
         expected_fingerprint_path=fingerprint_path,
         require_no_missing=require_no_missing,
+        track_id=track_id,
     )
 
 
 def main() -> None:
     args = parse_args()
-    cfg = load_config(args.config)
+    raw_cfg = load_config(args.config)
     track_spec = load_track_spec(args.track)
+    cfg = apply_track_policy(raw_cfg, track_spec=track_spec) if args.official else raw_cfg
 
     deterministic = bool(args.deterministic or args.official)
 
     fingerprint_path = _resolve_fingerprint_path(args, track_spec)
     if args.official:
-        assert_config_matches_track(cfg, track_spec=track_spec, enforce_manifest_paths=True)
+        assert_track_policy(
+            cfg=cfg,
+            track_spec=track_spec,
+            enforce_manifest_paths=True,
+            enforce_manifest_hashes=True,
+        )
         try:
             _verify_dataset(
                 cfg=cfg,
                 fingerprint_path=fingerprint_path,
                 require_no_missing=True,
+                track_id=track_spec.track_id,
             )
         except FileNotFoundError as exc:
             raise RuntimeError(f"{exc}\n\n{_guidance_for_missing_data(track_spec)}") from exc
@@ -256,6 +277,7 @@ def main() -> None:
             cfg=cfg,
             fingerprint_path=fingerprint_path,
             require_no_missing=False,
+            track_id=track_spec.track_id,
         )
         print(f"Fingerprint verification succeeded: {Path(fingerprint_path).resolve()}")
 
@@ -278,12 +300,16 @@ def main() -> None:
         train_loader = make_loader(
             cfg,
             split="train",
+            include_labels=True,
+            fail_if_labels_present=False,
             allow_missing=allow_missing,
             generator_seed=seed,
         )
         val_loader = make_loader(
             cfg,
             split="val",
+            include_labels=True,
+            fail_if_labels_present=False,
             allow_missing=allow_missing,
             generator_seed=seed + 1,
         )
@@ -300,6 +326,8 @@ def main() -> None:
     n_params = count_parameters(model)
     print(f"Model params: {n_params:,}")
     print(f"Submission module: {hooks.module_ref}")
+    if args.official:
+        enforce_model_param_limit(track_spec=track_spec, n_params=n_params)
 
     opt = hooks.build_optimizer(cfg, model)
     if not callable(getattr(opt, "step", None)) or not callable(getattr(opt, "zero_grad", None)):
@@ -347,9 +375,11 @@ def main() -> None:
         "updated_at": utc_now_iso(),
         "history": [],
         "step_metrics_jsonl": str(step_metrics_path),
+        "cumulative_residues_seen": 0,
     }
 
     start_step = 0
+    cumulative_residues_seen = 0
     if args.resume:
         resume_path = Path(args.resume)
         if not resume_path.exists():
@@ -365,6 +395,20 @@ def main() -> None:
             except Exception:
                 pass
         start_step = int(ckpt.get("step", 0))
+        cumulative_residues_seen = int(ckpt.get("cumulative_residues_seen", 0))
+        if "rng_state" in ckpt:
+            rng_state = ckpt["rng_state"]
+            try:
+                import random as _random
+                _random.setstate(rng_state["python"])
+                import numpy as _np
+                _np.random.set_state(rng_state["numpy"])
+                torch.set_rng_state(rng_state["torch"])
+                cuda_state = rng_state.get("torch_cuda")
+                if cuda_state is not None and torch.cuda.is_available():
+                    torch.cuda.set_rng_state_all(cuda_state)
+            except Exception:
+                pass
         print(f"Resumed from {resume_path} at step {start_step}")
         if paths.metrics_path.exists():
             try:
@@ -373,6 +417,7 @@ def main() -> None:
                     metrics.update(existing_metrics)
                     metrics["resumed_from"] = str(resume_path.resolve())
                     metrics["updated_at"] = utc_now_iso()
+                    cumulative_residues_seen = int(metrics.get("cumulative_residues_seen", cumulative_residues_seen))
             except Exception:
                 pass
 
@@ -398,9 +443,8 @@ def main() -> None:
         with torch.no_grad():
             for batch in tqdm(val_loader, desc="val", leave=False):
                 batch = to_device(batch, device)
-                inference_batch = strip_supervision_from_batch(batch)
                 with make_autocast_ctx(device=device, enabled=use_amp):
-                    out = run_submission_batch(hooks, model=model, batch=inference_batch, cfg=cfg, training=False)
+                    out = run_submission_batch(hooks, model=model, batch=batch, cfg=cfg, training=False)
                 pred_ca = out["pred_ca"]
                 score = batch_lddt_ca(pred_ca, batch["ca_coords"], batch["ca_mask"], batch["residue_mask"])
                 scores.append(score.detach().cpu())
@@ -415,6 +459,7 @@ def main() -> None:
     while step < max_steps:
         optimizer_zero_grad(opt)
         running_loss = 0.0
+        residues_this_step = 0
         for _ in range(grad_accum_steps):
             try:
                 batch = next(train_iter)
@@ -423,6 +468,7 @@ def main() -> None:
                 batch = next(train_iter)
 
             batch = to_device(batch, device)
+            residues_this_step += int(batch["residue_mask"].sum().item())
 
             with make_autocast_ctx(device=device, enabled=use_amp):
                 out = run_submission_batch(hooks, model=model, batch=batch, cfg=cfg, training=True)
@@ -457,6 +503,7 @@ def main() -> None:
 
         step += 1
         pbar.update(1)
+        cumulative_residues_seen += residues_this_step
         train_loss = running_loss / grad_accum_steps
         lr = _current_lr(opt)
         now = time.perf_counter()
@@ -474,6 +521,9 @@ def main() -> None:
             "step_seconds": step_seconds,
             "steps_per_sec": steps_per_sec,
             "residues_per_sec": residues_per_sec,
+            "residues_this_step": residues_this_step,
+            "cumulative_residues_seen": cumulative_residues_seen,
+            "budget_fraction": (cumulative_residues_seen / float(residue_budget)) if residue_budget > 0 else float("nan"),
         }
         with step_metrics_path.open("a") as f:
             f.write(json.dumps(step_record) + "\n")
@@ -491,6 +541,7 @@ def main() -> None:
             val_metrics["residues_per_sec"] = residues_per_sec
             metrics["history"].append(val_metrics)
             metrics["updated_at"] = utc_now_iso()
+            metrics["cumulative_residues_seen"] = cumulative_residues_seen
             Path(paths.metrics_path).write_text(json.dumps(metrics, indent=2))
             print("Eval:", val_metrics)
 
@@ -503,6 +554,13 @@ def main() -> None:
                 "config": cfg,
                 "track": track_spec.track_id,
                 "scaler": scaler.state_dict() if use_amp else None,
+                "cumulative_residues_seen": cumulative_residues_seen,
+                "rng_state": {
+                    "python": __import__("random").getstate(),
+                    "numpy": __import__("numpy").random.get_state(),
+                    "torch": torch.get_rng_state(),
+                    "torch_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+                },
             }
             if scheduler is not None and callable(getattr(scheduler, "state_dict", None)):
                 ckpt["scheduler"] = scheduler.state_dict()

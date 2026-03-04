@@ -5,14 +5,22 @@ official: false
 dataset:
   train_manifest: data/manifests/train.txt
   val_manifest: data/manifests/val.txt
+  hidden_manifest: null
   fingerprint: null
+  hidden_fingerprint: null
+  hidden_manifest_sha256: null
+  hidden_fingerprint_sha256: null
+  hidden_lock_file: null
   train_chain_count: 100
   val_chain_count: 20
+  hidden_chain_count: null
 train:
   seed: 0
   crop_size: 128
   msa_depth: 64
   effective_batch_size: 2
-  max_steps: 200
+  max_steps: 20
   val_crop_mode: center
   val_msa_sample_mode: top
+model:
+  max_params: null

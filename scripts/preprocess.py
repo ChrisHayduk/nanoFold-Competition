@@ -28,15 +28,16 @@ Input assumptions (adjust as needed):
 - mmcif_root contains mmCIF files named like <pdb_id>.cif (lowercase)
 
 Output:
-- processed_dir/<chain_id>.npz containing:
+- processed_features_dir/<chain_id>.npz containing:
     aatype: (L,) int32
     msa: (N,L) int32
     deletions: (N,L) int32
-    ca_coords: (L,3) float32
-    ca_mask: (L,) bool
     template_aatype: (T,L) int32
     template_ca_coords: (T,L,3) float32
     template_ca_mask: (T,L) bool
+- processed_labels_dir/<chain_id>.npz containing:
+    ca_coords: (L,3) float32
+    ca_mask: (L,) bool
 """
 
 
@@ -51,7 +52,18 @@ def parse_args() -> argparse.Namespace:
     )
     ap.add_argument("--mmcif-root", type=str, default="data/mmcif", help="Directory containing mmCIF files")
     ap.add_argument("--manifest", type=str, required=True, help="train.txt or val.txt listing chain IDs")
-    ap.add_argument("--processed-dir", type=str, default="data/processed", help="Output directory")
+    ap.add_argument(
+        "--processed-features-dir",
+        type=str,
+        default="data/processed_features",
+        help="Output directory for feature .npz files",
+    )
+    ap.add_argument(
+        "--processed-labels-dir",
+        type=str,
+        default="data/processed_labels",
+        help="Output directory for label .npz files",
+    )
     ap.add_argument("--msa-name", type=str, default="uniref90_hits.a3m", help="Which MSA file to use")
     ap.add_argument("--max-msa-seqs", type=int, default=2048, help="Cap raw MSA depth to keep files smaller")
     ap.add_argument("--template-hhr-name", type=str, default="pdb70_hits.hhr", help="Template hits file name under chain dir")
@@ -248,8 +260,10 @@ def main() -> None:
     raw_root = Path(args.raw_root)
     alignments_root = Path(args.alignments_root) if args.alignments_root else None
     mmcif_root = Path(args.mmcif_root)
-    processed_dir = Path(args.processed_dir)
-    processed_dir.mkdir(parents=True, exist_ok=True)
+    processed_features_dir = Path(args.processed_features_dir)
+    processed_labels_dir = Path(args.processed_labels_dir)
+    processed_features_dir.mkdir(parents=True, exist_ok=True)
+    processed_labels_dir.mkdir(parents=True, exist_ok=True)
 
     manifest = Path(args.manifest)
     chain_ids = [ln.strip() for ln in manifest.read_text().splitlines() if ln.strip() and not ln.startswith("#")]
@@ -314,16 +328,18 @@ def main() -> None:
                 if int(target_ca_mask.sum()) == 0:
                     raise ValueError(f"No aligned C-alpha positions for {cid} after sequence projection")
 
-            out = {
+            features_out = {
                 "aatype": aatype_from_sequence(target_seq),
                 "msa": msa.astype(np.int32),
                 "deletions": deletions.astype(np.int32),
+            }
+            labels_out = {
                 "ca_coords": target_ca_coords.astype(np.float32),
                 "ca_mask": target_ca_mask.astype(bool),
             }
 
             if args.disable_templates:
-                out.update(_empty_template_features(len(target_seq)))
+                features_out.update(_empty_template_features(len(target_seq)))
             else:
                 tpl = _extract_template_features(
                     chain_dir=chain_dir,
@@ -335,10 +351,11 @@ def main() -> None:
                     template_hhr_name=args.template_hhr_name,
                     max_templates=int(args.max_templates),
                 )
-                out.update(tpl)
+                features_out.update(tpl)
 
-            np.savez_compressed(processed_dir / f"{cid}.npz", **out)
-            err_marker = processed_dir / f"{cid}.error.txt"
+            np.savez_compressed(processed_features_dir / f"{cid}.npz", **features_out)
+            np.savez_compressed(processed_labels_dir / f"{cid}.npz", **labels_out)
+            err_marker = processed_features_dir / f"{cid}.error.txt"
             if err_marker.exists():
                 err_marker.unlink()
             n_ok += 1
@@ -347,12 +364,12 @@ def main() -> None:
             if args.fail_fast:
                 raise
             # Write an error marker file for debugging
-            (processed_dir / f"{cid}.error.txt").write_text(str(e) + "\n")
+            (processed_features_dir / f"{cid}.error.txt").write_text(str(e) + "\n")
             continue
 
     print(f"Preprocess complete: ok={n_ok}, fail={n_fail}")
     if n_fail > 0:
-        print("Inspect *.error.txt files in", processed_dir)
+        print("Inspect *.error.txt files in", processed_features_dir)
 
 
 if __name__ == "__main__":

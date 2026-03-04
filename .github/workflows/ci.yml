@@ -5,6 +5,54 @@ on:
   pull_request:
 
 jobs:
+  protected-manifest-guard:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Enforce approval on protected manifest edits
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const protectedFiles = new Set([
+              'data/manifests/train.txt',
+              'data/manifests/val.txt',
+            ]);
+            const approvalLabel = 'manifest-change-approved';
+            const pr = context.payload.pull_request;
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const pull_number = pr.number;
+
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner,
+              repo,
+              pull_number,
+              per_page: 100,
+            });
+
+            const touched = files
+              .filter((f) => protectedFiles.has(f.filename) || (f.previous_filename && protectedFiles.has(f.previous_filename)))
+              .map((f) => f.filename);
+
+            if (touched.length === 0) {
+              core.info('No protected manifest files changed.');
+              return;
+            }
+
+            const labels = (pr.labels || []).map((l) => l.name);
+            if (!labels.includes(approvalLabel)) {
+              core.setFailed(
+                `This PR modifies protected manifest file(s): ${touched.join(', ')}. ` +
+                `A maintainer must explicitly approve this by adding the '${approvalLabel}' label.`
+              );
+              return;
+            }
+
+            core.info(`Protected manifest change approved via '${approvalLabel}' label.`);
+
   lint-type-test:
     runs-on: ubuntu-latest
     steps:
@@ -20,5 +68,194 @@ jobs:
         run: ruff check .
       - name: Mypy
         run: mypy nanofold scripts train.py eval.py
+      - name: Official Hash Sync Check
+        run: python scripts/sync_official_manifest_hashes.py --check
       - name: Pytest
         run: pytest
+      - name: JSON Schema Checks
+        run: |
+          python - <<'PY'
+          from __future__ import annotations
+
+          import json
+          from pathlib import Path
+
+          lb_path = Path("leaderboard/leaderboard.json")
+          if lb_path.exists():
+              entries = json.loads(lb_path.read_text())
+              if not isinstance(entries, list):
+                  raise SystemExit("leaderboard/leaderboard.json must be a JSON list")
+              for idx, row in enumerate(entries):
+                  if not isinstance(row, dict):
+                      raise SystemExit(f"leaderboard row {idx} must be an object")
+                  required_any = ("score_lddt_ca", "score_hidden_lddt_ca", "rank_score")
+                  if not any(key in row for key in required_any):
+                      raise SystemExit(f"leaderboard row {idx} missing any score field: {required_any}")
+          for result in Path("runs").glob("*/result.json"):
+              obj = json.loads(result.read_text())
+              if not isinstance(obj, dict):
+                  raise SystemExit(f"{result} must be an object")
+              if "schema_version" not in obj:
+                  raise SystemExit(f"{result} missing schema_version")
+              if "track" not in obj:
+                  raise SystemExit(f"{result} missing track")
+          PY
+      - name: Hidden Path Guardrail
+        run: |
+          python - <<'PY'
+          from __future__ import annotations
+
+          from pathlib import Path
+
+          import yaml
+
+          for path in Path("tracks").glob("*.yaml"):
+              raw = yaml.safe_load(path.read_text()) or {}
+              dataset = raw.get("dataset", {}) if isinstance(raw, dict) else {}
+              for key in ("hidden_manifest", "hidden_fingerprint"):
+                  value = dataset.get(key)
+                  if value in (None, "", "null"):
+                      continue
+                  if not isinstance(value, str):
+                      raise SystemExit(f"{path}: dataset.{key} must be string/null")
+                  if Path(value).is_absolute():
+                      raise SystemExit(f"{path}: dataset.{key} must not be an absolute path ({value})")
+          PY
+
+  smoke-official:
+    runs-on: ubuntu-latest
+    needs: lint-type-test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+      - name: Build synthetic smoke dataset and config
+        run: |
+          mkdir -p .ci_smoke/processed_features .ci_smoke/processed_labels data/manifests
+          python - <<'PY'
+          from __future__ import annotations
+
+          from pathlib import Path
+          import numpy as np
+          import yaml
+
+          cid = "1abc_A"
+          Path("data/manifests/train.txt").write_text(f"{cid}\n")
+          Path("data/manifests/val.txt").write_text(f"{cid}\n")
+
+          L, N, T = 128, 8, 1
+          np.savez_compressed(
+              Path(".ci_smoke/processed_features") / f"{cid}.npz",
+              aatype=np.zeros((L,), dtype=np.int32),
+              msa=np.zeros((N, L), dtype=np.int32),
+              deletions=np.zeros((N, L), dtype=np.int32),
+              template_aatype=np.zeros((T, L), dtype=np.int32),
+              template_ca_coords=np.zeros((T, L, 3), dtype=np.float32),
+              template_ca_mask=np.ones((T, L), dtype=bool),
+          )
+          np.savez_compressed(
+              Path(".ci_smoke/processed_labels") / f"{cid}.npz",
+              ca_coords=np.zeros((L, 3), dtype=np.float32),
+              ca_mask=np.ones((L,), dtype=bool),
+          )
+
+          cfg = {
+              "run_name": "ci_smoke_official",
+              "track": "smoke",
+              "seed": 0,
+              "submission": {"module": "nanofold.baseline_submission"},
+              "data": {
+                  "processed_features_dir": ".ci_smoke/processed_features",
+                  "processed_labels_dir": ".ci_smoke/processed_labels",
+                  "train_manifest": "data/manifests/train.txt",
+                  "val_manifest": "data/manifests/val.txt",
+                  "crop_size": 128,
+                  "msa_depth": 64,
+                  "batch_size": 1,
+                  "num_workers": 0,
+                  "train_crop_mode": "random",
+                  "val_crop_mode": "center",
+                  "train_msa_sample_mode": "random",
+                  "val_msa_sample_mode": "top",
+              },
+              "model": {"d_model": 64, "n_layers": 2, "n_heads": 4, "dropout": 0.0, "max_seq_len": 256},
+              "optim": {
+                  "lr": 2.5e-4,
+                  "weight_decay": 1.0e-3,
+                  "grad_clip_norm": 1.0,
+                  "scheduler": "none",
+              },
+              "loss": {
+                  "local_weight": 1.0,
+                  "global_weight": 0.25,
+                  "bond_weight": 0.10,
+                  "local_cutoff": 15.0,
+                  "global_max_dist": 32.0,
+              },
+              "train": {
+                  "max_steps": 20,
+                  "log_every": 5,
+                  "eval_every": 10,
+                  "save_every": 10,
+                  "grad_accum_steps": 2,
+                  "amp": False,
+              },
+          }
+          Path(".ci_smoke/config.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False))
+          PY
+      - name: Build smoke fingerprint
+        run: |
+          python scripts/build_fingerprint.py \
+            --config .ci_smoke/config.yaml \
+            --output .ci_smoke/fingerprint.json \
+            --track smoke
+      - name: Validate submission smoke contract
+        run: |
+          python scripts/validate_submission.py --submission submissions/template --track smoke
+      - name: Train smoke official run
+        run: |
+          python train.py \
+            --config .ci_smoke/config.yaml \
+            --track smoke \
+            --official \
+            --fingerprint .ci_smoke/fingerprint.json \
+            --deterministic
+      - name: Eval smoke multi-checkpoint
+        run: |
+          mkdir -p .ci_smoke/forbid_labels
+          python eval.py \
+            --config .ci_smoke/config.yaml \
+            --track smoke \
+            --official \
+            --fingerprint .ci_smoke/fingerprint.json \
+            --split val \
+            --forbid-labels-dir .ci_smoke/forbid_labels \
+            --score-labels-dir .ci_smoke/processed_labels \
+            --ckpt-dir runs/ci_smoke_official/checkpoints \
+            --ckpt-steps 10,20 \
+            --pred-out-dir .ci_smoke/preds \
+            --save .ci_smoke/eval_multi.json \
+            --per-chain-out .ci_smoke/per_chain.jsonl
+      - name: Smoke artifact schema checks
+        run: |
+          python - <<'PY'
+          from __future__ import annotations
+
+          import json
+          from pathlib import Path
+
+          obj = json.loads(Path(".ci_smoke/eval_multi.json").read_text())
+          if not isinstance(obj, dict):
+              raise SystemExit("eval summary must be object")
+          if "checkpoints" not in obj or not isinstance(obj["checkpoints"], list):
+              raise SystemExit("eval summary missing checkpoints list")
+          if len(obj["checkpoints"]) < 2:
+              raise SystemExit("expected multi-checkpoint eval output")
+          if "mean_lddt_ca" not in obj:
+              raise SystemExit("eval summary missing mean_lddt_ca")
+          PY

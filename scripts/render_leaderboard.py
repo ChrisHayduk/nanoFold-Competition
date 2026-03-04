@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -23,13 +24,34 @@ def parse_args() -> argparse.Namespace:
 
 
 def render_table(entries: List[Dict[str, Any]]) -> str:
+    def _fmt_score(value: Any) -> str:
+        try:
+            f = float(value)
+        except Exception:
+            return "n/a"
+        if math.isnan(f):
+            return "n/a"
+        return f"{f:.4f}"
+
+    def _rank_score(entry: Dict[str, Any]) -> float:
+        try:
+            v = float(
+                entry.get("rank_score", entry.get("score_hidden_lddt_ca", entry.get("score_lddt_ca", float("nan"))))
+            )
+        except Exception:
+            return float("-inf")
+        return v if not math.isnan(v) else float("-inf")
+
     lines = []
-    lines.append("| # | Score (lDDT-Cα) | Track | Date | Commit | Description |")
-    lines.append("|---:|---:|---|---|---|---|")
-    for i, e in enumerate(sorted(entries, key=lambda x: (-x["score_lddt_ca"], x.get("date", ""))), start=1):
+    lines.append("| # | Rank Score | Hidden Final | Hidden AUC | Public Val | Track | Date | Commit | Description |")
+    lines.append("|---:|---:|---:|---:|---:|---|---|---|---|")
+    sorted_entries = sorted(entries, key=lambda x: (-_rank_score(x), str(x.get("date", ""))))
+    for i, e in enumerate(sorted_entries, start=1):
         commit = e.get("commit", "")[:7]
+        hidden = e.get("score_hidden_lddt_ca", e.get("final_hidden_lddt_ca", float("nan")))
+        public = e.get("score_public_val_lddt_ca", e.get("score_lddt_ca", float("nan")))
         lines.append(
-            f"| {i} | {e['score_lddt_ca']:.4f} | {e.get('track','')} | {e.get('date','')} | `{commit}` | {e.get('description','')} |"
+            f"| {i} | {_fmt_score(e.get('rank_score', hidden))} | {_fmt_score(hidden)} | {_fmt_score(e.get('lddt_auc_hidden', float('nan')))} | {_fmt_score(public)} | {e.get('track','')} | {e.get('date','')} | `{commit}` | {e.get('description','')} |"
         )
     return "\n".join(lines)
 

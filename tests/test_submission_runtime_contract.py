@@ -10,9 +10,14 @@ from nanofold.submission_runtime import SubmissionHooks, run_submission_batch, s
 
 
 class TinyModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.scale = torch.nn.Parameter(torch.tensor(1.0))
+
     def forward(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         B, L = batch["aatype"].shape
-        return torch.zeros((B, L, 3), dtype=torch.float32)
+        base = torch.zeros((B, L, 3), dtype=torch.float32, device=self.scale.device)
+        return base * self.scale
 
 
 def _batch() -> Dict[str, Any]:
@@ -83,3 +88,27 @@ def test_strip_supervision_from_batch_for_inference() -> None:
     out = strip_supervision_from_batch(batch)
     assert "ca_coords" not in out
     assert "ca_mask" not in out
+
+
+def test_run_submission_batch_strips_supervision_internally() -> None:
+    observed_keys: list[str] = []
+
+    def run_batch(model, batch, cfg, training):  # noqa: ANN001, ANN201
+        observed_keys.extend(list(batch.keys()))
+        pred = torch.zeros((1, 8, 3), dtype=torch.float32)
+        return {"pred_ca": pred}
+
+    hooks = _hooks(run_batch)
+    _ = run_submission_batch(hooks, model=TinyModel(), batch=_batch(), cfg={}, training=False)
+    assert "ca_coords" not in observed_keys
+    assert "ca_mask" not in observed_keys
+
+
+def test_run_submission_batch_training_loss_requires_grad() -> None:
+    def run_batch(model, batch, cfg, training):  # noqa: ANN001, ANN201
+        pred = torch.zeros((1, 8, 3), dtype=torch.float32)
+        return {"pred_ca": pred, "loss": torch.tensor(0.0)}
+
+    hooks = _hooks(run_batch)
+    with pytest.raises(ValueError, match="must require gradients"):
+        run_submission_batch(hooks, model=TinyModel(), batch=_batch(), cfg={}, training=True)

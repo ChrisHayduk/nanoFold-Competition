@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -32,13 +33,30 @@ def _result_to_entry(result: Dict[str, Any], description_override: str) -> Dict[
     description = description_override.strip() or str(
         result.get("description", f"Official run for {submission}")
     )
+    def _to_float(value: Any) -> float:
+        try:
+            return float(value)
+        except Exception:
+            return float("nan")
+
+    hidden_score = result.get("final_hidden_lddt_ca", result.get("score_hidden_lddt_ca", float("nan")))
+    public_score = result.get("public_val_lddt_ca", result.get("score_lddt_ca", float("nan")))
+    rank_metric = str(result.get("rank_metric", "final_hidden_lddt_ca"))
+    rank_score = result.get("rank_score", hidden_score if rank_metric == "final_hidden_lddt_ca" else public_score)
     return {
-        "score_lddt_ca": float(result["score_lddt_ca"]),
+        "schema_version": int(result.get("schema_version", 1)),
+        "rank_metric": rank_metric,
+        "rank_score": _to_float(rank_score),
+        "score_hidden_lddt_ca": _to_float(hidden_score),
+        "score_public_val_lddt_ca": _to_float(public_score),
+        "lddt_auc_hidden": _to_float(result.get("lddt_auc_hidden", float("nan"))),
+        "lddt_at_steps": dict(result.get("lddt_at_steps", {})) if isinstance(result.get("lddt_at_steps"), dict) else {},
         "track": str(result.get("track", "limited")),
         "date": created_at,
         "commit": commit,
         "description": description,
         "run_name": str(result.get("run_name", "")),
+        "submission_name": submission,
     }
 
 
@@ -57,9 +75,15 @@ def _dedupe_entries(entries: List[Dict[str, Any]], new_entry: Dict[str, Any]) ->
 
 
 def _rank_entries(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def score_value(row: Dict[str, Any]) -> float:
+        score = float(row.get("rank_score", float("nan")))
+        if math.isnan(score):
+            return float("-inf")
+        return score
+
     ranked = sorted(
         entries,
-        key=lambda x: (-float(x.get("score_lddt_ca", float("-inf"))), str(x.get("date", ""))),
+        key=lambda x: (-score_value(x), str(x.get("date", ""))),
     )
     for i, row in enumerate(ranked, start=1):
         row["rank"] = i

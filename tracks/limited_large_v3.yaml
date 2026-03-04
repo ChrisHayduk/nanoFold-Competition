@@ -5,9 +5,19 @@ official: true
 dataset:
   train_manifest: data/manifests/train.txt
   val_manifest: data/manifests/val.txt
+  all_manifest: data/manifests/all.txt
+  hidden_manifest: null
+  train_manifest_sha256: c3288fe5f855b602921734ea0113a858b09c8acfb28e53468940a5657abe2682
+  val_manifest_sha256: 7c279df96fad21e04909bc331466d96118256d3b0f69bccf1c2cc86d957d1f67
+  all_manifest_sha256: 2b2a298d078b7a398a5f3379769bdbfb33b27fe39239a5f052e07d24800df778
+  hidden_manifest_sha256: null
   fingerprint: leaderboard/official_dataset_fingerprint.json
+  hidden_fingerprint: null
+  hidden_fingerprint_sha256: null
+  hidden_lock_file: leaderboard/official_hidden_assets.lock.json
   train_chain_count: 10000
   val_chain_count: 1000
+  hidden_chain_count: null
 train:
   seed: 0
   crop_size: 256
@@ -16,3 +26,5 @@ train:
   max_steps: 10000
   val_crop_mode: center
   val_msa_sample_mode: top
+model:
+  max_params: 50000000

@@ -18,16 +18,28 @@ if str(REPO_ROOT) not in sys.path:
 
 from nanofold.competition_policy import (
     DEFAULT_TRACK_ID,
+    TrackSpec,
+    apply_track_policy,
     compute_effective_batch_size,
     compute_residue_budget,
+    enforce_model_param_limit,
     load_track_spec,
-    validate_config_against_track,
+    validate_track_policy,
 )
+from nanofold.utils import count_parameters
 from nanofold.submission_runtime import load_submission_hooks, run_submission_batch, strip_supervision_from_batch
 
 
 REQUIRED_TOP_LEVEL = ("run_name", "seed", "submission", "data", "train")
-REQUIRED_DATA_KEYS = ("processed_dir", "train_manifest", "val_manifest", "crop_size", "msa_depth", "batch_size")
+REQUIRED_DATA_KEYS = (
+    "processed_features_dir",
+    "processed_labels_dir",
+    "train_manifest",
+    "val_manifest",
+    "crop_size",
+    "msa_depth",
+    "batch_size",
+)
 REQUIRED_TRAIN_KEYS = ("max_steps", "eval_every", "save_every")
 
 METADATA_FIELDS = (
@@ -199,7 +211,13 @@ def _make_dummy_batch(crop_size: int, msa_depth: int) -> Dict[str, Any]:
     }
 
 
-def _validate_submission_interface(diags: List[Diagnostic], cfg: Dict[str, Any], config_path: Path) -> None:
+def _validate_submission_interface(
+    diags: List[Diagnostic],
+    cfg: Dict[str, Any],
+    config_path: Path,
+    *,
+    track_spec: TrackSpec,
+) -> None:
     try:
         hooks = load_submission_hooks(cfg, config_path)
     except Exception as exc:  # noqa: BLE001
@@ -212,8 +230,10 @@ def _validate_submission_interface(diags: List[Diagnostic], cfg: Dict[str, Any],
         add_error(diags, f"`build_model(cfg)` failed: {exc}")
         return
 
-    if not isinstance(model, torch.nn.Module):
-        add_error(diags, "`build_model(cfg)` must return a torch.nn.Module.")
+    try:
+        enforce_model_param_limit(track_spec=track_spec, n_params=count_parameters(model))
+    except Exception as exc:  # noqa: BLE001
+        add_error(diags, str(exc))
         return
 
     try:
@@ -438,16 +458,18 @@ def validate_submission(submission_dir: Path, strict: bool, track_id: str) -> in
             add_error(diags, "`train` must be a mapping")
 
     if cfg and all(k in cfg for k in ("submission", "data", "train")):
+        cfg = apply_track_policy(cfg, track_spec=track_spec)
         effective_batch_size, residue_budget = _validate_numeric(diags, cfg)
-        policy_errors = validate_config_against_track(
-            cfg,
+        policy_errors = validate_track_policy(
+            cfg=cfg,
             track_spec=track_spec,
             enforce_manifest_paths=True,
+            enforce_manifest_hashes=True,
         )
         for msg in policy_errors:
             add_error(diags, msg)
         _validate_submission_entrypoint(diags, cfg, config_path=config_path, submission_dir=submission_dir, allow_placeholders=allow_placeholders)
-        _validate_submission_interface(diags, cfg, config_path=config_path)
+        _validate_submission_interface(diags, cfg, config_path=config_path, track_spec=track_spec)
         _validate_submission_artifacts(diags, submission_dir=submission_dir)
         _validate_suspicious_imports(diags, submission_dir=submission_dir)
         run_name = str(cfg.get("run_name", "")).strip()

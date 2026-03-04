@@ -24,10 +24,18 @@ Usage: bash scripts/setup_custom_data.sh [options]
 Options:
   --data-root <path>          Root for downloaded OpenProteinSet files (default: data/openproteinset)
   --manifests-dir <path>      Output dir for train/val manifests (default: data/manifests)
-  --processed-dir <path>      Output dir for preprocessed .npz files (default: data/processed)
+  --processed-features-dir <path>
+                              Output dir for feature .npz files (default: data/processed_features)
+  --processed-labels-dir <path>
+                              Output dir for label .npz files (default: data/processed_labels)
+  --processed-dir <path>       Backward-compatible alias that sets both processed dirs to <path>
   --train-size <int>          Number of training chains (default: 10000)
   --val-size <int>            Number of validation chains (default: 1000)
   --seed <int>                Manifest sampling seed (default: 0)
+  --expected-chain-cache-sha256 <hex>
+                              Optional expected SHA256 for chain_data_cache.json
+                              (fails generation if cache hash differs)
+  --manifest-lock-file <path> Optional lock metadata output path from build_manifests.py
   --min-len <int>             Minimum chain length filter (default: 40)
   --max-len <int>             Maximum chain length filter (default: 256)
   --max-resolution <float>    Maximum resolution filter (default: 3.0)
@@ -50,10 +58,13 @@ PREPROCESS_SCRIPT="$SCRIPT_DIR/preprocess.py"
 
 DATA_ROOT="data/openproteinset"
 MANIFESTS_DIR="data/manifests"
-PROCESSED_DIR="data/processed"
+PROCESSED_FEATURES_DIR="data/processed_features"
+PROCESSED_LABELS_DIR="data/processed_labels"
 TRAIN_SIZE=10000
 VAL_SIZE=1000
 SEED=0
+EXPECTED_CHAIN_CACHE_SHA256=""
+MANIFEST_LOCK_FILE=""
 MIN_LEN=40
 MAX_LEN=256
 MAX_RESOLUTION=3.0
@@ -75,8 +86,17 @@ while [[ $# -gt 0 ]]; do
       MANIFESTS_DIR="$2"
       shift 2
       ;;
+    --processed-features-dir)
+      PROCESSED_FEATURES_DIR="$2"
+      shift 2
+      ;;
+    --processed-labels-dir)
+      PROCESSED_LABELS_DIR="$2"
+      shift 2
+      ;;
     --processed-dir)
-      PROCESSED_DIR="$2"
+      PROCESSED_FEATURES_DIR="$2"
+      PROCESSED_LABELS_DIR="$2"
       shift 2
       ;;
     --train-size)
@@ -89,6 +109,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --seed)
       SEED="$2"
+      shift 2
+      ;;
+    --expected-chain-cache-sha256)
+      EXPECTED_CHAIN_CACHE_SHA256="$2"
+      shift 2
+      ;;
+    --manifest-lock-file)
+      MANIFEST_LOCK_FILE="$2"
       shift 2
       ;;
     --min-len)
@@ -174,7 +202,7 @@ PDB_DIR="$DATA_ROOT/pdb_data"
 DATA_CACHES_DIR="$PDB_DIR/data_caches"
 MMCIF_ROOT="$PDB_DIR/mmcif_files"
 
-mkdir -p "$DATA_ROOT" "$PDB_DIR" "$DATA_CACHES_DIR" "$MANIFESTS_DIR" "$PROCESSED_DIR"
+mkdir -p "$DATA_ROOT" "$PDB_DIR" "$DATA_CACHES_DIR" "$MANIFESTS_DIR" "$PROCESSED_FEATURES_DIR" "$PROCESSED_LABELS_DIR"
 
 echo "NOTE: This script regenerates manifests for custom/research runs."
 echo "For strict official runs, use scripts/setup_official_data.sh."
@@ -196,15 +224,24 @@ if [[ "$DRY_RUN" -eq 0 ]] && [[ ! -f "$CHAIN_DATA_CACHE_PATH" ]]; then
 fi
 
 echo "[2/6] Building fixed manifests..."
-run_cmd python "$BUILD_MANIFESTS_SCRIPT" \
-  --chain-data-cache "$CHAIN_DATA_CACHE_PATH" \
-  --out-dir "$MANIFESTS_DIR" \
-  --train-size "$TRAIN_SIZE" \
-  --val-size "$VAL_SIZE" \
-  --min-len "$MIN_LEN" \
-  --max-len "$MAX_LEN" \
-  --max-resolution "$MAX_RESOLUTION" \
+BUILD_MANIFESTS_CMD=(
+  python "$BUILD_MANIFESTS_SCRIPT"
+  --chain-data-cache "$CHAIN_DATA_CACHE_PATH"
+  --out-dir "$MANIFESTS_DIR"
+  --train-size "$TRAIN_SIZE"
+  --val-size "$VAL_SIZE"
+  --min-len "$MIN_LEN"
+  --max-len "$MAX_LEN"
+  --max-resolution "$MAX_RESOLUTION"
   --seed "$SEED"
+)
+if [[ -n "$EXPECTED_CHAIN_CACHE_SHA256" ]]; then
+  BUILD_MANIFESTS_CMD+=(--expected-chain-cache-sha256 "$EXPECTED_CHAIN_CACHE_SHA256")
+fi
+if [[ -n "$MANIFEST_LOCK_FILE" ]]; then
+  BUILD_MANIFESTS_CMD+=(--lock-file "$MANIFEST_LOCK_FILE")
+fi
+run_cmd "${BUILD_MANIFESTS_CMD[@]}"
 
 ALL_MANIFEST="$MANIFESTS_DIR/all.txt"
 echo "[3/6] Building union manifest at $ALL_MANIFEST..."
@@ -246,7 +283,8 @@ else
     python "$PREPROCESS_SCRIPT"
     --raw-root "$DATA_ROOT"
     --mmcif-root "$MMCIF_ROOT"
-    --processed-dir "$PROCESSED_DIR"
+    --processed-features-dir "$PROCESSED_FEATURES_DIR"
+    --processed-labels-dir "$PROCESSED_LABELS_DIR"
     --msa-name "$MSA_NAME"
   )
   if [[ "$USE_TEMPLATES" -eq 1 ]]; then
@@ -263,7 +301,8 @@ echo ""
 echo "Subset setup complete."
 echo "Data root: $DATA_ROOT"
 echo "Manifests: $MANIFESTS_DIR"
-echo "Processed: $PROCESSED_DIR"
+echo "Processed features: $PROCESSED_FEATURES_DIR"
+echo "Processed labels: $PROCESSED_LABELS_DIR"
 echo ""
 echo "Next:"
 echo "  python train.py --config submissions/seed_esmfold/config.yaml"

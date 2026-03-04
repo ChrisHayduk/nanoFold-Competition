@@ -39,6 +39,15 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--max-resolution", type=float, default=3.0)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument(
+        "--expected-chain-cache-sha256",
+        type=str,
+        default="",
+        help=(
+            "Optional expected SHA256 of chain_data_cache.json. "
+            "If provided, generation fails on mismatch."
+        ),
+    )
+    ap.add_argument(
         "--lock-file",
         type=str,
         default="",
@@ -53,12 +62,34 @@ def _pdb_id(chain_id: str) -> str:
     return chain_id.split("_", 1)[0].lower()
 
 
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
 def main() -> None:
     args = parse_args()
-    random.seed(args.seed)
+    rng = random.Random(args.seed)
 
     cache_path = Path(args.chain_data_cache)
+    cache_sha = _sha256(cache_path)
+    expected_cache_sha = args.expected_chain_cache_sha256.strip().lower()
+    if expected_cache_sha:
+        if len(expected_cache_sha) != 64 or any(ch not in "0123456789abcdef" for ch in expected_cache_sha):
+            raise ValueError("--expected-chain-cache-sha256 must be a 64-char lowercase hex digest.")
+        if cache_sha != expected_cache_sha:
+            raise ValueError(
+                "chain_data_cache SHA256 mismatch.\n"
+                f"expected: {expected_cache_sha}\n"
+                f"actual:   {cache_sha}\n"
+                f"path:     {cache_path.resolve()}"
+            )
+
     data = json.loads(cache_path.read_text())
+    if not isinstance(data, dict):
+        raise ValueError(
+            "chain_data_cache.json must be a JSON object keyed by chain id. "
+            f"Got {type(data).__name__}."
+        )
 
     # Heuristic: cache might be a dict keyed by chain_id, with a nested dict of fields.
     # We'll try to pull:
@@ -96,7 +127,7 @@ def main() -> None:
     if len(candidates) < args.train_size + args.val_size:
         raise ValueError(f"Not enough candidates after filtering: {len(candidates)}")
 
-    random.shuffle(candidates)
+    rng.shuffle(candidates)
 
     # Sample val first, then restrict train to proteins not present in val.
     val_ids = candidates[: args.val_size]
@@ -110,7 +141,7 @@ def main() -> None:
             "Try reducing --val-size or adjusting filters."
         )
 
-    random.shuffle(train_pool)
+    rng.shuffle(train_pool)
     train_ids = train_pool[: args.train_size]
 
     # Safety check to enforce split contract.
@@ -135,7 +166,6 @@ def main() -> None:
     )
 
     if args.lock_file:
-        cache_sha = hashlib.sha256(cache_path.read_bytes()).hexdigest()
         lock = {
             "chain_data_cache_path": str(cache_path.resolve()),
             "chain_data_cache_sha256": cache_sha,
@@ -146,11 +176,15 @@ def main() -> None:
                 "max_len": int(args.max_len),
                 "max_resolution": float(args.max_resolution),
                 "seed": int(args.seed),
+                "expected_chain_cache_sha256": expected_cache_sha or None,
             },
             "outputs": {
                 "train_manifest": str(train_path.resolve()),
                 "val_manifest": str(val_path.resolve()),
                 "all_manifest": str(all_path.resolve()),
+                "train_manifest_sha256": _sha256(train_path),
+                "val_manifest_sha256": _sha256(val_path),
+                "all_manifest_sha256": _sha256(all_path),
                 "train_count": len(train_ids),
                 "val_count": len(val_ids),
                 "unique_count": len(all_ids),

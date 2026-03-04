@@ -82,8 +82,10 @@ def load_submission_hooks(cfg: Dict[str, Any], config_path: str | Path) -> Submi
         raise ValueError("`submission` must set exactly one of `module` or `path`.")
 
     if has_name:
+        assert isinstance(module_name, str)
         module_ref, module = _import_module_from_name(module_name.strip())
     else:
+        assert isinstance(module_path, str)
         path = Path(module_path.strip())
         if not path.is_absolute():
             path = config_path.parent / path
@@ -124,7 +126,13 @@ def run_submission_batch(
     cfg: Dict[str, Any],
     training: bool,
 ) -> Dict[str, torch.Tensor]:
-    out = hooks.run_batch(model=model, batch=batch, cfg=cfg, training=training)
+    run_batch_input = batch
+    if not training:
+        # Runtime-level safety: never expose supervision tensors to submission code
+        # in inference mode, even if a caller accidentally passes them through.
+        run_batch_input = strip_supervision_from_batch(batch)
+
+    out = hooks.run_batch(model=model, batch=run_batch_input, cfg=cfg, training=training)
     if not isinstance(out, dict):
         raise TypeError("`run_batch` must return a dict with at least `pred_ca`.")
 
@@ -137,8 +145,8 @@ def run_submission_batch(
     if pred_ca.ndim != 3 or pred_ca.shape[-1] != 3:
         raise ValueError(f"`pred_ca` must have shape (B, L, 3), got {tuple(pred_ca.shape)}")
 
-    if "aatype" in batch and torch.is_tensor(batch["aatype"]):
-        B, L = batch["aatype"].shape[:2]
+    if "aatype" in run_batch_input and torch.is_tensor(run_batch_input["aatype"]):
+        B, L = run_batch_input["aatype"].shape[:2]
         if pred_ca.shape[0] != B or pred_ca.shape[1] != L:
             raise ValueError(
                 f"`pred_ca` must match aatype shape (B={B}, L={L}); got {tuple(pred_ca.shape)}"
@@ -160,5 +168,7 @@ def run_submission_batch(
             raise ValueError(f"`loss` must be a scalar tensor, got shape {tuple(loss.shape)}")
         if not torch.isfinite(loss):
             raise ValueError("`loss` is NaN/Inf.")
+        if training and not loss.requires_grad:
+            raise ValueError("`loss` must require gradients when training=True.")
 
     return out

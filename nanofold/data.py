@@ -2,11 +2,23 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset
+
+
+FEATURE_KEYS = (
+    "aatype",
+    "msa",
+    "deletions",
+    "template_aatype",
+    "template_ca_coords",
+    "template_ca_mask",
+)
+
+LABEL_KEYS = ("ca_coords", "ca_mask")
 
 
 @dataclass(frozen=True)
@@ -31,36 +43,79 @@ def read_manifest(manifest_path: str | Path) -> List[str]:
 
 
 class ProcessedNPZDataset(Dataset):
-    """Loads per-chain preprocessed .npz examples produced by scripts/preprocess.py."""
+    """Loads split per-chain features/labels .npz examples produced by scripts/preprocess.py."""
 
     def __init__(
         self,
-        processed_dir: str | Path,
+        processed_features_dir: str | Path,
         manifest_path: str | Path,
         *,
+        processed_labels_dir: str | Path | None = None,
+        include_labels: bool = True,
         allow_missing: bool = False,
+        fail_if_labels_present: bool = False,
     ):
-        self.processed_dir = Path(processed_dir)
+        self.processed_features_dir = Path(processed_features_dir)
+        self.processed_labels_dir = Path(processed_labels_dir) if processed_labels_dir else None
+        self.include_labels = bool(include_labels)
+        self.fail_if_labels_present = bool(fail_if_labels_present)
+        if self.include_labels and self.processed_labels_dir is None:
+            raise ValueError("`include_labels=True` requires `processed_labels_dir`.")
+
         requested_chain_ids = read_manifest(manifest_path)
         present_chain_ids: List[str] = []
         missing_chain_ids: List[str] = []
+        label_conflict_chain_ids: List[str] = []
+
         for chain_id in requested_chain_ids:
-            if (self.processed_dir / f"{chain_id}.npz").exists():
-                present_chain_ids.append(chain_id)
+            feature_path = self.processed_features_dir / f"{chain_id}.npz"
+            label_path = (self.processed_labels_dir / f"{chain_id}.npz") if self.processed_labels_dir else None
+            has_feature = feature_path.exists()
+            has_label = bool(label_path and label_path.exists())
+
+            if self.include_labels:
+                if has_feature and has_label:
+                    present_chain_ids.append(chain_id)
+                else:
+                    missing_chain_ids.append(chain_id)
+                continue
+
+            if has_feature:
+                if self.fail_if_labels_present and has_label:
+                    label_conflict_chain_ids.append(chain_id)
+                else:
+                    present_chain_ids.append(chain_id)
             else:
                 missing_chain_ids.append(chain_id)
 
         self.missing_chain_ids = missing_chain_ids
+        self.label_conflict_chain_ids = label_conflict_chain_ids
+
+        if label_conflict_chain_ids:
+            sample = ", ".join(label_conflict_chain_ids[:8])
+            raise RuntimeError(
+                "Labels are mounted for examples that should be features-only. "
+                f"Examples: {sample}. Remove label mount/path for official eval."
+            )
+
         if missing_chain_ids and not allow_missing:
             sample = ", ".join(missing_chain_ids[:8])
+            if self.include_labels:
+                raise FileNotFoundError(
+                    "Missing split preprocessed features/labels for manifest chains in "
+                    f"{self.processed_features_dir} and {self.processed_labels_dir}. "
+                    f"Examples: {sample}"
+                )
             raise FileNotFoundError(
-                f"{len(missing_chain_ids)} chains from manifest are missing preprocessed files in {self.processed_dir}. "
-                f"Examples: {sample}"
+                f"{len(missing_chain_ids)} chains from manifest are missing feature files in "
+                f"{self.processed_features_dir}. Examples: {sample}"
             )
+
         self.chain_ids = present_chain_ids if allow_missing else requested_chain_ids
         if not self.chain_ids:
             raise ValueError(
-                f"No preprocessed examples available in {self.processed_dir} for manifest {manifest_path}."
+                "No preprocessed examples available for manifest "
+                f"{manifest_path} using features dir {self.processed_features_dir}."
             )
 
     def __len__(self) -> int:
@@ -68,115 +123,77 @@ class ProcessedNPZDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         chain_id = self.chain_ids[idx]
-        path = self.processed_dir / f"{chain_id}.npz"
-        data = np.load(path)
-        L = int(data["aatype"].shape[0])
+        features_path = self.processed_features_dir / f"{chain_id}.npz"
+        if not features_path.exists():
+            raise FileNotFoundError(f"Missing feature file: {features_path}")
 
-        if "template_aatype" in data:
-            template_aatype = torch.from_numpy(data["template_aatype"]).long()
-        else:
-            template_aatype = torch.zeros((0, L), dtype=torch.long)
+        with np.load(features_path) as feature_data:
+            L = int(feature_data["aatype"].shape[0])
 
-        if "template_ca_coords" in data:
-            template_ca_coords = torch.from_numpy(data["template_ca_coords"]).float()
-        else:
-            template_ca_coords = torch.zeros((0, L, 3), dtype=torch.float32)
+            template_aatype = (
+                torch.from_numpy(feature_data["template_aatype"]).long()
+                if "template_aatype" in feature_data
+                else torch.zeros((0, L), dtype=torch.long)
+            )
+            template_ca_coords = (
+                torch.from_numpy(feature_data["template_ca_coords"]).float()
+                if "template_ca_coords" in feature_data
+                else torch.zeros((0, L, 3), dtype=torch.float32)
+            )
+            template_ca_mask = (
+                torch.from_numpy(feature_data["template_ca_mask"]).bool()
+                if "template_ca_mask" in feature_data
+                else torch.zeros((0, L), dtype=torch.bool)
+            )
 
-        if "template_ca_mask" in data:
-            template_ca_mask = torch.from_numpy(data["template_ca_mask"]).bool()
-        else:
-            template_ca_mask = torch.zeros((0, L), dtype=torch.bool)
+            out: Dict[str, Any] = {
+                "chain_id": chain_id,
+                "aatype": torch.from_numpy(feature_data["aatype"]).long(),  # (L,)
+                "msa": torch.from_numpy(feature_data["msa"]).long(),  # (N,L)
+                "deletions": torch.from_numpy(feature_data["deletions"]).long(),  # (N,L)
+                "template_aatype": template_aatype,  # (T,L)
+                "template_ca_coords": template_ca_coords,  # (T,L,3)
+                "template_ca_mask": template_ca_mask,  # (T,L)
+            }
 
-        out = {
-            "chain_id": chain_id,
-            "aatype": torch.from_numpy(data["aatype"]).long(),                  # (L,)
-            "msa": torch.from_numpy(data["msa"]).long(),                        # (N,L)
-            "deletions": torch.from_numpy(data["deletions"]).long(),            # (N,L)
-            "ca_coords": torch.from_numpy(data["ca_coords"]).float(),           # (L,3)
-            "ca_mask": torch.from_numpy(data["ca_mask"]).bool(),                # (L,)
-            "template_aatype": template_aatype,                                  # (T,L)
-            "template_ca_coords": template_ca_coords,                            # (T,L,3)
-            "template_ca_mask": template_ca_mask,                                # (T,L)
-        }
+        if self.include_labels:
+            assert self.processed_labels_dir is not None
+            labels_path = self.processed_labels_dir / f"{chain_id}.npz"
+            if not labels_path.exists():
+                raise FileNotFoundError(f"Missing label file: {labels_path}")
+            with np.load(labels_path) as label_data:
+                out["ca_coords"] = torch.from_numpy(label_data["ca_coords"]).float()  # (L,3)
+                out["ca_mask"] = torch.from_numpy(label_data["ca_mask"]).bool()  # (L,)
+
         return out
 
 
-def random_crop(
-    aatype: torch.Tensor,
-    msa: torch.Tensor,
-    deletions: torch.Tensor,
-    ca_coords: torch.Tensor,
-    ca_mask: torch.Tensor,
-    template_aatype: torch.Tensor,
-    template_ca_coords: torch.Tensor,
-    template_ca_mask: torch.Tensor,
-    crop_size: int,
-) -> Dict[str, torch.Tensor]:
-    L = aatype.shape[0]
+def _crop_single_example(example: Dict[str, torch.Tensor], crop_size: int, crop_mode: str) -> Dict[str, torch.Tensor]:
+    aatype = example["aatype"]
+    L = int(aatype.shape[0])
     if L <= crop_size:
-        return {
-            "aatype": aatype,
-            "msa": msa,
-            "deletions": deletions,
-            "ca_coords": ca_coords,
-            "ca_mask": ca_mask,
-            "template_aatype": template_aatype,
-            "template_ca_coords": template_ca_coords,
-            "template_ca_mask": template_ca_mask,
-        }
+        return dict(example)
 
-    # Simple contiguous crop (AlphaFold uses more complex masking; keep it simple).
-    start = torch.randint(low=0, high=L - crop_size + 1, size=(1,)).item()
+    if crop_mode == "random":
+        start = int(torch.randint(low=0, high=L - crop_size + 1, size=(1,)).item())
+    elif crop_mode == "center":
+        start = (L - crop_size) // 2
+    else:
+        raise ValueError(f"Unsupported crop_mode={crop_mode!r}; expected 'random' or 'center'.")
     end = start + crop_size
 
-    return {
-        "aatype": aatype[start:end],
-        "msa": msa[:, start:end],
-        "deletions": deletions[:, start:end],
-        "ca_coords": ca_coords[start:end],
-        "ca_mask": ca_mask[start:end],
-        "template_aatype": template_aatype[:, start:end],
-        "template_ca_coords": template_ca_coords[:, start:end],
-        "template_ca_mask": template_ca_mask[:, start:end],
-    }
-
-
-def center_crop(
-    aatype: torch.Tensor,
-    msa: torch.Tensor,
-    deletions: torch.Tensor,
-    ca_coords: torch.Tensor,
-    ca_mask: torch.Tensor,
-    template_aatype: torch.Tensor,
-    template_ca_coords: torch.Tensor,
-    template_ca_mask: torch.Tensor,
-    crop_size: int,
-) -> Dict[str, torch.Tensor]:
-    L = aatype.shape[0]
-    if L <= crop_size:
-        return {
-            "aatype": aatype,
-            "msa": msa,
-            "deletions": deletions,
-            "ca_coords": ca_coords,
-            "ca_mask": ca_mask,
-            "template_aatype": template_aatype,
-            "template_ca_coords": template_ca_coords,
-            "template_ca_mask": template_ca_mask,
-        }
-
-    start = (L - crop_size) // 2
-    end = start + crop_size
-    return {
-        "aatype": aatype[start:end],
-        "msa": msa[:, start:end],
-        "deletions": deletions[:, start:end],
-        "ca_coords": ca_coords[start:end],
-        "ca_mask": ca_mask[start:end],
-        "template_aatype": template_aatype[:, start:end],
-        "template_ca_coords": template_ca_coords[:, start:end],
-        "template_ca_mask": template_ca_mask[:, start:end],
-    }
+    cropped = dict(example)
+    cropped["aatype"] = example["aatype"][start:end]
+    cropped["msa"] = example["msa"][:, start:end]
+    cropped["deletions"] = example["deletions"][:, start:end]
+    cropped["template_aatype"] = example["template_aatype"][:, start:end]
+    cropped["template_ca_coords"] = example["template_ca_coords"][:, start:end]
+    cropped["template_ca_mask"] = example["template_ca_mask"][:, start:end]
+    if "ca_coords" in example:
+        cropped["ca_coords"] = example["ca_coords"][start:end]
+    if "ca_mask" in example:
+        cropped["ca_mask"] = example["ca_mask"][start:end]
+    return cropped
 
 
 def sample_msa(
@@ -200,7 +217,6 @@ def sample_msa(
     perm = torch.randperm(N - 1) + 1
     keep = torch.cat([torch.zeros(1, dtype=torch.long), perm[: msa_depth - 1]])
     keep = keep.sort().values
-
     return msa[keep], deletions[keep]
 
 
@@ -213,37 +229,15 @@ def collate_batch(
 ) -> Dict[str, torch.Tensor]:
     # This baseline uses batch_size=1 in the config by default.
     # Still implement stacking for convenience.
-    batch = []
-    chain_ids = []
-    for ex in examples:
-        chain_ids.append(ex["chain_id"])
-        if crop_mode == "random":
-            cropped = random_crop(
-                ex["aatype"],
-                ex["msa"],
-                ex["deletions"],
-                ex["ca_coords"],
-                ex["ca_mask"],
-                ex["template_aatype"],
-                ex["template_ca_coords"],
-                ex["template_ca_mask"],
-                crop_size=crop_size,
-            )
-        elif crop_mode == "center":
-            cropped = center_crop(
-                ex["aatype"],
-                ex["msa"],
-                ex["deletions"],
-                ex["ca_coords"],
-                ex["ca_mask"],
-                ex["template_aatype"],
-                ex["template_ca_coords"],
-                ex["template_ca_mask"],
-                crop_size=crop_size,
-            )
-        else:
-            raise ValueError(f"Unsupported crop_mode={crop_mode!r}; expected 'random' or 'center'.")
+    batch: List[Dict[str, torch.Tensor]] = []
+    chain_ids: List[str] = []
+    has_labels = all(("ca_coords" in ex and "ca_mask" in ex) for ex in examples)
+    if any(("ca_coords" in ex or "ca_mask" in ex) for ex in examples) and not has_labels:
+        raise ValueError("Inconsistent supervision presence inside one batch.")
 
+    for ex in examples:
+        chain_ids.append(str(ex["chain_id"]))
+        cropped = _crop_single_example(ex, crop_size=crop_size, crop_mode=crop_mode)
         msa_s, del_s = sample_msa(
             cropped["msa"],
             cropped["deletions"],
@@ -291,29 +285,39 @@ def collate_batch(
         out[:T, :L] = x
         return out
 
-    aatype = torch.stack([pad_1d(item["aatype"], pad_value=0) for item in batch], dim=0)          # (B,L)
-    msa = torch.stack([pad_2d(item["msa"], pad_value=21) for item in batch], dim=0)              # (B,N,L), pad with GAP_ID=21
-    deletions = torch.stack([pad_2d(item["deletions"], pad_value=0) for item in batch], dim=0)    # (B,N,L)
-    ca_coords = torch.stack([pad_coords(item["ca_coords"]) for item in batch], dim=0)            # (B,L,3)
-    ca_mask = torch.stack([pad_1d(item["ca_mask"].to(torch.int64), pad_value=0).bool() for item in batch], dim=0)  # (B,L)
-    template_aatype = torch.stack([pad_template_2d(item["template_aatype"], pad_value=20) for item in batch], dim=0)  # (B,T,L)
-    template_ca_coords = torch.stack([pad_template_coords(item["template_ca_coords"]) for item in batch], dim=0)        # (B,T,L,3)
+    aatype = torch.stack([pad_1d(item["aatype"], pad_value=0) for item in batch], dim=0)  # (B,L)
+    msa = torch.stack([pad_2d(item["msa"], pad_value=21) for item in batch], dim=0)  # (B,N,L)
+    deletions = torch.stack([pad_2d(item["deletions"], pad_value=0) for item in batch], dim=0)  # (B,N,L)
+    template_aatype = torch.stack(
+        [pad_template_2d(item["template_aatype"], pad_value=20) for item in batch], dim=0
+    )  # (B,T,L)
+    template_ca_coords = torch.stack(
+        [pad_template_coords(item["template_ca_coords"]) for item in batch], dim=0
+    )  # (B,T,L,3)
     template_ca_mask = torch.stack(
-        [pad_template_2d(item["template_ca_mask"].to(torch.int64), pad_value=0).bool() for item in batch], dim=0
+        [pad_template_2d(item["template_ca_mask"].to(torch.int64), pad_value=0).bool() for item in batch],
+        dim=0,
     )  # (B,T,L)
 
-    # Additionally provide an overall residue mask for padding positions.
-    residue_mask = torch.stack([pad_1d(torch.ones_like(item["aatype"], dtype=torch.bool), pad_value=0) for item in batch], dim=0)
+    # Overall residue mask for padding positions.
+    residue_mask = torch.stack(
+        [pad_1d(torch.ones_like(item["aatype"], dtype=torch.bool), pad_value=0) for item in batch],
+        dim=0,
+    )
 
-    return {
+    out: Dict[str, Any] = {
         "chain_id": chain_ids,
         "aatype": aatype,
         "msa": msa,
         "deletions": deletions,
-        "ca_coords": ca_coords,
-        "ca_mask": ca_mask,
         "template_aatype": template_aatype,
         "template_ca_coords": template_ca_coords,
         "template_ca_mask": template_ca_mask,
         "residue_mask": residue_mask,
     }
+    if has_labels:
+        out["ca_coords"] = torch.stack([pad_coords(item["ca_coords"]) for item in batch], dim=0)  # (B,L,3)
+        out["ca_mask"] = torch.stack(
+            [pad_1d(item["ca_mask"].to(torch.int64), pad_value=0).bool() for item in batch], dim=0
+        )  # (B,L)
+    return out

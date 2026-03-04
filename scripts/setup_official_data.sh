@@ -5,10 +5,17 @@ usage() {
   cat <<'EOF'
 Usage: bash scripts/setup_official_data.sh [options]
 
+This script verifies official manifest SHA256 digests for `limited_large_v3`
+before downloading or preprocessing data.
+
 Options:
   --data-root <path>          Root for downloaded OpenProteinSet files (default: data/openproteinset)
   --manifests-dir <path>      Target manifests dir to use (default: data/manifests)
-  --processed-dir <path>      Output dir for preprocessed .npz files (default: data/processed)
+  --processed-features-dir <path>
+                              Output dir for feature .npz files (default: data/processed_features)
+  --processed-labels-dir <path>
+                              Output dir for label .npz files (default: data/processed_labels)
+  --processed-dir <path>       Backward-compatible alias that sets both processed dirs to <path>
   --msa-name <filename>       MSA filename to download/use (default: uniref90_hits.a3m)
   --template-hhr-name <name>  Template hits filename (default: pdb70_hits.hhr)
   --download-retries <int>    Retries per failed aws chain download (default: 2)
@@ -30,7 +37,8 @@ PREPROCESS_SCRIPT="$SCRIPT_DIR/preprocess.py"
 
 DATA_ROOT="data/openproteinset"
 MANIFESTS_DIR="data/manifests"
-PROCESSED_DIR="data/processed"
+PROCESSED_FEATURES_DIR="data/processed_features"
+PROCESSED_LABELS_DIR="data/processed_labels"
 MSA_NAME="uniref90_hits.a3m"
 TEMPLATE_HHR_NAME="pdb70_hits.hhr"
 DOWNLOAD_RETRIES=2
@@ -50,8 +58,17 @@ while [[ $# -gt 0 ]]; do
       MANIFESTS_DIR="$2"
       shift 2
       ;;
+    --processed-features-dir)
+      PROCESSED_FEATURES_DIR="$2"
+      shift 2
+      ;;
+    --processed-labels-dir)
+      PROCESSED_LABELS_DIR="$2"
+      shift 2
+      ;;
     --processed-dir)
-      PROCESSED_DIR="$2"
+      PROCESSED_FEATURES_DIR="$2"
+      PROCESSED_LABELS_DIR="$2"
       shift 2
       ;;
     --msa-name)
@@ -105,6 +122,52 @@ run_cmd() {
   fi
 }
 
+verify_manifest_hashes() {
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    echo "+ verify official manifest SHA256 digests for track limited_large_v3"
+    return
+  fi
+  python - "$REPO_ROOT" "$1" "$2" "$3" <<'PY'
+from __future__ import annotations
+
+import hashlib
+import sys
+from pathlib import Path
+
+repo_root = Path(sys.argv[1]).resolve()
+if str(repo_root) not in sys.path:
+    sys.path.insert(0, str(repo_root))
+
+from nanofold.competition_policy import load_track_spec
+
+
+def sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+track = load_track_spec("limited_large_v3")
+checks = [
+    ("train_manifest", Path(sys.argv[2]), track.train_manifest_sha256),
+    ("val_manifest", Path(sys.argv[3]), track.val_manifest_sha256),
+    ("all_manifest", Path(sys.argv[4]), track.all_manifest_sha256),
+]
+for name, path, expected in checks:
+    if expected is None:
+        continue
+    if not path.exists():
+        raise SystemExit(f"Missing manifest file for hash check: {path}")
+    actual = sha256(path)
+    if actual != expected:
+        raise SystemExit(
+            f"{name} hash mismatch for {path}\n"
+            f"expected: {expected}\n"
+            f"actual:   {actual}\n"
+            "Restore committed official manifests before running setup_official_data.sh."
+        )
+print("Verified official manifest hashes for track limited_large_v3.")
+PY
+}
+
 if ! command -v aws >/dev/null 2>&1; then
   echo "aws CLI not found. Install awscli first."
   exit 1
@@ -140,7 +203,7 @@ if [[ ! -f "$SOURCE_TRAIN" || ! -f "$SOURCE_VAL" ]]; then
   exit 1
 fi
 
-mkdir -p "$DATA_ROOT" "$PDB_DIR" "$DATA_CACHES_DIR" "$MANIFESTS_DIR" "$PROCESSED_DIR"
+mkdir -p "$DATA_ROOT" "$PDB_DIR" "$DATA_CACHES_DIR" "$MANIFESTS_DIR" "$PROCESSED_FEATURES_DIR" "$PROCESSED_LABELS_DIR"
 
 TARGET_TRAIN="$MANIFESTS_DIR/train.txt"
 TARGET_VAL="$MANIFESTS_DIR/val.txt"
@@ -165,6 +228,8 @@ if [[ ! -f "$TARGET_ALL" ]]; then
     echo "+ cat $TARGET_TRAIN $TARGET_VAL | awk 'NF {print \$0}' | sort -u > $TARGET_ALL"
   fi
 fi
+
+verify_manifest_hashes "$TARGET_TRAIN" "$TARGET_VAL" "$TARGET_ALL"
 
 echo "[1/5] Downloading OpenFold cache metadata from RODA..."
 run_cmd aws s3 cp s3://openfold/data_caches/ "$DATA_CACHES_DIR/" --recursive --no-sign-request
@@ -202,7 +267,8 @@ else
     python "$PREPROCESS_SCRIPT"
     --raw-root "$DATA_ROOT"
     --mmcif-root "$MMCIF_ROOT"
-    --processed-dir "$PROCESSED_DIR"
+    --processed-features-dir "$PROCESSED_FEATURES_DIR"
+    --processed-labels-dir "$PROCESSED_LABELS_DIR"
     --msa-name "$MSA_NAME"
   )
   if [[ "$USE_TEMPLATES" -eq 1 ]]; then
@@ -218,4 +284,5 @@ echo "[5/5] Done."
 echo "Official manifest setup complete."
 echo "Data root: $DATA_ROOT"
 echo "Manifests dir: $MANIFESTS_DIR"
-echo "Processed dir: $PROCESSED_DIR"
+echo "Processed features dir: $PROCESSED_FEATURES_DIR"
+echo "Processed labels dir: $PROCESSED_LABELS_DIR"

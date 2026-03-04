@@ -10,7 +10,8 @@ submission:
   module: nanofold.baseline_submission
 
 data:
-  processed_dir: data/processed
+  processed_features_dir: data/processed_features
+  processed_labels_dir: data/processed_labels
   train_manifest: data/manifests/train.txt
   val_manifest: data/manifests/val.txt
   crop_size: 256
