@@ -5,6 +5,8 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List
 
+import numpy as np
+
 from .data import read_manifest
 
 
@@ -19,6 +21,17 @@ FINGERPRINT_COMPARISON_KEYS = (
     "missing_chain_count",
     "chain_ids_sha256",
     "npz_files_sha256",
+)
+
+REQUIRED_NPZ_KEYS = (
+    "aatype",
+    "msa",
+    "deletions",
+    "ca_coords",
+    "ca_mask",
+    "template_aatype",
+    "template_ca_coords",
+    "template_ca_mask",
 )
 
 
@@ -41,13 +54,138 @@ def _chain_ids_sha256(chain_ids: List[str]) -> str:
     return hasher.hexdigest()
 
 
-def _npz_files_sha256(processed_dir: Path, chain_ids: List[str], missing_chain_ids: List[str]) -> str:
+def _dtype_name(dtype: np.dtype) -> str:
+    return str(np.dtype(dtype))
+
+
+def validate_npz_schema(npz_path: str | Path) -> List[str]:
+    npz_path = Path(npz_path)
+    errors: List[str] = []
+
+    with np.load(npz_path) as data:
+        keys = set(data.keys())
+        for key in REQUIRED_NPZ_KEYS:
+            if key not in keys:
+                errors.append(f"Missing key `{key}`")
+        if errors:
+            return errors
+
+        aatype = data["aatype"]
+        msa = data["msa"]
+        deletions = data["deletions"]
+        ca_coords = data["ca_coords"]
+        ca_mask = data["ca_mask"]
+        template_aatype = data["template_aatype"]
+        template_ca_coords = data["template_ca_coords"]
+        template_ca_mask = data["template_ca_mask"]
+
+        if _dtype_name(aatype.dtype) not in {"int32", "int64"}:
+            errors.append(f"`aatype` dtype must be int32/int64 (got {_dtype_name(aatype.dtype)})")
+        if _dtype_name(msa.dtype) not in {"int32", "int64"}:
+            errors.append(f"`msa` dtype must be int32/int64 (got {_dtype_name(msa.dtype)})")
+        if _dtype_name(deletions.dtype) not in {"int32", "int64"}:
+            errors.append(f"`deletions` dtype must be int32/int64 (got {_dtype_name(deletions.dtype)})")
+        if _dtype_name(ca_coords.dtype) not in {"float32", "float64"}:
+            errors.append(f"`ca_coords` dtype must be float32/float64 (got {_dtype_name(ca_coords.dtype)})")
+        if _dtype_name(ca_mask.dtype) not in {"bool"}:
+            errors.append(f"`ca_mask` dtype must be bool (got {_dtype_name(ca_mask.dtype)})")
+        if _dtype_name(template_aatype.dtype) not in {"int32", "int64"}:
+            errors.append(
+                f"`template_aatype` dtype must be int32/int64 (got {_dtype_name(template_aatype.dtype)})"
+            )
+        if _dtype_name(template_ca_coords.dtype) not in {"float32", "float64"}:
+            errors.append(
+                "`template_ca_coords` dtype must be float32/float64 "
+                f"(got {_dtype_name(template_ca_coords.dtype)})"
+            )
+        if _dtype_name(template_ca_mask.dtype) not in {"bool"}:
+            errors.append(f"`template_ca_mask` dtype must be bool (got {_dtype_name(template_ca_mask.dtype)})")
+
+        if aatype.ndim != 1:
+            errors.append(f"`aatype` must have shape (L,), got {aatype.shape}")
+            return errors
+        L = int(aatype.shape[0])
+
+        if msa.ndim != 2:
+            errors.append(f"`msa` must have shape (N, L), got {msa.shape}")
+        elif msa.shape[1] != L:
+            errors.append(f"`msa` second dimension must equal len(aatype)={L}, got {msa.shape[1]}")
+
+        if deletions.ndim != 2:
+            errors.append(f"`deletions` must have shape (N, L), got {deletions.shape}")
+        elif deletions.shape != msa.shape:
+            errors.append(f"`deletions` shape must match `msa` shape, got {deletions.shape} vs {msa.shape}")
+
+        if ca_coords.ndim != 2 or ca_coords.shape[1] != 3:
+            errors.append(f"`ca_coords` must have shape (L,3), got {ca_coords.shape}")
+        elif ca_coords.shape[0] != L:
+            errors.append(f"`ca_coords` first dimension must equal len(aatype)={L}, got {ca_coords.shape[0]}")
+
+        if ca_mask.ndim != 1:
+            errors.append(f"`ca_mask` must have shape (L,), got {ca_mask.shape}")
+        elif ca_mask.shape[0] != L:
+            errors.append(f"`ca_mask` first dimension must equal len(aatype)={L}, got {ca_mask.shape[0]}")
+
+        if template_aatype.ndim != 2:
+            errors.append(f"`template_aatype` must have shape (T,L), got {template_aatype.shape}")
+        elif template_aatype.shape[1] != L:
+            errors.append(
+                "`template_aatype` second dimension must equal len(aatype)="
+                f"{L}, got {template_aatype.shape[1]}"
+            )
+
+        if template_ca_coords.ndim != 3 or template_ca_coords.shape[-1] != 3:
+            errors.append(
+                f"`template_ca_coords` must have shape (T,L,3), got {template_ca_coords.shape}"
+            )
+        else:
+            if template_ca_coords.shape[1] != L:
+                errors.append(
+                    "`template_ca_coords` second dimension must equal len(aatype)="
+                    f"{L}, got {template_ca_coords.shape[1]}"
+                )
+            if template_aatype.ndim == 2 and template_ca_coords.shape[0] != template_aatype.shape[0]:
+                errors.append(
+                    "`template_ca_coords` first dimension must match `template_aatype` "
+                    f"({template_ca_coords.shape[0]} vs {template_aatype.shape[0]})"
+                )
+
+        if template_ca_mask.ndim != 2:
+            errors.append(f"`template_ca_mask` must have shape (T,L), got {template_ca_mask.shape}")
+        else:
+            if template_ca_mask.shape[1] != L:
+                errors.append(
+                    "`template_ca_mask` second dimension must equal len(aatype)="
+                    f"{L}, got {template_ca_mask.shape[1]}"
+                )
+            if template_aatype.ndim == 2 and template_ca_mask.shape[0] != template_aatype.shape[0]:
+                errors.append(
+                    "`template_ca_mask` first dimension must match `template_aatype` "
+                    f"({template_ca_mask.shape[0]} vs {template_aatype.shape[0]})"
+                )
+    return errors
+
+
+def _npz_files_sha256(
+    processed_dir: Path,
+    chain_ids: List[str],
+    missing_chain_ids: List[str],
+    *,
+    validate_schema: bool,
+) -> str:
     hasher = hashlib.sha256()
     for chain_id in chain_ids:
         npz_path = processed_dir / f"{chain_id}.npz"
         if not npz_path.exists():
             missing_chain_ids.append(chain_id)
             continue
+
+        if validate_schema:
+            schema_errors = validate_npz_schema(npz_path)
+            if schema_errors:
+                joined = "; ".join(schema_errors[:8])
+                raise ValueError(f"Invalid schema for {npz_path}: {joined}")
+
         file_hash = sha256_file(npz_path)
         hasher.update(chain_id.encode("utf-8"))
         hasher.update(b"\t")
@@ -62,6 +200,7 @@ def build_dataset_fingerprint(
     train_manifest: str | Path,
     val_manifest: str | Path,
     require_no_missing: bool,
+    validate_schema: bool = True,
 ) -> Dict[str, Any]:
     processed_dir = Path(processed_dir).resolve()
     train_manifest = Path(train_manifest).resolve()
@@ -72,7 +211,12 @@ def build_dataset_fingerprint(
     all_chain_ids = sorted(set(train_chain_ids + val_chain_ids))
 
     missing_chain_ids: List[str] = []
-    npz_hash = _npz_files_sha256(processed_dir=processed_dir, chain_ids=all_chain_ids, missing_chain_ids=missing_chain_ids)
+    npz_hash = _npz_files_sha256(
+        processed_dir=processed_dir,
+        chain_ids=all_chain_ids,
+        missing_chain_ids=missing_chain_ids,
+        validate_schema=validate_schema,
+    )
     if require_no_missing and missing_chain_ids:
         sample = ", ".join(missing_chain_ids[:8])
         raise FileNotFoundError(
@@ -124,6 +268,7 @@ def verify_dataset_against_fingerprint(
     val_manifest: str | Path,
     expected_fingerprint_path: str | Path,
     require_no_missing: bool,
+    validate_schema: bool = True,
 ) -> Dict[str, Any]:
     expected = load_fingerprint(expected_fingerprint_path)
     actual = build_dataset_fingerprint(
@@ -131,6 +276,7 @@ def verify_dataset_against_fingerprint(
         train_manifest=train_manifest,
         val_manifest=val_manifest,
         require_no_missing=require_no_missing,
+        validate_schema=validate_schema,
     )
     mismatches = compare_fingerprints(actual=actual, expected=expected)
     if mismatches:

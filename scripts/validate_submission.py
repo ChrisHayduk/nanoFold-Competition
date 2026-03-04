@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import re
 import sys
 from dataclasses import dataclass
@@ -16,10 +17,11 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from nanofold.competition_policy import (
-    OFFICIAL_LARGE_V3_SPEC,
+    DEFAULT_TRACK_ID,
     compute_effective_batch_size,
     compute_residue_budget,
-    validate_official_limited_config,
+    load_track_spec,
+    validate_config_against_track,
 )
 from nanofold.submission_runtime import load_submission_hooks, run_submission_batch, strip_supervision_from_batch
 
@@ -38,6 +40,16 @@ METADATA_FIELDS = (
     "wall_clock_time",
     "commit",
 )
+
+MAX_ALLOWED_FILE_SIZE_BYTES = 20 * 1024 * 1024
+FORBIDDEN_WEIGHT_EXTENSIONS = {".pt", ".pth", ".ckpt", ".safetensors", ".npz"}
+SUSPICIOUS_IMPORTS = {
+    "requests",
+    "urllib",
+    "urllib.request",
+    "torch.hub",
+    "huggingface_hub",
+}
 
 
 @dataclass
@@ -58,6 +70,12 @@ def parse_args() -> argparse.Namespace:
         "--strict",
         action="store_true",
         help="Treat warnings as failures (non-zero exit).",
+    )
+    ap.add_argument(
+        "--track",
+        type=str,
+        default=DEFAULT_TRACK_ID,
+        help=f"Track id to validate against (default: {DEFAULT_TRACK_ID})",
     )
     return ap.parse_args()
 
@@ -233,6 +251,66 @@ def _validate_submission_interface(diags: List[Diagnostic], cfg: Dict[str, Any],
         add_error(diags, f"`run_batch(..., training=False)` failed validation: {exc}")
 
 
+def _iter_submission_files(submission_dir: Path) -> List[Path]:
+    files: List[Path] = []
+    for path in sorted(submission_dir.rglob("*")):
+        if not path.is_file():
+            continue
+        if "__pycache__" in path.parts:
+            continue
+        files.append(path)
+    return files
+
+
+def _validate_submission_artifacts(diags: List[Diagnostic], submission_dir: Path) -> None:
+    for path in _iter_submission_files(submission_dir):
+        ext = path.suffix.lower()
+        size = path.stat().st_size
+        if size > MAX_ALLOWED_FILE_SIZE_BYTES:
+            add_error(
+                diags,
+                f"File exceeds {MAX_ALLOWED_FILE_SIZE_BYTES // (1024 * 1024)}MB limit: {path} ({size} bytes).",
+            )
+        if ext in FORBIDDEN_WEIGHT_EXTENSIONS:
+            add_error(
+                diags,
+                f"Forbidden model artifact extension detected: {path}. "
+                "Pretrained weights are not allowed in submissions.",
+            )
+
+
+def _collect_import_names(py_path: Path) -> List[str]:
+    text = py_path.read_text()
+    tree = ast.parse(text, filename=str(py_path))
+    names: List[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                names.append(alias.name)
+        elif isinstance(node, ast.ImportFrom):
+            if node.module:
+                names.append(node.module)
+    return names
+
+
+def _validate_suspicious_imports(diags: List[Diagnostic], submission_dir: Path) -> None:
+    for path in _iter_submission_files(submission_dir):
+        if path.suffix.lower() != ".py":
+            continue
+        try:
+            imports = _collect_import_names(path)
+        except Exception as exc:  # noqa: BLE001
+            add_warning(diags, f"Could not parse imports for {path}: {exc}")
+            continue
+        for name in imports:
+            for suspicious in SUSPICIOUS_IMPORTS:
+                if name == suspicious or name.startswith(f"{suspicious}."):
+                    add_warning(
+                        diags,
+                        f"Suspicious import `{name}` in {path}; network/model download paths are disallowed in official runs.",
+                    )
+
+
 def _extract_metadata_value(notes_text: str, field: str) -> str | None:
     pattern = re.compile(rf"^\s*-\s*{re.escape(field)}\s*:\s*(.*)$", flags=re.MULTILINE)
     match = pattern.search(notes_text)
@@ -303,9 +381,16 @@ def _validate_notes(
             add_warning(diags, f"Compliance checklist item not checked in notes.md: `{item}`")
 
 
-def validate_submission(submission_dir: Path, strict: bool) -> int:
+def validate_submission(submission_dir: Path, strict: bool, track_id: str) -> int:
     diags: List[Diagnostic] = []
     submission_dir = submission_dir.resolve()
+
+    try:
+        track_spec = load_track_spec(track_id)
+    except Exception as exc:  # noqa: BLE001
+        add_error(diags, f"Failed to load track `{track_id}`: {exc}")
+        _print_diagnostics(diags)
+        return 1
 
     if not submission_dir.exists():
         add_error(diags, f"Submission directory does not exist: {submission_dir}")
@@ -354,15 +439,17 @@ def validate_submission(submission_dir: Path, strict: bool) -> int:
 
     if cfg and all(k in cfg for k in ("submission", "data", "train")):
         effective_batch_size, residue_budget = _validate_numeric(diags, cfg)
-        policy_errors = validate_official_limited_config(
+        policy_errors = validate_config_against_track(
             cfg,
-            spec=OFFICIAL_LARGE_V3_SPEC,
+            track_spec=track_spec,
             enforce_manifest_paths=True,
         )
         for msg in policy_errors:
             add_error(diags, msg)
         _validate_submission_entrypoint(diags, cfg, config_path=config_path, submission_dir=submission_dir, allow_placeholders=allow_placeholders)
         _validate_submission_interface(diags, cfg, config_path=config_path)
+        _validate_submission_artifacts(diags, submission_dir=submission_dir)
+        _validate_suspicious_imports(diags, submission_dir=submission_dir)
         run_name = str(cfg.get("run_name", "")).strip()
         if run_name == "":
             add_error(diags, "`run_name` must be non-empty.")
@@ -409,7 +496,7 @@ def _print_diagnostics(diags: List[Diagnostic]) -> None:
 
 def main() -> None:
     args = parse_args()
-    code = validate_submission(Path(args.submission), strict=bool(args.strict))
+    code = validate_submission(Path(args.submission), strict=bool(args.strict), track_id=args.track)
     sys.exit(code)
 
 

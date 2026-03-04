@@ -7,7 +7,7 @@ from pathlib import Path
 
 import yaml
 
-# Allow running as `python scripts/build_dataset_fingerprint.py` from repo root.
+# Allow running as `python scripts/build_fingerprint.py` from repo root.
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
@@ -17,7 +17,7 @@ from nanofold.dataset_integrity import build_dataset_fingerprint
 
 
 def parse_args() -> argparse.Namespace:
-    ap = argparse.ArgumentParser(description="Build dataset fingerprint JSON for official evaluations.")
+    ap = argparse.ArgumentParser(description="Canonical dataset fingerprint builder.")
     ap.add_argument("--config", type=str, default="", help="Optional config YAML path to read data paths from.")
     ap.add_argument("--processed-dir", type=str, default="", help="Path to preprocessed .npz directory.")
     ap.add_argument("--train-manifest", type=str, default="", help="Path to train manifest.")
@@ -32,6 +32,11 @@ def parse_args() -> argparse.Namespace:
         "--allow-missing",
         action="store_true",
         help="Allow missing .npz files when building the fingerprint.",
+    )
+    ap.add_argument(
+        "--skip-schema-checks",
+        action="store_true",
+        help="Skip NPZ schema validation (not recommended).",
     )
     return ap.parse_args()
 
@@ -66,6 +71,7 @@ def main() -> None:
         train_manifest=train_manifest,
         val_manifest=val_manifest,
         require_no_missing=not bool(args.allow_missing),
+        validate_schema=not bool(args.skip_schema_checks),
     )
 
     output_path = Path(args.output)

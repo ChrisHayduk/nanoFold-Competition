@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import random
 from pathlib import Path
@@ -8,8 +9,9 @@ from typing import Dict, List
 
 """Create train/val manifests from an OpenFold/OpenProteinSet chain_data_cache.
 
-This is *one* reasonable way to define a fixed 10k benchmark. You can replace this logic as you like,
-but once you publish a competition, treat the resulting manifests as immutable.
+Maintainer-only workflow:
+- use this script to generate/refresh official manifests and lock metadata.
+- participants should use committed manifests via scripts/setup_official_data.sh.
 
 Expected input:
 - chain_data_cache.json (available from RODA as described in OpenFold docs)
@@ -31,11 +33,17 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--chain-data-cache", type=str, required=True, help="Path to chain_data_cache.json")
     ap.add_argument("--out-dir", type=str, required=True, help="Where to write train.txt and val.txt")
     ap.add_argument("--train-size", type=int, default=10000)
-    ap.add_argument("--val-size", type=int, default=500)
+    ap.add_argument("--val-size", type=int, default=1000)
     ap.add_argument("--min-len", type=int, default=40)
     ap.add_argument("--max-len", type=int, default=256)
     ap.add_argument("--max-resolution", type=float, default=3.0)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument(
+        "--lock-file",
+        type=str,
+        default="",
+        help="Optional JSON path capturing generation inputs/hashes for reproducibility.",
+    )
     return ap.parse_args()
 
 
@@ -113,13 +121,45 @@ def main() -> None:
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "train.txt").write_text("\n".join(train_ids) + "\n")
-    (out_dir / "val.txt").write_text("\n".join(val_ids) + "\n")
+    train_path = out_dir / "train.txt"
+    val_path = out_dir / "val.txt"
+    all_path = out_dir / "all.txt"
+    train_path.write_text("\n".join(train_ids) + "\n")
+    val_path.write_text("\n".join(val_ids) + "\n")
+    all_ids = sorted(set(train_ids + val_ids))
+    all_path.write_text("\n".join(all_ids) + "\n")
 
     print(
         f"Wrote {len(train_ids)} train + {len(val_ids)} val chains to {out_dir} "
         f"(protein-disjoint: {len(overlap)} overlaps)"
     )
+
+    if args.lock_file:
+        cache_sha = hashlib.sha256(cache_path.read_bytes()).hexdigest()
+        lock = {
+            "chain_data_cache_path": str(cache_path.resolve()),
+            "chain_data_cache_sha256": cache_sha,
+            "args": {
+                "train_size": int(args.train_size),
+                "val_size": int(args.val_size),
+                "min_len": int(args.min_len),
+                "max_len": int(args.max_len),
+                "max_resolution": float(args.max_resolution),
+                "seed": int(args.seed),
+            },
+            "outputs": {
+                "train_manifest": str(train_path.resolve()),
+                "val_manifest": str(val_path.resolve()),
+                "all_manifest": str(all_path.resolve()),
+                "train_count": len(train_ids),
+                "val_count": len(val_ids),
+                "unique_count": len(all_ids),
+            },
+        }
+        lock_path = Path(args.lock_file)
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.write_text(json.dumps(lock, indent=2) + "\n")
+        print(f"Wrote manifest lock file: {lock_path.resolve()}")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,16 @@
+id: unlimited
+name: Unlimited Research
+mode: unlimited
+official: false
+dataset:
+  train_manifest: data/manifests/train.txt
+  val_manifest: data/manifests/val.txt
+  fingerprint: null
+train:
+  seed: null
+  crop_size: null
+  msa_depth: null
+  effective_batch_size: null
+  max_steps: null
+  val_crop_mode: null
+  val_msa_sample_mode: null

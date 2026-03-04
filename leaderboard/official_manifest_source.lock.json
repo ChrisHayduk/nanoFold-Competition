@@ -1,0 +1,20 @@
+{
+  "chain_data_cache_path": "/Users/christopherhayduk/Desktop/nanoFold-Competition/data/openproteinset/pdb_data/data_caches/chain_data_cache.json",
+  "chain_data_cache_sha256": "7286d79a9060cd67e16df69deced99bd7aa96d56add30f28d852438dffe3f1ea",
+  "args": {
+    "train_size": 10000,
+    "val_size": 1000,
+    "min_len": 40,
+    "max_len": 256,
+    "max_resolution": 3.0,
+    "seed": 0
+  },
+  "outputs": {
+    "train_manifest": "/Users/christopherhayduk/Desktop/nanoFold-Competition/data/manifests/train.txt",
+    "val_manifest": "/Users/christopherhayduk/Desktop/nanoFold-Competition/data/manifests/val.txt",
+    "all_manifest": "/Users/christopherhayduk/Desktop/nanoFold-Competition/data/manifests/all.txt",
+    "train_count": 10000,
+    "val_count": 1000,
+    "unique_count": 11000
+  }
+}

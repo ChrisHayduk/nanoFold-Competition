@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import random
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict
 
@@ -10,14 +11,41 @@ import numpy as np
 import torch
 
 
-def set_seed(seed: int) -> None:
+def set_seed(seed: int, *, deterministic: bool = False) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-    # NOTE: deterministic can hurt speed; enable if you want strict bitwise runs.
-    # torch.use_deterministic_algorithms(True)
+    if deterministic:
+        if hasattr(torch.backends, "cudnn"):
+            torch.backends.cudnn.benchmark = False
+            torch.backends.cudnn.deterministic = True
+        try:
+            torch.use_deterministic_algorithms(True)
+        except Exception:
+            # Some ops are nondeterministic on specific platforms; keep the
+            # run alive while still forcing deterministic behavior where possible.
+            pass
+
+
+def make_dataloader_generator(seed: int) -> torch.Generator:
+    gen = torch.Generator()
+    gen.manual_seed(int(seed))
+    return gen
+
+
+def seed_worker(worker_id: int) -> None:
+    # DataLoader sets each worker's PyTorch seed from the provided generator.
+    # Mirror it into numpy/python RNG to remove worker-level randomness drift.
+    del worker_id
+    worker_seed = torch.initial_seed() % (2**32)
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
+def utc_now_iso() -> str:
+    return datetime.now(tz=timezone.utc).isoformat()
 
 
 def ensure_dir(path: str | Path) -> Path:
@@ -57,3 +85,18 @@ def to_device(batch: Dict[str, Any], device: torch.device) -> Dict[str, Any]:
         else:
             out[k] = v
     return out
+
+
+def get_env_metadata(device: torch.device) -> Dict[str, Any]:
+    cuda_available = torch.cuda.is_available()
+    cuda_index = torch.cuda.current_device() if cuda_available else None
+    cuda_name = torch.cuda.get_device_name(cuda_index) if cuda_available and cuda_index is not None else None
+    return {
+        "device_type": device.type,
+        "cuda_available": cuda_available,
+        "cuda_device_name": cuda_name,
+        "torch_version": torch.__version__,
+        "cuda_version": torch.version.cuda,
+        "cudnn_version": torch.backends.cudnn.version() if hasattr(torch.backends, "cudnn") else None,
+        "pythonhashseed": os.environ.get("PYTHONHASHSEED"),
+    }

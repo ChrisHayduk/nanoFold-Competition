@@ -1,6 +1,11 @@
 *.pyc
 .DS_Store
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 *.pt
+/runs/
 /data/openproteinset/*
 *.npz
 data/processed/1p11_I.error.txt

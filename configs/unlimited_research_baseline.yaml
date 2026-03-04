@@ -1,19 +1,21 @@
-# Canonical maintainer profile for the official limited track (Large-v3).
-# This keeps the baseline model/optimizer choices, but enforces official
-# data-budget constants and validation protocol settings.
+# Baseline research config (non-official).
+# This keeps the same model family but relaxes official track constraints.
+# Use with `--track unlimited` for local experimentation.
 
-run_name: official_limited_large_v3_baseline
+run_name: unlimited_research_baseline
+track: unlimited
 seed: 0
 
 submission:
   module: nanofold.baseline_submission
 
 data:
-  processed_dir: data/processed
+  processed_dir: data/processed   # created by scripts/preprocess.py
   train_manifest: data/manifests/train.txt
   val_manifest: data/manifests/val.txt
+
   crop_size: 256
-  msa_depth: 192
+  msa_depth: 128          # number of MSA rows sampled per example
   batch_size: 1
   num_workers: 2
   train_crop_mode: random
@@ -44,7 +46,7 @@ loss:
   global_max_dist: 32.0
 
 train:
-  max_steps: 10000
+  max_steps: 7000
   log_every: 50
   eval_every: 500
   save_every: 500
