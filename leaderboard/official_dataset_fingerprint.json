@@ -1,0 +1,13 @@
+{
+  "chain_ids_sha256": "769dd26dc0cb510e3aa44020fd4297a5e11c568d435de1dc43f221b491ed2d26",
+  "missing_chain_count": 1,
+  "missing_chain_ids": [
+    "1p11_I"
+  ],
+  "npz_files_sha256": "a5e14541c8bc7bbcf79f0cd828a6a17a0d9550700afeb561ca5f3aec759bc5b1",
+  "present_chain_count": 1099,
+  "schema_version": 1,
+  "train_manifest_chain_count": 1000,
+  "unique_chain_count": 1100,
+  "val_manifest_chain_count": 100
+}

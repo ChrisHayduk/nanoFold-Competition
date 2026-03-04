@@ -13,15 +13,31 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 import yaml
 
+from nanofold.competition_policy import (
+    OFFICIAL_DATASET_FINGERPRINT_PATH,
+    assert_official_limited_config,
+)
 from nanofold.data import ProcessedNPZDataset, collate_batch
+from nanofold.dataset_integrity import verify_dataset_against_fingerprint
 from nanofold.metrics import lddt_ca
-from nanofold.submission_runtime import load_submission_hooks, run_submission_batch
+from nanofold.submission_runtime import (
+    load_submission_hooks,
+    run_submission_batch,
+    strip_supervision_from_batch,
+)
 from nanofold.utils import RunPaths, count_parameters, ensure_dir, set_seed, to_device
 
 
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", type=str, required=True)
+    ap.add_argument("--official", action="store_true", help="Enable strict official limited-track enforcement.")
+    ap.add_argument(
+        "--fingerprint",
+        type=str,
+        default=OFFICIAL_DATASET_FINGERPRINT_PATH,
+        help=f"Expected dataset fingerprint JSON path (default: {OFFICIAL_DATASET_FINGERPRINT_PATH}).",
+    )
     return ap.parse_args()
 
 
@@ -53,7 +69,7 @@ def normalize_num_workers(n: int) -> int:
     return n
 
 
-def make_loader(cfg: Dict[str, Any], split: str) -> DataLoader:
+def make_loader(cfg: Dict[str, Any], split: str, *, allow_missing: bool) -> DataLoader:
     data_cfg = cfg["data"]
     processed_dir = data_cfg["processed_dir"]
     manifest_path = data_cfg["train_manifest"] if split == "train" else data_cfg["val_manifest"]
@@ -64,7 +80,7 @@ def make_loader(cfg: Dict[str, Any], split: str) -> DataLoader:
         crop_mode = str(data_cfg.get("val_crop_mode", "center"))
         msa_sample_mode = str(data_cfg.get("val_msa_sample_mode", "top"))
 
-    ds = ProcessedNPZDataset(processed_dir=processed_dir, manifest_path=manifest_path, allow_missing=True)
+    ds = ProcessedNPZDataset(processed_dir=processed_dir, manifest_path=manifest_path, allow_missing=allow_missing)
     if getattr(ds, "missing_chain_ids", None):
         print(
             f"[{split}] Skipping {len(ds.missing_chain_ids)} missing preprocessed chains "
@@ -109,6 +125,19 @@ def optimizer_zero_grad(optimizer: Any) -> None:
 def main() -> None:
     args = parse_args()
     cfg = load_config(args.config)
+
+    if args.official:
+        assert_official_limited_config(cfg)
+        data_cfg = cfg["data"]
+        verify_dataset_against_fingerprint(
+            processed_dir=data_cfg["processed_dir"],
+            train_manifest=data_cfg["train_manifest"],
+            val_manifest=data_cfg["val_manifest"],
+            expected_fingerprint_path=args.fingerprint,
+            require_no_missing=True,
+        )
+        print(f"Official mode enabled. Dataset fingerprint matched: {Path(args.fingerprint).resolve()}")
+
     hooks = load_submission_hooks(cfg, args.config)
 
     run_name = cfg.get("run_name", "run")
@@ -121,8 +150,9 @@ def main() -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    train_loader = make_loader(cfg, split="train")
-    val_loader = make_loader(cfg, split="val")
+    allow_missing = not bool(args.official)
+    train_loader = make_loader(cfg, split="train", allow_missing=allow_missing)
+    val_loader = make_loader(cfg, split="val", allow_missing=allow_missing)
 
     model = hooks.build_model(cfg)
     if not isinstance(model, nn.Module):
@@ -169,8 +199,9 @@ def main() -> None:
         with torch.no_grad():
             for batch in tqdm(val_loader, desc="val", leave=False):
                 batch = to_device(batch, device)
+                inference_batch = strip_supervision_from_batch(batch)
                 with make_autocast_ctx(device=device, enabled=use_amp):
-                    out = run_submission_batch(hooks, model=model, batch=batch, cfg=cfg, training=False)
+                    out = run_submission_batch(hooks, model=model, batch=inference_batch, cfg=cfg, training=False)
                 pred_ca = out["pred_ca"]
                 score = batch_lddt_ca(pred_ca, batch["ca_coords"], batch["ca_mask"], batch["residue_mask"])
                 scores.append(score.detach().cpu())

@@ -9,10 +9,14 @@
 # - `submission.path` should point to a Python file that defines:
 #   - `build_model(cfg)`
 #   - `build_optimizer(cfg, model)`
-#   - `run_batch(model, batch, cfg, training)` -> {"pred_ca": ..., "loss": ...}
+#   - `run_batch(model, batch, cfg, training)`:
+#       - always returns `pred_ca`
+#       - returns `loss` when `training=True`
+#       - must not depend on `ca_coords` / `ca_mask` when `training=False`
 #
 # Fixed-budget note:
-# - In this baseline, effective_batch_size == data.batch_size (no grad accumulation).
+# - Official limited Large-v3 requires:
+#   seed=0, crop_size=256, msa_depth=192, effective_batch_size=2, max_steps=10000.
 
 run_name: your_name_run1
 seed: 0
@@ -25,9 +29,13 @@ data:
   train_manifest: data/manifests/train.txt
   val_manifest: data/manifests/val.txt
   crop_size: 256
-  msa_depth: 128
+  msa_depth: 192
   batch_size: 1
   num_workers: 2
+  train_crop_mode: random
+  val_crop_mode: center
+  train_msa_sample_mode: random
+  val_msa_sample_mode: top
 
 model:
   d_model: 256
@@ -41,8 +49,9 @@ optim:
   grad_clip_norm: 1.0
 
 train:
-  max_steps: 7000
+  max_steps: 10000
   log_every: 50
   eval_every: 500
   save_every: 500
+  grad_accum_steps: 2
   amp: true

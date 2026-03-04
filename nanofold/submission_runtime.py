@@ -12,6 +12,9 @@ from typing import Any, Callable, Dict, Optional
 import torch
 
 
+SUPERVISION_BATCH_KEYS = ("ca_coords", "ca_mask")
+
+
 @dataclass(frozen=True)
 class SubmissionHooks:
     module_ref: str
@@ -103,6 +106,15 @@ def load_submission_hooks(cfg: Dict[str, Any], config_path: str | Path) -> Submi
         run_batch=getattr(module, "run_batch"),
         build_scheduler=build_scheduler,
     )
+
+
+def strip_supervision_from_batch(batch: Dict[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for k, v in batch.items():
+        if k in SUPERVISION_BATCH_KEYS:
+            continue
+        out[k] = v
+    return out
 
 
 def run_submission_batch(

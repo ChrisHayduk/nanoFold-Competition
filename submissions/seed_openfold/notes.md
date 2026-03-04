@@ -36,8 +36,9 @@ transformer. Template pair features can inject structural priors when good templ
 
 ## Required run metadata (limited track)
 
-- max_steps: 7000
-- effective_batch_size: 1
+- max_steps: 10000
+- effective_batch_size: 2
+- residue_budget: 5120000
 - crop_size: 256
 - seed: 0
 - hardware: pending maintainer benchmark run

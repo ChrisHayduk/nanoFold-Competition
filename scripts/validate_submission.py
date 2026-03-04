@@ -5,7 +5,7 @@ import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 import torch
 import yaml
@@ -15,19 +15,23 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from nanofold.submission_runtime import load_submission_hooks, run_submission_batch
+from nanofold.competition_policy import (
+    OFFICIAL_LARGE_V3_SPEC,
+    compute_effective_batch_size,
+    compute_residue_budget,
+    validate_official_limited_config,
+)
+from nanofold.submission_runtime import load_submission_hooks, run_submission_batch, strip_supervision_from_batch
 
 
 REQUIRED_TOP_LEVEL = ("run_name", "seed", "submission", "data", "train")
 REQUIRED_DATA_KEYS = ("processed_dir", "train_manifest", "val_manifest", "crop_size", "msa_depth", "batch_size")
 REQUIRED_TRAIN_KEYS = ("max_steps", "eval_every", "save_every")
 
-EXPECTED_TRAIN_MANIFEST_PARTS = ("data", "manifests", "train.txt")
-EXPECTED_VAL_MANIFEST_PARTS = ("data", "manifests", "val.txt")
-
 METADATA_FIELDS = (
     "max_steps",
     "effective_batch_size",
+    "residue_budget",
     "crop_size",
     "seed",
     "hardware",
@@ -66,19 +70,6 @@ def add_warning(diags: List[Diagnostic], message: str) -> None:
     diags.append(Diagnostic(level="warning", message=message))
 
 
-def _normalized_parts(path_str: str) -> tuple[str, ...]:
-    path = Path(path_str)
-    raw_parts = [p for p in path.parts if p not in ("", ".")]
-    return tuple(raw_parts)
-
-
-def _endswith_parts(path_str: str, expected_parts: tuple[str, ...]) -> bool:
-    parts = _normalized_parts(path_str)
-    if len(parts) < len(expected_parts):
-        return False
-    return tuple(parts[-len(expected_parts) :]) == expected_parts
-
-
 def _require_keys(diags: List[Diagnostic], mapping: Dict[str, Any], keys: tuple[str, ...], scope: str) -> None:
     for key in keys:
         if key not in mapping:
@@ -88,7 +79,7 @@ def _require_keys(diags: List[Diagnostic], mapping: Dict[str, Any], keys: tuple[
                 add_error(diags, f"Missing key `{key}`")
 
 
-def _validate_numeric(diags: List[Diagnostic], cfg: Dict[str, Any]) -> int:
+def _validate_numeric(diags: List[Diagnostic], cfg: Dict[str, Any]) -> Tuple[int, int]:
     data_cfg = cfg["data"]
     train_cfg = cfg["train"]
 
@@ -122,29 +113,15 @@ def _validate_numeric(diags: List[Diagnostic], cfg: Dict[str, Any]) -> int:
 
     grad_accum_steps = train_cfg.get("grad_accum_steps", 1)
     grad_accum_steps = require_int("train.grad_accum_steps", grad_accum_steps, min_value=0, strictly_positive=True)
-    effective_batch_size = batch_size * grad_accum_steps
+    effective_batch_size = compute_effective_batch_size(batch_size=batch_size, grad_accum_steps=grad_accum_steps)
+    residue_budget = compute_residue_budget(
+        max_steps=max_steps,
+        effective_batch_size=effective_batch_size,
+        crop_size=crop_size,
+    )
     if crop_size <= 0 or msa_depth <= 0:
-        return 0
-    return effective_batch_size
-
-
-def _validate_manifest_paths(diags: List[Diagnostic], cfg: Dict[str, Any]) -> None:
-    data_cfg = cfg["data"]
-    train_manifest = str(data_cfg["train_manifest"])
-    val_manifest = str(data_cfg["val_manifest"])
-
-    if not _endswith_parts(train_manifest, EXPECTED_TRAIN_MANIFEST_PARTS):
-        add_error(
-            diags,
-            "Competition requires `data.train_manifest` to target `data/manifests/train.txt`.",
-        )
-    if not _endswith_parts(val_manifest, EXPECTED_VAL_MANIFEST_PARTS):
-        add_error(
-            diags,
-            "Competition requires `data.val_manifest` to target `data/manifests/val.txt`.",
-        )
-    if train_manifest == val_manifest:
-        add_error(diags, "`data.train_manifest` and `data.val_manifest` must be different files.")
+        return 0, 0
+    return effective_batch_size, residue_budget
 
 
 def _validate_submission_entrypoint(
@@ -245,7 +222,13 @@ def _validate_submission_interface(diags: List[Diagnostic], cfg: Dict[str, Any],
     model.eval()
     try:
         with torch.no_grad():
-            _ = run_submission_batch(hooks, model=model, batch=dummy_batch, cfg=cfg, training=False)
+            _ = run_submission_batch(
+                hooks,
+                model=model,
+                batch=strip_supervision_from_batch(dummy_batch),
+                cfg=cfg,
+                training=False,
+            )
     except Exception as exc:  # noqa: BLE001
         add_error(diags, f"`run_batch(..., training=False)` failed validation: {exc}")
 
@@ -258,7 +241,13 @@ def _extract_metadata_value(notes_text: str, field: str) -> str | None:
     return match.group(1).strip()
 
 
-def _validate_notes(diags: List[Diagnostic], notes_text: str, allow_placeholders: bool, effective_batch_size: int) -> None:
+def _validate_notes(
+    diags: List[Diagnostic],
+    notes_text: str,
+    allow_placeholders: bool,
+    effective_batch_size: int,
+    residue_budget: int,
+) -> None:
     required_sections = (
         "## What changed?",
         "## Why should it help?",
@@ -293,6 +282,14 @@ def _validate_notes(diags: List[Diagnostic], notes_text: str, allow_placeholders
             add_warning(
                 diags,
                 f"`notes.md` effective_batch_size={ebs_value} does not match config-derived value {effective_batch_size}.",
+            )
+
+    bres_value = _extract_metadata_value(notes_text, "residue_budget")
+    if bres_value and bres_value.isdigit():
+        if int(bres_value) != residue_budget:
+            add_warning(
+                diags,
+                f"`notes.md` residue_budget={bres_value} does not match config-derived value {residue_budget}.",
             )
 
     checklist_items = (
@@ -356,8 +353,14 @@ def validate_submission(submission_dir: Path, strict: bool) -> int:
             add_error(diags, "`train` must be a mapping")
 
     if cfg and all(k in cfg for k in ("submission", "data", "train")):
-        _validate_manifest_paths(diags, cfg)
-        effective_batch_size = _validate_numeric(diags, cfg)
+        effective_batch_size, residue_budget = _validate_numeric(diags, cfg)
+        policy_errors = validate_official_limited_config(
+            cfg,
+            spec=OFFICIAL_LARGE_V3_SPEC,
+            enforce_manifest_paths=True,
+        )
+        for msg in policy_errors:
+            add_error(diags, msg)
         _validate_submission_entrypoint(diags, cfg, config_path=config_path, submission_dir=submission_dir, allow_placeholders=allow_placeholders)
         _validate_submission_interface(diags, cfg, config_path=config_path)
         run_name = str(cfg.get("run_name", "")).strip()
@@ -367,9 +370,16 @@ def validate_submission(submission_dir: Path, strict: bool) -> int:
             add_warning(diags, f"`run_name` looks like a placeholder/default: `{run_name}`")
     else:
         effective_batch_size = 0
+        residue_budget = 0
 
     if notes_text:
-        _validate_notes(diags, notes_text, allow_placeholders=allow_placeholders, effective_batch_size=effective_batch_size)
+        _validate_notes(
+            diags,
+            notes_text,
+            allow_placeholders=allow_placeholders,
+            effective_batch_size=effective_batch_size,
+            residue_budget=residue_budget,
+        )
 
     _print_diagnostics(diags)
 

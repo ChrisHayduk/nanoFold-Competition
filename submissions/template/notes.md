@@ -12,11 +12,13 @@ Give intuition and (ideally) references / ablations.
 - [ ] Used only the provided benchmark data (no external data, weights, or template/MSA searches).
 - [ ] Kept dataset manifests fixed (`data/manifests/train.txt` and `data/manifests/val.txt`).
 - [ ] Model outputs C-alpha coordinates per residue (`(L, 3)` in Angstrom).
+- [ ] `run_batch(..., training=False)` does not depend on supervision labels (`ca_coords`, `ca_mask`).
 
 ## Required run metadata (limited track)
 
 - max_steps:
 - effective_batch_size:
+- residue_budget:
 - crop_size:
 - seed:
 - hardware:

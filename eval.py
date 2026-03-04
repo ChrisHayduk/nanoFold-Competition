@@ -12,9 +12,18 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 import yaml
 
+from nanofold.competition_policy import (
+    OFFICIAL_DATASET_FINGERPRINT_PATH,
+    assert_official_limited_config,
+)
 from nanofold.data import ProcessedNPZDataset, collate_batch
+from nanofold.dataset_integrity import verify_dataset_against_fingerprint
 from nanofold.metrics import lddt_ca
-from nanofold.submission_runtime import load_submission_hooks, run_submission_batch
+from nanofold.submission_runtime import (
+    load_submission_hooks,
+    run_submission_batch,
+    strip_supervision_from_batch,
+)
 from nanofold.utils import to_device
 
 
@@ -23,6 +32,13 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--config", type=str, required=True)
     ap.add_argument("--ckpt", type=str, required=True)
     ap.add_argument("--split", type=str, default="val", choices=["train", "val"])
+    ap.add_argument("--official", action="store_true", help="Enable strict official limited-track enforcement.")
+    ap.add_argument(
+        "--fingerprint",
+        type=str,
+        default=OFFICIAL_DATASET_FINGERPRINT_PATH,
+        help=f"Expected dataset fingerprint JSON path (default: {OFFICIAL_DATASET_FINGERPRINT_PATH}).",
+    )
     return ap.parse_args()
 
 
@@ -59,6 +75,18 @@ def batch_lddt_ca(pred_ca: torch.Tensor, true_ca: torch.Tensor, ca_mask: torch.T
 def main() -> None:
     args = parse_args()
     cfg = load_config(args.config)
+    if args.official:
+        assert_official_limited_config(cfg)
+        data_cfg = cfg["data"]
+        verify_dataset_against_fingerprint(
+            processed_dir=data_cfg["processed_dir"],
+            train_manifest=data_cfg["train_manifest"],
+            val_manifest=data_cfg["val_manifest"],
+            expected_fingerprint_path=args.fingerprint,
+            require_no_missing=True,
+        )
+        print(f"Official mode enabled. Dataset fingerprint matched: {Path(args.fingerprint).resolve()}")
+
     hooks = load_submission_hooks(cfg, args.config)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -69,7 +97,7 @@ def main() -> None:
     ds = ProcessedNPZDataset(
         processed_dir=data_cfg["processed_dir"],
         manifest_path=manifest_path,
-        allow_missing=True,
+        allow_missing=not bool(args.official),
     )
     if getattr(ds, "missing_chain_ids", None):
         print(
@@ -115,8 +143,9 @@ def main() -> None:
     with torch.no_grad():
         for batch in tqdm(loader, desc=f"eval:{args.split}"):
             batch = to_device(batch, device)
+            inference_batch = strip_supervision_from_batch(batch)
             with make_autocast_ctx(device=device, enabled=use_amp):
-                out = run_submission_batch(hooks, model=model, batch=batch, cfg=cfg, training=False)
+                out = run_submission_batch(hooks, model=model, batch=inference_batch, cfg=cfg, training=False)
             pred_ca = out["pred_ca"]
             score = batch_lddt_ca(pred_ca, batch["ca_coords"], batch["ca_mask"], batch["residue_mask"])
             scores.append(score.detach().cpu())

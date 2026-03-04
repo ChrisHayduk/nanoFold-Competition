@@ -1,77 +1,81 @@
 # Competition rules & evaluation protocol
 
-This document is meant to be “runbook-level” concrete, so that runs are reproducible and comparable.
+This document defines the official benchmark contract used for leaderboard runs.
 
 ## 1) Allowed data
 
-Competitors **may only use the dataset produced by `scripts/prepare_data.py`**.
+Competitors may only use data produced by `scripts/prepare_data.py` + `scripts/preprocess.py`.
 
-They may:
-- subsample it
-- reweight it
-- derive new features from it (e.g., amino-acid counts, MSA profiles, predicted secondary structure)
-- change architecture / optimizer / losses
-- implement custom training/eval logic inside their submission module
+Allowed:
+- subsampling / reweighting / curriculum over the provided data
+- feature engineering derived from provided data
+- architecture, optimizer, scheduler, and loss changes
 
-They may not:
-- download or use additional sequences, structures, weights, or pretrained models
-- run MSA/template search against external databases
-- use PDB structures outside the provided dataset
+Not allowed:
+- external sequences, structures, weights, or pretrained models
+- external MSA/template searches
+- PDB structures outside the provided dataset
 
-**Enforcement suggestion:** maintainer runs training/eval with network disabled (e.g., Docker `--network none`)
-and only mounts the dataset directory read-only.
+## 2) Required submission interface
 
-## 2) Required output interface
-
-A submission must output **Cartesian coordinates** for each residue in the crop.
-
-Minimum requirement:
-- Cα coordinates: `(L, 3)` in Ångström units
-
-You may additionally output backbone or all-atom coordinates, but evaluation uses Cα only.
-
-Submission entrypoint requirements (`submissions/<name>/submission.py`):
+Entrypoint (`submissions/<name>/submission.py`) must define:
 - `build_model(cfg)`
 - `build_optimizer(cfg, model)`
-- `run_batch(model, batch, cfg, training)` returning:
-  - `pred_ca`: `(B, L, 3)` float tensor
-  - `loss`: scalar tensor when `training=True`
+- `run_batch(model, batch, cfg, training)`
 
-## 3) Dataset splits
+`run_batch` requirements:
+- always return `pred_ca` with shape `(B, L, 3)` and floating dtype
+- when `training=True`, must also return scalar tensor `loss`
+- when `training=False`, official runner passes an **unlabeled batch** (no `ca_coords` / `ca_mask`)
 
-The dataset is defined by manifests:
-- `manifests/train.txt`
-- `manifests/val.txt`
+## 3) Fixed dataset splits
 
-These are part of the benchmark. Do not change them in a submission PR.
+Official manifests are fixed:
+- `data/manifests/train.txt`
+- `data/manifests/val.txt`
 
-## 4) Fixed budget (limited track)
+Submissions must keep these paths unchanged.
 
-A run is defined by:
-- `max_steps` (optimizer steps)
-- `effective_batch_size` (including gradient accumulation)
-- `crop_size`
-- RNG seed
+## 4) Official limited track (Large-v3)
 
-The maintainer should record:
-- hardware (GPU model, #GPUs)
-- wall-clock time
-- commit hash
+Official constants:
+- `seed = 0`
+- `data.crop_size = 256`
+- `data.msa_depth = 192`
+- `effective_batch_size = data.batch_size * train.grad_accum_steps = 2`
+- `train.max_steps = 10000`
+- `data.val_crop_mode = "center"`
+- `data.val_msa_sample_mode = "top"`
 
-## 5) Scoring
+Derived fixed data budget:
+- `B_res = max_steps * effective_batch_size * crop_size = 5,120,000`
+
+## 5) Dataset integrity requirements (official runs)
+
+Official runs require:
+- canonical fingerprint JSON (default path: `leaderboard/official_dataset_fingerprint.json`)
+- zero missing manifest chains (`allow_missing=False`)
+
+Fingerprint tooling:
+- build/update: `python scripts/build_dataset_fingerprint.py --config <config> --output leaderboard/official_dataset_fingerprint.json`
+- official train/eval verify this fingerprint when `--official` is enabled
+
+## 6) Scoring
 
 Primary score:
-- mean lDDT-Cα on the validation set
+- mean lDDT-Cα on validation set
 
-Tie-breakers (optional):
+Tie-breaker (optional):
 - lower wall-clock time
-- fewer parameters
-- lower violation metrics (if you add them)
 
-## 6) How maintainers should evaluate a PR
+## 7) Maintainer runbook for official evaluation
 
-1) Checkout the PR commit.
-2) Run `python train.py --config submissions/<name>/config.yaml` (or similar).
-3) Run `python eval.py --config ... --ckpt ...`.
-4) Save `runs/<name>/metrics.json`.
-5) Update `leaderboard/leaderboard.json` and run `python scripts/render_leaderboard.py`.
+1. Checkout PR commit.
+2. Validate submission:
+   `python scripts/validate_submission.py --submission submissions/<name>`
+3. Train (official mode):
+   `python train.py --config submissions/<name>/config.yaml --official`
+4. Evaluate (official mode):
+   `python eval.py --config submissions/<name>/config.yaml --ckpt <ckpt> --official`
+5. Save `runs/<name>/metrics.json`.
+6. Update `leaderboard/leaderboard.json` and run `python scripts/render_leaderboard.py`.

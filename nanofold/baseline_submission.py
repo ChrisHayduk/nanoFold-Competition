@@ -68,6 +68,8 @@ def run_batch(
     training: bool,
 ) -> Dict[str, torch.Tensor]:
     pred_ca = model(batch["aatype"], batch["msa"], batch["deletions"], batch["residue_mask"])
+    if not training:
+        return {"pred_ca": pred_ca}
 
     loss_cfg = cfg.get("loss", {})
     loss, terms = baseline_composite_loss(

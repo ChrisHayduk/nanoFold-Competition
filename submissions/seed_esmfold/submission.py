@@ -111,6 +111,8 @@ def run_batch(
     pred_ca = out["pred_ca"]
     distogram_logits = out["distogram_logits"]
     plddt_logits = out["plddt_logits"]
+    if not training:
+        return {"pred_ca": pred_ca}
 
     loss_cfg = cfg.get("loss", {})
     coord_weight = float(loss_cfg.get("coord_weight", 1.0))

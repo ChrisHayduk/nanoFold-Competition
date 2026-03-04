@@ -18,6 +18,23 @@ Given an input protein (sequence + its MSA + optional templates), predict a 3D s
 
 **Primary metric:** mean lDDT-Cα on the validation set (higher is better).
 
+## Official Limited Track (Large-v3)
+
+Official fixed constants:
+- `seed = 0`
+- `data.crop_size = 256`
+- `data.msa_depth = 192`
+- `effective_batch_size = data.batch_size * train.grad_accum_steps = 2`
+- `train.max_steps = 10000`
+- `data.val_crop_mode = center`
+- `data.val_msa_sample_mode = top`
+
+Derived data budget:
+- `B_res = max_steps * effective_batch_size * crop_size = 5,120,000`
+
+Canonical maintainer config:
+- `configs/official_limited_large_v3.yaml`
+
 ## Quickstart
 
 ```bash
@@ -46,6 +63,15 @@ python train.py --config configs/baseline.yaml
 
 # 4) evaluate
 python eval.py --config configs/baseline.yaml --ckpt runs/baseline/checkpoints/ckpt_last.pt
+
+# 5) official-mode baseline run (strict policy + dataset fingerprint)
+python scripts/build_dataset_fingerprint.py \
+  --config configs/official_limited_large_v3.yaml \
+  --output leaderboard/official_dataset_fingerprint.json
+# Note: this command fails if any manifest chain is missing from data/processed.
+python train.py --config configs/official_limited_large_v3.yaml --official
+python eval.py --config configs/official_limited_large_v3.yaml \
+  --ckpt runs/official_limited_large_v3_baseline/checkpoints/ckpt_last.pt --official
 ```
 
 ## Data Flow (Detailed)
@@ -135,7 +161,10 @@ Open a PR that adds:
 - a `submission.py` entrypoint implementing:
   - `build_model(cfg)`
   - `build_optimizer(cfg, model)`
-  - `run_batch(model, batch, cfg, training)` returning at least `pred_ca` and (when training) `loss`
+  - `run_batch(model, batch, cfg, training)` returning:
+    - always `pred_ca`
+    - `loss` when `training=True`
+    - no dependence on `ca_coords` / `ca_mask` when `training=False` (official eval strips labels)
 - any additional code files your method needs (`model.py`, `loss.py`, etc.)
 - a short `notes.md` describing what changed and why
 
