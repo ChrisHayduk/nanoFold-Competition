@@ -15,10 +15,11 @@
 #       - must not depend on `ca_coords` / `ca_mask` when `training=False`
 #
 # Fixed-budget note:
-# - Official limited Large-v3 requires:
+# - Official `limited_large_v3` requires:
 #   seed=0, crop_size=256, msa_depth=192, effective_batch_size=2, max_steps=10000.
 
 run_name: your_name_run1
+track: limited_large_v3
 seed: 0
 
 submission:
