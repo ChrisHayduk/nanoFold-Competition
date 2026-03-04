@@ -119,7 +119,12 @@ def distogram_loss(
     pair_mask = (d_true < cutoff) & valid_res[:, :, None] & valid_res[:, None, :] & (~eye)
 
     diff2 = (d_pred - d_true) ** 2
-    loss = diff2[pair_mask].mean() if pair_mask.any() else torch.zeros((), device=device)
+    if pair_mask.any():
+        loss = diff2[pair_mask].mean()
+    else:
+        # Return a differentiable zero so backward() is still valid for batches
+        # where no residue pairs satisfy the supervision mask.
+        loss = d_pred.sum() * 0.0
     return loss
 
 

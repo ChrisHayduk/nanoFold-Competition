@@ -3,3 +3,4 @@
 *.pt
 /data/openproteinset/*
 *.npz
+data/processed/1p11_I.error.txt

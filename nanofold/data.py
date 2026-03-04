@@ -33,9 +33,35 @@ def read_manifest(manifest_path: str | Path) -> List[str]:
 class ProcessedNPZDataset(Dataset):
     """Loads per-chain preprocessed .npz examples produced by scripts/preprocess.py."""
 
-    def __init__(self, processed_dir: str | Path, manifest_path: str | Path):
+    def __init__(
+        self,
+        processed_dir: str | Path,
+        manifest_path: str | Path,
+        *,
+        allow_missing: bool = False,
+    ):
         self.processed_dir = Path(processed_dir)
-        self.chain_ids = read_manifest(manifest_path)
+        requested_chain_ids = read_manifest(manifest_path)
+        present_chain_ids: List[str] = []
+        missing_chain_ids: List[str] = []
+        for chain_id in requested_chain_ids:
+            if (self.processed_dir / f"{chain_id}.npz").exists():
+                present_chain_ids.append(chain_id)
+            else:
+                missing_chain_ids.append(chain_id)
+
+        self.missing_chain_ids = missing_chain_ids
+        if missing_chain_ids and not allow_missing:
+            sample = ", ".join(missing_chain_ids[:8])
+            raise FileNotFoundError(
+                f"{len(missing_chain_ids)} chains from manifest are missing preprocessed files in {self.processed_dir}. "
+                f"Examples: {sample}"
+            )
+        self.chain_ids = present_chain_ids if allow_missing else requested_chain_ids
+        if not self.chain_ids:
+            raise ValueError(
+                f"No preprocessed examples available in {self.processed_dir} for manifest {manifest_path}."
+            )
 
     def __len__(self) -> int:
         return len(self.chain_ids)

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import json
+from functools import partial
 from pathlib import Path
+import sys
 from typing import Any, Dict
 
 import torch
@@ -27,20 +29,55 @@ def load_config(path: str | Path) -> Dict[str, Any]:
     return yaml.safe_load(Path(path).read_text())
 
 
+def make_autocast_ctx(device: torch.device, enabled: bool):
+    try:
+        return torch.amp.autocast(device_type=device.type, enabled=enabled)
+    except Exception:
+        return torch.cuda.amp.autocast(enabled=enabled)
+
+
+def make_grad_scaler(enabled: bool):
+    try:
+        return torch.amp.GradScaler("cuda", enabled=enabled)
+    except Exception:
+        return torch.cuda.amp.GradScaler(enabled=enabled)
+
+
+def normalize_num_workers(n: int) -> int:
+    n = int(n)
+    if n <= 0:
+        return 0
+    if sys.platform == "darwin" and sys.version_info >= (3, 13):
+        print("Forcing data.num_workers=0 on macOS with Python 3.13+ for DataLoader stability.")
+        return 0
+    return n
+
+
 def make_loader(cfg: Dict[str, Any], split: str) -> DataLoader:
     data_cfg = cfg["data"]
     processed_dir = data_cfg["processed_dir"]
     manifest_path = data_cfg["train_manifest"] if split == "train" else data_cfg["val_manifest"]
 
-    ds = ProcessedNPZDataset(processed_dir=processed_dir, manifest_path=manifest_path)
+    ds = ProcessedNPZDataset(processed_dir=processed_dir, manifest_path=manifest_path, allow_missing=True)
+    if getattr(ds, "missing_chain_ids", None):
+        print(
+            f"[{split}] Skipping {len(ds.missing_chain_ids)} missing preprocessed chains "
+            f"(first: {', '.join(ds.missing_chain_ids[:6])})"
+        )
+    collate_fn = partial(
+        collate_batch,
+        crop_size=int(data_cfg["crop_size"]),
+        msa_depth=int(data_cfg["msa_depth"]),
+    )
+    num_workers = normalize_num_workers(int(data_cfg.get("num_workers", 0)))
 
     return DataLoader(
         ds,
         batch_size=data_cfg.get("batch_size", 1),
         shuffle=(split == "train"),
-        num_workers=data_cfg.get("num_workers", 0),
-        pin_memory=True,
-        collate_fn=lambda exs: collate_batch(exs, crop_size=data_cfg["crop_size"], msa_depth=data_cfg["msa_depth"]),
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+        collate_fn=collate_fn,
         drop_last=(split == "train"),
     )
 
@@ -107,9 +144,9 @@ def main() -> None:
     if grad_accum_steps <= 0:
         raise ValueError("`train.grad_accum_steps` must be >= 1")
     grad_clip = float(cfg.get("optim", {}).get("grad_clip_norm", 0.0))
-    use_amp = bool(tcfg.get("amp", False))
+    use_amp = bool(tcfg.get("amp", False)) and device.type == "cuda"
 
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    scaler = make_grad_scaler(enabled=use_amp)
 
     step = 0
     model.train()
@@ -124,7 +161,7 @@ def main() -> None:
         with torch.no_grad():
             for batch in tqdm(val_loader, desc="val", leave=False):
                 batch = to_device(batch, device)
-                with torch.cuda.amp.autocast(enabled=use_amp):
+                with make_autocast_ctx(device=device, enabled=use_amp):
                     out = run_submission_batch(hooks, model=model, batch=batch, cfg=cfg, training=False)
                 pred_ca = out["pred_ca"]
                 score = batch_lddt_ca(pred_ca, batch["ca_coords"], batch["ca_mask"], batch["residue_mask"])
@@ -157,9 +194,20 @@ def main() -> None:
 
             batch = to_device(batch, device)
 
-            with torch.cuda.amp.autocast(enabled=use_amp):
+            with make_autocast_ctx(device=device, enabled=use_amp):
                 out = run_submission_batch(hooks, model=model, batch=batch, cfg=cfg, training=True)
                 raw_loss = out["loss"]
+                if not raw_loss.requires_grad:
+                    # Some batches may have no valid supervision and return a constant
+                    # scalar loss. Anchor it to model outputs so backward() stays valid.
+                    pred_ca = out.get("pred_ca", None)
+                    if torch.is_tensor(pred_ca):
+                        raw_loss = raw_loss + pred_ca.sum() * 0.0
+                    else:
+                        raise RuntimeError(
+                            "Submission returned a non-differentiable `loss` and no `pred_ca` tensor "
+                            "to anchor gradients."
+                        )
                 loss = raw_loss / grad_accum_steps
 
             scaler.scale(loss).backward()
