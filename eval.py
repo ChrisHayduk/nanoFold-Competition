@@ -76,10 +76,18 @@ def main() -> None:
             f"[{args.split}] Skipping {len(ds.missing_chain_ids)} missing preprocessed chains "
             f"(first: {', '.join(ds.missing_chain_ids[:6])})"
         )
+    if args.split == "train":
+        crop_mode = str(data_cfg.get("train_crop_mode", "random"))
+        msa_sample_mode = str(data_cfg.get("train_msa_sample_mode", "random"))
+    else:
+        crop_mode = str(data_cfg.get("val_crop_mode", "center"))
+        msa_sample_mode = str(data_cfg.get("val_msa_sample_mode", "top"))
     collate_fn = partial(
         collate_batch,
         crop_size=int(data_cfg["crop_size"]),
         msa_depth=int(data_cfg["msa_depth"]),
+        crop_mode=crop_mode,
+        msa_sample_mode=msa_sample_mode,
     )
     num_workers = normalize_num_workers(int(data_cfg.get("num_workers", 0)))
 

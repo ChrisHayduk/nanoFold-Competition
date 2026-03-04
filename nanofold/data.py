@@ -141,11 +141,60 @@ def random_crop(
     }
 
 
-def sample_msa(msa: torch.Tensor, deletions: torch.Tensor, msa_depth: int) -> Tuple[torch.Tensor, torch.Tensor]:
+def center_crop(
+    aatype: torch.Tensor,
+    msa: torch.Tensor,
+    deletions: torch.Tensor,
+    ca_coords: torch.Tensor,
+    ca_mask: torch.Tensor,
+    template_aatype: torch.Tensor,
+    template_ca_coords: torch.Tensor,
+    template_ca_mask: torch.Tensor,
+    crop_size: int,
+) -> Dict[str, torch.Tensor]:
+    L = aatype.shape[0]
+    if L <= crop_size:
+        return {
+            "aatype": aatype,
+            "msa": msa,
+            "deletions": deletions,
+            "ca_coords": ca_coords,
+            "ca_mask": ca_mask,
+            "template_aatype": template_aatype,
+            "template_ca_coords": template_ca_coords,
+            "template_ca_mask": template_ca_mask,
+        }
+
+    start = (L - crop_size) // 2
+    end = start + crop_size
+    return {
+        "aatype": aatype[start:end],
+        "msa": msa[:, start:end],
+        "deletions": deletions[:, start:end],
+        "ca_coords": ca_coords[start:end],
+        "ca_mask": ca_mask[start:end],
+        "template_aatype": template_aatype[:, start:end],
+        "template_ca_coords": template_ca_coords[:, start:end],
+        "template_ca_mask": template_ca_mask[:, start:end],
+    }
+
+
+def sample_msa(
+    msa: torch.Tensor,
+    deletions: torch.Tensor,
+    msa_depth: int,
+    sample_mode: str = "random",
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """Subsample MSA rows to a fixed depth, always keeping row 0 (query)."""
     N = msa.shape[0]
     if N <= msa_depth:
         return msa, deletions
+
+    if sample_mode == "top":
+        keep = torch.arange(msa_depth, dtype=torch.long)
+        return msa[keep], deletions[keep]
+    if sample_mode != "random":
+        raise ValueError(f"Unsupported msa sample_mode={sample_mode!r}; expected 'random' or 'top'.")
 
     # Keep query at index 0; sample the rest.
     perm = torch.randperm(N - 1) + 1
@@ -159,6 +208,8 @@ def collate_batch(
     examples: List[Dict[str, torch.Tensor]],
     crop_size: int,
     msa_depth: int,
+    crop_mode: str = "random",
+    msa_sample_mode: str = "random",
 ) -> Dict[str, torch.Tensor]:
     # This baseline uses batch_size=1 in the config by default.
     # Still implement stacking for convenience.
@@ -166,18 +217,39 @@ def collate_batch(
     chain_ids = []
     for ex in examples:
         chain_ids.append(ex["chain_id"])
-        cropped = random_crop(
-            ex["aatype"],
-            ex["msa"],
-            ex["deletions"],
-            ex["ca_coords"],
-            ex["ca_mask"],
-            ex["template_aatype"],
-            ex["template_ca_coords"],
-            ex["template_ca_mask"],
-            crop_size=crop_size,
+        if crop_mode == "random":
+            cropped = random_crop(
+                ex["aatype"],
+                ex["msa"],
+                ex["deletions"],
+                ex["ca_coords"],
+                ex["ca_mask"],
+                ex["template_aatype"],
+                ex["template_ca_coords"],
+                ex["template_ca_mask"],
+                crop_size=crop_size,
+            )
+        elif crop_mode == "center":
+            cropped = center_crop(
+                ex["aatype"],
+                ex["msa"],
+                ex["deletions"],
+                ex["ca_coords"],
+                ex["ca_mask"],
+                ex["template_aatype"],
+                ex["template_ca_coords"],
+                ex["template_ca_mask"],
+                crop_size=crop_size,
+            )
+        else:
+            raise ValueError(f"Unsupported crop_mode={crop_mode!r}; expected 'random' or 'center'.")
+
+        msa_s, del_s = sample_msa(
+            cropped["msa"],
+            cropped["deletions"],
+            msa_depth=msa_depth,
+            sample_mode=msa_sample_mode,
         )
-        msa_s, del_s = sample_msa(cropped["msa"], cropped["deletions"], msa_depth=msa_depth)
         cropped["msa"] = msa_s
         cropped["deletions"] = del_s
         batch.append(cropped)

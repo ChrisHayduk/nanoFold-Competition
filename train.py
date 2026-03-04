@@ -57,6 +57,12 @@ def make_loader(cfg: Dict[str, Any], split: str) -> DataLoader:
     data_cfg = cfg["data"]
     processed_dir = data_cfg["processed_dir"]
     manifest_path = data_cfg["train_manifest"] if split == "train" else data_cfg["val_manifest"]
+    if split == "train":
+        crop_mode = str(data_cfg.get("train_crop_mode", "random"))
+        msa_sample_mode = str(data_cfg.get("train_msa_sample_mode", "random"))
+    else:
+        crop_mode = str(data_cfg.get("val_crop_mode", "center"))
+        msa_sample_mode = str(data_cfg.get("val_msa_sample_mode", "top"))
 
     ds = ProcessedNPZDataset(processed_dir=processed_dir, manifest_path=manifest_path, allow_missing=True)
     if getattr(ds, "missing_chain_ids", None):
@@ -68,6 +74,8 @@ def make_loader(cfg: Dict[str, Any], split: str) -> DataLoader:
         collate_batch,
         crop_size=int(data_cfg["crop_size"]),
         msa_depth=int(data_cfg["msa_depth"]),
+        crop_mode=crop_mode,
+        msa_sample_mode=msa_sample_mode,
     )
     num_workers = normalize_num_workers(int(data_cfg.get("num_workers", 0)))
 
