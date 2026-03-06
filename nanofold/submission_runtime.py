@@ -12,13 +12,26 @@ from typing import Any, Callable, Dict, Optional
 import torch
 
 
-SUPERVISION_BATCH_KEYS = ("ca_coords", "ca_mask")
+INFERENCE_BATCH_KEYS = frozenset(
+    {
+        "chain_id",
+        "aatype",
+        "msa",
+        "deletions",
+        "template_aatype",
+        "template_ca_coords",
+        "template_ca_mask",
+        "residue_mask",
+    }
+)
 
 
 @dataclass(frozen=True)
 class SubmissionHooks:
     module_ref: str
     module: ModuleType
+    source_path: str | None
+    source_sha256: str | None
     build_model: Callable[[Dict[str, Any]], torch.nn.Module]
     build_optimizer: Callable[[Dict[str, Any], torch.nn.Module], torch.optim.Optimizer]
     run_batch: Callable[..., Dict[str, torch.Tensor]]
@@ -57,7 +70,42 @@ def _import_module_from_path(module_path: Path) -> tuple[str, ModuleType]:
     return f"path:{resolved}", module
 
 
-def load_submission_hooks(cfg: Dict[str, Any], config_path: str | Path) -> SubmissionHooks:
+def _resolve_module_source_path(module: ModuleType) -> str | None:
+    module_file = getattr(module, "__file__", None)
+    if not isinstance(module_file, str) or module_file.strip() == "":
+        return None
+    resolved = Path(module_file).resolve()
+    if not resolved.exists() or not resolved.is_file():
+        return None
+    return str(resolved)
+
+
+def _sha256_file(path: str | Path) -> str:
+    hasher = hashlib.sha256()
+    with Path(path).open("rb") as f:
+        while True:
+            chunk = f.read(1024 * 1024)
+            if not chunk:
+                break
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def _ensure_path_within_root(path: Path, allowed_root: Path) -> None:
+    try:
+        path.relative_to(allowed_root)
+    except ValueError as exc:
+        raise ValueError(
+            f"Submission module path must resolve inside `{allowed_root}` (got `{path}`)."
+        ) from exc
+
+
+def load_submission_hooks(
+    cfg: Dict[str, Any],
+    config_path: str | Path,
+    *,
+    allowed_root: str | Path | None = None,
+) -> SubmissionHooks:
     """Load required submission hooks from cfg['submission'].
 
     Supported config formats:
@@ -89,6 +137,9 @@ def load_submission_hooks(cfg: Dict[str, Any], config_path: str | Path) -> Submi
         path = Path(module_path.strip())
         if not path.is_absolute():
             path = config_path.parent / path
+        path = path.resolve()
+        if allowed_root is not None:
+            _ensure_path_within_root(path, Path(allowed_root).resolve())
         module_ref, module = _import_module_from_path(path)
 
     required = ("build_model", "build_optimizer", "run_batch")
@@ -100,9 +151,14 @@ def load_submission_hooks(cfg: Dict[str, Any], config_path: str | Path) -> Submi
     if build_scheduler is not None and not callable(build_scheduler):
         raise TypeError("`build_scheduler` exists but is not callable.")
 
+    source_path = _resolve_module_source_path(module)
+    source_sha256 = _sha256_file(source_path) if source_path is not None else None
+
     return SubmissionHooks(
         module_ref=module_ref,
         module=module,
+        source_path=source_path,
+        source_sha256=source_sha256,
         build_model=getattr(module, "build_model"),
         build_optimizer=getattr(module, "build_optimizer"),
         run_batch=getattr(module, "run_batch"),
@@ -111,12 +167,11 @@ def load_submission_hooks(cfg: Dict[str, Any], config_path: str | Path) -> Submi
 
 
 def strip_supervision_from_batch(batch: Dict[str, Any]) -> Dict[str, Any]:
-    out: Dict[str, Any] = {}
-    for k, v in batch.items():
-        if k in SUPERVISION_BATCH_KEYS:
-            continue
-        out[k] = v
-    return out
+    return {
+        key: value
+        for key, value in batch.items()
+        if key in INFERENCE_BATCH_KEYS
+    }
 
 
 def run_submission_batch(

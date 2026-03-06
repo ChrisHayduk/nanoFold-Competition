@@ -47,6 +47,15 @@ class TrackSpec:
     max_params: int | None
 
     @property
+    def sample_budget(self) -> int | None:
+        if self.max_steps is None or self.effective_batch_size is None:
+            return None
+        return compute_sample_budget(
+            max_steps=self.max_steps,
+            effective_batch_size=self.effective_batch_size,
+        )
+
+    @property
     def residue_budget(self) -> int | None:
         if self.max_steps is None or self.effective_batch_size is None or self.crop_size is None:
             return None
@@ -68,6 +77,13 @@ class OfficialLimitedSpec:
     max_steps: int
     val_crop_mode: str
     val_msa_sample_mode: str
+
+    @property
+    def sample_budget(self) -> int:
+        return compute_sample_budget(
+            max_steps=self.max_steps,
+            effective_batch_size=self.effective_batch_size,
+        )
 
     @property
     def residue_budget(self) -> int:
@@ -179,8 +195,12 @@ def compute_effective_batch_size(batch_size: int, grad_accum_steps: int) -> int:
     return int(batch_size) * int(grad_accum_steps)
 
 
+def compute_sample_budget(max_steps: int, effective_batch_size: int) -> int:
+    return int(max_steps) * int(effective_batch_size)
+
+
 def compute_residue_budget(max_steps: int, effective_batch_size: int, crop_size: int) -> int:
-    return int(max_steps) * int(effective_batch_size) * int(crop_size)
+    return compute_sample_budget(max_steps=max_steps, effective_batch_size=effective_batch_size) * int(crop_size)
 
 
 def _ensure_mapping(root: Dict[str, Any], key: str) -> Dict[str, Any]:

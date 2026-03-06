@@ -3,16 +3,16 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Mapping
 
 import numpy as np
 
 from .data import read_manifest
 
 
-FINGERPRINT_SCHEMA_VERSION = 2
+FINGERPRINT_SCHEMA_VERSION = 3
 
-FINGERPRINT_COMPARISON_KEYS = (
+FINGERPRINT_COMPARISON_KEYS_V2 = (
     "schema_version",
     "track_id",
     "train_manifest_chain_count",
@@ -27,6 +27,22 @@ FINGERPRINT_COMPARISON_KEYS = (
     "val_manifest_sha256",
     "feature_files_sha256",
     "label_files_sha256",
+)
+
+FINGERPRINT_COMPARISON_KEYS_V3 = (
+    "schema_version",
+    "track_id",
+    "split_names",
+    "unique_chain_count",
+    "present_feature_chain_count",
+    "missing_feature_chain_count",
+    "present_label_chain_count",
+    "missing_label_chain_count",
+    "chain_ids_sha256",
+    "feature_files_sha256",
+    "label_files_sha256",
+    "require_labels",
+    "source_lock_sha256",
 )
 
 REQUIRED_FEATURE_KEYS = (
@@ -220,11 +236,22 @@ def _files_sha256(
     return hasher.hexdigest()
 
 
-def build_dataset_fingerprint(
+def _normalize_manifest_map(manifest_paths: Mapping[str, str | Path]) -> Dict[str, Path]:
+    normalized: Dict[str, Path] = {}
+    for split_name, manifest_path in manifest_paths.items():
+        key = str(split_name).strip()
+        if key == "":
+            raise ValueError("Manifest split names must be non-empty.")
+        normalized[key] = Path(manifest_path).resolve()
+    if not normalized:
+        raise ValueError("At least one manifest path is required to build a fingerprint.")
+    return normalized
+
+
+def build_split_fingerprint(
     *,
     processed_features_dir: str | Path,
-    train_manifest: str | Path,
-    val_manifest: str | Path,
+    manifest_paths: Mapping[str, str | Path],
     require_no_missing: bool,
     processed_labels_dir: str | Path | None = None,
     require_labels: bool = True,
@@ -234,12 +261,18 @@ def build_dataset_fingerprint(
 ) -> Dict[str, Any]:
     processed_features_dir = Path(processed_features_dir).resolve()
     processed_labels_dir_path = Path(processed_labels_dir).resolve() if processed_labels_dir else None
-    train_manifest = Path(train_manifest).resolve()
-    val_manifest = Path(val_manifest).resolve()
+    manifest_map = _normalize_manifest_map(manifest_paths)
 
-    train_chain_ids = read_manifest(train_manifest)
-    val_chain_ids = read_manifest(val_manifest)
-    all_chain_ids = sorted(set(train_chain_ids + val_chain_ids))
+    manifest_meta: Dict[str, Dict[str, Any]] = {}
+    all_chain_ids_unsorted: List[str] = []
+    for split_name, manifest_path in manifest_map.items():
+        chain_ids = read_manifest(manifest_path)
+        manifest_meta[split_name] = {
+            "chain_count": len(chain_ids),
+            "sha256": sha256_file(manifest_path),
+        }
+        all_chain_ids_unsorted.extend(chain_ids)
+    all_chain_ids = sorted(set(all_chain_ids_unsorted))
 
     missing_feature_chain_ids: List[str] = []
     missing_label_chain_ids: List[str] = []
@@ -272,11 +305,11 @@ def build_dataset_fingerprint(
             f"Examples: {sample}"
         )
 
-    return {
+    result: Dict[str, Any] = {
         "schema_version": FINGERPRINT_SCHEMA_VERSION,
         "track_id": track_id,
-        "train_manifest_chain_count": len(train_chain_ids),
-        "val_manifest_chain_count": len(val_chain_ids),
+        "split_names": list(manifest_map.keys()),
+        "manifests": manifest_meta,
         "unique_chain_count": len(all_chain_ids),
         "present_feature_chain_count": len(all_chain_ids) - len(missing_feature_chain_ids),
         "missing_feature_chain_count": len(missing_feature_chain_ids),
@@ -285,14 +318,42 @@ def build_dataset_fingerprint(
         "missing_label_chain_count": len(missing_label_chain_ids) if require_labels else 0,
         "missing_label_chain_ids": missing_label_chain_ids if require_labels else [],
         "chain_ids_sha256": _chain_ids_sha256(all_chain_ids),
-        "train_manifest_sha256": sha256_file(train_manifest),
-        "val_manifest_sha256": sha256_file(val_manifest),
         "feature_files_sha256": feature_hash,
         "label_files_sha256": label_hash,
         "require_labels": bool(require_labels),
         "source_lock_path": str(Path(source_lock_path).resolve()) if source_lock_path else None,
         "source_lock_sha256": sha256_file(source_lock_path) if source_lock_path else None,
     }
+    if list(manifest_map.keys()) == ["train", "val"]:
+        result["train_manifest_chain_count"] = manifest_meta["train"]["chain_count"]
+        result["val_manifest_chain_count"] = manifest_meta["val"]["chain_count"]
+        result["train_manifest_sha256"] = manifest_meta["train"]["sha256"]
+        result["val_manifest_sha256"] = manifest_meta["val"]["sha256"]
+    return result
+
+
+def build_dataset_fingerprint(
+    *,
+    processed_features_dir: str | Path,
+    train_manifest: str | Path,
+    val_manifest: str | Path,
+    require_no_missing: bool,
+    processed_labels_dir: str | Path | None = None,
+    require_labels: bool = True,
+    validate_schema: bool = True,
+    track_id: str | None = None,
+    source_lock_path: str | Path | None = None,
+) -> Dict[str, Any]:
+    return build_split_fingerprint(
+        processed_features_dir=processed_features_dir,
+        processed_labels_dir=processed_labels_dir,
+        manifest_paths={"train": train_manifest, "val": val_manifest},
+        require_no_missing=require_no_missing,
+        require_labels=require_labels,
+        validate_schema=validate_schema,
+        track_id=track_id,
+        source_lock_path=source_lock_path,
+    )
 
 
 def load_fingerprint(path: str | Path) -> Dict[str, Any]:
@@ -302,13 +363,64 @@ def load_fingerprint(path: str | Path) -> Dict[str, Any]:
     return raw
 
 
-def compare_fingerprints(actual: Dict[str, Any], expected: Dict[str, Any]) -> List[str]:
-    mismatches: List[str] = []
-    for key in FINGERPRINT_COMPARISON_KEYS:
-        if actual.get(key) != expected.get(key):
-            mismatches.append(f"Mismatch `{key}`: expected={expected.get(key)!r}, actual={actual.get(key)!r}")
+def compare_fingerprints(
+    actual: Dict[str, Any],
+    expected: Dict[str, Any],
+    *,
+    comparison_mode: str = "exact",
+) -> List[str]:
+    if comparison_mode not in {"exact", "features_only"}:
+        raise ValueError(f"Unsupported fingerprint comparison_mode={comparison_mode!r}")
 
-    for key in ("missing_feature_chain_ids", "missing_label_chain_ids"):
+    mismatches: List[str] = []
+    if "manifests" in expected:
+        if comparison_mode == "exact":
+            keys = FINGERPRINT_COMPARISON_KEYS_V3
+        else:
+            keys = (
+                "schema_version",
+                "track_id",
+                "split_names",
+                "unique_chain_count",
+                "present_feature_chain_count",
+                "missing_feature_chain_count",
+                "chain_ids_sha256",
+                "feature_files_sha256",
+                "source_lock_sha256",
+            )
+        for key in keys:
+            if actual.get(key) != expected.get(key):
+                mismatches.append(f"Mismatch `{key}`: expected={expected.get(key)!r}, actual={actual.get(key)!r}")
+        if dict(actual.get("manifests") or {}) != dict(expected.get("manifests") or {}):
+            mismatches.append(
+                f"Mismatch `manifests`: expected={dict(expected.get('manifests') or {})!r}, "
+                f"actual={dict(actual.get('manifests') or {})!r}"
+            )
+    else:
+        if comparison_mode == "exact":
+            keys = FINGERPRINT_COMPARISON_KEYS_V2
+        else:
+            keys = (
+                "schema_version",
+                "track_id",
+                "train_manifest_chain_count",
+                "val_manifest_chain_count",
+                "unique_chain_count",
+                "present_feature_chain_count",
+                "missing_feature_chain_count",
+                "chain_ids_sha256",
+                "train_manifest_sha256",
+                "val_manifest_sha256",
+                "feature_files_sha256",
+            )
+        for key in keys:
+            if actual.get(key) != expected.get(key):
+                mismatches.append(f"Mismatch `{key}`: expected={expected.get(key)!r}, actual={actual.get(key)!r}")
+
+    list_keys = ("missing_feature_chain_ids", "missing_label_chain_ids")
+    if comparison_mode == "features_only":
+        list_keys = ("missing_feature_chain_ids",)
+    for key in list_keys:
         if key in expected and list(actual.get(key) or []) != list(expected.get(key) or []):
             mismatches.append(
                 f"Mismatch `{key}`: expected={list(expected.get(key) or [])!r}, "
@@ -318,6 +430,37 @@ def compare_fingerprints(actual: Dict[str, Any], expected: Dict[str, Any]) -> Li
         if key in expected and actual.get(key) != expected.get(key):
             mismatches.append(f"Mismatch `{key}`: expected={expected.get(key)!r}, actual={actual.get(key)!r}")
     return mismatches
+
+
+def verify_split_against_fingerprint(
+    *,
+    processed_features_dir: str | Path,
+    manifest_paths: Mapping[str, str | Path],
+    expected_fingerprint_path: str | Path,
+    require_no_missing: bool,
+    processed_labels_dir: str | Path | None = None,
+    require_labels: bool = True,
+    validate_schema: bool = True,
+    track_id: str | None = None,
+    source_lock_path: str | Path | None = None,
+    comparison_mode: str = "exact",
+) -> Dict[str, Any]:
+    expected = load_fingerprint(expected_fingerprint_path)
+    actual = build_split_fingerprint(
+        processed_features_dir=processed_features_dir,
+        processed_labels_dir=processed_labels_dir,
+        manifest_paths=manifest_paths,
+        require_no_missing=require_no_missing,
+        require_labels=require_labels,
+        validate_schema=validate_schema,
+        track_id=track_id,
+        source_lock_path=source_lock_path,
+    )
+    mismatches = compare_fingerprints(actual=actual, expected=expected, comparison_mode=comparison_mode)
+    if mismatches:
+        joined = "\n".join(f"- {m}" for m in mismatches)
+        raise ValueError(f"Dataset fingerprint mismatch:\n{joined}")
+    return actual
 
 
 def verify_dataset_against_fingerprint(
@@ -332,21 +475,17 @@ def verify_dataset_against_fingerprint(
     validate_schema: bool = True,
     track_id: str | None = None,
     source_lock_path: str | Path | None = None,
+    comparison_mode: str = "exact",
 ) -> Dict[str, Any]:
-    expected = load_fingerprint(expected_fingerprint_path)
-    actual = build_dataset_fingerprint(
+    return verify_split_against_fingerprint(
         processed_features_dir=processed_features_dir,
         processed_labels_dir=processed_labels_dir,
-        train_manifest=train_manifest,
-        val_manifest=val_manifest,
+        manifest_paths={"train": train_manifest, "val": val_manifest},
+        expected_fingerprint_path=expected_fingerprint_path,
         require_no_missing=require_no_missing,
         require_labels=require_labels,
         validate_schema=validate_schema,
         track_id=track_id,
         source_lock_path=source_lock_path,
+        comparison_mode=comparison_mode,
     )
-    mismatches = compare_fingerprints(actual=actual, expected=expected)
-    if mismatches:
-        joined = "\n".join(f"- {m}" for m in mismatches)
-        raise ValueError(f"Dataset fingerprint mismatch:\n{joined}")
-    return actual

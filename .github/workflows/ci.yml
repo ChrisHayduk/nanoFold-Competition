@@ -225,22 +225,27 @@ jobs:
             --official \
             --fingerprint .ci_smoke/fingerprint.json \
             --deterministic
-      - name: Eval smoke multi-checkpoint
+      - name: Predict smoke multi-checkpoint
         run: |
           mkdir -p .ci_smoke/forbid_labels
-          python eval.py \
+          python predict.py \
             --config .ci_smoke/config.yaml \
             --track smoke \
             --official \
             --fingerprint .ci_smoke/fingerprint.json \
             --split val \
             --forbid-labels-dir .ci_smoke/forbid_labels \
-            --score-labels-dir .ci_smoke/processed_labels \
             --ckpt-dir runs/ci_smoke_official/checkpoints \
-            --ckpt-steps 10,20 \
+            --ckpt-steps 0,10,20 \
             --pred-out-dir .ci_smoke/preds \
-            --save .ci_smoke/eval_multi.json \
-            --per-chain-out .ci_smoke/per_chain.jsonl
+            --save .ci_smoke/predict_multi.json
+      - name: Score smoke multi-checkpoint
+        run: |
+          python score.py \
+            --prediction-summary .ci_smoke/predict_multi.json \
+            --labels-dir .ci_smoke/processed_labels \
+            --per-chain-out .ci_smoke/per_chain.jsonl \
+            --save .ci_smoke/eval_multi.json
       - name: Smoke artifact schema checks
         run: |
           python - <<'PY'
@@ -258,4 +263,8 @@ jobs:
               raise SystemExit("expected multi-checkpoint eval output")
           if "mean_lddt_ca" not in obj:
               raise SystemExit("eval summary missing mean_lddt_ca")
+          if "sample_budget" not in obj:
+              raise SystemExit("eval summary missing sample_budget")
+          if not any(int(item.get("step", -1)) == 0 for item in obj["checkpoints"]):
+              raise SystemExit("expected step-0 checkpoint metadata")
           PY

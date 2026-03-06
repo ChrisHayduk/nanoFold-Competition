@@ -14,13 +14,13 @@ def _cache_sha(path: Path) -> str:
 def _make_chain_cache(path: Path) -> None:
     # Keep insertion order stable and include enough chains for deterministic sampling.
     payload = {
-        "1aaa_A": {"seq_length": 100, "resolution": 2.0, "oligomeric_count": 1},
-        "1aaa_B": {"seq_length": 120, "resolution": 2.2, "oligomeric_count": 1},
-        "2bbb_A": {"seq_length": 140, "resolution": 2.0, "oligomeric_count": 1},
-        "3ccc_A": {"seq_length": 160, "resolution": 1.8, "oligomeric_count": 1},
-        "4ddd_A": {"seq_length": 200, "resolution": 2.7, "oligomeric_count": 1},
-        "5eee_A": {"seq_length": 220, "resolution": 2.9, "oligomeric_count": 1},
-        "6fff_A": {"seq_length": 240, "resolution": 2.5, "oligomeric_count": 1},
+        "1aaa_A": {"seq_length": 100, "resolution": 2.0, "oligomeric_count": 1, "sequence": "A" * 100},
+        "1aaa_B": {"seq_length": 120, "resolution": 2.2, "oligomeric_count": 1, "sequence": "A" * 120},
+        "2bbb_A": {"seq_length": 140, "resolution": 2.0, "oligomeric_count": 1, "sequence": "C" * 140},
+        "3ccc_A": {"seq_length": 160, "resolution": 1.8, "oligomeric_count": 1, "sequence": "D" * 160},
+        "4ddd_A": {"seq_length": 200, "resolution": 2.7, "oligomeric_count": 1, "sequence": "E" * 200},
+        "5eee_A": {"seq_length": 220, "resolution": 2.9, "oligomeric_count": 1, "sequence": "F" * 220},
+        "6fff_A": {"seq_length": 240, "resolution": 2.5, "oligomeric_count": 1, "sequence": "G" * 240},
     }
     path.write_text(json.dumps(payload))
 
@@ -40,6 +40,31 @@ def _run_build(cache_path: Path, out_dir: Path, expected_sha: str) -> subprocess
             "2",
             "--seed",
             "0",
+            "--expected-chain-cache-sha256",
+            expected_sha,
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def _run_build_require_mmseqs(cache_path: Path, out_dir: Path, expected_sha: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            sys.executable,
+            "scripts/build_manifests.py",
+            "--chain-data-cache",
+            str(cache_path),
+            "--out-dir",
+            str(out_dir),
+            "--train-size",
+            "4",
+            "--val-size",
+            "2",
+            "--seed",
+            "0",
+            "--require-mmseqs",
             "--expected-chain-cache-sha256",
             expected_sha,
         ],
@@ -82,3 +107,14 @@ def test_build_manifests_deterministic_with_expected_cache_sha(tmp_path: Path) -
     assert train_a == train_b
     assert val_a == val_b
     assert all_a == all_b
+
+
+def test_build_manifests_require_mmseqs_fails_without_binary(tmp_path: Path) -> None:
+    cache_path = tmp_path / "chain_data_cache.json"
+    _make_chain_cache(cache_path)
+    expected_sha = _cache_sha(cache_path)
+
+    out_dir = tmp_path / "out_mmseqs"
+    proc = _run_build_require_mmseqs(cache_path, out_dir, expected_sha)
+    assert proc.returncode != 0
+    assert "MMseqs2 clustering was required" in (proc.stderr + proc.stdout)

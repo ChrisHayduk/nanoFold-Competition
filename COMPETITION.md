@@ -48,6 +48,7 @@ Config fields:
 Official eval path is features-only for submission runtime:
 - supervision keys are stripped inside runtime when `training=False`
 - hidden labels are used only in maintainer scoring stage, outside submission runtime
+- official hidden prediction rejects configs that set `data.processed_labels_dir`
 
 ## 4) Submission Interface Contract
 
@@ -143,11 +144,12 @@ Metric:
 - lDDT-Ca (`cutoff=15.0A`, thresholds `[0.5,1.0,2.0,4.0]`)
 
 Leaderboard ranking metric:
-- `final_hidden_lddt_ca`
+- `lddt_auc_hidden`
 
 Secondary metrics:
-- `lddt_auc_hidden`
-- `lddt_at_steps` (`1000`, `2000`, `5000`, `10000` by default)
+- `final_hidden_lddt_ca`
+- `lddt_at_steps` (`0`, `1000`, `2000`, `5000`, `last` by default)
+- `lddt_at_samples`
 - public val score is retained for diagnostics only
 
 Canonical result artifact:
@@ -170,6 +172,18 @@ Hidden assets are resolved via env (or explicit CLI overrides):
 
 Hidden lock metadata (safe to commit):
 - `leaderboard/official_hidden_assets.lock.json`
+- populate/update it with `python scripts/pin_hidden_assets.py ...`
+
+Hidden official runs are split into:
+- prediction stage: hidden features mounted, labels absent
+- scoring stage: saved predictions + hidden labels, no submission hooks
+
+Official orchestration entrypoints:
+- `predict.py` for prediction only
+- `score.py` for label-only scoring
+- `scripts/run_official.py` for orchestration
+
+Hidden leaderboard runs must execute in a sealed runtime. The supported maintainer path is:
 
 Containerized no-network execution:
 

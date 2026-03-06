@@ -22,6 +22,7 @@ Summarize the expected gains and intuition behind your method.
 
 - max_steps: 10000
 - effective_batch_size: 2
+- sample_budget: 20000
 - residue_budget: 5120000
 - crop_size: 256
 - seed: 0

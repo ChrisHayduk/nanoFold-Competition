@@ -21,6 +21,7 @@ from nanofold.competition_policy import (
     TrackSpec,
     apply_track_policy,
     compute_effective_batch_size,
+    compute_sample_budget,
     compute_residue_budget,
     enforce_model_param_limit,
     load_track_spec,
@@ -73,6 +74,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable deterministic training settings (can reduce speed).",
     )
+    ap.add_argument(
+        "--allow-resume-mismatch",
+        action="store_true",
+        help="Allow resume metadata mismatches (maintainer-only override).",
+    )
     return ap.parse_args()
 
 
@@ -104,6 +110,19 @@ def normalize_num_workers(n: int) -> int:
     return n
 
 
+def _sha256_file(path: str | Path) -> str:
+    import hashlib
+
+    hasher = hashlib.sha256()
+    with Path(path).open("rb") as f:
+        while True:
+            chunk = f.read(1024 * 1024)
+            if not chunk:
+                break
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
 def _guidance_for_missing_data(track_spec: TrackSpec) -> str:
     return (
         "Official mode requires fully preprocessed data for every chain in the official manifests.\n"
@@ -112,6 +131,32 @@ def _guidance_for_missing_data(track_spec: TrackSpec) -> str:
         "  bash scripts/setup_official_data.sh\n"
         "or preprocess any missing chains listed in the error message."
     )
+
+
+def resume_metadata_mismatches(
+    *,
+    ckpt_obj: Dict[str, Any],
+    submission_entrypoint_sha256: str | None,
+    config_sha256: str,
+    track_id: str,
+    fingerprint_sha256: str | None,
+    n_params: int,
+) -> list[str]:
+    expected_pairs = {
+        "submission_entrypoint_sha256": submission_entrypoint_sha256,
+        "config_sha256": config_sha256,
+        "track_id": track_id,
+        "fingerprint_sha256": fingerprint_sha256,
+        "n_params": n_params,
+    }
+    mismatches: list[str] = []
+    for key, expected in expected_pairs.items():
+        actual = ckpt_obj.get(key)
+        if key == "track_id" and actual is None:
+            actual = ckpt_obj.get("track")
+        if actual != expected:
+            mismatches.append(f"{key}: expected={expected!r}, actual={actual!r}")
+    return mismatches
 
 
 def make_loader(
@@ -245,6 +290,7 @@ def _verify_dataset(
 
 def main() -> None:
     args = parse_args()
+    config_path = Path(args.config).resolve()
     raw_cfg = load_config(args.config)
     track_spec = load_track_spec(args.track)
     cfg = apply_track_policy(raw_cfg, track_spec=track_spec) if args.official else raw_cfg
@@ -281,7 +327,7 @@ def main() -> None:
         )
         print(f"Fingerprint verification succeeded: {Path(fingerprint_path).resolve()}")
 
-    hooks = load_submission_hooks(cfg, args.config)
+    hooks = load_submission_hooks(cfg, config_path, allowed_root=config_path.parent)
 
     run_name = cfg.get("run_name", "run")
     paths = RunPaths.from_run_name(run_name)
@@ -355,7 +401,12 @@ def main() -> None:
     batch_size = int(cfg["data"]["batch_size"])
     crop_size = int(cfg["data"]["crop_size"])
     effective_batch_size = compute_effective_batch_size(batch_size, grad_accum_steps)
+    sample_budget = compute_sample_budget(max_steps, effective_batch_size)
     residue_budget = compute_residue_budget(max_steps, effective_batch_size, crop_size)
+    config_sha256 = _sha256_file(config_path)
+    fingerprint_sha256 = (
+        _sha256_file(fingerprint_path) if (args.official or args.verify_fingerprint) and Path(fingerprint_path).exists() else None
+    )
 
     metrics: Dict[str, Any] = {
         "run_name": run_name,
@@ -365,26 +416,91 @@ def main() -> None:
         "deterministic": deterministic,
         "n_params": n_params,
         "submission_module": hooks.module_ref,
-        "config_path": str(Path(args.config).resolve()),
+        "submission_entrypoint_path": hooks.source_path,
+        "submission_entrypoint_sha256": hooks.source_sha256,
+        "config_path": str(config_path),
+        "config_sha256": config_sha256,
         "config": cfg,
         "effective_batch_size": effective_batch_size,
+        "sample_budget": sample_budget,
         "residue_budget": residue_budget,
         "fingerprint_path": str(Path(fingerprint_path).resolve()) if (args.official or args.verify_fingerprint) else None,
+        "fingerprint_sha256": fingerprint_sha256,
         "env": env_meta,
         "started_at": utc_now_iso(),
         "updated_at": utc_now_iso(),
         "history": [],
         "step_metrics_jsonl": str(step_metrics_path),
+        "cumulative_samples_seen": 0,
+        "cumulative_cropped_residues_seen": 0,
+        "cumulative_nonpad_residues_seen": 0,
         "cumulative_residues_seen": 0,
     }
 
     start_step = 0
-    cumulative_residues_seen = 0
+    cumulative_samples_seen = 0
+    cumulative_cropped_residues_seen = 0
+    cumulative_nonpad_residues_seen = 0
+
+    def _checkpoint_payload(*, step_value: int) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "step": step_value,
+            "model": model.state_dict(),
+            "opt": opt.state_dict(),
+            "submission_module": hooks.module_ref,
+            "submission_entrypoint_path": hooks.source_path,
+            "submission_entrypoint_sha256": hooks.source_sha256,
+            "config": cfg,
+            "config_sha256": config_sha256,
+            "track": track_spec.track_id,
+            "track_id": track_spec.track_id,
+            "n_params": n_params,
+            "effective_batch_size": effective_batch_size,
+            "sample_budget": sample_budget,
+            "residue_budget": residue_budget,
+            "fingerprint_path": str(Path(fingerprint_path).resolve()) if (args.official or args.verify_fingerprint) else None,
+            "fingerprint_sha256": fingerprint_sha256,
+            "scaler": scaler.state_dict() if use_amp else None,
+            "cumulative_samples_seen": cumulative_samples_seen,
+            "cumulative_cropped_residues_seen": cumulative_cropped_residues_seen,
+            "cumulative_nonpad_residues_seen": cumulative_nonpad_residues_seen,
+            "cumulative_residues_seen": cumulative_nonpad_residues_seen,
+            "rng_state": {
+                "python": __import__("random").getstate(),
+                "numpy": __import__("numpy").random.get_state(),
+                "torch": torch.get_rng_state(),
+                "torch_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+            },
+        }
+        if scheduler is not None and callable(getattr(scheduler, "state_dict", None)):
+            payload["scheduler"] = scheduler.state_dict()
+        return payload
+
+    def _save_checkpoint_files(*, step_value: int) -> None:
+        ckpt = _checkpoint_payload(step_value=step_value)
+        ckpt_path = paths.ckpt_dir / f"ckpt_step_{step_value}.pt"
+        torch.save(ckpt, ckpt_path)
+        torch.save(ckpt, paths.ckpt_dir / "ckpt_last.pt")
     if args.resume:
         resume_path = Path(args.resume)
         if not resume_path.exists():
             raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
         ckpt = torch.load(resume_path, map_location="cpu")
+        resume_mismatches = resume_metadata_mismatches(
+            ckpt_obj=ckpt,
+            submission_entrypoint_sha256=hooks.source_sha256,
+            config_sha256=config_sha256,
+            track_id=track_spec.track_id,
+            fingerprint_sha256=fingerprint_sha256,
+            n_params=n_params,
+        )
+        if resume_mismatches and not args.allow_resume_mismatch:
+            joined = "\n".join(f"- {item}" for item in resume_mismatches)
+            raise ValueError(
+                "Resume checkpoint metadata does not match the current run.\n"
+                "Pass --allow-resume-mismatch to override.\n"
+                f"{joined}"
+            )
         model.load_state_dict(ckpt["model"], strict=True)
         opt.load_state_dict(ckpt["opt"])
         if scheduler is not None and "scheduler" in ckpt and callable(getattr(scheduler, "load_state_dict", None)):
@@ -395,7 +511,16 @@ def main() -> None:
             except Exception:
                 pass
         start_step = int(ckpt.get("step", 0))
-        cumulative_residues_seen = int(ckpt.get("cumulative_residues_seen", 0))
+        cumulative_samples_seen = int(ckpt.get("cumulative_samples_seen", start_step * effective_batch_size))
+        cumulative_cropped_residues_seen = int(
+            ckpt.get("cumulative_cropped_residues_seen", start_step * effective_batch_size * crop_size)
+        )
+        cumulative_nonpad_residues_seen = int(
+            ckpt.get(
+                "cumulative_nonpad_residues_seen",
+                ckpt.get("cumulative_residues_seen", cumulative_cropped_residues_seen),
+            )
+        )
         if "rng_state" in ckpt:
             rng_state = ckpt["rng_state"]
             try:
@@ -417,13 +542,36 @@ def main() -> None:
                     metrics.update(existing_metrics)
                     metrics["resumed_from"] = str(resume_path.resolve())
                     metrics["updated_at"] = utc_now_iso()
-                    cumulative_residues_seen = int(metrics.get("cumulative_residues_seen", cumulative_residues_seen))
+                    metrics["submission_entrypoint_path"] = hooks.source_path
+                    metrics["submission_entrypoint_sha256"] = hooks.source_sha256
+                    metrics["config_path"] = str(config_path)
+                    metrics["config_sha256"] = config_sha256
+                    metrics["effective_batch_size"] = effective_batch_size
+                    metrics["sample_budget"] = sample_budget
+                    metrics["residue_budget"] = residue_budget
+                    metrics["fingerprint_path"] = (
+                        str(Path(fingerprint_path).resolve()) if (args.official or args.verify_fingerprint) else None
+                    )
+                    metrics["fingerprint_sha256"] = fingerprint_sha256
+                    cumulative_samples_seen = int(metrics.get("cumulative_samples_seen", cumulative_samples_seen))
+                    cumulative_cropped_residues_seen = int(
+                        metrics.get("cumulative_cropped_residues_seen", cumulative_cropped_residues_seen)
+                    )
+                    cumulative_nonpad_residues_seen = int(
+                        metrics.get("cumulative_nonpad_residues_seen", cumulative_nonpad_residues_seen)
+                    )
             except Exception:
                 pass
+    else:
+        _save_checkpoint_files(step_value=0)
 
     step = start_step
     if step >= max_steps:
         print(f"Checkpoint step {step} already reached max_steps={max_steps}; nothing to do.")
+        metrics["cumulative_samples_seen"] = cumulative_samples_seen
+        metrics["cumulative_cropped_residues_seen"] = cumulative_cropped_residues_seen
+        metrics["cumulative_nonpad_residues_seen"] = cumulative_nonpad_residues_seen
+        metrics["cumulative_residues_seen"] = cumulative_nonpad_residues_seen
         metrics["finished_at"] = utc_now_iso()
         metrics["updated_at"] = utc_now_iso()
         Path(paths.metrics_path).write_text(json.dumps(metrics, indent=2))
@@ -459,7 +607,9 @@ def main() -> None:
     while step < max_steps:
         optimizer_zero_grad(opt)
         running_loss = 0.0
-        residues_this_step = 0
+        samples_this_step = 0
+        cropped_residues_this_step = 0
+        nonpad_residues_this_step = 0
         for _ in range(grad_accum_steps):
             try:
                 batch = next(train_iter)
@@ -468,7 +618,9 @@ def main() -> None:
                 batch = next(train_iter)
 
             batch = to_device(batch, device)
-            residues_this_step += int(batch["residue_mask"].sum().item())
+            samples_this_step += int(batch["aatype"].shape[0])
+            cropped_residues_this_step += int(batch["aatype"].shape[0] * batch["aatype"].shape[1])
+            nonpad_residues_this_step += int(batch["residue_mask"].sum().item())
 
             with make_autocast_ctx(device=device, enabled=use_amp):
                 out = run_submission_batch(hooks, model=model, batch=batch, cfg=cfg, training=True)
@@ -503,14 +655,19 @@ def main() -> None:
 
         step += 1
         pbar.update(1)
-        cumulative_residues_seen += residues_this_step
+        cumulative_samples_seen += samples_this_step
+        cumulative_cropped_residues_seen += cropped_residues_this_step
+        cumulative_nonpad_residues_seen += nonpad_residues_this_step
         train_loss = running_loss / grad_accum_steps
         lr = _current_lr(opt)
         now = time.perf_counter()
         step_seconds = max(now - step_start, 1e-8)
         step_start = now
         steps_per_sec = 1.0 / step_seconds
-        residues_per_sec = (effective_batch_size * crop_size) / step_seconds
+        theoretical_residues_per_sec = (effective_batch_size * crop_size) / step_seconds
+        samples_per_sec = samples_this_step / step_seconds
+        cropped_residues_per_sec = cropped_residues_this_step / step_seconds
+        actual_residues_per_sec = nonpad_residues_this_step / step_seconds
 
         step_record = {
             "timestamp": utc_now_iso(),
@@ -520,10 +677,28 @@ def main() -> None:
             "grad_norm": grad_norm,
             "step_seconds": step_seconds,
             "steps_per_sec": steps_per_sec,
-            "residues_per_sec": residues_per_sec,
-            "residues_this_step": residues_this_step,
-            "cumulative_residues_seen": cumulative_residues_seen,
-            "budget_fraction": (cumulative_residues_seen / float(residue_budget)) if residue_budget > 0 else float("nan"),
+            "samples_per_sec": samples_per_sec,
+            "cropped_residues_per_sec": cropped_residues_per_sec,
+            "actual_residues_per_sec": actual_residues_per_sec,
+            "residues_per_sec": theoretical_residues_per_sec,
+            "samples_this_step": samples_this_step,
+            "cropped_residues_this_step": cropped_residues_this_step,
+            "nonpad_residues_this_step": nonpad_residues_this_step,
+            "residues_this_step": nonpad_residues_this_step,
+            "cumulative_samples_seen": cumulative_samples_seen,
+            "cumulative_cropped_residues_seen": cumulative_cropped_residues_seen,
+            "cumulative_nonpad_residues_seen": cumulative_nonpad_residues_seen,
+            "cumulative_residues_seen": cumulative_nonpad_residues_seen,
+            "sample_budget_fraction": (cumulative_samples_seen / float(sample_budget)) if sample_budget > 0 else float("nan"),
+            "cropped_residue_budget_fraction": (
+                cumulative_cropped_residues_seen / float(residue_budget)
+            ) if residue_budget > 0 else float("nan"),
+            "nonpad_residue_budget_fraction": (
+                cumulative_nonpad_residues_seen / float(residue_budget)
+            ) if residue_budget > 0 else float("nan"),
+            "budget_fraction": (
+                cumulative_nonpad_residues_seen / float(residue_budget)
+            ) if residue_budget > 0 else float("nan"),
         }
         with step_metrics_path.open("a") as f:
             f.write(json.dumps(step_record) + "\n")
@@ -538,37 +713,39 @@ def main() -> None:
             val_metrics["lr"] = lr
             val_metrics["grad_norm"] = grad_norm
             val_metrics["steps_per_sec"] = steps_per_sec
-            val_metrics["residues_per_sec"] = residues_per_sec
+            val_metrics["samples_per_sec"] = samples_per_sec
+            val_metrics["cropped_residues_per_sec"] = cropped_residues_per_sec
+            val_metrics["actual_residues_per_sec"] = actual_residues_per_sec
+            val_metrics["residues_per_sec"] = theoretical_residues_per_sec
+            val_metrics["cumulative_samples_seen"] = cumulative_samples_seen
+            val_metrics["cumulative_cropped_residues_seen"] = cumulative_cropped_residues_seen
+            val_metrics["cumulative_nonpad_residues_seen"] = cumulative_nonpad_residues_seen
+            val_metrics["sample_budget_fraction"] = (
+                cumulative_samples_seen / float(sample_budget)
+            ) if sample_budget > 0 else float("nan")
+            val_metrics["cropped_residue_budget_fraction"] = (
+                cumulative_cropped_residues_seen / float(residue_budget)
+            ) if residue_budget > 0 else float("nan")
+            val_metrics["nonpad_residue_budget_fraction"] = (
+                cumulative_nonpad_residues_seen / float(residue_budget)
+            ) if residue_budget > 0 else float("nan")
             metrics["history"].append(val_metrics)
             metrics["updated_at"] = utc_now_iso()
-            metrics["cumulative_residues_seen"] = cumulative_residues_seen
+            metrics["cumulative_samples_seen"] = cumulative_samples_seen
+            metrics["cumulative_cropped_residues_seen"] = cumulative_cropped_residues_seen
+            metrics["cumulative_nonpad_residues_seen"] = cumulative_nonpad_residues_seen
+            metrics["cumulative_residues_seen"] = cumulative_nonpad_residues_seen
             Path(paths.metrics_path).write_text(json.dumps(metrics, indent=2))
             print("Eval:", val_metrics)
 
         if step % save_every == 0 or step == max_steps:
-            ckpt = {
-                "step": step,
-                "model": model.state_dict(),
-                "opt": opt.state_dict(),
-                "submission_module": hooks.module_ref,
-                "config": cfg,
-                "track": track_spec.track_id,
-                "scaler": scaler.state_dict() if use_amp else None,
-                "cumulative_residues_seen": cumulative_residues_seen,
-                "rng_state": {
-                    "python": __import__("random").getstate(),
-                    "numpy": __import__("numpy").random.get_state(),
-                    "torch": torch.get_rng_state(),
-                    "torch_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
-                },
-            }
-            if scheduler is not None and callable(getattr(scheduler, "state_dict", None)):
-                ckpt["scheduler"] = scheduler.state_dict()
-            ckpt_path = paths.ckpt_dir / f"ckpt_step_{step}.pt"
-            torch.save(ckpt, ckpt_path)
-            torch.save(ckpt, paths.ckpt_dir / "ckpt_last.pt")
+            _save_checkpoint_files(step_value=step)
 
     pbar.close()
+    metrics["cumulative_samples_seen"] = cumulative_samples_seen
+    metrics["cumulative_cropped_residues_seen"] = cumulative_cropped_residues_seen
+    metrics["cumulative_nonpad_residues_seen"] = cumulative_nonpad_residues_seen
+    metrics["cumulative_residues_seen"] = cumulative_nonpad_residues_seen
     metrics["wall_time_seconds"] = float(time.perf_counter() - run_start)
     metrics["finished_at"] = utc_now_iso()
     metrics["updated_at"] = utc_now_iso()

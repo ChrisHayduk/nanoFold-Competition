@@ -93,14 +93,19 @@ python train.py \
   --official
 
 mkdir -p runs/official_limited_large_v3_baseline/_forbid_labels
-python eval.py \
+python predict.py \
   --config configs/limited_large_v3_official_baseline.yaml \
   --ckpt runs/official_limited_large_v3_baseline/checkpoints/ckpt_last.pt \
   --split val \
   --track limited_large_v3 \
   --official \
   --forbid-labels-dir runs/official_limited_large_v3_baseline/_forbid_labels \
-  --score-labels-dir data/processed_labels \
+  --pred-out-dir runs/official_limited_large_v3_baseline/public_predictions \
+  --save runs/official_limited_large_v3_baseline/predict_val.json
+
+python score.py \
+  --prediction-summary runs/official_limited_large_v3_baseline/predict_val.json \
+  --labels-dir data/processed_labels \
   --save runs/official_limited_large_v3_baseline/eval_val.json \
   --per-chain-out runs/official_limited_large_v3_baseline/per_chain_scores_val.jsonl
 ```
@@ -127,11 +132,12 @@ bash scripts/full_official_data_refresh.sh --rewrite-lock --dry-run
 ## Official Hidden Pipeline (Maintainers)
 
 Leaderboard ranking metric is:
-- `final_hidden_lddt_ca` (hidden split, final checkpoint)
+- `lddt_auc_hidden` over cumulative samples on `[0, B_sample]`
 
 Secondary metrics:
-- `lddt_auc_hidden`
-- `lddt_at_steps` (default checkpoints: `1000,2000,5000,10000`)
+- `final_hidden_lddt_ca`
+- `lddt_at_steps` (default checkpoints: `0,1000,2000,5000,last`)
+- `lddt_at_samples`
 
 Required maintainer env vars for hidden mode:
 - `NANOFOLD_HIDDEN_MANIFEST`
@@ -139,7 +145,11 @@ Required maintainer env vars for hidden mode:
 - `NANOFOLD_HIDDEN_LABELS_DIR`
 - `NANOFOLD_HIDDEN_FINGERPRINT`
 
-Canonical run:
+Hidden leaderboard runs are now two-stage:
+- predict stage mounts submission code plus hidden features only
+- score stage mounts saved predictions plus hidden labels only
+
+Canonical runner entrypoint:
 
 ```bash
 python scripts/run_official.py \
@@ -147,6 +157,8 @@ python scripts/run_official.py \
   --track limited_large_v3 \
   --update-leaderboard
 ```
+
+For hidden leaderboard runs this now requires a sealed runtime. The supported path is the Docker wrapper below.
 
 No-network containerized run:
 
@@ -159,6 +171,7 @@ bash scripts/run_official_docker.sh \
 
 Hidden lock metadata (hashes only, no secret paths) is stored in:
 - `leaderboard/official_hidden_assets.lock.json`
+- populate/update it with `python scripts/pin_hidden_assets.py ...`
 
 ## Manifest Reproducibility
 

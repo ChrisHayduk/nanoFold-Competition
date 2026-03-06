@@ -43,14 +43,18 @@ def _result_to_entry(result: Dict[str, Any], description_override: str) -> Dict[
     public_score = result.get("public_val_lddt_ca", result.get("score_lddt_ca", float("nan")))
     rank_metric = str(result.get("rank_metric", "final_hidden_lddt_ca"))
     rank_score = result.get("rank_score", hidden_score if rank_metric == "final_hidden_lddt_ca" else public_score)
+    rank_tiebreak_score = result.get("rank_tiebreak_score", hidden_score)
     return {
         "schema_version": int(result.get("schema_version", 1)),
         "rank_metric": rank_metric,
         "rank_score": _to_float(rank_score),
+        "rank_tiebreak_score": _to_float(rank_tiebreak_score),
         "score_hidden_lddt_ca": _to_float(hidden_score),
         "score_public_val_lddt_ca": _to_float(public_score),
         "lddt_auc_hidden": _to_float(result.get("lddt_auc_hidden", float("nan"))),
+        "lddt_at_samples": dict(result.get("lddt_at_samples", {})) if isinstance(result.get("lddt_at_samples"), dict) else {},
         "lddt_at_steps": dict(result.get("lddt_at_steps", {})) if isinstance(result.get("lddt_at_steps"), dict) else {},
+        "sample_budget": int(result.get("sample_budget", 0) or 0),
         "track": str(result.get("track", "limited")),
         "date": created_at,
         "commit": commit,
@@ -81,9 +85,15 @@ def _rank_entries(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             return float("-inf")
         return score
 
+    def tiebreak_value(row: Dict[str, Any]) -> float:
+        score = float(row.get("rank_tiebreak_score", row.get("score_hidden_lddt_ca", float("nan"))))
+        if math.isnan(score):
+            return float("-inf")
+        return score
+
     ranked = sorted(
         entries,
-        key=lambda x: (-score_value(x), str(x.get("date", ""))),
+        key=lambda x: (-score_value(x), -tiebreak_value(x), str(x.get("date", ""))),
     )
     for i, row in enumerate(ranked, start=1):
         row["rank"] = i

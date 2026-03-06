@@ -66,6 +66,7 @@ Guaranteed keys:
 
 Guaranteed keys:
 - all non-supervision keys above
+- runtime forwards only the inference allowlist: `chain_id`, `aatype`, `msa`, `deletions`, `template_*`, `residue_mask`
 
 Not present:
 - `ca_coords`
@@ -100,6 +101,7 @@ In `--official` mode runtime enforces:
 - pinned manifest SHA checks (when present in track)
 - dataset fingerprint verification
 - model parameter cap (`model.max_params`) if set
+- official prediction sanitizes `data.processed_labels_dir` before submission hooks are constructed
 
 ## Budget Definitions
 

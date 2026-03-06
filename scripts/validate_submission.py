@@ -21,6 +21,7 @@ from nanofold.competition_policy import (
     TrackSpec,
     apply_track_policy,
     compute_effective_batch_size,
+    compute_sample_budget,
     compute_residue_budget,
     enforce_model_param_limit,
     load_track_spec,
@@ -45,6 +46,7 @@ REQUIRED_TRAIN_KEYS = ("max_steps", "eval_every", "save_every")
 METADATA_FIELDS = (
     "max_steps",
     "effective_batch_size",
+    "sample_budget",
     "residue_budget",
     "crop_size",
     "seed",
@@ -109,7 +111,7 @@ def _require_keys(diags: List[Diagnostic], mapping: Dict[str, Any], keys: tuple[
                 add_error(diags, f"Missing key `{key}`")
 
 
-def _validate_numeric(diags: List[Diagnostic], cfg: Dict[str, Any]) -> Tuple[int, int]:
+def _validate_numeric(diags: List[Diagnostic], cfg: Dict[str, Any]) -> Tuple[int, int, int]:
     data_cfg = cfg["data"]
     train_cfg = cfg["train"]
 
@@ -144,14 +146,18 @@ def _validate_numeric(diags: List[Diagnostic], cfg: Dict[str, Any]) -> Tuple[int
     grad_accum_steps = train_cfg.get("grad_accum_steps", 1)
     grad_accum_steps = require_int("train.grad_accum_steps", grad_accum_steps, min_value=0, strictly_positive=True)
     effective_batch_size = compute_effective_batch_size(batch_size=batch_size, grad_accum_steps=grad_accum_steps)
+    sample_budget = compute_sample_budget(
+        max_steps=max_steps,
+        effective_batch_size=effective_batch_size,
+    )
     residue_budget = compute_residue_budget(
         max_steps=max_steps,
         effective_batch_size=effective_batch_size,
         crop_size=crop_size,
     )
     if crop_size <= 0 or msa_depth <= 0:
-        return 0, 0
-    return effective_batch_size, residue_budget
+        return 0, 0, 0
+    return effective_batch_size, sample_budget, residue_budget
 
 
 def _validate_submission_entrypoint(
@@ -219,7 +225,7 @@ def _validate_submission_interface(
     track_spec: TrackSpec,
 ) -> None:
     try:
-        hooks = load_submission_hooks(cfg, config_path)
+        hooks = load_submission_hooks(cfg, config_path, allowed_root=config_path.parent)
     except Exception as exc:  # noqa: BLE001
         add_error(diags, f"Failed loading submission entrypoint: {exc}")
         return
@@ -344,6 +350,7 @@ def _validate_notes(
     notes_text: str,
     allow_placeholders: bool,
     effective_batch_size: int,
+    sample_budget: int,
     residue_budget: int,
 ) -> None:
     required_sections = (
@@ -380,6 +387,14 @@ def _validate_notes(
             add_warning(
                 diags,
                 f"`notes.md` effective_batch_size={ebs_value} does not match config-derived value {effective_batch_size}.",
+            )
+
+    bsample_value = _extract_metadata_value(notes_text, "sample_budget")
+    if bsample_value and bsample_value.isdigit():
+        if int(bsample_value) != sample_budget:
+            add_warning(
+                diags,
+                f"`notes.md` sample_budget={bsample_value} does not match config-derived value {sample_budget}.",
             )
 
     bres_value = _extract_metadata_value(notes_text, "residue_budget")
@@ -459,7 +474,7 @@ def validate_submission(submission_dir: Path, strict: bool, track_id: str) -> in
 
     if cfg and all(k in cfg for k in ("submission", "data", "train")):
         cfg = apply_track_policy(cfg, track_spec=track_spec)
-        effective_batch_size, residue_budget = _validate_numeric(diags, cfg)
+        effective_batch_size, sample_budget, residue_budget = _validate_numeric(diags, cfg)
         policy_errors = validate_track_policy(
             cfg=cfg,
             track_spec=track_spec,
@@ -479,6 +494,7 @@ def validate_submission(submission_dir: Path, strict: bool, track_id: str) -> in
             add_warning(diags, f"`run_name` looks like a placeholder/default: `{run_name}`")
     else:
         effective_batch_size = 0
+        sample_budget = 0
         residue_budget = 0
 
     if notes_text:
@@ -487,6 +503,7 @@ def validate_submission(submission_dir: Path, strict: bool, track_id: str) -> in
             notes_text,
             allow_placeholders=allow_placeholders,
             effective_batch_size=effective_batch_size,
+            sample_budget=sample_budget,
             residue_budget=residue_budget,
         )
 

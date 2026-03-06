@@ -105,12 +105,20 @@ for key in required:
 cache_sha = str(lock.get("chain_data_cache_sha256", "")).strip().lower()
 if len(cache_sha) != 64 or any(ch not in "0123456789abcdef" for ch in cache_sha):
     raise SystemExit("Lock file has invalid chain_data_cache_sha256")
+min_seq_id = float(args.get("min_seq_id", 0.30))
+coverage = float(args.get("coverage", 0.80))
+mmseqs_bin = str(args.get("mmseqs_bin", "mmseqs")).strip() or "mmseqs"
+require_mmseqs = bool(args.get("require_mmseqs", True))
 print(f"TRAIN_SIZE={int(args['train_size'])}")
 print(f"VAL_SIZE={int(args['val_size'])}")
 print(f"MIN_LEN={int(args['min_len'])}")
 print(f"MAX_LEN={int(args['max_len'])}")
 print(f"MAX_RESOLUTION={float(args['max_resolution'])}")
 print(f"SEED={int(args['seed'])}")
+print(f"MIN_SEQ_ID={min_seq_id}")
+print(f"COVERAGE={coverage}")
+print(f"MMSEQS_BIN={mmseqs_bin}")
+print(f"REQUIRE_MMSEQS={1 if require_mmseqs else 0}")
 print(f"EXPECTED_CACHE_SHA={cache_sha}")
 PY
 )"
@@ -125,8 +133,14 @@ BUILD_CMD=(
   --max-len "$MAX_LEN"
   --max-resolution "$MAX_RESOLUTION"
   --seed "$SEED"
+  --min-seq-id "$MIN_SEQ_ID"
+  --coverage "$COVERAGE"
+  --mmseqs-bin "$MMSEQS_BIN"
   --expected-chain-cache-sha256 "$EXPECTED_CACHE_SHA"
 )
+if [[ "$REQUIRE_MMSEQS" -eq 1 ]]; then
+  BUILD_CMD+=(--require-mmseqs)
+fi
 if [[ "$REWRITE_LOCK" -eq 1 ]]; then
   BUILD_CMD+=(--lock-file "$LOCK_FILE")
 fi

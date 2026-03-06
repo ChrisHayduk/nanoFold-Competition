@@ -270,6 +270,7 @@ else
     --processed-features-dir "$PROCESSED_FEATURES_DIR"
     --processed-labels-dir "$PROCESSED_LABELS_DIR"
     --msa-name "$MSA_NAME"
+    --strict
   )
   if [[ "$USE_TEMPLATES" -eq 1 ]]; then
     PREPROCESS_COMMON+=(--template-hhr-name "$TEMPLATE_HHR_NAME")

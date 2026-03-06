@@ -9,3 +9,14 @@ __pycache__/
 /data/openproteinset/*
 *.npz
 data/processed/1p11_I.error.txt
+data/processed_features/1iz9_B.error.txt
+data/processed_features/2ntw_A.error.txt
+data/processed_features/3ai6_F.error.txt
+data/processed_features/3liy_K.error.txt
+data/processed_features/4yd9_X.error.txt
+data/processed_features/5b0w_G.error.txt
+data/processed_features/5cn6_A.error.txt
+data/processed_features/5emf_B.error.txt
+data/processed_features/5emg_A.error.txt
+data/processed_features/6ann_C.error.txt
+data/processed_features/6su0_A.error.txt

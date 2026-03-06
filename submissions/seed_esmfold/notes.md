@@ -33,6 +33,7 @@ under the benchmark's fixed budget and no-pretraining constraint.
 
 - max_steps: 10000
 - effective_batch_size: 2
+- sample_budget: 20000
 - residue_budget: 5120000
 - crop_size: 256
 - seed: 0

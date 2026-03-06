@@ -13,35 +13,64 @@ DOCKER_ARGS=(
   --rm
   --network=none
   --cap-drop=ALL
+  -e NANOFOLD_OFFICIAL_SEALED_RUNTIME=1
   -v "$REPO_ROOT:/workspace"
   -w /workspace
 )
 
-for ENV_KEY in \
-  NANOFOLD_HIDDEN_MANIFEST \
-  NANOFOLD_HIDDEN_FEATURES_DIR \
-  NANOFOLD_HIDDEN_LABELS_DIR \
-  NANOFOLD_HIDDEN_FINGERPRINT
-do
-  VALUE="${!ENV_KEY:-}"
-  if [[ -z "$VALUE" ]]; then
-    continue
+has_flag() {
+  local needle="$1"
+  shift
+  for token in "$@"; do
+    if [[ "$token" == "$needle" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+add_hidden_mount() {
+  local env_key="$1"
+  local -n args_ref="$2"
+  local value="${!env_key:-}"
+  if [[ -z "$value" ]]; then
+    return 0
   fi
-  if [[ ! -e "$VALUE" ]]; then
-    echo "ERROR: $ENV_KEY points to a missing path: $VALUE"
+  if [[ ! -e "$value" ]]; then
+    echo "ERROR: $env_key points to a missing path: $value"
     exit 1
   fi
-  # Pass through env var for scripts/run_official.py path resolution.
-  DOCKER_ARGS+=(-e "$ENV_KEY=$VALUE")
-
-  # Mount hidden assets read-only unless already under the repo mount.
-  case "$VALUE" in
+  args_ref+=(-e "$env_key=$value")
+  case "$value" in
     "$REPO_ROOT"/*) ;;
     *)
-      DOCKER_ARGS+=(-v "$VALUE:$VALUE:ro")
+      args_ref+=(-v "$value:$value:ro")
       ;;
   esac
-done
+}
 
-echo "+ docker run ${DOCKER_ARGS[*]} $IMAGE_NAME $*"
-docker run "${DOCKER_ARGS[@]}" "$IMAGE_NAME" "$@"
+run_stage() {
+  local -n stage_args_ref="$1"
+  shift
+  echo "+ docker run ${stage_args_ref[*]} $IMAGE_NAME $*"
+  docker run "${stage_args_ref[@]}" "$IMAGE_NAME" "$@"
+}
+
+PREDICT_ARGS=("${DOCKER_ARGS[@]}")
+add_hidden_mount NANOFOLD_HIDDEN_MANIFEST PREDICT_ARGS
+add_hidden_mount NANOFOLD_HIDDEN_FEATURES_DIR PREDICT_ARGS
+add_hidden_mount NANOFOLD_HIDDEN_FINGERPRINT PREDICT_ARGS
+
+run_stage PREDICT_ARGS "$@" --skip-hidden-scoring
+
+if has_flag --disable-hidden "$@"; then
+  exit 0
+fi
+
+SCORE_ARGS=("${DOCKER_ARGS[@]}")
+add_hidden_mount NANOFOLD_HIDDEN_MANIFEST SCORE_ARGS
+add_hidden_mount NANOFOLD_HIDDEN_FEATURES_DIR SCORE_ARGS
+add_hidden_mount NANOFOLD_HIDDEN_LABELS_DIR SCORE_ARGS
+add_hidden_mount NANOFOLD_HIDDEN_FINGERPRINT SCORE_ARGS
+
+run_stage SCORE_ARGS "$@" --score-hidden-only --skip-train

@@ -7,6 +7,10 @@
     "min_len": 40,
     "max_len": 256,
     "max_resolution": 3.0,
+    "min_seq_id": 0.3,
+    "coverage": 0.8,
+    "mmseqs_bin": "mmseqs",
+    "require_mmseqs": true,
     "seed": 0,
     "expected_chain_cache_sha256": "7286d79a9060cd67e16df69deced99bd7aa96d56add30f28d852438dffe3f1ea"
   },

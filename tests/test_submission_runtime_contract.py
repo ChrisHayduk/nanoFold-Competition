@@ -6,7 +6,12 @@ from typing import Any, Dict
 import pytest
 import torch
 
-from nanofold.submission_runtime import SubmissionHooks, run_submission_batch, strip_supervision_from_batch
+from nanofold.submission_runtime import (
+    SubmissionHooks,
+    load_submission_hooks,
+    run_submission_batch,
+    strip_supervision_from_batch,
+)
 
 
 class TinyModel(torch.nn.Module):
@@ -41,6 +46,8 @@ def _hooks(run_batch_fn):
     return SubmissionHooks(
         module_ref="test:submission",
         module=mod,
+        source_path=None,
+        source_sha256=None,
         build_model=lambda cfg: TinyModel(),
         build_optimizer=lambda cfg, model: torch.optim.Adam(model.parameters(), lr=1e-3),
         run_batch=run_batch_fn,
@@ -88,6 +95,16 @@ def test_strip_supervision_from_batch_for_inference() -> None:
     out = strip_supervision_from_batch(batch)
     assert "ca_coords" not in out
     assert "ca_mask" not in out
+    assert set(out.keys()) == {
+        "chain_id",
+        "aatype",
+        "msa",
+        "deletions",
+        "template_aatype",
+        "template_ca_coords",
+        "template_ca_mask",
+        "residue_mask",
+    }
 
 
 def test_run_submission_batch_strips_supervision_internally() -> None:
@@ -112,3 +129,34 @@ def test_run_submission_batch_training_loss_requires_grad() -> None:
     hooks = _hooks(run_batch)
     with pytest.raises(ValueError, match="must require gradients"):
         run_submission_batch(hooks, model=TinyModel(), batch=_batch(), cfg={}, training=True)
+
+
+def test_load_submission_hooks_rejects_out_of_tree_path(tmp_path) -> None:
+    config_dir = tmp_path / "submission"
+    config_dir.mkdir()
+    config_path = config_dir / "config.yaml"
+    config_path.write_text("run_name: test\n")
+
+    outside_entry = tmp_path / "outside.py"
+    outside_entry.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "def build_model(cfg):",
+                "    return torch.nn.Identity()",
+                "def build_optimizer(cfg, model):",
+                "    return torch.optim.Adam([torch.nn.Parameter(torch.tensor(1.0))])",
+                "def run_batch(model, batch, cfg, training):",
+                "    pred = torch.zeros((1, 1, 3), dtype=torch.float32)",
+                "    out = {'pred_ca': pred}",
+                "    if training:",
+                "        out['loss'] = pred.sum() * 0.0",
+                "    return out",
+            ]
+        )
+        + "\n"
+    )
+
+    cfg = {"submission": {"path": str(outside_entry)}}
+    with pytest.raises(ValueError, match="inside"):
+        load_submission_hooks(cfg, config_path, allowed_root=config_dir)
