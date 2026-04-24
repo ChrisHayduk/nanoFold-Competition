@@ -400,8 +400,16 @@ def _score_hidden_predictions(
                     raise ValueError(f"Official hidden scoring requires pred_atom14 in {pred_path}")
                 pred_atom14 = np.asarray(pred_npz["pred_atom14"], dtype=np.float32)
             with np.load(label_path) as label_npz:
-                if "atom14_positions" not in label_npz or "atom14_mask" not in label_npz:
-                    raise ValueError(f"Official hidden scoring requires atom14 labels in {label_path}")
+                missing_label_keys = [
+                    key
+                    for key in ("ca_coords", "ca_mask", "atom14_positions", "atom14_mask")
+                    if key not in label_npz
+                ]
+                if missing_label_keys:
+                    raise ValueError(
+                        f"Official hidden scoring label file {label_path} is missing required keys: "
+                        f"{', '.join(missing_label_keys)}"
+                    )
                 true_atom14 = np.asarray(label_npz["atom14_positions"], dtype=np.float32)
                 atom14_mask = np.asarray(label_npz["atom14_mask"], dtype=bool)
             true_atom14, atom14_mask = _center_crop_atom14_labels(true_atom14, atom14_mask, crop_size=crop_size)
