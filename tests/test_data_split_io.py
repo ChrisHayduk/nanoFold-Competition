@@ -25,6 +25,8 @@ def _write_label_npz(path: Path) -> None:
         path,
         ca_coords=np.zeros((8, 3), dtype=np.float32),
         ca_mask=np.ones((8,), dtype=bool),
+        atom14_positions=np.zeros((8, 14, 3), dtype=np.float32),
+        atom14_mask=np.ones((8, 14), dtype=bool),
     )
 
 

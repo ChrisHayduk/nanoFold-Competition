@@ -1,18 +1,19 @@
 from __future__ import annotations
 
 import copy
-import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 import yaml
 
+from .utils import sha256_file
+
 
 EXPECTED_TRAIN_MANIFEST_PARTS = ("data", "manifests", "train.txt")
 EXPECTED_VAL_MANIFEST_PARTS = ("data", "manifests", "val.txt")
 
-DEFAULT_TRACK_ID = "limited_large_v3"
+DEFAULT_TRACK_ID = "limited_large"
 TRACKS_DIR = Path(__file__).resolve().parents[1] / "tracks"
 
 
@@ -37,6 +38,11 @@ class TrackSpec:
     train_chain_count: int | None
     val_chain_count: int | None
     hidden_chain_count: int | None
+    rank_metric: str | None
+    rank_tiebreak_metric: str | None
+    foldscore_weights: Dict[str, float]
+    template_policy: str | None
+    templates_enabled: bool | None
     seed: int | None
     crop_size: int | None
     msa_depth: int | None
@@ -65,35 +71,6 @@ class TrackSpec:
             crop_size=self.crop_size,
         )
 
-
-@dataclass(frozen=True)
-class OfficialLimitedSpec:
-    # Backward-compatible view used by existing validation tooling.
-    name: str
-    seed: int
-    crop_size: int
-    msa_depth: int
-    effective_batch_size: int
-    max_steps: int
-    val_crop_mode: str
-    val_msa_sample_mode: str
-
-    @property
-    def sample_budget(self) -> int:
-        return compute_sample_budget(
-            max_steps=self.max_steps,
-            effective_batch_size=self.effective_batch_size,
-        )
-
-    @property
-    def residue_budget(self) -> int:
-        return compute_residue_budget(
-            max_steps=self.max_steps,
-            effective_batch_size=self.effective_batch_size,
-            crop_size=self.crop_size,
-        )
-
-
 def _tracks_dir() -> Path:
     if not TRACKS_DIR.exists():
         raise FileNotFoundError(f"Tracks directory not found: {TRACKS_DIR}")
@@ -121,12 +98,18 @@ def load_track_spec(track_id: str = DEFAULT_TRACK_ID) -> TrackSpec:
     dataset = raw.get("dataset", {})
     train = raw.get("train", {})
     model = raw.get("model", {})
+    scoring = raw.get("scoring", {})
+    templates = raw.get("templates", {})
     if not isinstance(dataset, dict):
         raise ValueError(f"`dataset` must be a mapping in {path}")
     if not isinstance(train, dict):
         raise ValueError(f"`train` must be a mapping in {path}")
     if not isinstance(model, dict):
         raise ValueError(f"`model` must be a mapping in {path}")
+    if not isinstance(scoring, dict):
+        raise ValueError(f"`scoring` must be a mapping in {path}")
+    if not isinstance(templates, dict):
+        raise ValueError(f"`templates` must be a mapping in {path}")
 
     return TrackSpec(
         track_id=str(raw.get("id") or track_id),
@@ -154,6 +137,18 @@ def load_track_spec(track_id: str = DEFAULT_TRACK_ID) -> TrackSpec:
         train_chain_count=_opt_int(dataset.get("train_chain_count")),
         val_chain_count=_opt_int(dataset.get("val_chain_count")),
         hidden_chain_count=_opt_int(dataset.get("hidden_chain_count")),
+        rank_metric=_opt_str(scoring.get("rank_metric")),
+        rank_tiebreak_metric=_opt_str(scoring.get("rank_tiebreak_metric")),
+        foldscore_weights=_float_map(
+            scoring.get("foldscore_weights"),
+            default={
+                "lddt_ca": 0.55,
+                "lddt_backbone_atom14": 0.30,
+                "lddt_atom14": 0.15,
+            },
+        ),
+        template_policy=_opt_str(templates.get("policy")),
+        templates_enabled=_opt_bool(templates.get("enabled"), default=None),
         seed=_opt_int(train.get("seed")),
         crop_size=_opt_int(train.get("crop_size")),
         msa_depth=_opt_int(train.get("msa_depth")),
@@ -173,6 +168,14 @@ def _opt_int(value: Any) -> int | None:
     return value
 
 
+def _opt_bool(value: Any, *, default: bool | None) -> bool | None:
+    if value is None:
+        return default
+    if not isinstance(value, bool):
+        raise TypeError(f"Expected boolean or null, got {type(value).__name__}")
+    return value
+
+
 def _opt_str(value: Any) -> str | None:
     if value is None:
         return None
@@ -189,6 +192,19 @@ def _opt_sha256(value: Any, *, field_name: str) -> str | None:
     if len(lowered) != 64 or any(ch not in "0123456789abcdef" for ch in lowered):
         raise TypeError(f"`{field_name}` must be a 64-char lowercase hex SHA256 digest.")
     return lowered
+
+
+def _float_map(value: Any, *, default: Dict[str, float]) -> Dict[str, float]:
+    if value is None:
+        return dict(default)
+    if not isinstance(value, dict):
+        raise TypeError(f"Expected mapping or null, got {type(value).__name__}")
+    out: Dict[str, float] = {}
+    for key, raw in value.items():
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            raise TypeError(f"Expected numeric value for `{key}`, got {type(raw).__name__}")
+        out[str(key)] = float(raw)
+    return out
 
 
 def compute_effective_batch_size(batch_size: int, grad_accum_steps: int) -> int:
@@ -332,17 +348,6 @@ def _resolve_local_path(path_str: str) -> Path:
     return path.resolve()
 
 
-def _sha256_file(path: Path) -> str:
-    h = hashlib.sha256()
-    with path.open("rb") as f:
-        while True:
-            chunk = f.read(1024 * 1024)
-            if not chunk:
-                break
-            h.update(chunk)
-    return h.hexdigest()
-
-
 def _validate_manifest_hash(
     *,
     errors: List[str],
@@ -359,7 +364,7 @@ def _validate_manifest_hash(
     if not path.is_file():
         errors.append(f"{label} must be a file: `{path}`.")
         return
-    actual_sha256 = _sha256_file(path)
+    actual_sha256 = sha256_file(path)
     if actual_sha256 != expected_sha256:
         errors.append(
             f"{label} SHA256 mismatch for `{path}`: expected `{expected_sha256}`, got `{actual_sha256}`."
@@ -548,49 +553,5 @@ def assert_config_matches_track(
         raise ValueError(f"Track `{track_spec.track_id}` config validation failed:\n{joined}")
 
 
-# Backward-compatible aliases used by existing code paths.
-OFFICIAL_LARGE_V3_TRACK = load_track_spec(DEFAULT_TRACK_ID)
-OFFICIAL_DATASET_FINGERPRINT_PATH = OFFICIAL_LARGE_V3_TRACK.fingerprint_path or "leaderboard/official_dataset_fingerprint.json"
-OFFICIAL_LARGE_V3_SPEC = OfficialLimitedSpec(
-    name=f"official_{OFFICIAL_LARGE_V3_TRACK.track_id}",
-    seed=int(OFFICIAL_LARGE_V3_TRACK.seed or 0),
-    crop_size=int(OFFICIAL_LARGE_V3_TRACK.crop_size or 0),
-    msa_depth=int(OFFICIAL_LARGE_V3_TRACK.msa_depth or 0),
-    effective_batch_size=int(OFFICIAL_LARGE_V3_TRACK.effective_batch_size or 0),
-    max_steps=int(OFFICIAL_LARGE_V3_TRACK.max_steps or 0),
-    val_crop_mode=str(OFFICIAL_LARGE_V3_TRACK.val_crop_mode or "center"),
-    val_msa_sample_mode=str(OFFICIAL_LARGE_V3_TRACK.val_msa_sample_mode or "top"),
-)
-
-
-def validate_official_limited_config(
-    cfg: Dict[str, Any],
-    *,
-    spec: OfficialLimitedSpec = OFFICIAL_LARGE_V3_SPEC,
-    enforce_manifest_paths: bool = True,
-    enforce_manifest_hashes: bool = False,
-) -> List[str]:
-    # `spec` is kept for API compatibility; validation uses the official track registry.
-    _ = spec
-    return validate_config_against_track(
-        cfg=cfg,
-        track_spec=OFFICIAL_LARGE_V3_TRACK,
-        enforce_manifest_paths=enforce_manifest_paths,
-        enforce_manifest_hashes=enforce_manifest_hashes,
-    )
-
-
-def assert_official_limited_config(
-    cfg: Dict[str, Any],
-    *,
-    spec: OfficialLimitedSpec = OFFICIAL_LARGE_V3_SPEC,
-    enforce_manifest_paths: bool = True,
-    enforce_manifest_hashes: bool = False,
-) -> None:
-    _ = spec
-    assert_config_matches_track(
-        cfg=cfg,
-        track_spec=OFFICIAL_LARGE_V3_TRACK,
-        enforce_manifest_paths=enforce_manifest_paths,
-        enforce_manifest_hashes=enforce_manifest_hashes,
-    )
+OFFICIAL_TRACK = load_track_spec(DEFAULT_TRACK_ID)
+OFFICIAL_DATASET_FINGERPRINT_PATH = OFFICIAL_TRACK.fingerprint_path or "leaderboard/official_dataset_fingerprint.json"

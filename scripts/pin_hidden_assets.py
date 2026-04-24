@@ -15,7 +15,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--hidden-features-dir", type=str, required=True)
     ap.add_argument("--hidden-labels-dir", type=str, required=True)
     ap.add_argument("--hidden-fingerprint", type=str, required=True)
-    ap.add_argument("--track-file", type=str, default="tracks/limited_large_v3.yaml")
+    ap.add_argument("--track-file", type=str, default="tracks/limited_large.yaml")
     ap.add_argument("--lock-file", type=str, default="leaderboard/official_hidden_assets.lock.json")
     ap.add_argument("--hidden-chain-count", type=int, default=-1)
     return ap.parse_args()

@@ -213,6 +213,8 @@ def _make_dummy_batch(crop_size: int, msa_depth: int) -> Dict[str, Any]:
         "template_ca_mask": torch.ones(B, T, L, dtype=torch.bool),
         "ca_coords": torch.randn(B, L, 3, dtype=torch.float32),
         "ca_mask": torch.ones(B, L, dtype=torch.bool),
+        "atom14_positions": torch.randn(B, L, 14, 3, dtype=torch.float32),
+        "atom14_mask": torch.ones(B, L, 14, dtype=torch.bool),
         "residue_mask": torch.ones(B, L, dtype=torch.bool),
     }
 
@@ -258,7 +260,13 @@ def _validate_submission_interface(
 
     model.train()
     try:
-        _ = run_submission_batch(hooks, model=model, batch=dummy_batch, cfg=cfg, training=True)
+        _ = run_submission_batch(
+            hooks,
+            model=model,
+            batch=dummy_batch,
+            cfg=cfg,
+            training=True,
+        )
     except Exception as exc:  # noqa: BLE001
         add_error(diags, f"`run_batch(..., training=True)` failed validation: {exc}")
         return
@@ -408,7 +416,7 @@ def _validate_notes(
     checklist_items = (
         "Used only the provided benchmark data",
         "Kept dataset manifests fixed",
-        "Model outputs C-alpha coordinates",
+        "Model outputs atom14 coordinates",
     )
     for item in checklist_items:
         matched = re.search(rf"^\s*-\s*\[(x|X)\]\s*.*{re.escape(item)}", notes_text, flags=re.MULTILINE)

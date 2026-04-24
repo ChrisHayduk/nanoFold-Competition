@@ -11,8 +11,8 @@ import torch.nn.functional as F
 # Portions of this file are adapted from publicly available ESMFold code:
 # https://github.com/facebookresearch/esm
 # Specifically inspired by:
-# - esm/esmfold/v1/trunk.py (RelativePosition and seq/pair trunk structure)
-# - esm/esmfold/v1/tri_self_attn_block.py (pair-biased sequence attention idea)
+# - the ESMFold trunk implementation (relative positions and seq/pair structure)
+# - the ESMFold pair-biased sequence attention block
 # The ESM repository is MIT licensed (see THIRD_PARTY_LICENSES.md in this folder).
 
 

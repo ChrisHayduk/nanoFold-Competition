@@ -5,6 +5,13 @@ from typing import Any, Dict
 import torch
 
 from nanofold.model import NanoFoldBaseline, distogram_loss
+from nanofold.residue_constants import ATOM14_NUM_SLOTS, CA_ATOM14_SLOT
+
+
+def _atom14_from_ca(pred_ca: torch.Tensor) -> torch.Tensor:
+    pred_atom14 = pred_ca.unsqueeze(2).expand(-1, -1, ATOM14_NUM_SLOTS, -1).contiguous()
+    pred_atom14[:, :, CA_ATOM14_SLOT, :] = pred_ca
+    return pred_atom14
 
 
 def build_model(cfg: Dict[str, Any]) -> torch.nn.Module:
@@ -33,8 +40,9 @@ def run_batch(
     training: bool,
 ) -> Dict[str, torch.Tensor]:
     pred_ca = model(batch["aatype"], batch["msa"], batch["deletions"], batch["residue_mask"])
+    pred_atom14 = _atom14_from_ca(pred_ca)
     if not training:
-        return {"pred_ca": pred_ca}
+        return {"pred_atom14": pred_atom14}
 
     loss = distogram_loss(
         pred_ca=pred_ca,
@@ -43,6 +51,6 @@ def run_batch(
         residue_mask=batch["residue_mask"],
     )
     return {
-        "pred_ca": pred_ca,
+        "pred_atom14": pred_atom14,
         "loss": loss,
     }

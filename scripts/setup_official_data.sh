@@ -5,7 +5,7 @@ usage() {
   cat <<'EOF'
 Usage: bash scripts/setup_official_data.sh [options]
 
-This script verifies official manifest SHA256 digests for `limited_large_v3`
+This script verifies official manifest SHA256 digests for `limited_large`
 before downloading or preprocessing data.
 
 Options:
@@ -15,13 +15,13 @@ Options:
                               Output dir for feature .npz files (default: data/processed_features)
   --processed-labels-dir <path>
                               Output dir for label .npz files (default: data/processed_labels)
-  --processed-dir <path>       Backward-compatible alias that sets both processed dirs to <path>
   --msa-name <filename>       MSA filename to download/use (default: uniref90_hits.a3m)
-  --template-hhr-name <name>  Template hits filename (default: pdb70_hits.hhr)
+  --template-hhr-name <name>  Template hits filename (default: pdb70_hits.hhr; ignored unless templates enabled)
+  --enable-templates          Enable template-hit download and template preprocessing
   --download-retries <int>    Retries per failed aws chain download (default: 2)
   --download-retry-delay-seconds <float>
                               Base delay for retries in seconds (default: 2.0)
-  --disable-templates         Skip template-hit download and template preprocessing
+  --disable-templates         Skip template-hit download and template preprocessing (default)
   --skip-preprocess           Do not run preprocess.py
   --force                     Allow overwriting manifest files when copying to --manifests-dir
   --dry-run                   Print commands without executing
@@ -43,7 +43,7 @@ MSA_NAME="uniref90_hits.a3m"
 TEMPLATE_HHR_NAME="pdb70_hits.hhr"
 DOWNLOAD_RETRIES=2
 DOWNLOAD_RETRY_DELAY_SECONDS=2.0
-USE_TEMPLATES=1
+USE_TEMPLATES=0
 SKIP_PREPROCESS=0
 FORCE=0
 DRY_RUN=0
@@ -66,11 +66,6 @@ while [[ $# -gt 0 ]]; do
       PROCESSED_LABELS_DIR="$2"
       shift 2
       ;;
-    --processed-dir)
-      PROCESSED_FEATURES_DIR="$2"
-      PROCESSED_LABELS_DIR="$2"
-      shift 2
-      ;;
     --msa-name)
       MSA_NAME="$2"
       shift 2
@@ -78,6 +73,10 @@ while [[ $# -gt 0 ]]; do
     --template-hhr-name)
       TEMPLATE_HHR_NAME="$2"
       shift 2
+      ;;
+    --enable-templates)
+      USE_TEMPLATES=1
+      shift 1
       ;;
     --download-retries)
       DOWNLOAD_RETRIES="$2"
@@ -124,7 +123,7 @@ run_cmd() {
 
 verify_manifest_hashes() {
   if [[ "$DRY_RUN" -eq 1 ]]; then
-    echo "+ verify official manifest SHA256 digests for track limited_large_v3"
+    echo "+ verify official manifest SHA256 digests for track limited_large"
     return
   fi
   python - "$REPO_ROOT" "$1" "$2" "$3" <<'PY'
@@ -145,7 +144,7 @@ def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-track = load_track_spec("limited_large_v3")
+track = load_track_spec("limited_large")
 checks = [
     ("train_manifest", Path(sys.argv[2]), track.train_manifest_sha256),
     ("val_manifest", Path(sys.argv[3]), track.val_manifest_sha256),
@@ -164,7 +163,7 @@ for name, path, expected in checks:
             f"actual:   {actual}\n"
             "Restore committed official manifests before running setup_official_data.sh."
         )
-print("Verified official manifest hashes for track limited_large_v3.")
+print("Verified official manifest hashes for track limited_large.")
 PY
 }
 

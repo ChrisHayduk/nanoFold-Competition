@@ -15,7 +15,7 @@ Architecture summary:
 - ESMFold-style auxiliary heads/losses:
   - pair distogram cross-entropy
   - per-residue confidence (pLDDT-style) cross-entropy
-- C-alpha head outputs `(B, L, 3)` coordinates.
+- C-alpha head is expanded into official `(B, L, 14, 3)` atom14 output.
 
 ## Why should it help?
 
@@ -27,7 +27,7 @@ under the benchmark's fixed budget and no-pretraining constraint.
 
 - [x] Used only the provided benchmark data (no external data, weights, or template/MSA searches).
 - [x] Kept dataset manifests fixed (`data/manifests/train.txt` and `data/manifests/val.txt`).
-- [x] Model outputs C-alpha coordinates per residue (`(L, 3)` in Angstrom).
+- [x] Model outputs atom14 coordinates per residue (`(L, 14, 3)` in Angstrom).
 
 ## Required run metadata (limited track)
 
@@ -45,5 +45,5 @@ under the benchmark's fixed budget and no-pretraining constraint.
 
 ```bash
 python train.py --config submissions/seed_esmfold/config.yaml
-python eval.py --config submissions/seed_esmfold/config.yaml --ckpt runs/seed_esmfold_v1/checkpoints/ckpt_last.pt
+python eval.py --config submissions/seed_esmfold/config.yaml --ckpt runs/seed_esmfold/checkpoints/ckpt_last.pt
 ```

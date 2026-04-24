@@ -8,29 +8,10 @@ from typing import Any, Dict, List, Mapping
 import numpy as np
 
 from .data import read_manifest
+from .utils import sha256_file
 
 
-FINGERPRINT_SCHEMA_VERSION = 3
-
-FINGERPRINT_COMPARISON_KEYS_V2 = (
-    "schema_version",
-    "track_id",
-    "train_manifest_chain_count",
-    "val_manifest_chain_count",
-    "unique_chain_count",
-    "present_feature_chain_count",
-    "missing_feature_chain_count",
-    "present_label_chain_count",
-    "missing_label_chain_count",
-    "chain_ids_sha256",
-    "train_manifest_sha256",
-    "val_manifest_sha256",
-    "feature_files_sha256",
-    "label_files_sha256",
-)
-
-FINGERPRINT_COMPARISON_KEYS_V3 = (
-    "schema_version",
+FINGERPRINT_COMPARISON_KEYS = (
     "track_id",
     "split_names",
     "unique_chain_count",
@@ -43,7 +24,10 @@ FINGERPRINT_COMPARISON_KEYS_V3 = (
     "label_files_sha256",
     "require_labels",
     "source_lock_sha256",
+    "preprocess_config_sha256",
 )
+
+PREPROCESS_META_FILENAME = "preprocess_meta.json"
 
 REQUIRED_FEATURE_KEYS = (
     "aatype",
@@ -53,18 +37,11 @@ REQUIRED_FEATURE_KEYS = (
     "template_ca_coords",
     "template_ca_mask",
 )
-REQUIRED_LABEL_KEYS = ("ca_coords", "ca_mask")
-
-
-def sha256_file(path: str | Path, chunk_size: int = 1024 * 1024) -> str:
-    hasher = hashlib.sha256()
-    with Path(path).open("rb") as f:
-        while True:
-            chunk = f.read(chunk_size)
-            if not chunk:
-                break
-            hasher.update(chunk)
-    return hasher.hexdigest()
+REQUIRED_LABEL_KEYS = ("ca_coords", "ca_mask", "atom14_positions", "atom14_mask")
+OPTIONAL_LABEL_KEYS = (
+    "residue_index",
+    "resolution",
+)
 
 
 def _chain_ids_sha256(chain_ids: List[str]) -> str:
@@ -197,11 +174,65 @@ def validate_label_npz_schema(npz_path: str | Path) -> List[str]:
                 "`ca_coords` first dimension must equal `ca_mask` length "
                 f"({ca_coords.shape[0]} vs {ca_mask.shape[0]})"
             )
+
+        residue_count = int(ca_mask.shape[0]) if ca_mask.ndim == 1 else None
+
+        if "atom14_positions" in keys:
+            atom14_positions = data["atom14_positions"]
+            if _dtype_name(atom14_positions.dtype) not in {"float32", "float64"}:
+                errors.append(
+                    f"`atom14_positions` dtype must be float32/float64 (got {_dtype_name(atom14_positions.dtype)})"
+                )
+            if atom14_positions.ndim != 3 or atom14_positions.shape[1:] != (14, 3):
+                errors.append(
+                    f"`atom14_positions` must have shape (L,14,3), got {atom14_positions.shape}"
+                )
+            elif residue_count is not None and atom14_positions.shape[0] != residue_count:
+                errors.append(
+                    "`atom14_positions` first dimension must equal `ca_mask` length "
+                    f"({atom14_positions.shape[0]} vs {residue_count})"
+                )
+
+        if "atom14_mask" in keys:
+            atom14_mask = data["atom14_mask"]
+            if _dtype_name(atom14_mask.dtype) != "bool":
+                errors.append(f"`atom14_mask` dtype must be bool (got {_dtype_name(atom14_mask.dtype)})")
+            if atom14_mask.ndim != 2 or atom14_mask.shape[1] != 14:
+                errors.append(f"`atom14_mask` must have shape (L,14), got {atom14_mask.shape}")
+            elif residue_count is not None and atom14_mask.shape[0] != residue_count:
+                errors.append(
+                    "`atom14_mask` first dimension must equal `ca_mask` length "
+                    f"({atom14_mask.shape[0]} vs {residue_count})"
+                )
+
+        if "residue_index" in keys:
+            residue_index = data["residue_index"]
+            if _dtype_name(residue_index.dtype) not in {"int32", "int64"}:
+                errors.append(
+                    f"`residue_index` dtype must be int32/int64 (got {_dtype_name(residue_index.dtype)})"
+                )
+            if residue_index.ndim != 1:
+                errors.append(f"`residue_index` must have shape (L,), got {residue_index.shape}")
+            elif residue_count is not None and residue_index.shape[0] != residue_count:
+                errors.append(
+                    "`residue_index` first dimension must equal `ca_mask` length "
+                    f"({residue_index.shape[0]} vs {residue_count})"
+                )
+
+        if "resolution" in keys:
+            resolution = data["resolution"]
+            if _dtype_name(resolution.dtype) not in {"float32", "float64"}:
+                errors.append(
+                    f"`resolution` dtype must be float32/float64 (got {_dtype_name(resolution.dtype)})"
+                )
+            if resolution.ndim not in (0, 1):
+                errors.append(f"`resolution` must be a scalar, got shape {resolution.shape}")
+            elif resolution.ndim == 1 and resolution.shape[0] != 1:
+                errors.append(f"`resolution` rank-1 form must be length 1, got {resolution.shape}")
     return errors
 
 
 def validate_npz_schema(npz_path: str | Path) -> List[str]:
-    # Backward-compatible export used by tests/utilities.
     return validate_feature_npz_schema(npz_path)
 
 
@@ -305,8 +336,10 @@ def build_split_fingerprint(
             f"Examples: {sample}"
         )
 
+    preprocess_meta_path = processed_features_dir / PREPROCESS_META_FILENAME
+    preprocess_config_sha256 = sha256_file(preprocess_meta_path) if preprocess_meta_path.exists() else None
+
     result: Dict[str, Any] = {
-        "schema_version": FINGERPRINT_SCHEMA_VERSION,
         "track_id": track_id,
         "split_names": list(manifest_map.keys()),
         "manifests": manifest_meta,
@@ -323,6 +356,7 @@ def build_split_fingerprint(
         "require_labels": bool(require_labels),
         "source_lock_path": str(Path(source_lock_path).resolve()) if source_lock_path else None,
         "source_lock_sha256": sha256_file(source_lock_path) if source_lock_path else None,
+        "preprocess_config_sha256": preprocess_config_sha256,
     }
     if list(manifest_map.keys()) == ["train", "val"]:
         result["train_manifest_chain_count"] = manifest_meta["train"]["chain_count"]
@@ -373,12 +407,14 @@ def compare_fingerprints(
         raise ValueError(f"Unsupported fingerprint comparison_mode={comparison_mode!r}")
 
     mismatches: List[str] = []
-    if "manifests" in expected:
+
+    if "manifests" not in expected:
+        mismatches.append("Expected fingerprint is missing required `manifests` metadata.")
+    else:
         if comparison_mode == "exact":
-            keys = FINGERPRINT_COMPARISON_KEYS_V3
+            keys = FINGERPRINT_COMPARISON_KEYS
         else:
             keys = (
-                "schema_version",
                 "track_id",
                 "split_names",
                 "unique_chain_count",
@@ -387,35 +423,17 @@ def compare_fingerprints(
                 "chain_ids_sha256",
                 "feature_files_sha256",
                 "source_lock_sha256",
+                "preprocess_config_sha256",
             )
         for key in keys:
             if actual.get(key) != expected.get(key):
                 mismatches.append(f"Mismatch `{key}`: expected={expected.get(key)!r}, actual={actual.get(key)!r}")
+
         if dict(actual.get("manifests") or {}) != dict(expected.get("manifests") or {}):
             mismatches.append(
                 f"Mismatch `manifests`: expected={dict(expected.get('manifests') or {})!r}, "
                 f"actual={dict(actual.get('manifests') or {})!r}"
             )
-    else:
-        if comparison_mode == "exact":
-            keys = FINGERPRINT_COMPARISON_KEYS_V2
-        else:
-            keys = (
-                "schema_version",
-                "track_id",
-                "train_manifest_chain_count",
-                "val_manifest_chain_count",
-                "unique_chain_count",
-                "present_feature_chain_count",
-                "missing_feature_chain_count",
-                "chain_ids_sha256",
-                "train_manifest_sha256",
-                "val_manifest_sha256",
-                "feature_files_sha256",
-            )
-        for key in keys:
-            if actual.get(key) != expected.get(key):
-                mismatches.append(f"Mismatch `{key}`: expected={expected.get(key)!r}, actual={actual.get(key)!r}")
 
     list_keys = ("missing_feature_chain_ids", "missing_label_chain_ids")
     if comparison_mode == "features_only":
@@ -426,9 +444,6 @@ def compare_fingerprints(
                 f"Mismatch `{key}`: expected={list(expected.get(key) or [])!r}, "
                 f"actual={list(actual.get(key) or [])!r}"
             )
-    for key in ("source_lock_sha256",):
-        if key in expected and actual.get(key) != expected.get(key):
-            mismatches.append(f"Mismatch `{key}`: expected={expected.get(key)!r}, actual={actual.get(key)!r}")
     return mismatches
 
 

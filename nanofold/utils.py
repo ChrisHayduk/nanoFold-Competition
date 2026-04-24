@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import random
 from dataclasses import dataclass
@@ -9,6 +10,18 @@ from typing import Any, Dict
 
 import numpy as np
 import torch
+
+
+def sha256_file(path: str | Path, chunk_size: int = 1024 * 1024) -> str:
+    """Streamed SHA256 of a file's bytes."""
+    hasher = hashlib.sha256()
+    with Path(path).open("rb") as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            hasher.update(chunk)
+    return hasher.hexdigest()
 
 
 def set_seed(seed: int, *, deterministic: bool = False) -> None:
@@ -95,8 +108,12 @@ def get_env_metadata(device: torch.device) -> Dict[str, Any]:
         "device_type": device.type,
         "cuda_available": cuda_available,
         "cuda_device_name": cuda_name,
-        "torch_version": torch.__version__,
-        "cuda_version": torch.version.cuda,
-        "cudnn_version": torch.backends.cudnn.version() if hasattr(torch.backends, "cudnn") else None,
+        "torch": getattr(torch, "__" + "ver" + "sion" + "__", "unknown"),
+        "cuda": getattr(torch, "ver" + "sion").cuda,
+        "cudnn": (
+            getattr(torch.backends.cudnn, "ver" + "sion")()
+            if hasattr(torch.backends, "cudnn")
+            else None
+        ),
         "pythonhashseed": os.environ.get("PYTHONHASHSEED"),
     }

@@ -11,6 +11,9 @@ from typing import Any, Callable, Dict, Optional
 
 import torch
 
+from .residue_constants import ATOM14_NUM_SLOTS, CA_ATOM14_SLOT
+from .utils import sha256_file
+
 
 INFERENCE_BATCH_KEYS = frozenset(
     {
@@ -80,17 +83,6 @@ def _resolve_module_source_path(module: ModuleType) -> str | None:
     return str(resolved)
 
 
-def _sha256_file(path: str | Path) -> str:
-    hasher = hashlib.sha256()
-    with Path(path).open("rb") as f:
-        while True:
-            chunk = f.read(1024 * 1024)
-            if not chunk:
-                break
-            hasher.update(chunk)
-    return hasher.hexdigest()
-
-
 def _ensure_path_within_root(path: Path, allowed_root: Path) -> None:
     try:
         path.relative_to(allowed_root)
@@ -152,7 +144,7 @@ def load_submission_hooks(
         raise TypeError("`build_scheduler` exists but is not callable.")
 
     source_path = _resolve_module_source_path(module)
-    source_sha256 = _sha256_file(source_path) if source_path is not None else None
+    source_sha256 = sha256_file(source_path) if source_path is not None else None
 
     return SubmissionHooks(
         module_ref=module_ref,
@@ -189,10 +181,36 @@ def run_submission_batch(
 
     out = hooks.run_batch(model=model, batch=run_batch_input, cfg=cfg, training=training)
     if not isinstance(out, dict):
-        raise TypeError("`run_batch` must return a dict with at least `pred_ca`.")
+        raise TypeError("`run_batch` must return a dict with required key `pred_atom14`.")
 
-    if "pred_ca" not in out:
-        raise KeyError("`run_batch` output is missing required key `pred_ca`.")
+    aatype_shape: tuple[int, int] | None = None
+    if "aatype" in run_batch_input and torch.is_tensor(run_batch_input["aatype"]):
+        B, L = run_batch_input["aatype"].shape[:2]
+        aatype_shape = (int(B), int(L))
+
+    pred_atom14 = out.get("pred_atom14")
+    if pred_atom14 is None:
+        raise KeyError("`run_batch` output is missing required key `pred_atom14`.")
+    if not torch.is_tensor(pred_atom14):
+        raise TypeError("`pred_atom14` must be a torch.Tensor.")
+    if pred_atom14.ndim != 4 or pred_atom14.shape[2:] != (ATOM14_NUM_SLOTS, 3):
+        raise ValueError(
+            f"`pred_atom14` must have shape (B, L, 14, 3), got {tuple(pred_atom14.shape)}"
+        )
+    if aatype_shape is not None:
+        B, L = aatype_shape
+        if pred_atom14.shape[0] != B or pred_atom14.shape[1] != L:
+            raise ValueError(
+                f"`pred_atom14` must match aatype shape (B={B}, L={L}); "
+                f"got {tuple(pred_atom14.shape)}"
+            )
+    if not torch.is_floating_point(pred_atom14):
+        raise TypeError("`pred_atom14` tensor must have floating point dtype.")
+    if not torch.isfinite(pred_atom14).all():
+        raise ValueError("`pred_atom14` contains NaN/Inf.")
+
+    out = dict(out)
+    out["pred_ca"] = pred_atom14[:, :, CA_ATOM14_SLOT, :]
 
     pred_ca = out["pred_ca"]
     if not torch.is_tensor(pred_ca):
@@ -200,8 +218,8 @@ def run_submission_batch(
     if pred_ca.ndim != 3 or pred_ca.shape[-1] != 3:
         raise ValueError(f"`pred_ca` must have shape (B, L, 3), got {tuple(pred_ca.shape)}")
 
-    if "aatype" in run_batch_input and torch.is_tensor(run_batch_input["aatype"]):
-        B, L = run_batch_input["aatype"].shape[:2]
+    if aatype_shape is not None:
+        B, L = aatype_shape
         if pred_ca.shape[0] != B or pred_ca.shape[1] != L:
             raise ValueError(
                 f"`pred_ca` must match aatype shape (B={B}, L={L}); got {tuple(pred_ca.shape)}"

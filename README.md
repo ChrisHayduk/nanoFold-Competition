@@ -1,43 +1,72 @@
-# nanoFold Data Efficiency Competition
+# nanoFold: A Protein Folding Slowrun
 
-Reproducible benchmark for protein structure prediction under fixed data and fixed training budget.
+nanoFold is a data-efficiency competition for protein structure prediction. It is inspired by the nanoGPT slowrun: everyone trains under a fixed budget, and the leaderboard rewards models that learn more structure from the same amount of data.
 
-## What This Repo Enforces
+The core bet is simple: biological data is expensive. Text and image models often improve by consuming more data, but protein structure data is far more constrained, far harder to generate, and far more sensitive to leakage. If we want better biological foundation models, we need architectures and training methods that make stronger use of the data we already have.
 
-- Fixed manifests and pinned manifest hashes for official runs.
-- Fixed track-level budget/policy (`tracks/*.yaml`).
-- Fixed runtime contract for submissions:
-  - `build_model(cfg)`
-  - `build_optimizer(cfg, model)`
-  - `run_batch(model, batch, cfg, training)`
-- Common lDDT-Ca metric implementation and official runner artifact format.
+This repo turns that idea into a benchmark. Participants get the same official train set, the same sample budget, and the same hidden evaluation path. Progress should come from better biological priors, better inductive biases, better objectives, better curricula, and better optimization under scarcity.
+
+## What Counts As Progress
+
+nanoFold is not meant to be a pretrained-weight contest, a web-retrieval contest, or a race to find near-duplicate templates. The official track is deliberately strict:
+
+- fixed official data and manifests
+- no external structures, pretrained weights, external MSA retrieval, or network access
+- no template features in the official track
+- hidden ranking by area under the learning curve, not just final checkpoint score
+- atom14-aware scoring so methods are rewarded for more than Cα traces
+
+The intended question is: **given the same limited training set, who learns useful protein geometry fastest and best?**
+
+## How The Slowrun Works
+
+Each official run trains for the same sample budget. The hidden leaderboard evaluates multiple checkpoints and ranks by `foldscore_auc_hidden`: trapezoidal area under hidden FoldScore versus cumulative samples seen.
+
+That makes early learning matter. A model that gets useful structure after 2,000 samples should beat a model that only wakes up at the end, even if their final scores are close. This is the pressure that should surface architectures with better biological priors.
+
+FoldScore combines:
+
+```text
+0.55*lDDT-Ca + 0.30*lDDT-backbone-atom14 + 0.15*lDDT-all-atom14
+```
+
+The final hidden FoldScore is the tie-breaker. Public validation exists for debugging, not ranking.
+
+## What This Repo Provides
+
+- official track policy in `tracks/limited_large.yaml`
+- minAlphaFold2-derived preprocessing for A3M/mmCIF alignment, atom14 labels, residue constants, and template plumbing
+- sealed prediction/scoring entrypoints that keep hidden labels away from submission code
+- a strict submission API with `build_model`, `build_optimizer`, and `run_batch`
+- dataset fingerprints and manifest checks so official data changes are visible
+- baseline/template submissions that pass the official atom14 contract
 
 Primary docs:
 - [COMPETITION.md](COMPETITION.md): enforceable rules and official protocol
 - [API.md](API.md): submission/runtime API contract
 
-## Official Track (`limited_large_v3`)
+## Official Track At A Glance
 
-Source of truth: `tracks/limited_large_v3.yaml`
+Source of truth: `tracks/limited_large.yaml`
 
-Official constants:
-- train chains: `10,000`
-- val chains: `1,000`
-- `seed = 0`
-- `data.crop_size = 256`
-- `data.msa_depth = 192`
-- effective batch size: `data.batch_size * train.grad_accum_steps = 2`
-- `train.max_steps = 10,000`
-- `data.val_crop_mode = center`
-- `data.val_msa_sample_mode = top`
+| Item | Value |
+|---|---:|
+| Train chains | `10,000` |
+| Public val chains | `1,000` |
+| Hidden val chains | `1,000` |
+| Seed | `0` |
+| Crop size | `256` |
+| MSA depth | `192` |
+| Effective batch size | `2` |
+| Max steps | `10,000` |
+| Sample budget | `20,000` |
+| Residue budget | `5,120,000` |
+| Rank metric | `foldscore_auc_hidden` |
+| Tie-breaker | `final_hidden_foldscore` |
 
-Derived budgets:
-- sample budget: `B_sample = max_steps * effective_batch_size = 20,000`
-- residue budget: `B_res = max_steps * effective_batch_size * crop_size = 5,120,000`
+## Data Format
 
-## Data Format (Breaking Cutover)
-
-Official preprocessing now writes split artifacts per chain:
+Official preprocessing writes split artifacts per chain:
 - features: `data/processed_features/<chain_id>.npz`
 - labels: `data/processed_labels/<chain_id>.npz`
 
@@ -46,16 +75,26 @@ Required feature keys:
 
 Required label keys:
 - `ca_coords`, `ca_mask`
+- `atom14_positions` — `(L, 14, 3)` float32, full atom14 layout
+- `atom14_mask` — `(L, 14)` bool, True where coordinate was present in mmCIF
+
+Additional label metadata:
+- `residue_index` — `(L,)` int32, contiguous 0..L-1
+- `resolution` — `()` float32, Å (0.0 if unknown)
+
+Preprocessing run metadata is captured in `<processed_features_dir>/preprocess_meta.json`. Its SHA256 is folded into the dataset fingerprint, so changes to preprocessing flags, projection thresholds, dependency metadata, or source revision are visible to the verifier.
+
+Official scoring requires atom14 labels, and submissions must return `pred_atom14` shaped `(B, L, 14, 3)`. The runtime derives the Cα view from atom14 slot 1 for diagnostics and baseline losses.
+
+The official track disables templates by preprocessing with `T=0`; template tensors remain in the API so a future template-enabled track can add leakage filters explicitly.
 
 Config schema uses:
 - `data.processed_features_dir`
 - `data.processed_labels_dir`
 
-`data.processed_dir` is no longer the canonical field.
+## Official Policy
 
-## Official Policy Semantics
-
-In `--official` mode, the runner applies **override + validate**:
+In `--official` mode, the runner applies override + validate:
 - immutable track constants are forced into config at startup
 - then policy validation and manifest hash checks run
 - model parameter cap is enforced from track policy (`model.max_params`)
@@ -66,7 +105,7 @@ This is implemented in:
 - `eval.py`
 - `scripts/validate_submission.py`
 
-## Quickstart (Official Public Data)
+## Quickstart
 
 ```bash
 # 1) environment
@@ -81,43 +120,43 @@ bash scripts/setup_official_data.sh \
 
 # 3) build official fingerprint (split features+labels)
 python scripts/build_fingerprint.py \
-  --config configs/limited_large_v3_official_baseline.yaml \
-  --track limited_large_v3 \
+  --config configs/official_baseline.yaml \
+  --track limited_large \
   --source-lock leaderboard/official_manifest_source.lock.json \
   --output leaderboard/official_dataset_fingerprint.json
 
-# 4) official train/eval
+# 4) official train + public validation scoring
 python train.py \
-  --config configs/limited_large_v3_official_baseline.yaml \
-  --track limited_large_v3 \
+  --config configs/official_baseline.yaml \
+  --track limited_large \
   --official
 
-mkdir -p runs/official_limited_large_v3_baseline/_forbid_labels
+mkdir -p runs/official_limited_large_baseline/_forbid_labels
 python predict.py \
-  --config configs/limited_large_v3_official_baseline.yaml \
-  --ckpt runs/official_limited_large_v3_baseline/checkpoints/ckpt_last.pt \
+  --config configs/official_baseline.yaml \
+  --ckpt runs/official_limited_large_baseline/checkpoints/ckpt_last.pt \
   --split val \
-  --track limited_large_v3 \
+  --track limited_large \
   --official \
-  --forbid-labels-dir runs/official_limited_large_v3_baseline/_forbid_labels \
-  --pred-out-dir runs/official_limited_large_v3_baseline/public_predictions \
-  --save runs/official_limited_large_v3_baseline/predict_val.json
+  --forbid-labels-dir runs/official_limited_large_baseline/_forbid_labels \
+  --pred-out-dir runs/official_limited_large_baseline/public_predictions \
+  --save runs/official_limited_large_baseline/predict_val.json
 
 python score.py \
-  --prediction-summary runs/official_limited_large_v3_baseline/predict_val.json \
+  --prediction-summary runs/official_limited_large_baseline/predict_val.json \
   --labels-dir data/processed_labels \
-  --save runs/official_limited_large_v3_baseline/eval_val.json \
-  --per-chain-out runs/official_limited_large_v3_baseline/per_chain_scores_val.jsonl
+  --save runs/official_limited_large_baseline/eval_val.json \
+  --per-chain-out runs/official_limited_large_baseline/per_chain_scores_val.jsonl
 ```
 
-## Single End-to-End Official Data Flow (Maintainers)
+## Maintainer Data Refresh
 
-Run this one command to execute the full pipeline:
-- regenerate official manifests from locked chain cache inputs
-- sync manifest hashes/counts across track + docs + lock
-- download required OpenFold assets
-- preprocess split NPZs (`processed_features` + `processed_labels`)
-- rebuild official fingerprint
+Maintainers can refresh the official public assets with one command. This path:
+- regenerates official manifests from locked chain cache inputs
+- syncs manifest hashes/counts across track + docs + lock
+- downloads required OpenFold assets
+- preprocesses split NPZs (`processed_features` + `processed_labels`)
+- rebuilds the official fingerprint
 
 ```bash
 bash scripts/full_official_data_refresh.sh --rewrite-lock
@@ -129,15 +168,9 @@ Dry-run preview:
 bash scripts/full_official_data_refresh.sh --rewrite-lock --dry-run
 ```
 
-## Official Hidden Pipeline (Maintainers)
+## Hidden Leaderboard Runs
 
-Leaderboard ranking metric is:
-- `lddt_auc_hidden` over cumulative samples on `[0, B_sample]`
-
-Secondary metrics:
-- `final_hidden_lddt_ca`
-- `lddt_at_steps` (default checkpoints: `0,1000,2000,5000,last`)
-- `lddt_at_samples`
+Hidden leaderboard runs are maintainer-only. The prediction stage sees submission code plus hidden features. The scoring stage sees saved predictions plus hidden labels. Submission code is never imported during hidden scoring.
 
 Required maintainer env vars for hidden mode:
 - `NANOFOLD_HIDDEN_MANIFEST`
@@ -145,27 +178,21 @@ Required maintainer env vars for hidden mode:
 - `NANOFOLD_HIDDEN_LABELS_DIR`
 - `NANOFOLD_HIDDEN_FINGERPRINT`
 
-Hidden leaderboard runs are now two-stage:
-- predict stage mounts submission code plus hidden features only
-- score stage mounts saved predictions plus hidden labels only
-
 Canonical runner entrypoint:
 
 ```bash
 python scripts/run_official.py \
   --submission submissions/<name> \
-  --track limited_large_v3 \
+  --track limited_large \
   --update-leaderboard
 ```
 
-For hidden leaderboard runs this now requires a sealed runtime. The supported path is the Docker wrapper below.
-
-No-network containerized run:
+Hidden leaderboard runs require a sealed no-network runtime. The supported path is:
 
 ```bash
 bash scripts/run_official_docker.sh \
   --submission submissions/<name> \
-  --track limited_large_v3 \
+  --track limited_large \
   --update-leaderboard
 ```
 
@@ -181,7 +208,7 @@ Check committed official manifest hashes:
 shasum -a 256 data/manifests/train.txt data/manifests/val.txt data/manifests/all.txt
 ```
 
-Expected `limited_large_v3` values:
+Expected `limited_large` values:
 - `train.txt`: `c3288fe5f855b602921734ea0113a858b09c8acfb28e53468940a5657abe2682`
 - `val.txt`: `7c279df96fad21e04909bc331466d96118256d3b0f69bccf1c2cc86d957d1f67`
 - `all.txt`: `2b2a298d078b7a398a5f3379769bdbfb33b27fe39239a5f052e07d24800df778`
@@ -203,7 +230,7 @@ python scripts/sync_official_manifest_hashes.py
 ```bash
 python scripts/validate_submission.py \
   --submission submissions/<your_name> \
-  --track limited_large_v3 \
+  --track limited_large \
   --strict
 
 if git diff --name-only origin/main...HEAD | grep -Eq '^data/manifests/(train|val)\.txt$'; then
@@ -234,8 +261,6 @@ CI enforces the same PR guardrail:
 ## Leaderboard
 
 <!-- LEADERBOARD_START -->
-| # | Rank Score | Hidden Final | Hidden AUC | Public Val | Track | Date | Commit | Description |
-|---:|---:|---:|---:|---:|---|---|---|---|
-| 1 | 0.0000 | n/a | n/a | 0.0000 | limited | 2026-03-03 | `seedesm` | Seed submission: ESMFold-inspired trunk (pending official benchmark run) |
-| 2 | 0.0000 | n/a | n/a | 0.0000 | limited | 2026-03-03 | `seedope` | Seed submission: OpenFold-style Evoformer + template stack (pending official benchmark run) |
+| # | FoldScore AUC | Hidden FoldScore | Public FoldScore | Track | Date | Commit | Description |
+|---:|---:|---:|---:|---|---|---|---|
 <!-- LEADERBOARD_END -->

@@ -1,5 +1,5 @@
-id: limited_large_v3
-name: Official Limited Large-v3
+id: limited_large
+name: Official Limited Large
 mode: limited
 official: true
 dataset:
@@ -17,7 +17,17 @@ dataset:
   hidden_lock_file: leaderboard/official_hidden_assets.lock.json
   train_chain_count: 10000
   val_chain_count: 1000
-  hidden_chain_count: null
+  hidden_chain_count: 1000
+scoring:
+  rank_metric: foldscore_auc_hidden
+  rank_tiebreak_metric: final_hidden_foldscore
+  foldscore_weights:
+    lddt_ca: 0.55
+    lddt_backbone_atom14: 0.30
+    lddt_atom14: 0.15
+templates:
+  enabled: false
+  policy: disabled_to_avoid_template_and_release_date_leakage
 train:
   seed: 0
   crop_size: 256

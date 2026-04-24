@@ -3,9 +3,9 @@
 This submission includes code patterns adapted from the public ESM repository:
 
 - Repository: https://github.com/facebookresearch/esm
-- Relevant files:
-  - `esm/esmfold/v1/trunk.py`
-  - `esm/esmfold/v1/tri_self_attn_block.py`
+- Relevant source areas:
+  - ESMFold trunk implementation
+  - ESMFold pair-biased sequence attention block
 
 Adapted concepts include:
 - Relative positional pair embedding

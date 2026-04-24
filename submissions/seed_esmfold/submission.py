@@ -6,7 +6,14 @@ import torch
 import torch.nn.functional as F
 
 from nanofold.model import distogram_loss
+from nanofold.residue_constants import ATOM14_NUM_SLOTS, CA_ATOM14_SLOT
 from esmfold_seed_model import build_model
+
+
+def _atom14_from_ca(pred_ca: torch.Tensor) -> torch.Tensor:
+    pred_atom14 = pred_ca.unsqueeze(2).expand(-1, -1, ATOM14_NUM_SLOTS, -1).contiguous()
+    pred_atom14[:, :, CA_ATOM14_SLOT, :] = pred_ca
+    return pred_atom14
 
 
 def build_optimizer(cfg: Dict[str, Any], model: torch.nn.Module) -> torch.optim.Optimizer:
@@ -109,10 +116,11 @@ def run_batch(
 ) -> Dict[str, torch.Tensor]:
     out = model(batch["aatype"], batch["residue_mask"])
     pred_ca = out["pred_ca"]
+    pred_atom14 = _atom14_from_ca(pred_ca)
     distogram_logits = out["distogram_logits"]
     plddt_logits = out["plddt_logits"]
     if not training:
-        return {"pred_ca": pred_ca}
+        return {"pred_atom14": pred_atom14}
 
     loss_cfg = cfg.get("loss", {})
     coord_weight = float(loss_cfg.get("coord_weight", 1.0))
@@ -148,7 +156,7 @@ def run_batch(
 
     loss = coord_weight * coord + disto_weight * disto + plddt_weight * plddt
     return {
-        "pred_ca": pred_ca,
+        "pred_atom14": pred_atom14,
         "loss": loss,
         "coord_loss": coord.detach(),
         "distogram_ce_loss": disto.detach(),

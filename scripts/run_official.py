@@ -24,10 +24,9 @@ if str(REPO_ROOT) not in sys.path:
 
 from nanofold.competition_policy import DEFAULT_TRACK_ID, load_track_spec
 from nanofold.data import read_manifest
-from nanofold.metrics import lddt_ca
+from nanofold.metrics import foldscore_auc, foldscore_components
 
 
-SCHEMA_VERSION = 3
 DEFAULT_CHECKPOINT_STEPS = "0,1000,2000,5000,last"
 SEALED_RUNTIME_ENV = "NANOFOLD_OFFICIAL_SEALED_RUNTIME"
 RUNTIME_STAGE_ENV = "NANOFOLD_OFFICIAL_RUNTIME_STAGE"
@@ -344,13 +343,17 @@ def _prediction_subdir(pred_root: Path, ckpt_path: str, n_ckpts: int) -> Path:
     return pred_root / Path(ckpt_path).stem
 
 
-def _center_crop_labels(ca_coords: np.ndarray, ca_mask: np.ndarray, crop_size: int) -> tuple[np.ndarray, np.ndarray]:
-    L = int(ca_coords.shape[0])
+def _center_crop_atom14_labels(
+    atom14_positions: np.ndarray,
+    atom14_mask: np.ndarray,
+    crop_size: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    L = int(atom14_positions.shape[0])
     if L <= crop_size:
-        return ca_coords, ca_mask
+        return atom14_positions, atom14_mask
     start = (L - crop_size) // 2
     end = start + crop_size
-    return ca_coords[start:end], ca_mask[start:end]
+    return atom14_positions[start:end], atom14_mask[start:end]
 
 
 def _score_hidden_predictions(
@@ -377,7 +380,12 @@ def _score_hidden_predictions(
         if cumulative_samples_seen < 0:
             raise ValueError(f"Checkpoint entry is missing `cumulative_samples_seen`: {item}")
         ckpt_pred_dir = _prediction_subdir(pred_root, ckpt_path, n_ckpts=n_ckpts)
-        scores: List[float] = []
+        score_lists: Dict[str, List[float]] = {
+            "foldscore": [],
+            "lddt_ca": [],
+            "lddt_backbone_atom14": [],
+            "lddt_atom14": [],
+        }
 
         for chain_id in chain_ids:
             pred_path = ckpt_pred_dir / f"{chain_id}.npz"
@@ -388,27 +396,34 @@ def _score_hidden_predictions(
                 raise FileNotFoundError(f"Missing hidden label file: {label_path}")
 
             with np.load(pred_path) as pred_npz:
-                pred_ca = np.asarray(pred_npz["pred_ca"], dtype=np.float32)
+                if "pred_atom14" not in pred_npz:
+                    raise ValueError(f"Official hidden scoring requires pred_atom14 in {pred_path}")
+                pred_atom14 = np.asarray(pred_npz["pred_atom14"], dtype=np.float32)
             with np.load(label_path) as label_npz:
-                true_ca = np.asarray(label_npz["ca_coords"], dtype=np.float32)
-                ca_mask = np.asarray(label_npz["ca_mask"], dtype=bool)
-            true_ca, ca_mask = _center_crop_labels(true_ca, ca_mask, crop_size=crop_size)
+                if "atom14_positions" not in label_npz or "atom14_mask" not in label_npz:
+                    raise ValueError(f"Official hidden scoring requires atom14 labels in {label_path}")
+                true_atom14 = np.asarray(label_npz["atom14_positions"], dtype=np.float32)
+                atom14_mask = np.asarray(label_npz["atom14_mask"], dtype=bool)
+            true_atom14, atom14_mask = _center_crop_atom14_labels(true_atom14, atom14_mask, crop_size=crop_size)
 
-            L = min(pred_ca.shape[0], true_ca.shape[0], ca_mask.shape[0])
+            L = min(pred_atom14.shape[0], true_atom14.shape[0], atom14_mask.shape[0])
             if L <= 0:
-                chain_score = float("nan")
+                metrics = {
+                    "foldscore": float("nan"),
+                    "lddt_ca": float("nan"),
+                    "lddt_backbone_atom14": float("nan"),
+                    "lddt_atom14": float("nan"),
+                }
             else:
-                chain_score = float(
-                    lddt_ca(
-                        torch.from_numpy(pred_ca[:L]),
-                        torch.from_numpy(true_ca[:L]),
-                        torch.from_numpy(ca_mask[:L]),
-                    )
-                    .detach()
-                    .cpu()
+                comps = foldscore_components(
+                    pred_atom14=torch.from_numpy(pred_atom14[:L]),
+                    true_atom14=torch.from_numpy(true_atom14[:L]),
+                    atom14_mask=torch.from_numpy(atom14_mask[:L]),
                 )
-            if not np.isnan(chain_score):
-                scores.append(chain_score)
+                metrics = {name: float(value.detach().cpu()) for name, value in comps.items()}
+            for name, value in metrics.items():
+                if not np.isnan(value):
+                    score_lists[name].append(float(value))
             per_chain_rows.append(
                 {
                     "split": "hidden_val",
@@ -416,11 +431,14 @@ def _score_hidden_predictions(
                     "step": step,
                     "cumulative_samples_seen": cumulative_samples_seen,
                     "chain_id": chain_id,
-                    "lddt_ca": chain_score,
+                    **metrics,
                 }
             )
 
-        mean_score = float(sum(scores) / len(scores)) if scores else float("nan")
+        mean_scores = {
+            f"mean_{name}": float(sum(values) / len(values)) if values else float("nan")
+            for name, values in score_lists.items()
+        }
         checkpoint_scores.append(
             {
                 "ckpt": ckpt_path,
@@ -428,7 +446,7 @@ def _score_hidden_predictions(
                 "cumulative_samples_seen": cumulative_samples_seen,
                 "cumulative_cropped_residues_seen": cumulative_cropped_residues_seen,
                 "cumulative_nonpad_residues_seen": cumulative_nonpad_residues_seen,
-                "mean_lddt_ca": mean_score,
+                **mean_scores,
                 "num_chains": len(chain_ids),
             }
         )
@@ -451,7 +469,7 @@ def _score_hidden_predictions(
 
     final_hidden = float("nan")
     if sorted_points:
-        final_hidden = float(sorted_points[-1]["mean_lddt_ca"])
+        final_hidden = float(sorted_points[-1]["mean_foldscore"])
 
     if not sorted_points or int(sorted_points[0]["cumulative_samples_seen"]) != 0:
         raise ValueError("Hidden scoring requires a step-0 checkpoint with cumulative_samples_seen=0.")
@@ -461,32 +479,53 @@ def _score_hidden_predictions(
             f"({sample_budget}); got {sorted_points[-1]['cumulative_samples_seen']}."
         )
 
-    auc_hidden = float("nan")
-    if len(sorted_points) == 1:
-        auc_hidden = float(sorted_points[0]["mean_lddt_ca"])
-    else:
-        area = 0.0
-        for i in range(1, len(sorted_points)):
-            x0 = float(sorted_points[i - 1]["cumulative_samples_seen"])
-            x1 = float(sorted_points[i]["cumulative_samples_seen"])
-            y0 = float(sorted_points[i - 1]["mean_lddt_ca"])
-            y1 = float(sorted_points[i]["mean_lddt_ca"])
-            area += (x1 - x0) * (y0 + y1) * 0.5
-        denom = max(float(sample_budget), 1.0)
-        auc_hidden = area / denom if denom > 0 else float("nan")
+    auc_hidden = foldscore_auc(
+        (
+            (
+                int(row["step"]),
+                int(row["cumulative_samples_seen"]),
+                float(row["mean_foldscore"]),
+            )
+            for row in sorted_points
+        ),
+        sample_budget=sample_budget,
+    )
+    lddt_auc_hidden = foldscore_auc(
+        (
+            (
+                int(row["step"]),
+                int(row["cumulative_samples_seen"]),
+                float(row.get("mean_lddt_ca", row["mean_foldscore"])),
+            )
+            for row in sorted_points
+        ),
+        sample_budget=sample_budget,
+    )
 
+    foldscore_at_steps = {
+        str(int(row["step"])): float(row["mean_foldscore"])
+        for row in sorted_points
+    }
+    foldscore_at_samples = {
+        str(int(row["cumulative_samples_seen"])): float(row["mean_foldscore"])
+        for row in sorted_points
+    }
     lddt_at_steps = {
-        str(int(row["step"])): float(row["mean_lddt_ca"])
+        str(int(row["step"])): float(row.get("mean_lddt_ca", row["mean_foldscore"]))
         for row in sorted_points
     }
     lddt_at_samples = {
-        str(int(row["cumulative_samples_seen"])): float(row["mean_lddt_ca"])
+        str(int(row["cumulative_samples_seen"])): float(row.get("mean_lddt_ca", row["mean_foldscore"]))
         for row in sorted_points
     }
 
     return {
-        "final_hidden_lddt_ca": final_hidden,
-        "lddt_auc_hidden": auc_hidden,
+        "final_hidden_foldscore": final_hidden,
+        "foldscore_auc_hidden": auc_hidden,
+        "foldscore_at_steps": foldscore_at_steps,
+        "foldscore_at_samples": foldscore_at_samples,
+        "final_hidden_lddt_ca": float(sorted_points[-1].get("mean_lddt_ca", final_hidden)),
+        "lddt_auc_hidden": lddt_auc_hidden,
         "lddt_at_steps": lddt_at_steps,
         "lddt_at_samples": lddt_at_samples,
         "checkpoint_metrics_hidden": checkpoint_scores,
@@ -627,7 +666,7 @@ def main() -> None:
 
     eval_public_summary = _read_json(eval_public_summary_path)
     public_per_chain_rows = _read_per_chain(per_chain_public_path)
-    public_scores = [float(row["lddt_ca"]) for row in public_per_chain_rows if "lddt_ca" in row]
+    public_scores = [float(row["foldscore"]) for row in public_per_chain_rows if "foldscore" in row]
     public_summary = {
         "count": len(public_scores),
         "mean": float(mean(public_scores)) if public_scores else float("nan"),
@@ -637,6 +676,10 @@ def main() -> None:
     }
 
     hidden_results: Dict[str, Any] = {
+        "final_hidden_foldscore": float("nan"),
+        "foldscore_auc_hidden": float("nan"),
+        "foldscore_at_steps": {},
+        "foldscore_at_samples": {},
         "final_hidden_lddt_ca": float("nan"),
         "lddt_auc_hidden": float("nan"),
         "lddt_at_steps": {},
@@ -731,6 +774,10 @@ def main() -> None:
         )
         hidden_eval_summary = _read_json(hidden_eval_summary_path)
         hidden_results = {
+            "final_hidden_foldscore": float(hidden_eval_summary.get("final_hidden_foldscore", float("nan"))),
+            "foldscore_auc_hidden": float(hidden_eval_summary.get("foldscore_auc_hidden", float("nan"))),
+            "foldscore_at_steps": hidden_eval_summary.get("foldscore_at_steps", {}),
+            "foldscore_at_samples": hidden_eval_summary.get("foldscore_at_samples", {}),
             "final_hidden_lddt_ca": float(hidden_eval_summary.get("final_hidden_lddt_ca", float("nan"))),
             "lddt_auc_hidden": float(hidden_eval_summary.get("lddt_auc_hidden", float("nan"))),
             "lddt_at_steps": hidden_eval_summary.get("lddt_at_steps", {}),
@@ -755,15 +802,14 @@ def main() -> None:
     train_metrics_path = run_dir / "metrics.json"
     train_metrics = _read_json(train_metrics_path) if train_metrics_path.exists() else {}
 
-    rank_metric = "lddt_auc_hidden" if not args.disable_hidden else "public_val_lddt_ca"
+    rank_metric = "foldscore_auc_hidden" if not args.disable_hidden else "public_val_foldscore"
     rank_score = (
-        float(hidden_results["lddt_auc_hidden"])
+        float(hidden_results["foldscore_auc_hidden"])
         if not args.disable_hidden
-        else float(eval_public_summary["mean_lddt_ca"])
+        else float(eval_public_summary["mean_foldscore"])
     )
 
     result = {
-        "schema_version": SCHEMA_VERSION,
         "run_name": run_name,
         "submission_name": submission_dir.name,
         "submission_dir": str(submission_dir),
@@ -771,17 +817,22 @@ def main() -> None:
         "track": track_spec.track_id,
         "rank_metric": rank_metric,
         "rank_score": rank_score,
-        "rank_tiebreak_metric": "final_hidden_lddt_ca" if not args.disable_hidden else None,
+        "rank_tiebreak_metric": "final_hidden_foldscore" if not args.disable_hidden else None,
         "rank_tiebreak_score": (
-            float(hidden_results["final_hidden_lddt_ca"])
+            float(hidden_results["final_hidden_foldscore"])
             if not args.disable_hidden
-            else float(eval_public_summary["mean_lddt_ca"])
+            else float(eval_public_summary["mean_foldscore"])
         ),
+        "final_hidden_foldscore": float(hidden_results["final_hidden_foldscore"]),
+        "foldscore_auc_hidden": float(hidden_results["foldscore_auc_hidden"]),
+        "foldscore_at_steps": hidden_results["foldscore_at_steps"],
+        "foldscore_at_samples": hidden_results.get("foldscore_at_samples", {}),
         "final_hidden_lddt_ca": float(hidden_results["final_hidden_lddt_ca"]),
         "lddt_auc_hidden": float(hidden_results["lddt_auc_hidden"]),
         "lddt_at_steps": hidden_results["lddt_at_steps"],
         "lddt_at_samples": hidden_results.get("lddt_at_samples", {}),
         "checkpoint_metrics_hidden": hidden_results["checkpoint_metrics_hidden"],
+        "public_val_foldscore": float(eval_public_summary["mean_foldscore"]),
         "public_val_lddt_ca": float(eval_public_summary["mean_lddt_ca"]),
         "public_val_per_chain_summary": public_summary,
         "num_chains_public_val": int(eval_public_summary.get("num_chains", len(public_per_chain_rows))),
@@ -796,7 +847,9 @@ def main() -> None:
         "train_wall_time_seconds": float(train_metrics.get("wall_time_seconds", float("nan")))
         if isinstance(train_metrics, dict)
         else float("nan"),
-        "eval_public_wall_time_seconds": float(eval_public_summary.get("eval_wall_time_seconds", float("nan"))),
+        "eval_public_wall_time_seconds": float(
+            eval_public_summary.get("score_wall_time_seconds", eval_public_summary.get("eval_wall_time_seconds", float("nan")))
+        ),
         "sample_budget": int(train_metrics.get("sample_budget", 0)) if isinstance(train_metrics, dict) else 0,
         "residue_budget": int(train_metrics.get("residue_budget", 0)) if isinstance(train_metrics, dict) else 0,
         "cumulative_samples_seen": int(train_metrics.get("cumulative_samples_seen", 0)) if isinstance(train_metrics, dict) else 0,

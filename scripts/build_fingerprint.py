@@ -98,7 +98,7 @@ def _resolve_data_paths(args: argparse.Namespace) -> tuple[str, str | None, dict
     if not processed_features_dir or not manifest_paths:
         raise ValueError(
             "Must provide either --config, or --processed-features-dir plus --manifest NAME=PATH "
-            "(or legacy --train-manifest and --val-manifest)."
+            "(or --train-manifest and --val-manifest)."
         )
     return processed_features_dir, processed_labels_dir, manifest_paths
 

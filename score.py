@@ -9,7 +9,7 @@ from typing import Any, Dict, List
 import numpy as np
 import torch
 
-from nanofold.metrics import lddt_ca
+from nanofold.metrics import foldscore_components, foldscore_auc
 from nanofold.utils import get_env_metadata, utc_now_iso
 
 
@@ -32,7 +32,7 @@ def parse_args() -> argparse.Namespace:
         "--per-chain-out",
         type=str,
         default="",
-        help="Optional JSONL output path for per-chain lDDT-Ca records.",
+        help="Optional JSONL output path for per-chain FoldScore/component records.",
     )
     ap.add_argument(
         "--save",
@@ -49,22 +49,42 @@ def _load_label_crop(
     chain_id: str,
     crop_size: int,
     crop_mode: str,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> Dict[str, torch.Tensor]:
     label_path = labels_dir / f"{chain_id}.npz"
     if not label_path.exists():
         raise FileNotFoundError(f"Missing label file for scoring: {label_path}")
     with np.load(label_path) as data:
-        ca_coords = torch.from_numpy(data["ca_coords"]).float()
-        ca_mask = torch.from_numpy(data["ca_mask"]).bool()
+        missing = [key for key in ("ca_coords", "ca_mask", "atom14_positions", "atom14_mask") if key not in data]
+        if missing:
+            raise ValueError(f"Label file {label_path} is missing required keys: {', '.join(missing)}")
+        labels: Dict[str, torch.Tensor] = {
+            "ca_coords": torch.from_numpy(data["ca_coords"]).float(),
+            "ca_mask": torch.from_numpy(data["ca_mask"]).bool(),
+            "atom14_positions": torch.from_numpy(np.asarray(data["atom14_positions"], dtype=np.float32)),
+            "atom14_mask": torch.from_numpy(np.asarray(data["atom14_mask"], dtype=bool)),
+        }
+    ca_coords = labels["ca_coords"]
+    ca_mask = labels["ca_mask"]
     if ca_coords.ndim != 2 or ca_coords.shape[-1] != 3:
         raise ValueError(f"Invalid ca_coords shape in {label_path}: {tuple(ca_coords.shape)}")
     if ca_mask.ndim != 1:
         raise ValueError(f"Invalid ca_mask shape in {label_path}: {tuple(ca_mask.shape)}")
     if ca_coords.shape[0] != ca_mask.shape[0]:
         raise ValueError(f"Label length mismatch in {label_path}")
+    atom14_positions = labels["atom14_positions"]
+    if atom14_positions.ndim != 3 or atom14_positions.shape[1:] != (14, 3):
+        raise ValueError(f"Invalid atom14_positions shape in {label_path}: {tuple(atom14_positions.shape)}")
+    if atom14_positions.shape[0] != ca_coords.shape[0]:
+        raise ValueError(f"atom14_positions length mismatch in {label_path}")
+    atom14_mask = labels["atom14_mask"]
+    if atom14_mask.ndim != 2 or atom14_mask.shape[1] != 14:
+        raise ValueError(f"Invalid atom14_mask shape in {label_path}: {tuple(atom14_mask.shape)}")
+    if atom14_mask.shape[0] != ca_coords.shape[0]:
+        raise ValueError(f"atom14_mask length mismatch in {label_path}")
+
     L = int(ca_coords.shape[0])
     if L <= crop_size:
-        return ca_coords, ca_mask
+        return labels
     if crop_mode == "center":
         start = (L - crop_size) // 2
     elif crop_mode == "random":
@@ -72,15 +92,28 @@ def _load_label_crop(
     else:
         raise ValueError(f"Unsupported crop_mode={crop_mode!r}")
     end = start + crop_size
-    return ca_coords[start:end], ca_mask[start:end]
+    cropped = dict(labels)
+    cropped["ca_coords"] = labels["ca_coords"][start:end]
+    cropped["ca_mask"] = labels["ca_mask"][start:end]
+    cropped["atom14_positions"] = labels["atom14_positions"][start:end]
+    cropped["atom14_mask"] = labels["atom14_mask"][start:end]
+    return cropped
 
 
-def _lddt_for_chain(pred_ca: torch.Tensor, true_ca: torch.Tensor, ca_mask: torch.Tensor) -> float:
-    L = min(int(pred_ca.shape[0]), int(true_ca.shape[0]), int(ca_mask.shape[0]))
-    if L <= 0:
-        return float("nan")
-    score = lddt_ca(pred_ca[:L], true_ca[:L], ca_mask[:L])
-    return float(score.detach().cpu())
+def _score_chain(
+    *,
+    pred_atom14: torch.Tensor,
+    labels: Dict[str, torch.Tensor],
+) -> Dict[str, float]:
+    has_atom14_labels = "atom14_positions" in labels and "atom14_mask" in labels
+    if not has_atom14_labels:
+        raise ValueError("FoldScore scoring requires label atom14_positions/atom14_mask.")
+    comps = foldscore_components(
+        pred_atom14=pred_atom14,
+        true_atom14=labels["atom14_positions"],
+        atom14_mask=labels["atom14_mask"],
+    )
+    return {name: float(value.detach().cpu()) for name, value in comps.items()}
 
 
 def _prediction_subdir(pred_root: Path, ckpt_path: str, n_ckpts: int) -> Path:
@@ -115,23 +148,43 @@ def _validate_hidden_axis(checkpoint_rows: List[Dict[str, Any]], sample_budget: 
 
 def _hidden_curve_metrics(checkpoint_rows: List[Dict[str, Any]], *, sample_budget: int) -> Dict[str, Any]:
     rows = _validate_hidden_axis(checkpoint_rows, sample_budget=sample_budget)
-    final_hidden = float(rows[-1]["mean_lddt_ca"])
-    if len(rows) == 1:
-        auc_hidden = final_hidden
-    else:
-        area = 0.0
-        for idx in range(1, len(rows)):
-            x0 = float(rows[idx - 1]["cumulative_samples_seen"])
-            x1 = float(rows[idx]["cumulative_samples_seen"])
-            y0 = float(rows[idx - 1]["mean_lddt_ca"])
-            y1 = float(rows[idx]["mean_lddt_ca"])
-            area += (x1 - x0) * (y0 + y1) * 0.5
-        auc_hidden = area / max(float(sample_budget), 1.0)
+    final_hidden = float(rows[-1]["mean_foldscore"])
+    auc_hidden = foldscore_auc(
+        (
+            (
+                int(row["step"]),
+                int(row["cumulative_samples_seen"]),
+                float(row["mean_foldscore"]),
+            )
+            for row in rows
+        ),
+        sample_budget=sample_budget,
+    )
+    lddt_auc = foldscore_auc(
+        (
+            (
+                int(row["step"]),
+                int(row["cumulative_samples_seen"]),
+                float(row.get("mean_lddt_ca", row["mean_foldscore"])),
+            )
+            for row in rows
+        ),
+        sample_budget=sample_budget,
+    )
     return {
-        "final_hidden_lddt_ca": final_hidden,
-        "lddt_auc_hidden": auc_hidden,
-        "lddt_at_steps": {str(int(row["step"])): float(row["mean_lddt_ca"]) for row in rows},
-        "lddt_at_samples": {str(int(row["cumulative_samples_seen"])): float(row["mean_lddt_ca"]) for row in rows},
+        "final_hidden_foldscore": final_hidden,
+        "foldscore_auc_hidden": auc_hidden,
+        "foldscore_at_steps": {str(int(row["step"])): float(row["mean_foldscore"]) for row in rows},
+        "foldscore_at_samples": {
+            str(int(row["cumulative_samples_seen"])): float(row["mean_foldscore"]) for row in rows
+        },
+        "final_hidden_lddt_ca": float(rows[-1].get("mean_lddt_ca", final_hidden)),
+        "lddt_auc_hidden": lddt_auc,
+        "lddt_at_steps": {str(int(row["step"])): float(row.get("mean_lddt_ca", row["mean_foldscore"])) for row in rows},
+        "lddt_at_samples": {
+            str(int(row["cumulative_samples_seen"])): float(row.get("mean_lddt_ca", row["mean_foldscore"]))
+            for row in rows
+        },
         "checkpoint_metrics_hidden": rows,
     }
 
@@ -164,7 +217,6 @@ def main() -> None:
     crop_mode = args.crop_mode.strip() or str(prediction_summary.get("crop_mode", "center"))
     split = str(prediction_summary["split"])
     n_ckpts = len(checkpoints)
-
     per_chain_rows: List[Dict[str, Any]] = []
     scored_checkpoints: List[Dict[str, Any]] = []
     scoring_start = time.perf_counter()
@@ -172,7 +224,12 @@ def main() -> None:
     for item in checkpoints:
         ckpt_path = str(item["ckpt"])
         pred_dir = _prediction_subdir(pred_root, ckpt_path, n_ckpts=n_ckpts)
-        chain_scores: List[float] = []
+        chain_metrics: Dict[str, List[float]] = {
+            "foldscore": [],
+            "lddt_ca": [],
+            "lddt_backbone_atom14": [],
+            "lddt_atom14": [],
+        }
         ckpt_start = time.perf_counter()
 
         for chain_id in chain_ids:
@@ -180,16 +237,22 @@ def main() -> None:
             if not pred_path.exists():
                 raise FileNotFoundError(f"Missing prediction file for scoring: {pred_path}")
             with np.load(pred_path) as pred_npz:
-                pred_ca = torch.from_numpy(np.asarray(pred_npz["pred_ca"], dtype=np.float32))
-            true_ca, ca_mask = _load_label_crop(
+                if "pred_atom14" not in pred_npz:
+                    raise ValueError(f"Prediction file is missing required `pred_atom14`: {pred_path}")
+                pred_atom14 = torch.from_numpy(np.asarray(pred_npz["pred_atom14"], dtype=np.float32))
+            labels = _load_label_crop(
                 labels_dir=labels_dir,
                 chain_id=chain_id,
                 crop_size=crop_size,
                 crop_mode=crop_mode,
             )
-            chain_score = _lddt_for_chain(pred_ca, true_ca, ca_mask)
-            if not np.isnan(chain_score):
-                chain_scores.append(chain_score)
+            metrics = _score_chain(
+                pred_atom14=pred_atom14,
+                labels=labels,
+            )
+            for name, value in metrics.items():
+                if not np.isnan(value):
+                    chain_metrics[name].append(float(value))
             per_chain_rows.append(
                 {
                     "split": split,
@@ -197,13 +260,13 @@ def main() -> None:
                     "step": int(item.get("step", 0)),
                     "cumulative_samples_seen": int(item.get("cumulative_samples_seen", -1)),
                     "chain_id": chain_id,
-                    "lddt_ca": chain_score,
+                    **metrics,
                 }
             )
 
-        mean_score = float(sum(chain_scores) / len(chain_scores)) if chain_scores else float("nan")
         scored_row = dict(item)
-        scored_row["mean_lddt_ca"] = mean_score
+        for name, values in chain_metrics.items():
+            scored_row[f"mean_{name}"] = float(sum(values) / len(values)) if values else float("nan")
         scored_row["num_chains"] = len(chain_ids)
         scored_row["score_wall_time_seconds"] = float(time.perf_counter() - ckpt_start)
         scored_checkpoints.append(scored_row)
@@ -227,7 +290,10 @@ def main() -> None:
         "manifest_path": str(manifest_path),
         "num_checkpoints": len(scored_checkpoints),
         "checkpoints": scored_checkpoints,
+        "mean_foldscore": float(final_row["mean_foldscore"]),
         "mean_lddt_ca": float(final_row["mean_lddt_ca"]),
+        "mean_lddt_backbone_atom14": float(final_row.get("mean_lddt_backbone_atom14", float("nan"))),
+        "mean_lddt_atom14": float(final_row.get("mean_lddt_atom14", float("nan"))),
         "num_chains": int(final_row["num_chains"]),
         "effective_batch_size": int(prediction_summary.get("effective_batch_size", 0)),
         "sample_budget": int(prediction_summary.get("sample_budget", 0)),

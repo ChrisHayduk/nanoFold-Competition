@@ -14,7 +14,7 @@ def test_resume_metadata_mismatches_detects_all_key_differences() -> None:
         },
         submission_entrypoint_sha256="new-submission",
         config_sha256="new-config",
-        track_id="limited_large_v3",
+        track_id="limited_large",
         fingerprint_sha256="new-fingerprint",
         n_params=456,
     )
@@ -26,20 +26,20 @@ def test_resume_metadata_mismatches_detects_all_key_differences() -> None:
     assert any(item.startswith("n_params:") for item in mismatches)
 
 
-def test_resume_metadata_mismatches_accepts_legacy_track_field() -> None:
+def test_resume_metadata_mismatches_requires_track_id() -> None:
     mismatches = resume_metadata_mismatches(
         ckpt_obj={
             "submission_entrypoint_sha256": "same",
             "config_sha256": "same",
-            "track": "limited_large_v3",
+            "track": "limited_large",
             "fingerprint_sha256": None,
             "n_params": 42,
         },
         submission_entrypoint_sha256="same",
         config_sha256="same",
-        track_id="limited_large_v3",
+        track_id="limited_large",
         fingerprint_sha256=None,
         n_params=42,
     )
 
-    assert mismatches == []
+    assert any(item.startswith("track_id:") for item in mismatches)

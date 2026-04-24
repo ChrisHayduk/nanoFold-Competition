@@ -13,7 +13,7 @@ Single maintainer end-to-end flow for official data refresh:
   4) rebuild official dataset fingerprint
 
 Options:
-  --track-id <id>                     Track id metadata for fingerprint (default: limited_large_v3)
+  --track-id <id>                     Track id metadata for fingerprint (default: limited_large)
   --data-root <path>                  Download root (default: data/openproteinset)
   --manifests-dir <path>              Manifest directory (default: data/manifests)
   --processed-features-dir <path>     Feature NPZ output dir (default: data/processed_features)
@@ -23,14 +23,15 @@ Options:
   --lock-file <path>                  Official manifest lock file
                                       (default: leaderboard/official_manifest_source.lock.json)
   --track-file <path>                 Track policy YAML to update/check
-                                      (default: tracks/limited_large_v3.yaml)
+                                      (default: tracks/limited_large.yaml)
   --fingerprint-out <path>            Fingerprint output path
                                       (default: leaderboard/official_dataset_fingerprint.json)
   --rewrite-lock                      Rewrite lock metadata after manifest regeneration
   --skip-manifest-regen               Skip manifest regeneration step
   --skip-setup                        Skip download+preprocess step
   --skip-fingerprint                  Skip fingerprint rebuild step
-  --disable-templates                 Pass through to setup_official_data.sh
+  --enable-templates                  Pass through to setup_official_data.sh
+  --disable-templates                 Pass through to setup_official_data.sh (default)
   --download-retries <int>            Pass through to setup_official_data.sh (default: 2)
   --download-retry-delay-seconds <f>  Pass through to setup_official_data.sh (default: 2.0)
   --dry-run                           Print commands without executing
@@ -41,18 +42,18 @@ EOF
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 
-TRACK_ID="limited_large_v3"
+TRACK_ID="limited_large"
 DATA_ROOT="data/openproteinset"
 MANIFESTS_DIR="data/manifests"
 PROCESSED_FEATURES_DIR="data/processed_features"
 PROCESSED_LABELS_DIR="data/processed_labels"
 CHAIN_DATA_CACHE="data/openproteinset/pdb_data/data_caches/chain_data_cache.json"
 LOCK_FILE="leaderboard/official_manifest_source.lock.json"
-TRACK_FILE="tracks/limited_large_v3.yaml"
+TRACK_FILE="tracks/limited_large.yaml"
 FINGERPRINT_OUT="leaderboard/official_dataset_fingerprint.json"
 DOWNLOAD_RETRIES=2
 DOWNLOAD_RETRY_DELAY_SECONDS=2.0
-USE_TEMPLATES=1
+USE_TEMPLATES=0
 REWRITE_LOCK=0
 SKIP_MANIFEST_REGEN=0
 SKIP_SETUP=0
@@ -115,6 +116,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --disable-templates)
       USE_TEMPLATES=0
+      shift 1
+      ;;
+    --enable-templates)
+      USE_TEMPLATES=1
       shift 1
       ;;
     --download-retries)
@@ -225,6 +230,8 @@ if [[ "$SKIP_SETUP" -eq 0 ]]; then
   )
   if [[ "$USE_TEMPLATES" -eq 0 ]]; then
     SETUP_CMD+=(--disable-templates)
+  else
+    SETUP_CMD+=(--enable-templates)
   fi
   if [[ "$DRY_RUN" -eq 1 ]]; then
     SETUP_CMD+=(--dry-run)

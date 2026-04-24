@@ -36,22 +36,22 @@ def render_table(entries: List[Dict[str, Any]]) -> str:
     def _rank_score(entry: Dict[str, Any]) -> float:
         try:
             v = float(
-                entry.get("rank_score", entry.get("score_hidden_lddt_ca", entry.get("score_lddt_ca", float("nan"))))
+                entry.get("rank_score", entry.get("foldscore_auc_hidden", entry.get("score_hidden_foldscore", float("nan"))))
             )
         except Exception:
             return float("-inf")
         return v if not math.isnan(v) else float("-inf")
 
     lines = []
-    lines.append("| # | Rank Score | Hidden Final | Hidden AUC | Public Val | Track | Date | Commit | Description |")
-    lines.append("|---:|---:|---:|---:|---:|---|---|---|---|")
+    lines.append("| # | FoldScore AUC | Hidden FoldScore | Public FoldScore | Track | Date | Commit | Description |")
+    lines.append("|---:|---:|---:|---:|---|---|---|---|")
     sorted_entries = sorted(entries, key=lambda x: (-_rank_score(x), str(x.get("date", ""))))
     for i, e in enumerate(sorted_entries, start=1):
         commit = e.get("commit", "")[:7]
-        hidden = e.get("score_hidden_lddt_ca", e.get("final_hidden_lddt_ca", float("nan")))
-        public = e.get("score_public_val_lddt_ca", e.get("score_lddt_ca", float("nan")))
+        hidden = e.get("score_hidden_foldscore", e.get("final_hidden_foldscore", e.get("score_hidden_lddt_ca", float("nan"))))
+        public = e.get("score_public_val_foldscore", e.get("public_val_foldscore", e.get("score_public_val_lddt_ca", float("nan"))))
         lines.append(
-            f"| {i} | {_fmt_score(e.get('rank_score', hidden))} | {_fmt_score(hidden)} | {_fmt_score(e.get('lddt_auc_hidden', float('nan')))} | {_fmt_score(public)} | {e.get('track','')} | {e.get('date','')} | `{commit}` | {e.get('description','')} |"
+            f"| {i} | {_fmt_score(e.get('rank_score', e.get('foldscore_auc_hidden', hidden)))} | {_fmt_score(hidden)} | {_fmt_score(public)} | {e.get('track','')} | {e.get('date','')} | `{commit}` | {e.get('description','')} |"
         )
     return "\n".join(lines)
 

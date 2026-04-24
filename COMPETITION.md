@@ -1,16 +1,30 @@
 # Competition Rules and Official Protocol
 
-This document defines the enforceable contract for official leaderboard runs.
+nanoFold is a protein-folding slowrun: a fixed-data, fixed-budget benchmark for learning useful structure under biological data scarcity.
+
+The point of the competition is not to approximate production AlphaFold systems with more retrieval or bigger pretrained priors. It is to ask a sharper research question: when the training set is fixed and comparatively small, which architectures, losses, curricula, and biological inductive biases learn the most?
+
+Official rules are strict because the benchmark is only meaningful if the scarce-data premise is real. External structures, pretrained weights, network retrieval, and template lookup can all blur the line between learning from the official train set and importing knowledge from outside it.
+
+## Design Principles
+
+- Reward data efficiency, not just final checkpoint quality.
+- Make biological priors compete under the same sample budget.
+- Keep hidden labels sealed from submission code.
+- Make dataset and preprocessing changes auditable through fingerprints.
+- Prefer boring, enforceable rules over ambiguous leaderboard judgment calls.
+
+The rest of this document is the enforceable contract for official leaderboard runs.
 
 ## 1) Track Source of Truth
 
 Track policy is defined in `tracks/*.yaml`.
 
 Official leaderboard track:
-- `limited_large_v3`
+- `limited_large`
 
 Official runs must use:
-- `--track limited_large_v3`
+- `--track limited_large`
 - `--official`
 
 In official mode the runtime uses **override + validate**:
@@ -24,22 +38,47 @@ Allowed:
 - benchmark data produced by this repo’s preprocessing path
 - architecture/optimizer/loss changes
 - curriculum/sampling over provided benchmark data
+- train-from-scratch biological priors implemented directly in submission code
 
 Disallowed:
 - external sequences, structures, pretrained weights, checkpoints
 - external MSA/template retrieval
 - network downloads during official execution
 
+Official template policy:
+- template feature tensors are part of the schema, but official preprocessing uses `T=0`
+- a future template-enabled track must add release-date and homology leakage filtering before templates can affect ranking
+
+Rationale: if templates are enabled without a stronger policy, the contest risks rewarding target-template lookup instead of architectures that learn from limited data.
+
 Validation and runtime guardrails:
 - `scripts/validate_submission.py` blocks large artifacts and forbidden weight extensions
 - suspicious network/download imports are flagged
 - official Docker runner uses `--network=none`
 
-## 3) Split Data Contract (Breaking Format)
+## 3) Split Data Contract
 
 Official preprocessing outputs split artifacts per chain:
 - `processed_features/<chain_id>.npz`
 - `processed_labels/<chain_id>.npz`
+
+Required feature NPZ keys (per chain):
+- `aatype (L,) int32`
+- `msa (N,L) int32`
+- `deletions (N,L) int32`
+- `template_aatype (T,L) int32`
+- `template_ca_coords (T,L,3) float32`
+- `template_ca_mask (T,L) bool`
+
+Required label NPZ keys (per chain):
+- `ca_coords (L,3) float32`
+- `ca_mask (L,) bool`
+- `atom14_positions (L,14,3) float32` — full AF2 atom14 layout
+- `atom14_mask (L,14) bool` — 1 where coordinate was present in mmCIF
+
+Optional label NPZ keys:
+- `residue_index (L,) int32` — contiguous 0..L-1 (AF2 supplement 1.2.9)
+- `resolution () float32` — Å; 0.0 when unknown
 
 Config fields:
 - `data.processed_features_dir`
@@ -50,6 +89,11 @@ Official eval path is features-only for submission runtime:
 - hidden labels are used only in maintainer scoring stage, outside submission runtime
 - official hidden prediction rejects configs that set `data.processed_labels_dir`
 
+Fingerprint contract:
+- `leaderboard/official_dataset_fingerprint.json` pins manifest metadata, split file hashes, source-lock hash, and `preprocess_config_sha256`
+- `preprocess_config_sha256` is hashed from `<processed_features_dir>/preprocess_meta.json`, so preprocessing flag changes invalidate the fingerprint
+- hidden prediction may use `features_only` comparison so labels stay absent from the prediction runtime
+
 ## 4) Submission Interface Contract
 
 Submission entrypoint (`submissions/<name>/submission.py`) must implement:
@@ -59,7 +103,8 @@ Submission entrypoint (`submissions/<name>/submission.py`) must implement:
 - optional: `build_scheduler(cfg, optimizer)`
 
 `run_batch` requirements:
-- always return `pred_ca` shaped `(B, L, 3)` with floating dtype and finite values
+- return `pred_atom14` shaped `(B, L, 14, 3)`
+- runtime artifacts derive the Cα diagnostic view from atom14 slot 1
 - return scalar finite `loss` when `training=True`
 - training `loss` must require gradients
 - support unlabeled inference path (`training=False`)
@@ -73,6 +118,7 @@ Enforced by:
 Official split definition:
 - train: `10,000` chains
 - val: `1,000` chains
+- hidden val: `1,000` chains
 
 Protected official manifests:
 - `data/manifests/train.txt`
@@ -111,7 +157,7 @@ Fingerprint includes:
 - chain-id digest
 - feature file hash aggregate
 - label file hash aggregate
-- schema version and optional track/lock metadata
+- track, source-lock, and preprocessing metadata
 
 Official mode requirements:
 - pinned manifest SHA checks
@@ -125,7 +171,7 @@ Official budget definitions:
 - sample budget: `B_sample = max_steps * effective_batch_size`
 - residue budget: `B_res = max_steps * effective_batch_size * crop_size`
 
-Official constants (`limited_large_v3`):
+Official constants (`limited_large`):
 - `seed = 0`
 - `crop_size = 256`
 - `msa_depth = 192`
@@ -140,28 +186,31 @@ Runtime reproducibility:
 
 ## 8) Scoring and Ranking
 
-Metric:
-- lDDT-Ca (`cutoff=15.0A`, thresholds `[0.5,1.0,2.0,4.0]`)
+Primary metric:
+- `FoldScore = 0.55*lDDT-Ca + 0.30*lDDT-backbone-atom14 + 0.15*lDDT-all-atom14`
+- all components use `cutoff=15.0A`, thresholds `[0.5,1.0,2.0,4.0]`, label masks, and equal chain weighting
 
 Leaderboard ranking metric:
-- `lddt_auc_hidden`
+- `foldscore_auc_hidden`, trapezoidal AUC over cumulative samples on `[0, B_sample]`
+
+Why AUC: the competition is a slowrun, so learning speed matters. A method that learns robust geometry earlier in the sample budget should be rewarded, even when final checkpoint scores are close.
 
 Secondary metrics:
-- `final_hidden_lddt_ca`
-- `lddt_at_steps` (`0`, `1000`, `2000`, `5000`, `last` by default)
-- `lddt_at_samples`
+- `final_hidden_foldscore`
+- `foldscore_at_steps` (`0`, `1000`, `2000`, `5000`, `last` by default)
+- `foldscore_at_samples`
+- `final_hidden_lddt_ca` and `lddt_at_*` diagnostics
 - public val score is retained for diagnostics only
 
 Canonical result artifact:
 - `runs/<run_name>/result.json`
-- schema versioned (`schema_version`)
 
 ## 9) Official Hidden Pipeline
 
 Canonical maintainer runner:
 
 ```bash
-python scripts/run_official.py --submission submissions/<name> --track limited_large_v3 --update-leaderboard
+python scripts/run_official.py --submission submissions/<name> --track limited_large --update-leaderboard
 ```
 
 Hidden assets are resolved via env (or explicit CLI overrides):
@@ -188,7 +237,7 @@ Hidden leaderboard runs must execute in a sealed runtime. The supported maintain
 Containerized no-network execution:
 
 ```bash
-bash scripts/run_official_docker.sh --submission submissions/<name> --track limited_large_v3 --update-leaderboard
+bash scripts/run_official_docker.sh --submission submissions/<name> --track limited_large --update-leaderboard
 ```
 
 ## 10) CI and PR Guardrails
@@ -207,7 +256,7 @@ Protected manifest PR rule:
 ## 11) Submitter Self-Check
 
 ```bash
-python scripts/validate_submission.py --submission submissions/<your_name> --track limited_large_v3 --strict
+python scripts/validate_submission.py --submission submissions/<your_name> --track limited_large --strict
 if git diff --name-only origin/main...HEAD | grep -Eq '^data/manifests/(train|val)\.txt$'; then
   echo "ERROR: PR edits protected manifests (train/val)."
   exit 1

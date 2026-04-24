@@ -110,17 +110,7 @@ def normalize_num_workers(n: int) -> int:
     return n
 
 
-def _sha256_file(path: str | Path) -> str:
-    import hashlib
-
-    hasher = hashlib.sha256()
-    with Path(path).open("rb") as f:
-        while True:
-            chunk = f.read(1024 * 1024)
-            if not chunk:
-                break
-            hasher.update(chunk)
-    return hasher.hexdigest()
+from nanofold.utils import sha256_file as _sha256_file
 
 
 def _guidance_for_missing_data(track_spec: TrackSpec) -> str:
@@ -152,8 +142,6 @@ def resume_metadata_mismatches(
     mismatches: list[str] = []
     for key, expected in expected_pairs.items():
         actual = ckpt_obj.get(key)
-        if key == "track_id" and actual is None:
-            actual = ckpt_obj.get("track")
         if actual != expected:
             mismatches.append(f"{key}: expected={expected!r}, actual={actual!r}")
     return mismatches
@@ -328,7 +316,6 @@ def main() -> None:
         print(f"Fingerprint verification succeeded: {Path(fingerprint_path).resolve()}")
 
     hooks = load_submission_hooks(cfg, config_path, allowed_root=config_path.parent)
-
     run_name = cfg.get("run_name", "run")
     paths = RunPaths.from_run_name(run_name)
     ensure_dir(paths.run_dir)
@@ -452,7 +439,6 @@ def main() -> None:
             "submission_entrypoint_sha256": hooks.source_sha256,
             "config": cfg,
             "config_sha256": config_sha256,
-            "track": track_spec.track_id,
             "track_id": track_spec.track_id,
             "n_params": n_params,
             "effective_batch_size": effective_batch_size,
@@ -592,7 +578,13 @@ def main() -> None:
             for batch in tqdm(val_loader, desc="val", leave=False):
                 batch = to_device(batch, device)
                 with make_autocast_ctx(device=device, enabled=use_amp):
-                    out = run_submission_batch(hooks, model=model, batch=batch, cfg=cfg, training=False)
+                    out = run_submission_batch(
+                        hooks,
+                        model=model,
+                        batch=batch,
+                        cfg=cfg,
+                        training=False,
+                    )
                 pred_ca = out["pred_ca"]
                 score = batch_lddt_ca(pred_ca, batch["ca_coords"], batch["ca_mask"], batch["residue_mask"])
                 scores.append(score.detach().cpu())
@@ -623,17 +615,23 @@ def main() -> None:
             nonpad_residues_this_step += int(batch["residue_mask"].sum().item())
 
             with make_autocast_ctx(device=device, enabled=use_amp):
-                out = run_submission_batch(hooks, model=model, batch=batch, cfg=cfg, training=True)
+                out = run_submission_batch(
+                    hooks,
+                    model=model,
+                    batch=batch,
+                    cfg=cfg,
+                    training=True,
+                )
                 raw_loss = out["loss"]
                 if not raw_loss.requires_grad:
                     # Some batches may have no valid supervision and return a constant
                     # scalar loss. Anchor it to model outputs so backward() stays valid.
-                    pred_ca = out.get("pred_ca", None)
-                    if torch.is_tensor(pred_ca):
-                        raw_loss = raw_loss + pred_ca.sum() * 0.0
+                    pred_atom14 = out.get("pred_atom14", None)
+                    if torch.is_tensor(pred_atom14):
+                        raw_loss = raw_loss + pred_atom14.sum() * 0.0
                     else:
                         raise RuntimeError(
-                            "Submission returned a non-differentiable `loss` and no `pred_ca` tensor "
+                            "Submission returned a non-differentiable `loss` and no `pred_atom14` tensor "
                             "to anchor gradients."
                         )
                 loss = raw_loss / grad_accum_steps

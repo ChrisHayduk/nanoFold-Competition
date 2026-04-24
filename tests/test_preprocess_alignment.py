@@ -6,6 +6,9 @@ import sys
 
 import numpy as np
 
+from nanofold.a3m import ungap_query_columns
+from nanofold.residue_constants import ATOM14_NUM_SLOTS, CA_ATOM14_SLOT
+
 
 def _load_preprocess_module():
     module_path = Path("scripts/preprocess.py").resolve()
@@ -19,13 +22,14 @@ def _load_preprocess_module():
 
 
 def test_ungap_query_columns_removes_query_gap_positions() -> None:
-    module = _load_preprocess_module()
-    fn = getattr(module, "_ungap_query_columns")
-
     msa = np.asarray([[1, 2, 3, 4], [5, 6, 7, 8]], dtype=np.int32)
     deletions = np.asarray([[0, 1, 0, 0], [0, 0, 2, 0]], dtype=np.int32)
 
-    out_msa, out_deletions, target_seq = fn(msa=msa, deletions=deletions, query_aligned="A-CD")
+    out_msa, out_deletions, target_seq = ungap_query_columns(
+        msa=msa,
+        deletions=deletions,
+        query_aligned="A-CD",
+    )
     assert target_seq == "ACD"
     assert out_msa.shape == (2, 3)
     assert out_deletions.shape == (2, 3)
@@ -65,25 +69,35 @@ def test_parse_hhr_hits_preserves_file_order_and_alignment_strings(tmp_path: Pat
     assert matches == 3
 
 
-def test_project_structure_to_query_reports_alignment_provenance() -> None:
+def test_project_atom14_to_query_reports_alignment_provenance() -> None:
     module = _load_preprocess_module()
-    project = getattr(module, "_project_structure_to_query")
+    project = getattr(module, "_project_atom14_to_query")
 
     query_seq = "ACDE"
     structure_seq = "ACDF"
-    coords = np.zeros((4, 3), dtype=np.float32)
-    mask = np.asarray([True, True, True, False], dtype=bool)
+    L_s = len(structure_seq)
+    atom14_positions = np.zeros((L_s, ATOM14_NUM_SLOTS, 3), dtype=np.float32)
+    atom14_mask = np.zeros((L_s, ATOM14_NUM_SLOTS), dtype=bool)
+    # Mark CA present for the first 3 residues.
+    atom14_mask[:3, CA_ATOM14_SLOT] = True
+    # Give each CA a distinct coordinate so we can verify copying.
+    atom14_positions[:3, CA_ATOM14_SLOT, 0] = np.arange(3, dtype=np.float32)
 
-    out_coords, out_mask, stats = project(
+    out_positions, out_mask, stats = project(
         query_seq=query_seq,
         structure_seq=structure_seq,
-        structure_ca_coords=coords,
-        structure_ca_mask=mask,
+        structure_atom14_positions=atom14_positions,
+        structure_atom14_mask=atom14_mask,
     )
 
-    assert out_coords.shape == (4, 3)
-    assert out_mask.shape == (4,)
-    assert float(stats["projection_seq_identity"]) == 1.0
-    assert float(stats["projection_alignment_coverage"]) == 0.75
-    assert float(stats["projection_aligned_fraction"]) == 0.75
+    assert out_positions.shape == (len(query_seq), ATOM14_NUM_SLOTS, 3)
+    assert out_mask.shape == (len(query_seq), ATOM14_NUM_SLOTS)
+    # BioPython global aligner aligns all 4 positions (ACDE vs ACDF): 3 matches, 1 mismatch.
+    assert float(stats["projection_seq_identity"]) == 0.75
+    assert float(stats["projection_alignment_coverage"]) == 1.0
+    assert float(stats["projection_aligned_fraction"]) == 1.0
+    # Only 3 residues have CA coordinates present in the structure mask.
     assert float(stats["projection_valid_ca_count"]) == 3.0
+    # Check CA coordinates copied through for aligned residues.
+    assert float(out_positions[0, CA_ATOM14_SLOT, 0]) == 0.0
+    assert float(out_positions[2, CA_ATOM14_SLOT, 0]) == 2.0

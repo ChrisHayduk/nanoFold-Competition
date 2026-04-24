@@ -18,7 +18,14 @@ FEATURE_KEYS = (
     "template_ca_mask",
 )
 
-LABEL_KEYS = ("ca_coords", "ca_mask")
+# Required keys every label NPZ must carry.
+LABEL_KEYS = ("ca_coords", "ca_mask", "atom14_positions", "atom14_mask")
+
+# Extra keys produced by the current preprocessing pipeline.
+OPTIONAL_LABEL_KEYS = (
+    "residue_index",
+    "resolution",
+)
 
 
 @dataclass(frozen=True)
@@ -162,8 +169,27 @@ class ProcessedNPZDataset(Dataset):
             if not labels_path.exists():
                 raise FileNotFoundError(f"Missing label file: {labels_path}")
             with np.load(labels_path) as label_data:
+                missing = [key for key in LABEL_KEYS if key not in label_data]
+                if missing:
+                    raise KeyError(f"Label file {labels_path} is missing required keys: {', '.join(missing)}")
+
                 out["ca_coords"] = torch.from_numpy(label_data["ca_coords"]).float()  # (L,3)
                 out["ca_mask"] = torch.from_numpy(label_data["ca_mask"]).bool()  # (L,)
+                out["atom14_positions"] = torch.from_numpy(
+                    np.asarray(label_data["atom14_positions"], dtype=np.float32)
+                )  # (L,14,3)
+                out["atom14_mask"] = torch.from_numpy(
+                    np.asarray(label_data["atom14_mask"], dtype=bool)
+                )  # (L,14)
+                if "residue_index" in label_data:
+                    out["residue_index"] = torch.from_numpy(
+                        np.asarray(label_data["residue_index"], dtype=np.int64)
+                    )  # (L,)
+                if "resolution" in label_data:
+                    out["resolution"] = torch.tensor(
+                        float(np.asarray(label_data["resolution"]).item()),
+                        dtype=torch.float32,
+                    )  # scalar
 
         return out
 
@@ -193,6 +219,13 @@ def _crop_single_example(example: Dict[str, torch.Tensor], crop_size: int, crop_
         cropped["ca_coords"] = example["ca_coords"][start:end]
     if "ca_mask" in example:
         cropped["ca_mask"] = example["ca_mask"][start:end]
+    if "atom14_positions" in example:
+        cropped["atom14_positions"] = example["atom14_positions"][start:end]
+    if "atom14_mask" in example:
+        cropped["atom14_mask"] = example["atom14_mask"][start:end]
+    if "residue_index" in example:
+        cropped["residue_index"] = example["residue_index"][start:end]
+    # resolution is a scalar, passes through unchanged.
     return cropped
 
 
@@ -234,6 +267,22 @@ def collate_batch(
     has_labels = all(("ca_coords" in ex and "ca_mask" in ex) for ex in examples)
     if any(("ca_coords" in ex or "ca_mask" in ex) for ex in examples) and not has_labels:
         raise ValueError("Inconsistent supervision presence inside one batch.")
+
+    has_atom14 = all(
+        ("atom14_positions" in ex and "atom14_mask" in ex) for ex in examples
+    )
+    if has_labels and not has_atom14:
+        raise ValueError("Labelled batches require atom14 supervision.")
+    if any(("atom14_positions" in ex or "atom14_mask" in ex) for ex in examples) and not has_atom14:
+        raise ValueError("Inconsistent atom14 supervision presence inside one batch.")
+
+    has_residue_index = all("residue_index" in ex for ex in examples)
+    if any("residue_index" in ex for ex in examples) and not has_residue_index:
+        raise ValueError("Inconsistent residue_index presence inside one batch.")
+
+    has_resolution = all("resolution" in ex for ex in examples)
+    if any("resolution" in ex for ex in examples) and not has_resolution:
+        raise ValueError("Inconsistent resolution presence inside one batch.")
 
     for ex in examples:
         chain_ids.append(str(ex["chain_id"]))
@@ -285,6 +334,18 @@ def collate_batch(
         out[:T, :L] = x
         return out
 
+    def pad_atom14_coords(x: torch.Tensor) -> torch.Tensor:
+        L, A, _ = x.shape
+        out = torch.zeros((max_L, A, 3), dtype=x.dtype)
+        out[:L] = x
+        return out
+
+    def pad_atom14_mask(x: torch.Tensor) -> torch.Tensor:
+        L, A = x.shape
+        out = torch.zeros((max_L, A), dtype=x.dtype)
+        out[:L] = x
+        return out
+
     aatype = torch.stack([pad_1d(item["aatype"], pad_value=0) for item in batch], dim=0)  # (B,L)
     msa = torch.stack([pad_2d(item["msa"], pad_value=21) for item in batch], dim=0)  # (B,N,L)
     deletions = torch.stack([pad_2d(item["deletions"], pad_value=0) for item in batch], dim=0)  # (B,N,L)
@@ -320,4 +381,19 @@ def collate_batch(
         out["ca_mask"] = torch.stack(
             [pad_1d(item["ca_mask"].to(torch.int64), pad_value=0).bool() for item in batch], dim=0
         )  # (B,L)
+    if has_atom14:
+        out["atom14_positions"] = torch.stack(
+            [pad_atom14_coords(item["atom14_positions"]) for item in batch], dim=0
+        )  # (B,L,14,3)
+        out["atom14_mask"] = torch.stack(
+            [pad_atom14_mask(item["atom14_mask"].to(torch.int64)).bool() for item in batch], dim=0
+        )  # (B,L,14)
+    if has_residue_index:
+        out["residue_index"] = torch.stack(
+            [pad_1d(item["residue_index"].to(torch.int64), pad_value=0) for item in batch], dim=0
+        )  # (B,L)
+    if has_resolution:
+        out["resolution"] = torch.stack(
+            [item["resolution"].float().reshape(()) for item in batch], dim=0
+        )  # (B,)
     return out

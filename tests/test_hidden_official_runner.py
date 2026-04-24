@@ -18,6 +18,11 @@ def _load_run_official_module():
     return module
 
 
+def _atom14_from_ca(ca: np.ndarray) -> np.ndarray:
+    atom14 = np.repeat(ca[:, None, :], 14, axis=1).astype(np.float32)
+    return atom14
+
+
 def test_hidden_scoring_with_synthetic_predictions(tmp_path: Path) -> None:
     module = _load_run_official_module()
     score_fn = getattr(module, "_score_hidden_predictions")
@@ -29,7 +34,15 @@ def test_hidden_scoring_with_synthetic_predictions(tmp_path: Path) -> None:
     labels_dir.mkdir()
     true_ca = np.zeros((8, 3), dtype=np.float32)
     ca_mask = np.ones((8,), dtype=bool)
-    np.savez_compressed(labels_dir / "1abc_A.npz", ca_coords=true_ca, ca_mask=ca_mask)
+    true_atom14 = _atom14_from_ca(true_ca)
+    atom14_mask = np.ones((8, 14), dtype=bool)
+    np.savez_compressed(
+        labels_dir / "1abc_A.npz",
+        ca_coords=true_ca,
+        ca_mask=ca_mask,
+        atom14_positions=true_atom14,
+        atom14_mask=atom14_mask,
+    )
 
     pred_root = tmp_path / "hidden_preds"
     pred_root.mkdir()
@@ -39,9 +52,17 @@ def test_hidden_scoring_with_synthetic_predictions(tmp_path: Path) -> None:
     (pred_root / "ckpt_step_0").mkdir()
     (pred_root / "ckpt_step_1000").mkdir()
     (pred_root / "ckpt_step_2000").mkdir()
-    np.savez_compressed(pred_root / "ckpt_step_0" / "1abc_A.npz", pred_ca=true_ca, masked_length=np.array(8))
-    np.savez_compressed(pred_root / "ckpt_step_1000" / "1abc_A.npz", pred_ca=true_ca, masked_length=np.array(8))
-    np.savez_compressed(pred_root / "ckpt_step_2000" / "1abc_A.npz", pred_ca=true_ca, masked_length=np.array(8))
+    np.savez_compressed(pred_root / "ckpt_step_0" / "1abc_A.npz", pred_atom14=true_atom14, masked_length=np.array(8))
+    np.savez_compressed(
+        pred_root / "ckpt_step_1000" / "1abc_A.npz",
+        pred_atom14=true_atom14,
+        masked_length=np.array(8),
+    )
+    np.savez_compressed(
+        pred_root / "ckpt_step_2000" / "1abc_A.npz",
+        pred_atom14=true_atom14,
+        masked_length=np.array(8),
+    )
 
     result = score_fn(
         hidden_manifest=manifest,
@@ -57,12 +78,12 @@ def test_hidden_scoring_with_synthetic_predictions(tmp_path: Path) -> None:
         per_chain_out_path=tmp_path / "per_chain_hidden.jsonl",
     )
 
-    assert result["final_hidden_lddt_ca"] == 1.0
-    assert result["lddt_auc_hidden"] == 1.0
-    assert result["lddt_at_steps"]["0"] == 1.0
-    assert result["lddt_at_steps"]["1000"] == 1.0
-    assert result["lddt_at_steps"]["2000"] == 1.0
-    assert result["lddt_at_samples"]["2000"] == 1.0
+    assert result["final_hidden_foldscore"] == 1.0
+    assert result["foldscore_auc_hidden"] == 1.0
+    assert result["foldscore_at_steps"]["0"] == 1.0
+    assert result["foldscore_at_steps"]["1000"] == 1.0
+    assert result["foldscore_at_steps"]["2000"] == 1.0
+    assert result["foldscore_at_samples"]["2000"] == 1.0
 
 
 def test_hidden_scoring_rejects_non_monotone_sample_axis(tmp_path: Path) -> None:
@@ -76,13 +97,21 @@ def test_hidden_scoring_rejects_non_monotone_sample_axis(tmp_path: Path) -> None
     labels_dir.mkdir()
     true_ca = np.zeros((8, 3), dtype=np.float32)
     ca_mask = np.ones((8,), dtype=bool)
-    np.savez_compressed(labels_dir / "1abc_A.npz", ca_coords=true_ca, ca_mask=ca_mask)
+    true_atom14 = _atom14_from_ca(true_ca)
+    atom14_mask = np.ones((8, 14), dtype=bool)
+    np.savez_compressed(
+        labels_dir / "1abc_A.npz",
+        ca_coords=true_ca,
+        ca_mask=ca_mask,
+        atom14_positions=true_atom14,
+        atom14_mask=atom14_mask,
+    )
 
     pred_root = tmp_path / "hidden_preds"
     pred_root.mkdir()
     for stem in ("ckpt_step_0", "ckpt_step_1000", "ckpt_step_2000"):
         (pred_root / stem).mkdir()
-        np.savez_compressed(pred_root / stem / "1abc_A.npz", pred_ca=true_ca, masked_length=np.array(8))
+        np.savez_compressed(pred_root / stem / "1abc_A.npz", pred_atom14=true_atom14, masked_length=np.array(8))
 
     with pytest.raises(ValueError, match="strictly increasing"):
         score_fn(
@@ -221,7 +250,7 @@ def test_official_runner_builds_predict_and_score_commands() -> None:
         python="python",
         config_path=Path("/tmp/config.yaml"),
         split="hidden_val",
-        track_id="limited_large_v3",
+        track_id="limited_large",
         official=True,
         pred_out_dir=Path("/tmp/preds"),
         save_path=Path("/tmp/predict.json"),

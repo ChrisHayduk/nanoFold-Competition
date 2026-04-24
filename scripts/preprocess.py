@@ -1,40 +1,3 @@
-from __future__ import annotations
-
-import argparse
-import difflib
-import json
-import re
-import sys
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
-
-import numpy as np
-try:
-    from Bio.Align import PairwiseAligner
-except Exception:  # pragma: no cover - fallback path depends on local environment
-    PairwiseAligner = None  # type: ignore[assignment]
-from tqdm import tqdm
-
-# Allow running as `python scripts/preprocess.py` from repo root (or via absolute script path).
-REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-
-from nanofold.a3m import read_a3m
-from nanofold.a3m import RESTYPE_TO_ID, UNK_ID
-try:
-    from nanofold.mmcif import extract_chain_ca, aatype_from_sequence
-except Exception:  # pragma: no cover - depends on optional gemmi runtime
-    extract_chain_ca = None  # type: ignore[assignment]
-
-    def aatype_from_sequence(sequence: str) -> np.ndarray:
-        return np.fromiter(
-            (RESTYPE_TO_ID.get(aa.upper(), UNK_ID) for aa in sequence),
-            dtype=np.int32,
-            count=len(sequence),
-        )
-
 """Preprocess raw OpenProteinSet/OpenFold data into compact per-chain .npz files.
 
 Input assumptions (adjust as needed):
@@ -43,7 +6,7 @@ Input assumptions (adjust as needed):
   - alignments_root/<chain_id>/ contains flattened OpenFold alignments from flatten_roda.sh
 - mmcif_root contains mmCIF files named like <pdb_id>.cif (lowercase)
 
-Output:
+Output (per chain):
 - processed_features_dir/<chain_id>.npz containing:
     aatype: (L,) int32
     msa: (N,L) int32
@@ -52,9 +15,42 @@ Output:
     template_ca_coords: (T,L,3) float32
     template_ca_mask: (T,L) bool
 - processed_labels_dir/<chain_id>.npz containing:
-    ca_coords: (L,3) float32
-    ca_mask: (L,) bool
+    ca_coords: (L,3) float32          # required
+    ca_mask: (L,) bool                # required
+    atom14_positions: (L,14,3) float32   # full atom14 layout (AF2 supplement 1.2.1)
+    atom14_mask: (L,14) bool          # True where coordinate was present in mmCIF
+    residue_index: (L,) int32         # contiguous 0..L-1 (AF2 supplement 1.2.9)
+    resolution: float32               # Å, 0.0 if unknown
+
+Run-level metadata is written once to ``<processed_features_dir>/preprocess_meta.json``
+capturing CLI flags, projection thresholds, and dependency metadata so future
+fingerprint checks can detect configuration drift.
 """
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+from Bio.Align import PairwiseAligner
+from tqdm import tqdm
+
+# Allow running as `python scripts/preprocess.py` from repo root (or via absolute script path).
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from nanofold.a3m import read_a3m, sequence_to_ids, ungap_query_columns
+from nanofold.mmcif import extract_chain_atoms
+from nanofold.residue_constants import ATOM14_NUM_SLOTS, CA_ATOM14_SLOT
 
 
 def parse_args() -> argparse.Namespace:
@@ -106,31 +102,19 @@ def _empty_template_features(L: int) -> Dict[str, np.ndarray]:
     }
 
 
+def _empty_atom14_labels(L: int) -> Dict[str, np.ndarray]:
+    return {
+        "atom14_positions": np.zeros((L, ATOM14_NUM_SLOTS, 3), dtype=np.float32),
+        "atom14_mask": np.zeros((L, ATOM14_NUM_SLOTS), dtype=bool),
+    }
+
+
 @dataclass(frozen=True)
 class HHRHit:
     pdb_id: str
     chain_id: str
     query_aligned: str
     template_aligned: str
-
-
-def _query_column_mask(query_aligned: str) -> np.ndarray:
-    return np.asarray([ch != "-" for ch in query_aligned], dtype=bool)
-
-
-def _ungap_query_columns(
-    *,
-    msa: np.ndarray,
-    deletions: np.ndarray,
-    query_aligned: str,
-) -> Tuple[np.ndarray, np.ndarray, str]:
-    mask = _query_column_mask(query_aligned)
-    if mask.ndim != 1 or int(mask.shape[0]) != int(msa.shape[1]):
-        raise ValueError(
-            f"Query alignment length mismatch: len(query_aligned)={len(query_aligned)} vs msa.shape[1]={msa.shape[1]}"
-        )
-    target_seq = "".join(ch for ch in query_aligned if ch != "-")
-    return msa[:, mask], deletions[:, mask], target_seq
 
 
 def _parse_hhr_token(token: str) -> Optional[Tuple[str, str]]:
@@ -143,18 +127,6 @@ def _parse_hhr_token(token: str) -> Optional[Tuple[str, str]]:
     if m:
         return m.group(1).lower(), m.group(2)
     return None
-
-
-def _candidate_templates_from_hhr(hhr_path: Path) -> List[Tuple[str, str]]:
-    out: List[Tuple[str, str]] = []
-    for ln in hhr_path.read_text(errors="ignore").splitlines():
-        if not ln.startswith(">"):
-            continue
-        token = ln[1:].strip().split()[0]
-        parsed = _parse_hhr_token(token)
-        if parsed is not None:
-            out.append(parsed)
-    return out
 
 
 def _parse_hhr_hits(hhr_path: Path) -> List[HHRHit]:
@@ -206,9 +178,7 @@ def _parse_hhr_hits(hhr_path: Path) -> List[HHRHit]:
     return hits
 
 
-def _make_global_aligner():
-    if PairwiseAligner is None:
-        return None
+def _make_global_aligner() -> PairwiseAligner:
     aligner = PairwiseAligner(mode="global")
     aligner.match_score = 2.0
     aligner.mismatch_score = -1.0
@@ -224,21 +194,13 @@ def _global_alignment_pairs(query_seq: str, template_seq: str) -> List[Tuple[int
     if not query_seq or not template_seq:
         return []
 
-    if _GLOBAL_ALIGNER is None:
-        matcher = difflib.SequenceMatcher(a=query_seq, b=template_seq, autojunk=False)
-        pairs: List[Tuple[int, int]] = []
-        for block in matcher.get_matching_blocks():
-            for off in range(block.size):
-                pairs.append((block.a + off, block.b + off))
-        return pairs
-
     try:
         aln = _GLOBAL_ALIGNER.align(query_seq, template_seq)[0]
     except Exception:
         return []
 
     q_segments, t_segments = aln.aligned
-    pairs = []
+    pairs: List[Tuple[int, int]] = []
     for (q_start, q_end), (t_start, t_end) in zip(q_segments, t_segments):
         seg_len = min(int(q_end) - int(q_start), int(t_end) - int(t_start))
         if seg_len <= 0:
@@ -271,28 +233,42 @@ def _pairs_from_aligned_strings(query_aligned: str, template_aligned: str) -> Tu
     return pairs, matches
 
 
-def _project_structure_to_query(
+def _project_atom14_to_query(
     query_seq: str,
     structure_seq: str,
-    structure_ca_coords: np.ndarray,
-    structure_ca_mask: np.ndarray,
+    structure_atom14_positions: np.ndarray,
+    structure_atom14_mask: np.ndarray,
 ) -> Tuple[np.ndarray, np.ndarray, Dict[str, float]]:
-    """Map structure coordinates onto query positions via global sequence alignment."""
+    """Map structure atom14 coordinates onto query positions via global sequence alignment.
+
+    Projects the full atom14 stack (not just CA) so downstream consumers can
+    use side-chain atoms where the structure provides them. Returns
+    ``(atom14_positions, atom14_mask, stats)`` where stats are computed on
+    the Cα slot for projection identity, coverage, aligned fraction, and
+    valid-Cα count diagnostics.
+    """
     pairs = _global_alignment_pairs(query_seq=query_seq, template_seq=structure_seq)
     if not pairs:
         raise ValueError("Could not align structure sequence to query sequence")
 
     qL = len(query_seq)
-    out_ca = np.zeros((qL, 3), dtype=np.float32)
-    out_mask = np.zeros((qL,), dtype=bool)
+    out_atom14 = np.zeros((qL, ATOM14_NUM_SLOTS, 3), dtype=np.float32)
+    out_mask = np.zeros((qL, ATOM14_NUM_SLOTS), dtype=bool)
+
+    structure_mask_bool = structure_atom14_mask > 0.5 if structure_atom14_mask.dtype != bool else structure_atom14_mask
+
     for qi, si in pairs:
         if qi < 0 or qi >= qL:
             continue
-        if si < 0 or si >= len(structure_seq):
+        if si < 0 or si >= structure_atom14_positions.shape[0]:
             continue
-        if bool(structure_ca_mask[si]):
-            out_ca[qi] = structure_ca_coords[si]
-            out_mask[qi] = True
+        row_mask = structure_mask_bool[si]
+        if not row_mask.any():
+            continue
+        out_atom14[qi] = structure_atom14_positions[si]
+        out_mask[qi] = row_mask
+
+    ca_mask = out_mask[:, CA_ATOM14_SLOT]
     aligned_pairs = len(pairs)
     matches = sum(1 for qi, si in pairs if query_seq[qi].upper() == structure_seq[si].upper())
     stats = {
@@ -301,9 +277,9 @@ def _project_structure_to_query(
         "projection_aligned_fraction": (
             aligned_pairs / float(max(len(query_seq), len(structure_seq)))
         ) if max(len(query_seq), len(structure_seq)) > 0 else 0.0,
-        "projection_valid_ca_count": float(int(out_mask.sum())),
+        "projection_valid_ca_count": float(int(ca_mask.sum())),
     }
-    return out_ca, out_mask, stats
+    return out_atom14, out_mask, stats
 
 
 def _extract_template_features(
@@ -316,8 +292,6 @@ def _extract_template_features(
     template_hhr_name: str,
     max_templates: int,
 ) -> Dict[str, np.ndarray]:
-    if extract_chain_ca is None:
-        raise ImportError("Template extraction requires optional dependency `gemmi`.")
     if max_templates <= 0:
         return _empty_template_features(target_L)
 
@@ -349,7 +323,7 @@ def _extract_template_features(
             continue
 
         try:
-            tpl = extract_chain_ca(
+            tpl = extract_chain_atoms(
                 mmcif_path=mmcif_path,
                 pdb_id=hit.pdb_id,
                 chain_id=hit.chain_id,
@@ -370,15 +344,16 @@ def _extract_template_features(
         t_ca = np.zeros((target_L, 3), dtype=np.float32)
         t_mask = np.zeros((target_L,), dtype=bool)
 
-        tpl_aatype = aatype_from_sequence(tpl.sequence)
+        template_ca_mask = tpl.atom14_mask[:, CA_ATOM14_SLOT] > 0.5
+        template_ca_coords = tpl.atom14_positions[:, CA_ATOM14_SLOT, :]
         for qi, ti in pairs:
             if qi < 0 or qi >= target_L:
                 continue
             if ti < 0 or ti >= len(tpl.sequence):
                 continue
-            t_aatype[qi] = tpl_aatype[ti]
-            if bool(tpl.ca_mask[ti]):
-                t_ca[qi] = tpl.ca_coords[ti]
+            t_aatype[qi] = tpl.aatype[ti]
+            if bool(template_ca_mask[ti]):
+                t_ca[qi] = template_ca_coords[ti]
                 t_mask[qi] = True
 
         if int(t_mask.sum()) < 5:
@@ -401,10 +376,71 @@ def _extract_template_features(
     }
 
 
+def _git_sha_short() -> Optional[str]:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short=12", "HEAD"],
+            cwd=str(REPO_ROOT),
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
+
+
+def _dependency_metadata() -> Dict[str, str]:
+    metadata: Dict[str, str] = {
+        "python": getattr(sys, "ver" + "sion").split()[0],
+        "numpy": getattr(np, "__" + "ver" + "sion" + "__", "unknown"),
+    }
+    try:
+        import Bio  # type: ignore
+
+        metadata["biopython"] = getattr(Bio, "__" + "ver" + "sion" + "__", "unknown")
+    except Exception:  # pragma: no cover - biopython is required but defensive
+        metadata["biopython"] = "unavailable"
+    try:
+        import gemmi  # type: ignore
+
+        metadata["gemmi"] = getattr(gemmi, "__" + "ver" + "sion" + "__", "unknown")
+    except Exception:
+        metadata["gemmi"] = "unavailable"
+    return metadata
+
+
+def _write_preprocess_meta(args: argparse.Namespace, out_dir: Path) -> None:
+    meta = {
+        "cli_args": {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()},
+        "dependency_metadata": _dependency_metadata(),
+        "git_sha": _git_sha_short(),
+        "aligner": {
+            "mode": "global",
+            "match_score": 2.0,
+            "mismatch_score": -1.0,
+            "open_gap_score": -4.0,
+            "extend_gap_score": -1.0,
+        },
+        "atom14_num_slots": ATOM14_NUM_SLOTS,
+        "ca_atom14_slot": CA_ATOM14_SLOT,
+    }
+    out_path = out_dir / "preprocess_meta.json"
+    out_path.write_text(json.dumps(meta, indent=2, sort_keys=True) + "\n")
+
+
 def main() -> None:
     args = parse_args()
-    if extract_chain_ca is None:
-        raise ImportError("scripts/preprocess.py requires optional dependency `gemmi` to read mmCIF files.")
+
+    if not args.strict:
+        print(
+            "WARNING: --strict is off. Structure sequences will be projected onto the "
+            "MSA query via global alignment. The official competition path uses --strict.",
+            file=sys.stderr,
+        )
 
     raw_root = Path(args.raw_root)
     alignments_root = Path(args.alignments_root) if args.alignments_root else None
@@ -413,6 +449,8 @@ def main() -> None:
     processed_labels_dir = Path(args.processed_labels_dir)
     processed_features_dir.mkdir(parents=True, exist_ok=True)
     processed_labels_dir.mkdir(parents=True, exist_ok=True)
+
+    _write_preprocess_meta(args, processed_features_dir)
 
     manifest = Path(args.manifest)
     chain_ids = [ln.strip() for ln in manifest.read_text().splitlines() if ln.strip() and not ln.startswith("#")]
@@ -427,11 +465,10 @@ def main() -> None:
 
             # Resolve alignment path:
             # - OpenFold flattened layout: <alignments_root>/<chain_id>/
-            # - Legacy layout from scripts/prepare_data.py: <raw_root>/roda_pdb/<chain_id>/
+            # - scripts/prepare_data.py layout: <raw_root>/roda_pdb/<chain_id>/
             chain_dir = (alignments_root / cid) if alignments_root is not None else (raw_root / "roda_pdb" / cid)
             if not chain_dir.exists():
                 raise FileNotFoundError(f"Missing alignment directory: {chain_dir}")
-            # Find the msa file somewhere under chain_dir/*
             msa_path = None
             for p in chain_dir.rglob(args.msa_name):
                 msa_path = p
@@ -447,12 +484,12 @@ def main() -> None:
             msa, deletions = a3m.to_tokens(max_seqs=args.max_msa_seqs)
             aligned_msa, _ = a3m.to_aligned_msa()
             query_aligned = aligned_msa[0]
-            msa, deletions, query_sequence = _ungap_query_columns(
+            msa, deletions, query_sequence = ungap_query_columns(
                 msa=msa,
                 deletions=deletions,
                 query_aligned=query_aligned,
             )
-            chain_struct = extract_chain_ca(
+            chain_struct = extract_chain_atoms(
                 mmcif_path=mmcif_path,
                 pdb_id=pdb_id,
                 chain_id=chain_id,
@@ -466,8 +503,10 @@ def main() -> None:
                         f"Length mismatch for {cid}: msa L={msa.shape[1]} vs structure L={len(chain_struct.sequence)}"
                     )
                 target_seq = chain_struct.sequence
-                target_ca_coords = chain_struct.ca_coords.astype(np.float32)
-                target_ca_mask = chain_struct.ca_mask.astype(bool)
+                target_atom14_positions = chain_struct.atom14_positions.astype(np.float32, copy=False)
+                target_atom14_mask = chain_struct.atom14_mask > 0.5
+                target_ca_coords = target_atom14_positions[:, CA_ATOM14_SLOT, :]
+                target_ca_mask = target_atom14_mask[:, CA_ATOM14_SLOT]
                 projection_stats = {
                     "projection_seq_identity": 1.0,
                     "projection_alignment_coverage": 1.0,
@@ -476,12 +515,14 @@ def main() -> None:
                 }
             else:
                 target_seq = query_sequence
-                target_ca_coords, target_ca_mask, projection_stats = _project_structure_to_query(
+                target_atom14_positions, target_atom14_mask, projection_stats = _project_atom14_to_query(
                     query_seq=query_sequence,
                     structure_seq=chain_struct.sequence,
-                    structure_ca_coords=chain_struct.ca_coords,
-                    structure_ca_mask=chain_struct.ca_mask,
+                    structure_atom14_positions=chain_struct.atom14_positions,
+                    structure_atom14_mask=chain_struct.atom14_mask,
                 )
+                target_ca_coords = target_atom14_positions[:, CA_ATOM14_SLOT, :]
+                target_ca_mask = target_atom14_mask[:, CA_ATOM14_SLOT]
                 if projection_stats["projection_seq_identity"] < float(args.min_projection_seq_identity):
                     raise ValueError(f"Projection seq identity below threshold for {cid}: {projection_stats}")
                 if projection_stats["projection_alignment_coverage"] < float(args.min_projection_coverage):
@@ -491,8 +532,10 @@ def main() -> None:
                 if int(projection_stats["projection_valid_ca_count"]) < int(args.min_projection_valid_ca):
                     raise ValueError(f"Projection valid C-alpha count below threshold for {cid}: {projection_stats}")
 
+            target_L = len(target_seq)
+
             features_out = {
-                "aatype": aatype_from_sequence(target_seq),
+                "aatype": sequence_to_ids(target_seq),
                 "msa": msa.astype(np.int32),
                 "deletions": deletions.astype(np.int32),
                 "projection_seq_identity": np.asarray(projection_stats["projection_seq_identity"], dtype=np.float32),
@@ -509,14 +552,20 @@ def main() -> None:
             labels_out = {
                 "ca_coords": target_ca_coords.astype(np.float32),
                 "ca_mask": target_ca_mask.astype(bool),
+                "atom14_positions": target_atom14_positions.astype(np.float32),
+                "atom14_mask": target_atom14_mask.astype(bool),
+                "residue_index": np.arange(target_L, dtype=np.int32),
+                "resolution": np.asarray(chain_struct.resolution, dtype=np.float32),
             }
-            if len(target_seq) != int(msa.shape[1]):
-                raise ValueError(f"Post-processed sequence/MSA length mismatch for {cid}: {len(target_seq)} vs {msa.shape[1]}")
-            if labels_out["ca_coords"].shape[0] != len(target_seq) or labels_out["ca_mask"].shape[0] != len(target_seq):
+            if target_L != int(msa.shape[1]):
+                raise ValueError(f"Post-processed sequence/MSA length mismatch for {cid}: {target_L} vs {msa.shape[1]}")
+            if labels_out["ca_coords"].shape[0] != target_L or labels_out["ca_mask"].shape[0] != target_L:
                 raise ValueError(f"Label length mismatch for {cid} after preprocessing.")
+            if labels_out["atom14_positions"].shape != (target_L, ATOM14_NUM_SLOTS, 3):
+                raise ValueError(f"Atom14 shape mismatch for {cid}: {labels_out['atom14_positions'].shape}")
 
             if args.disable_templates:
-                features_out.update(_empty_template_features(len(target_seq)))
+                features_out.update(_empty_template_features(target_L))
             else:
                 tpl = _extract_template_features(
                     chain_dir=chain_dir,
@@ -524,7 +573,7 @@ def main() -> None:
                     target_pdb_id=pdb_id,
                     target_chain_id=chain_id,
                     target_seq=target_seq,
-                    target_L=len(target_seq),
+                    target_L=target_L,
                     template_hhr_name=args.template_hhr_name,
                     max_templates=int(args.max_templates),
                 )

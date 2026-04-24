@@ -3,23 +3,23 @@
 # Competition constraints:
 # - Use only data produced by scripts/prepare_data.py + scripts/preprocess.py.
 # - Do not change train_manifest / val_manifest.
-# - Submission models must output C-alpha coordinates with shape (L, 3).
+# - Official submissions must output atom14 coordinates with shape (B, L, 14, 3).
 #
 # Submission API:
 # - `submission.path` should point to a Python file that defines:
 #   - `build_model(cfg)`
 #   - `build_optimizer(cfg, model)`
 #   - `run_batch(model, batch, cfg, training)`:
-#       - always returns `pred_ca`
+#       - returns `pred_atom14`
 #       - returns `loss` when `training=True`
 #       - must not depend on `ca_coords` / `ca_mask` when `training=False`
 #
 # Fixed-budget note:
-# - Official `limited_large_v3` requires:
+# - Official `limited_large` requires:
 #   seed=0, crop_size=256, msa_depth=192, effective_batch_size=2, max_steps=10000.
 
 run_name: your_name_run1
-track: limited_large_v3
+track: limited_large
 seed: 0
 
 submission:

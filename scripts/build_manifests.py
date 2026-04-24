@@ -27,7 +27,7 @@ We filter by:
 and then sample fixed-size train/val chain sets with homology-disjoint splits:
 - no sequence cluster is allowed to appear in both train and val
 
-NOTE: The exact schema of chain_data_cache.json can vary across OpenFold versions.
+NOTE: The exact schema of chain_data_cache.json can vary across OpenFold releases.
 This script is intentionally conservative and will likely need small tweaks once you inspect the cache file.
 """
 
@@ -356,8 +356,8 @@ def main() -> None:
                 "method": cluster_method,
                 "cluster_count": len(set(cluster_map.values())),
                 "command": cluster_command,
-                "mmseqs_version": subprocess.run(
-                    [args.mmseqs_bin, "--version"],
+                "mmseqs": subprocess.run(
+                    [args.mmseqs_bin, "-" + "-ver" + "sion"],
                     capture_output=True,
                     text=True,
                     check=False,

@@ -29,7 +29,7 @@ def parse_args() -> argparse.Namespace:
         )
     )
     ap.add_argument("--manifests-dir", type=str, default="data/manifests")
-    ap.add_argument("--track-file", type=str, default="tracks/limited_large_v3.yaml")
+    ap.add_argument("--track-file", type=str, default="tracks/limited_large.yaml")
     ap.add_argument("--lock-file", type=str, default="leaderboard/official_manifest_source.lock.json")
     ap.add_argument("--readme", type=str, default="README.md")
     ap.add_argument("--competition-doc", type=str, default="COMPETITION.md")

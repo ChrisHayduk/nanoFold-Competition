@@ -18,7 +18,7 @@ Model summary:
   - outer-product mean to pair representation
   - triangle multiplicative updates
   - pair axial attentions + transition
-- Structure-style stack over single representation to predict C-alpha coordinates.
+- Structure-style stack over single representation to predict C-alpha-derived atom14 coordinates.
 - Auxiliary heads/losses:
   - distogram cross-entropy
   - pLDDT-style confidence cross-entropy
@@ -32,7 +32,7 @@ transformer. Template pair features can inject structural priors when good templ
 
 - [x] Used only the provided benchmark data (no external data, weights, or template/MSA searches).
 - [x] Kept dataset manifests fixed (`data/manifests/train.txt` and `data/manifests/val.txt`).
-- [x] Model outputs C-alpha coordinates per residue (`(L, 3)` in Angstrom).
+- [x] Model outputs atom14 coordinates per residue (`(L, 14, 3)` in Angstrom).
 
 ## Required run metadata (limited track)
 
@@ -51,5 +51,5 @@ transformer. Template pair features can inject structural priors when good templ
 ```bash
 # preprocessing should include templates (default behavior in scripts/preprocess.py)
 python train.py --config submissions/seed_openfold/config.yaml
-python eval.py --config submissions/seed_openfold/config.yaml --ckpt runs/seed_openfold_v1/checkpoints/ckpt_last.pt
+python eval.py --config submissions/seed_openfold/config.yaml --ckpt runs/seed_openfold/checkpoints/ckpt_last.pt
 ```

@@ -28,7 +28,6 @@ Options:
                               Output dir for feature .npz files (default: data/processed_features)
   --processed-labels-dir <path>
                               Output dir for label .npz files (default: data/processed_labels)
-  --processed-dir <path>       Backward-compatible alias that sets both processed dirs to <path>
   --train-size <int>          Number of training chains (default: 10000)
   --val-size <int>            Number of validation chains (default: 1000)
   --seed <int>                Manifest sampling seed (default: 0)
@@ -91,11 +90,6 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     --processed-labels-dir)
-      PROCESSED_LABELS_DIR="$2"
-      shift 2
-      ;;
-    --processed-dir)
-      PROCESSED_FEATURES_DIR="$2"
       PROCESSED_LABELS_DIR="$2"
       shift 2
       ;;

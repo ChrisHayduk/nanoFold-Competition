@@ -262,8 +262,11 @@ def main() -> None:
         )
 
     raw_cfg = load_config(args.config)
+    # Sanitize labels_dir immediately after load so no downstream code path —
+    # including submission hooks, which see only the sanitized cfg — can leak it.
+    sanitized_cfg = _sanitize_predict_config(raw_cfg)
     track_spec = load_track_spec(args.track)
-    cfg = apply_track_policy(raw_cfg, track_spec=track_spec) if args.official else raw_cfg
+    cfg = apply_track_policy(sanitized_cfg, track_spec=track_spec) if args.official else sanitized_cfg
     config_path = Path(args.config).resolve()
     fingerprint_path = _resolve_fingerprint_path(args, track_spec)
 
@@ -274,7 +277,7 @@ def main() -> None:
                 "Official hidden prediction requires a sanitized config with empty `data.processed_labels_dir`."
             )
 
-    predict_cfg = _sanitize_predict_config(cfg)
+    predict_cfg = cfg
     predict_data_cfg = predict_cfg["data"]
     verify_manifest_paths = (
         {args.split: _manifest_for_split(cfg, args, track_spec)}
@@ -391,7 +394,6 @@ def main() -> None:
     effective_batch_size = compute_effective_batch_size(batch_size, grad_accum_steps)
     sample_budget = compute_sample_budget(int(cfg["train"]["max_steps"]), effective_batch_size)
     residue_budget = compute_residue_budget(int(cfg["train"]["max_steps"]), effective_batch_size, crop_size)
-
     checkpoint_rows: List[Dict[str, Any]] = []
     for ckpt_idx, ckpt_path in enumerate(checkpoints):
         ckpt = torch.load(ckpt_path, map_location="cpu")
@@ -415,17 +417,16 @@ def main() -> None:
                         cfg=predict_cfg,
                         training=False,
                     )
-                pred_ca = run_out["pred_ca"].detach().cpu()
+                pred_atom14_cpu = run_out["pred_atom14"].detach().cpu()
                 residue_mask = batch["residue_mask"].detach().cpu()
                 for idx, chain_id in enumerate(chain_ids):
                     masked_length = int(residue_mask[idx].sum().item())
-                    pred_chain = pred_ca[idx][:masked_length]
-                    np.savez_compressed(
-                        pred_root / f"{chain_id}.npz",
-                        pred_ca=pred_chain.numpy().astype(np.float32),
-                        masked_length=np.array(masked_length, dtype=np.int32),
-                        ckpt=str(ckpt_path),
-                    )
+                    arrays: Dict[str, Any] = {
+                        "pred_atom14": pred_atom14_cpu[idx][:masked_length].numpy().astype(np.float32),
+                        "masked_length": np.array(masked_length, dtype=np.int32),
+                        "ckpt": str(ckpt_path),
+                    }
+                    np.savez_compressed(pred_root / f"{chain_id}.npz", **arrays)
                     prediction_count += 1
 
         step = int(ckpt.get("step", 0))
