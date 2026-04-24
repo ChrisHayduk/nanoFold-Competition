@@ -152,7 +152,7 @@ def _alignment_pairs_with_offsets(
     pairs: List[Tuple[int, int]] = []
     query_index = query_start - 1
     template_index = template_start - 1
-    for query_char, template_char in zip(query_aligned, template_aligned):
+    for query_char, template_char in zip(query_aligned, template_aligned, strict=True):
         query_has = query_char != "-"
         template_has = template_char != "-"
         if query_has and template_has:
@@ -266,7 +266,7 @@ def _global_alignment_pairs(query_seq: str, template_seq: str) -> List[Tuple[int
 
     q_segments, t_segments = aln.aligned
     pairs: List[Tuple[int, int]] = []
-    for (q_start, q_end), (t_start, t_end) in zip(q_segments, t_segments):
+    for (q_start, q_end), (t_start, t_end) in zip(q_segments, t_segments, strict=False):
         seg_len = min(int(q_end) - int(q_start), int(t_end) - int(t_start))
         if seg_len <= 0:
             continue
@@ -284,7 +284,7 @@ def _pairs_from_aligned_strings(query_aligned: str, template_aligned: str) -> Tu
     matches = 0
     q_idx = 0
     t_idx = 0
-    for q_char, t_char in zip(query_aligned, template_aligned):
+    for q_char, t_char in zip(query_aligned, template_aligned, strict=True):
         q_has = q_char != "-"
         t_has = t_char != "-"
         if q_has and t_has:
@@ -359,7 +359,7 @@ def _read_merged_msa(
             )
 
         loaded_paths.append(msa_path)
-        for row, deletion_row in zip(source_msa, source_deletions):
+        for row, deletion_row in zip(source_msa, source_deletions, strict=True):
             dedup_key = (row.tobytes(), deletion_row.tobytes())
             if dedup_key in seen_rows:
                 continue
@@ -538,18 +538,22 @@ def _dependency_metadata() -> Dict[str, str]:
         "numpy": getattr(np, "__" + "ver" + "sion" + "__", "unknown"),
     }
     try:
-        import Bio  # type: ignore
+        import Bio
 
         metadata["biopython"] = getattr(Bio, "__" + "ver" + "sion" + "__", "unknown")
     except Exception:  # pragma: no cover - biopython is required but defensive
         metadata["biopython"] = "unavailable"
     try:
-        import gemmi  # type: ignore
+        import gemmi
 
         metadata["gemmi"] = getattr(gemmi, "__" + "ver" + "sion" + "__", "unknown")
     except Exception:
         metadata["gemmi"] = "unavailable"
     return metadata
+
+
+def _save_npz(path: Path, arrays: Dict[str, np.ndarray]) -> None:
+    np.savez_compressed(path, **arrays)  # type: ignore[arg-type]
 
 
 def _write_preprocess_meta(args: argparse.Namespace, out_dir: Path) -> None:
@@ -710,8 +714,8 @@ def main() -> None:
                 )
                 features_out.update(tpl)
 
-            np.savez_compressed(processed_features_dir / f"{cid}.npz", **features_out)
-            np.savez_compressed(processed_labels_dir / f"{cid}.npz", **labels_out)
+            _save_npz(processed_features_dir / f"{cid}.npz", features_out)
+            _save_npz(processed_labels_dir / f"{cid}.npz", labels_out)
             err_marker = processed_features_dir / f"{cid}.error.txt"
             if err_marker.exists():
                 err_marker.unlink()

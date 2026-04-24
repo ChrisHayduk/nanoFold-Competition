@@ -64,7 +64,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "alignment_dir",
         type=Path,
-        help="""Path to flattened alignment directory, with one subdirectory 
+        help="""Path to flattened alignment directory, with one subdirectory
                 per chain.""",
     )
     parser.add_argument(

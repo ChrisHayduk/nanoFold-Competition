@@ -14,7 +14,6 @@ import torch
 from .residue_constants import ATOM14_NUM_SLOTS, CA_ATOM14_SLOT
 from .utils import sha256_file
 
-
 INFERENCE_BATCH_KEYS = frozenset(
     {
         "chain_id",

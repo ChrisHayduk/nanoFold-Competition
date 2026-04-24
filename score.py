@@ -9,9 +9,8 @@ from typing import Any, Dict, List
 import numpy as np
 import torch
 
-from nanofold.metrics import foldscore_components, foldscore_auc
+from nanofold.metrics import foldscore_auc, foldscore_components
 from nanofold.utils import get_env_metadata, utc_now_iso
-
 
 HIDDEN_SPLITS = {"hidden_val", "test_hidden"}
 

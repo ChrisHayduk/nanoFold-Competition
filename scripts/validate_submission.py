@@ -21,15 +21,14 @@ from nanofold.competition_policy import (
     TrackSpec,
     apply_track_policy,
     compute_effective_batch_size,
-    compute_sample_budget,
     compute_residue_budget,
+    compute_sample_budget,
     enforce_model_param_limit,
     load_track_spec,
     validate_track_policy,
 )
-from nanofold.utils import count_parameters
 from nanofold.submission_runtime import load_submission_hooks, run_submission_batch, strip_supervision_from_batch
-
+from nanofold.utils import count_parameters
 
 REQUIRED_TOP_LEVEL = ("run_name", "seed", "submission", "data", "train")
 REQUIRED_DATA_KEYS = (

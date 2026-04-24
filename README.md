@@ -116,6 +116,7 @@ This is implemented in:
 # 1) environment
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
+pip install -r requirements-dev.txt
 git submodule update --init --recursive
 
 # 2) setup official data using committed manifests

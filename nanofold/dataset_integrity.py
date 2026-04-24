@@ -10,7 +10,6 @@ import numpy as np
 from .data import read_manifest
 from .utils import sha256_file
 
-
 FINGERPRINT_COMPARISON_KEYS = (
     "track_id",
     "split_names",
@@ -422,6 +421,7 @@ def compare_fingerprints(
         raise ValueError(f"Unsupported fingerprint comparison_mode={comparison_mode!r}")
 
     mismatches: List[str] = []
+    keys: tuple[str, ...]
 
     if "manifests" not in expected:
         mismatches.append("Expected fingerprint is missing required `manifests` metadata.")
@@ -450,7 +450,7 @@ def compare_fingerprints(
                 f"actual={dict(actual.get('manifests') or {})!r}"
             )
 
-    list_keys = ("missing_feature_chain_ids", "missing_label_chain_ids")
+    list_keys: tuple[str, ...] = ("missing_feature_chain_ids", "missing_label_chain_ids")
     if comparison_mode == "features_only":
         list_keys = ("missing_feature_chain_ids",)
     for key in list_keys:

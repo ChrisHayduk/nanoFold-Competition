@@ -18,7 +18,6 @@ from typing import Dict, List
 
 import numpy as np
 
-
 # Canonical AF2 one-letter ordering.
 RESTYPES: List[str] = list("ARNDCQEGHILKMFPSTWYV")
 

@@ -3,17 +3,17 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import sys
 import time
 from functools import partial
 from pathlib import Path
-import sys
 from typing import Any, Dict, List
 
 import numpy as np
 import torch
+import yaml
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-import yaml
 
 from nanofold.competition_policy import (
     DEFAULT_TRACK_ID,
@@ -22,8 +22,8 @@ from nanofold.competition_policy import (
     apply_track_policy,
     assert_track_policy,
     compute_effective_batch_size,
-    compute_sample_budget,
     compute_residue_budget,
+    compute_sample_budget,
     enforce_model_param_limit,
     load_track_spec,
 )
@@ -39,7 +39,6 @@ from nanofold.utils import (
     to_device,
     utc_now_iso,
 )
-
 
 HIDDEN_SPLITS = {"hidden_val", "test_hidden"}
 

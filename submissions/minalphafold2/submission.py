@@ -7,7 +7,6 @@ from typing import Any, Dict, Iterable, Sequence
 
 import torch
 
-
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MINALPHAFOLD2_ROOT = REPO_ROOT / "third_party" / "minAlphaFold2"
 if not (MINALPHAFOLD2_ROOT / "minalphafold").exists():
@@ -30,7 +29,6 @@ from minalphafold.data import (  # noqa: E402
     sample_cluster_and_extra,
 )
 from minalphafold.model import AlphaFold2  # noqa: E402
-
 
 MODEL_CONFIG_DEFAULTS: Dict[str, Any] = {
     "c_m": 32,

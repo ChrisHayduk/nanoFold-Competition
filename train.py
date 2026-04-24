@@ -3,29 +3,29 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import sys
 import time
 from functools import partial
 from pathlib import Path
-import sys
 from typing import Any, Dict
 
 import torch
 import torch.nn as nn
+import yaml
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-import yaml
 
 from nanofold.competition_policy import (
     DEFAULT_TRACK_ID,
     OFFICIAL_DATASET_FINGERPRINT_PATH,
     TrackSpec,
     apply_track_policy,
+    assert_track_policy,
     compute_effective_batch_size,
-    compute_sample_budget,
     compute_residue_budget,
+    compute_sample_budget,
     enforce_model_param_limit,
     load_track_spec,
-    assert_track_policy,
 )
 from nanofold.data import ProcessedNPZDataset, collate_batch
 from nanofold.dataset_integrity import verify_dataset_against_fingerprint

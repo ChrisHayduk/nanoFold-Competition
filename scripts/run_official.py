@@ -26,7 +26,6 @@ from nanofold.competition_policy import DEFAULT_TRACK_ID, load_track_spec
 from nanofold.data import read_manifest
 from nanofold.metrics import foldscore_auc, foldscore_components
 
-
 DEFAULT_CHECKPOINT_STEPS = "0,1000,2000,5000,last"
 SEALED_RUNTIME_ENV = "NANOFOLD_OFFICIAL_SEALED_RUNTIME"
 RUNTIME_STAGE_ENV = "NANOFOLD_OFFICIAL_RUNTIME_STAGE"

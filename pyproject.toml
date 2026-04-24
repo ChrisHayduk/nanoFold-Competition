@@ -6,11 +6,22 @@ exclude = [
   ".venv",
   "data",
   "runs",
+  "third_party",
 ]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W", "B", "UP"]
-ignore = ["E501"]
+ignore = [
+  "E501",   # keep long command/doc strings readable
+  "E402",   # scripts adjust sys.path before importing repo modules
+  "B009",   # tests and runtime intentionally use dynamic module attributes
+  "UP015",  # avoid readability churn in old utility scripts
+  "UP017",
+  "UP037",
+  "UP045",
+  "UP006",  # allow typing.Dict/List in older modules until a focused modernization pass
+  "UP035",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -23,4 +34,4 @@ warn_unused_ignores = true
 warn_redundant_casts = true
 warn_unreachable = true
 strict_optional = true
-exclude = "(^data/|^runs/)"
+exclude = "(^data/|^runs/|^third_party/)"

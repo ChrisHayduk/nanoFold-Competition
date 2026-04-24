@@ -9,7 +9,6 @@ import yaml
 
 from .utils import sha256_file
 
-
 EXPECTED_TRAIN_MANIFEST_PARTS = ("data", "manifests", "train.txt")
 EXPECTED_VAL_MANIFEST_PARTS = ("data", "manifests", "val.txt")
 

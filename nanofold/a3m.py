@@ -36,7 +36,6 @@ from typing import List, Tuple
 
 import numpy as np
 
-
 # Canonical AF2 one-letter alphabet (20 standard amino acids).
 RESTYPES = "ARNDCQEGHILKMFPSTWYV"
 RESTYPE_TO_ID = {aa: i for i, aa in enumerate(RESTYPES)}

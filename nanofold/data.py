@@ -8,7 +8,6 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-
 FEATURE_KEYS = (
     "aatype",
     "msa",

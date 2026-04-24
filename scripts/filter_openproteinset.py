@@ -30,7 +30,6 @@ if str(REPO_ROOT) not in sys.path:
 
 from nanofold.data import read_manifest
 
-
 DEFAULT_MIN_LENGTH = 40
 DEFAULT_MAX_LENGTH = 256
 DEFAULT_MAX_RESOLUTION_ANGSTROMS = 3.0
