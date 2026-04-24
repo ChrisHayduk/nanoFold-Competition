@@ -1,3 +1,5 @@
+![nanoFold](assets/nanofold.png)
+
 # nanoFold: A Protein Folding Slowrun
 
 nanoFold is a data-efficiency competition for protein structure prediction. It is inspired by the nanoGPT slowrun: everyone trains under a fixed budget, and the leaderboard rewards models that learn more structure from the same amount of data.
