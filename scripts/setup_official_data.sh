@@ -16,8 +16,10 @@ Options:
   --processed-labels-dir <path>
                               Output dir for label .npz files (default: data/processed_labels)
   --msa-name <filename>       MSA filename to download/use (default: uniref90_hits.a3m)
+  --msa-names <csv>           Comma-separated MSA filenames to download/use
   --template-hhr-name <name>  Template hits filename (default: pdb70_hits.hhr; ignored unless templates enabled)
   --enable-templates          Enable template-hit download and template preprocessing
+  --mmcif-mode <mode>         mmCIF acquisition: subset, full, or existing (default: subset)
   --download-retries <int>    Retries per failed aws chain download (default: 2)
   --download-retry-delay-seconds <float>
                               Base delay for retries in seconds (default: 2.0)
@@ -40,9 +42,11 @@ MANIFESTS_DIR="data/manifests"
 PROCESSED_FEATURES_DIR="data/processed_features"
 PROCESSED_LABELS_DIR="data/processed_labels"
 MSA_NAME="uniref90_hits.a3m"
+MSA_NAMES=""
 TEMPLATE_HHR_NAME="pdb70_hits.hhr"
 DOWNLOAD_RETRIES=2
 DOWNLOAD_RETRY_DELAY_SECONDS=2.0
+MMCIF_MODE="subset"
 USE_TEMPLATES=0
 SKIP_PREPROCESS=0
 FORCE=0
@@ -70,6 +74,10 @@ while [[ $# -gt 0 ]]; do
       MSA_NAME="$2"
       shift 2
       ;;
+    --msa-names)
+      MSA_NAMES="$2"
+      shift 2
+      ;;
     --template-hhr-name)
       TEMPLATE_HHR_NAME="$2"
       shift 2
@@ -77,6 +85,10 @@ while [[ $# -gt 0 ]]; do
     --enable-templates)
       USE_TEMPLATES=1
       shift 1
+      ;;
+    --mmcif-mode)
+      MMCIF_MODE="$2"
+      shift 2
       ;;
     --download-retries)
       DOWNLOAD_RETRIES="$2"
@@ -187,6 +199,15 @@ if [[ "$DRY_RUN" -eq 0 ]] && ! python -c "import tqdm" >/dev/null 2>&1; then
   exit 1
 fi
 
+case "$MMCIF_MODE" in
+  subset|full|existing)
+    ;;
+  *)
+    echo "--mmcif-mode must be one of: subset, full, existing"
+    exit 1
+    ;;
+esac
+
 PDB_DIR="$DATA_ROOT/pdb_data"
 DATA_CACHES_DIR="$PDB_DIR/data_caches"
 MMCIF_ROOT="$PDB_DIR/mmcif_files"
@@ -243,7 +264,11 @@ PREPARE_CMD=(
   --msa-name "$MSA_NAME"
   --download-retries "$DOWNLOAD_RETRIES"
   --download-retry-delay-seconds "$DOWNLOAD_RETRY_DELAY_SECONDS"
+  --strict-downloads
 )
+if [[ -n "$MSA_NAMES" ]]; then
+  PREPARE_CMD+=(--msa-names "$MSA_NAMES")
+fi
 if [[ "$USE_TEMPLATES" -eq 1 ]]; then
   PREPARE_CMD+=(--template-hits-name "$TEMPLATE_HHR_NAME")
 else
@@ -252,11 +277,20 @@ fi
 if [[ "$DRY_RUN" -eq 1 ]]; then
   PREPARE_CMD+=(--dry-run)
 fi
+if [[ "$MMCIF_MODE" == "subset" ]]; then
+  PREPARE_CMD+=(--download-mmcif-subset)
+fi
 run_cmd "${PREPARE_CMD[@]}"
 
-echo "[3/5] Downloading + unpacking mmCIF archive..."
-run_cmd aws s3 cp s3://openfold/pdb_mmcif.zip "$PDB_DIR/" --no-sign-request
-run_cmd unzip -o "$PDB_DIR/pdb_mmcif.zip" -d "$PDB_DIR"
+if [[ "$MMCIF_MODE" == "full" ]]; then
+  echo "[3/5] Downloading + unpacking full mmCIF archive..."
+  run_cmd aws s3 cp s3://openfold/pdb_mmcif.zip "$PDB_DIR/" --no-sign-request
+  run_cmd unzip -o "$PDB_DIR/pdb_mmcif.zip" -d "$PDB_DIR"
+elif [[ "$MMCIF_MODE" == "subset" ]]; then
+  echo "[3/5] Downloaded manifest mmCIF subset into $MMCIF_ROOT."
+else
+  echo "[3/5] Using existing mmCIF files in $MMCIF_ROOT."
+fi
 
 if [[ "$SKIP_PREPROCESS" -eq 1 ]]; then
   echo "[4/5] Skipping preprocess (--skip-preprocess set)."
@@ -271,6 +305,9 @@ else
     --msa-name "$MSA_NAME"
     --strict
   )
+  if [[ -n "$MSA_NAMES" ]]; then
+    PREPROCESS_COMMON+=(--msa-names "$MSA_NAMES")
+  fi
   if [[ "$USE_TEMPLATES" -eq 1 ]]; then
     PREPROCESS_COMMON+=(--template-hhr-name "$TEMPLATE_HHR_NAME")
   else

@@ -3,12 +3,11 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict
-
-import yaml
 
 
 @dataclass(frozen=True)
@@ -16,8 +15,10 @@ class ManifestHashes:
     train: str
     val: str
     all: str
+    hidden_val: str | None
     train_count: int
     val_count: int
+    hidden_val_count: int | None
     unique_count: int
 
 
@@ -58,6 +59,7 @@ def _compute_hashes(manifests_dir: Path) -> ManifestHashes:
     train_path = manifests_dir / "train.txt"
     val_path = manifests_dir / "val.txt"
     all_path = manifests_dir / "all.txt"
+    hidden_val_path = manifests_dir / "hidden_val.txt"
     for p in (train_path, val_path, all_path):
         if not p.exists():
             raise FileNotFoundError(f"Missing manifest file: {p}")
@@ -65,12 +67,15 @@ def _compute_hashes(manifests_dir: Path) -> ManifestHashes:
     train_ids = _read_manifest_ids(train_path)
     val_ids = _read_manifest_ids(val_path)
     all_ids = _read_manifest_ids(all_path)
+    hidden_val_ids = _read_manifest_ids(hidden_val_path) if hidden_val_path.exists() else None
     return ManifestHashes(
         train=_sha256(train_path),
         val=_sha256(val_path),
         all=_sha256(all_path),
+        hidden_val=_sha256(hidden_val_path) if hidden_val_path.exists() else None,
         train_count=len(train_ids),
         val_count=len(val_ids),
+        hidden_val_count=len(hidden_val_ids) if hidden_val_ids is not None else None,
         unique_count=len(set(all_ids)),
     )
 
@@ -129,18 +134,44 @@ def _update_competition_doc(path: Path, hashes: ManifestHashes) -> str:
 
 
 def _update_track_yaml(path: Path, hashes: ManifestHashes) -> str:
-    raw = yaml.safe_load(path.read_text())
-    if not isinstance(raw, dict):
-        raise ValueError(f"Track file must be a YAML mapping: {path}")
-    dataset = raw.get("dataset")
-    if not isinstance(dataset, dict):
-        raise ValueError(f"Track file missing `dataset` mapping: {path}")
-    dataset["train_manifest_sha256"] = hashes.train
-    dataset["val_manifest_sha256"] = hashes.val
-    dataset["all_manifest_sha256"] = hashes.all
-    dataset["train_chain_count"] = hashes.train_count
-    dataset["val_chain_count"] = hashes.val_count
-    return yaml.safe_dump(raw, sort_keys=False)
+    text = path.read_text()
+    replacements = {
+        "train_manifest_sha256": hashes.train,
+        "val_manifest_sha256": hashes.val,
+        "all_manifest_sha256": hashes.all,
+        "train_chain_count": str(hashes.train_count),
+        "val_chain_count": str(hashes.val_count),
+    }
+    for key, value in replacements.items():
+        text = _replace_required(
+            text,
+            rf"(^\s*{re.escape(key)}:\s*).*$",
+            rf"\g<1>{value}",
+            label=f"track {key}",
+        )
+    if hashes.hidden_val is not None:
+        text = _replace_required(
+            text,
+            r"(^\s*hidden_manifest_sha256:\s*).*$",
+            rf"\g<1>{hashes.hidden_val}",
+            label="track hidden_manifest_sha256",
+        )
+        text = _replace_required(
+            text,
+            r"(^\s*hidden_chain_count:\s*).*$",
+            rf"\g<1>{hashes.hidden_val_count}",
+            label="track hidden_chain_count",
+        )
+    return text
+
+
+def _display_path(path: Path, *, lock_file: Path) -> str:
+    resolved = path.resolve()
+    cwd = Path.cwd().resolve()
+    try:
+        return str(resolved.relative_to(cwd))
+    except ValueError:
+        return os.path.relpath(resolved, start=lock_file.parent.resolve())
 
 
 def _update_lock_json(path: Path, hashes: ManifestHashes, manifests_dir: Path) -> str:
@@ -151,22 +182,45 @@ def _update_lock_json(path: Path, hashes: ManifestHashes, manifests_dir: Path) -
     if not isinstance(raw, dict):
         raise ValueError(f"Lock file must be a JSON object: {path}")
 
+    if isinstance(raw.get("chain_data_cache_path"), str):
+        cache_path = Path(str(raw["chain_data_cache_path"]))
+        if cache_path.is_absolute():
+            raw["chain_data_cache_path"] = _display_path(cache_path, lock_file=path)
+    if isinstance(raw.get("data_source_lock"), str):
+        source_lock_path = Path(str(raw["data_source_lock"]))
+        if source_lock_path.is_absolute():
+            raw["data_source_lock"] = _display_path(source_lock_path, lock_file=path)
+
+    args = raw.get("args")
+    if isinstance(args, dict):
+        for key in ("cluster_tsv", "structure_metadata"):
+            value = args.get(key)
+            if isinstance(value, str) and value and Path(value).is_absolute():
+                args[key] = _display_path(Path(value), lock_file=path)
+
     outputs = raw.get("outputs")
     if not isinstance(outputs, dict):
         outputs = {}
         raw["outputs"] = outputs
 
-    train_path = (manifests_dir / "train.txt").resolve()
-    val_path = (manifests_dir / "val.txt").resolve()
-    all_path = (manifests_dir / "all.txt").resolve()
-    outputs["train_manifest"] = str(train_path)
-    outputs["val_manifest"] = str(val_path)
-    outputs["all_manifest"] = str(all_path)
+    train_path = manifests_dir / "train.txt"
+    val_path = manifests_dir / "val.txt"
+    all_path = manifests_dir / "all.txt"
+    hidden_val_path = manifests_dir / "hidden_val.txt"
+    outputs["train_manifest"] = _display_path(train_path, lock_file=path)
+    outputs["val_manifest"] = _display_path(val_path, lock_file=path)
+    outputs["all_manifest"] = _display_path(all_path, lock_file=path)
+    if hidden_val_path.exists() or "hidden_val_manifest" in outputs:
+        outputs["hidden_val_manifest"] = _display_path(hidden_val_path, lock_file=path) if hidden_val_path.exists() else None
     outputs["train_manifest_sha256"] = hashes.train
     outputs["val_manifest_sha256"] = hashes.val
     outputs["all_manifest_sha256"] = hashes.all
+    if hashes.hidden_val is not None or "hidden_val_manifest_sha256" in outputs:
+        outputs["hidden_val_manifest_sha256"] = hashes.hidden_val
     outputs["train_count"] = hashes.train_count
     outputs["val_count"] = hashes.val_count
+    if hashes.hidden_val_count is not None or "hidden_val_count" in outputs:
+        outputs["hidden_val_count"] = hashes.hidden_val_count or 0
     outputs["unique_count"] = hashes.unique_count
     return json.dumps(raw, indent=2) + "\n"
 

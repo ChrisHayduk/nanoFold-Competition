@@ -19,6 +19,8 @@ jobs:
             const protectedFiles = new Set([
               'data/manifests/train.txt',
               'data/manifests/val.txt',
+              'data/manifests/hidden_val.txt',
+              'data/manifests/all.txt',
             ]);
             const approvalLabel = 'manifest-change-approved';
             const pr = context.payload.pull_request;
@@ -68,6 +70,8 @@ jobs:
         run: ruff check .
       - name: Mypy
         run: mypy nanofold scripts train.py eval.py
+      - name: Pyright
+        run: pyright --warnings
       - name: Official Hash Sync Check
         run: python scripts/sync_official_manifest_hashes.py --check
       - name: Pytest
@@ -88,7 +92,7 @@ jobs:
               for idx, row in enumerate(entries):
                   if not isinstance(row, dict):
                       raise SystemExit(f"leaderboard row {idx} must be an object")
-                  required_any = ("score_lddt_ca", "score_hidden_lddt_ca", "rank_score")
+                  required_any = ("rank_score", "foldscore_auc_hidden", "final_hidden_foldscore")
                   if not any(key in row for key in required_any):
                       raise SystemExit(f"leaderboard row {idx} missing any score field: {required_any}")
           for result in Path("runs").glob("*/result.json"):
@@ -105,6 +109,7 @@ jobs:
           python - <<'PY'
           from __future__ import annotations
 
+          import json
           from pathlib import Path
 
           import yaml
@@ -120,6 +125,18 @@ jobs:
                       raise SystemExit(f"{path}: dataset.{key} must be string/null")
                   if Path(value).is_absolute():
                       raise SystemExit(f"{path}: dataset.{key} must not be an absolute path ({value})")
+          lock_path = Path("leaderboard/official_manifest_source.lock.json")
+          if lock_path.exists():
+              lock = json.loads(lock_path.read_text())
+              for key in ("chain_data_cache_path",):
+                  value = lock.get(key)
+                  if isinstance(value, str) and Path(value).is_absolute():
+                      raise SystemExit(f"{lock_path}: {key} must not be an absolute path ({value})")
+              outputs = lock.get("outputs", {})
+              if isinstance(outputs, dict):
+                  for key, value in outputs.items():
+                      if key.endswith("_manifest") and isinstance(value, str) and Path(value).is_absolute():
+                          raise SystemExit(f"{lock_path}: outputs.{key} must not be an absolute path ({value})")
           PY
 
   smoke-official:
@@ -162,6 +179,10 @@ jobs:
               Path(".ci_smoke/processed_labels") / f"{cid}.npz",
               ca_coords=np.zeros((L, 3), dtype=np.float32),
               ca_mask=np.ones((L,), dtype=bool),
+              atom14_positions=np.zeros((L, 14, 3), dtype=np.float32),
+              atom14_mask=np.ones((L, 14), dtype=bool),
+              residue_index=np.arange(L, dtype=np.int32),
+              resolution=np.asarray(2.0, dtype=np.float32),
           )
 
           cfg = {

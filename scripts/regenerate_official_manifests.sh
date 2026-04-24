@@ -5,7 +5,8 @@ usage() {
   cat <<'EOF'
 Usage: bash scripts/regenerate_official_manifests.sh [options]
 
-Regenerates official manifests using locked args + locked chain cache SHA256 from:
+Regenerates official manifests using locked args, locked chain cache SHA256,
+and required structure metadata from:
   leaderboard/official_manifest_source.lock.json
 
 Then verifies generated manifest SHA256 digests match:
@@ -16,6 +17,7 @@ Options:
                               (default: data/openproteinset/pdb_data/data_caches/chain_data_cache.json)
   --out-dir <path>            Manifest output directory (default: data/manifests)
   --lock-file <path>          Lock metadata path (default: leaderboard/official_manifest_source.lock.json)
+  --structure-metadata <path> Structure metadata JSON override
   --rewrite-lock              Rewrite lock metadata at --lock-file after successful generation
   --sync-hashes               Sync manifest SHA256/count references across track + docs + lock
   --dry-run                   Print commands without executing
@@ -29,6 +31,7 @@ REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 CHAIN_DATA_CACHE="data/openproteinset/pdb_data/data_caches/chain_data_cache.json"
 OUT_DIR="data/manifests"
 LOCK_FILE="leaderboard/official_manifest_source.lock.json"
+STRUCTURE_METADATA_OVERRIDE=""
 REWRITE_LOCK=0
 SYNC_HASHES=0
 DRY_RUN=0
@@ -45,6 +48,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --lock-file)
       LOCK_FILE="$2"
+      shift 2
+      ;;
+    --structure-metadata)
+      STRUCTURE_METADATA_OVERRIDE="$2"
       shift 2
       ;;
     --rewrite-lock)
@@ -98,7 +105,7 @@ from pathlib import Path
 
 lock = json.loads(Path(sys.argv[1]).read_text())
 args = lock.get("args", {})
-required = ("train_size", "val_size", "min_len", "max_len", "max_resolution", "seed")
+required = ("train_size", "val_size", "hidden_val_size", "min_len", "max_len", "max_resolution", "seed", "structure_metadata")
 for key in required:
     if key not in args:
         raise SystemExit(f"Lock file missing args.{key}")
@@ -108,9 +115,16 @@ if len(cache_sha) != 64 or any(ch not in "0123456789abcdef" for ch in cache_sha)
 min_seq_id = float(args.get("min_seq_id", 0.30))
 coverage = float(args.get("coverage", 0.80))
 mmseqs_bin = str(args.get("mmseqs_bin", "mmseqs")).strip() or "mmseqs"
-require_mmseqs = bool(args.get("require_mmseqs", True))
+hidden_val_size = int(args.get("hidden_val_size", 0))
+cluster_tsv = str(args.get("cluster_tsv") or "").strip()
+structure_metadata = str(args.get("structure_metadata") or "").strip()
+if hidden_val_size <= 0:
+    raise SystemExit("Lock file args.hidden_val_size must be positive")
+if not structure_metadata:
+    raise SystemExit("Lock file missing args.structure_metadata")
 print(f"TRAIN_SIZE={int(args['train_size'])}")
 print(f"VAL_SIZE={int(args['val_size'])}")
+print(f"HIDDEN_VAL_SIZE={hidden_val_size}")
 print(f"MIN_LEN={int(args['min_len'])}")
 print(f"MAX_LEN={int(args['max_len'])}")
 print(f"MAX_RESOLUTION={float(args['max_resolution'])}")
@@ -118,10 +132,15 @@ print(f"SEED={int(args['seed'])}")
 print(f"MIN_SEQ_ID={min_seq_id}")
 print(f"COVERAGE={coverage}")
 print(f"MMSEQS_BIN={mmseqs_bin}")
-print(f"REQUIRE_MMSEQS={1 if require_mmseqs else 0}")
+print(f"CLUSTER_TSV={cluster_tsv}")
+print(f"STRUCTURE_METADATA={structure_metadata}")
 print(f"EXPECTED_CACHE_SHA={cache_sha}")
 PY
 )"
+
+if [[ -n "$STRUCTURE_METADATA_OVERRIDE" ]]; then
+  STRUCTURE_METADATA="$STRUCTURE_METADATA_OVERRIDE"
+fi
 
 BUILD_CMD=(
   python "$SCRIPT_DIR/build_manifests.py"
@@ -129,6 +148,7 @@ BUILD_CMD=(
   --out-dir "$OUT_DIR"
   --train-size "$TRAIN_SIZE"
   --val-size "$VAL_SIZE"
+  --hidden-val-size "$HIDDEN_VAL_SIZE"
   --min-len "$MIN_LEN"
   --max-len "$MAX_LEN"
   --max-resolution "$MAX_RESOLUTION"
@@ -136,10 +156,11 @@ BUILD_CMD=(
   --min-seq-id "$MIN_SEQ_ID"
   --coverage "$COVERAGE"
   --mmseqs-bin "$MMSEQS_BIN"
+  --structure-metadata "$STRUCTURE_METADATA"
   --expected-chain-cache-sha256 "$EXPECTED_CACHE_SHA"
 )
-if [[ "$REQUIRE_MMSEQS" -eq 1 ]]; then
-  BUILD_CMD+=(--require-mmseqs)
+if [[ -n "$CLUSTER_TSV" ]]; then
+  BUILD_CMD+=(--cluster-tsv "$CLUSTER_TSV")
 fi
 if [[ "$REWRITE_LOCK" -eq 1 ]]; then
   BUILD_CMD+=(--lock-file "$LOCK_FILE")

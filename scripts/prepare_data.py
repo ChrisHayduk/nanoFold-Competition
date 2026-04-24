@@ -3,9 +3,10 @@ from __future__ import annotations
 import argparse
 import signal
 import subprocess
+import tempfile
 import time
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
 
@@ -44,6 +45,12 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--bucket", type=str, default="s3://openfold", help="RODA bucket for OpenProteinSet")
     ap.add_argument("--msa-name", type=str, default="uniref90_hits.a3m", help="MSA filename to download per chain")
     ap.add_argument(
+        "--msa-names",
+        type=str,
+        default="",
+        help="Comma-separated MSA filenames to download per chain. Defaults to --msa-name.",
+    )
+    ap.add_argument(
         "--template-hits-name",
         type=str,
         default="pdb70_hits.hhr",
@@ -70,6 +77,11 @@ def parse_args() -> argparse.Namespace:
         help="Download only the manifest PDB mmCIF files from RCSB into pdb_data/mmcif_files.",
     )
     ap.add_argument(
+        "--only-mmcif-subset",
+        action="store_true",
+        help="Only download manifest PDB mmCIF files; skip OpenProteinSet per-chain MSA/template assets.",
+    )
+    ap.add_argument(
         "--dry-run",
         action="store_true",
         help="Print commands without running.",
@@ -85,6 +97,11 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=2.0,
         help="Base delay for download retries in seconds (default: 2.0).",
+    )
+    ap.add_argument(
+        "--strict-downloads",
+        action="store_true",
+        help="Exit non-zero if any manifest chain is missing required MSA/template files after retries.",
     )
     return ap.parse_args()
 
@@ -151,8 +168,23 @@ def _has_file(root: Path, filename: str) -> bool:
     return False
 
 
-def _has_required_files(root: Path, msa_name: str, template_hits_name: str, need_template_hits: bool) -> tuple[bool, bool]:
-    has_msa = _has_file(root, msa_name)
+def _normalize_msa_names(msa_name: str, msa_names: str | Sequence[str] | None = None) -> List[str]:
+    if msa_names is None:
+        return [msa_name]
+    if isinstance(msa_names, str):
+        parsed = [token.strip() for token in msa_names.split(",") if token.strip()]
+    else:
+        parsed = [token.strip() for token in msa_names if token.strip()]
+    return parsed or [msa_name]
+
+
+def _has_required_files(
+    root: Path,
+    msa_names: Sequence[str],
+    template_hits_name: str,
+    need_template_hits: bool,
+) -> tuple[bool, bool]:
+    has_msa = all(_has_file(root, name) for name in msa_names)
     has_tpl = _has_file(root, template_hits_name) if need_template_hits else True
     return has_msa, has_tpl
 
@@ -212,7 +244,14 @@ def _download_url(
     while True:
         try:
             with urlopen(url) as response:
-                destination.write_bytes(response.read())
+                with tempfile.NamedTemporaryFile(
+                    dir=str(destination.parent),
+                    prefix=f".{destination.name}.",
+                    delete=False,
+                ) as tmp:
+                    tmp.write(response.read())
+                    tmp_path = Path(tmp.name)
+                tmp_path.replace(destination)
             return True
         except (HTTPError, URLError, OSError) as exc:
             attempt += 1
@@ -234,8 +273,10 @@ def _download_mmcif_subset(
     dry_run: bool,
     retries: int,
     retry_delay_seconds: float,
+    strict: bool = False,
 ) -> None:
     seen_pdb_ids: set[str] = set()
+    missing: list[str] = []
     for cid in chain_ids:
         pdb_id = cid.split("_", 1)[0].lower()
         if pdb_id in seen_pdb_ids:
@@ -244,14 +285,19 @@ def _download_mmcif_subset(
         url, destination = _structure_url_and_destination(cid, data_root)
         if destination.exists():
             continue
-        _download_url(
+        ok = _download_url(
             url,
             destination,
             dry_run=dry_run,
             retries=retries,
             retry_delay_seconds=retry_delay_seconds,
-            allow_fail=True,
+            allow_fail=not strict,
         )
+        if not ok:
+            missing.append(pdb_id)
+    if missing and strict:
+        sample = ", ".join(missing[:12])
+        raise SystemExit(f"Missing required mmCIF downloads for {len(missing)} PDB entrie(s). Examples: {sample}")
 
 
 def _download_chain(
@@ -259,7 +305,7 @@ def _download_chain(
     out_dir: Path,
     *,
     bucket: str,
-    msa_name: str,
+    msa_names: Sequence[str],
     template_hits_name: str,
     no_template_hits: bool,
     full_chain_dir: bool,
@@ -286,10 +332,7 @@ def _download_chain(
         "--recursive",
         "--exclude",
         "*",
-        "--include",
-        msa_name,
-        "--include",
-        f"*/{msa_name}",
+        *[item for name in msa_names for item in ("--include", name, "--include", f"*/{name}")],
     ]
     if not no_template_hits:
         cmd.extend(
@@ -336,14 +379,28 @@ def main() -> None:
     manifest = Path(args.manifest)
     chain_ids = [ln.strip() for ln in manifest.read_text().splitlines() if ln.strip() and not ln.startswith("#")]
     duplicate_map = _load_duplicate_map(args.duplicate_chains_file)
+    msa_names = _normalize_msa_names(args.msa_name, args.msa_names)
     known_missing_sources = set()
+    missing_required: List[str] = []
+
+    if args.only_mmcif_subset:
+        _download_mmcif_subset(
+            chain_ids,
+            data_root,
+            dry_run=args.dry_run,
+            retries=max(0, int(args.download_retries)),
+            retry_delay_seconds=max(0.0, float(args.download_retry_delay_seconds)),
+            strict=bool(args.strict_downloads),
+        )
+        print("Done downloading manifest mmCIF subset.")
+        return
 
     for cid in chain_ids:
         out_dir = roda_root / cid
         out_dir.parent.mkdir(parents=True, exist_ok=True)
 
         need_tpl = not args.no_template_hits
-        has_msa, has_tpl = _has_required_files(out_dir, args.msa_name, args.template_hits_name, need_tpl)
+        has_msa, has_tpl = _has_required_files(out_dir, msa_names, args.template_hits_name, need_tpl)
         if has_msa and has_tpl:
             continue
 
@@ -361,7 +418,7 @@ def main() -> None:
         for source_cid in candidates:
             source_dir = roda_root / source_cid
             source_dir.parent.mkdir(parents=True, exist_ok=True)
-            src_msa, src_tpl = _has_required_files(source_dir, args.msa_name, args.template_hits_name, need_tpl)
+            src_msa, src_tpl = _has_required_files(source_dir, msa_names, args.template_hits_name, need_tpl)
             if src_msa and fallback_source is None:
                 fallback_source = source_cid
                 fallback_has_tpl = src_tpl
@@ -381,7 +438,7 @@ def main() -> None:
                     source_cid,
                     source_dir,
                     bucket=args.bucket,
-                    msa_name=args.msa_name,
+                    msa_names=msa_names,
                     template_hits_name=args.template_hits_name,
                     no_template_hits=args.no_template_hits,
                     full_chain_dir=args.full_chain_dir,
@@ -389,7 +446,7 @@ def main() -> None:
                     retries=max(0, int(args.download_retries)),
                     retry_delay_seconds=max(0.0, float(args.download_retry_delay_seconds)),
                 )
-                src_msa, src_tpl = _has_required_files(source_dir, args.msa_name, args.template_hits_name, need_tpl)
+                src_msa, src_tpl = _has_required_files(source_dir, msa_names, args.template_hits_name, need_tpl)
                 if not src_msa:
                     known_missing_sources.add(source_cid)
                     continue
@@ -407,20 +464,25 @@ def main() -> None:
             chosen_has_tpl = fallback_has_tpl
 
         if chosen_source is None:
-            print(f"WARNING: {cid} missing {args.msa_name} after download")
+            print(f"WARNING: {cid} missing required MSA file(s) after download: {','.join(msa_names)}")
+            missing_required.extend(f"{cid}:{name}" for name in msa_names)
             if need_tpl:
                 print(f"WARNING: {cid} missing {args.template_hits_name} after download")
+                missing_required.append(f"{cid}:{args.template_hits_name}")
             continue
 
         if chosen_source != cid and not args.dry_run:
             _replace_with_symlink(out_dir, roda_root / chosen_source)
 
-        has_msa = _has_file(out_dir, args.msa_name)
+        has_msa = all(_has_file(out_dir, name) for name in msa_names)
         has_tpl = chosen_has_tpl if need_tpl else True
         if not has_msa:
-            print(f"WARNING: {cid} missing {args.msa_name} after download")
+            missing_names = [name for name in msa_names if not _has_file(out_dir, name)]
+            print(f"WARNING: {cid} missing required MSA file(s) after download: {','.join(missing_names)}")
+            missing_required.extend(f"{cid}:{name}" for name in missing_names)
         if not has_tpl:
             print(f"WARNING: {cid} missing {args.template_hits_name} after download")
+            missing_required.append(f"{cid}:{args.template_hits_name}")
 
     if args.include_mmcif_zip:
         run(["aws", "s3", "cp", f"{args.bucket}/pdb_mmcif.zip", str(data_root), "--no-sign-request"], args.dry_run)
@@ -431,6 +493,13 @@ def main() -> None:
             dry_run=args.dry_run,
             retries=max(0, int(args.download_retries)),
             retry_delay_seconds=max(0.0, float(args.download_retry_delay_seconds)),
+            strict=bool(args.strict_downloads),
+        )
+
+    if missing_required and args.strict_downloads:
+        sample = ", ".join(missing_required[:12])
+        raise SystemExit(
+            f"Missing required downloaded files for {len(missing_required)} chain/file pair(s). Examples: {sample}"
         )
 
     print("Done. Next: run scripts/preprocess.py to build data/processed/*.npz")

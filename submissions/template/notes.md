@@ -1,13 +1,13 @@
-## What changed?
+## Submission Summary
 
 Template submission scaffold for participants.
 
 Suggested edits:
-- briefly describe architectural/training differences from baseline
+- briefly describe the architecture and training method
 - list any added files under your submission directory
 - state any key hyperparameter choices
 
-## Why should it help?
+## Method Rationale
 
 Summarize the expected gains and intuition behind your method.
 

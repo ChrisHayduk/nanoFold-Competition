@@ -6,16 +6,16 @@ from train import resume_metadata_mismatches
 def test_resume_metadata_mismatches_detects_all_key_differences() -> None:
     mismatches = resume_metadata_mismatches(
         ckpt_obj={
-            "submission_entrypoint_sha256": "old-submission",
-            "config_sha256": "old-config",
-            "track_id": "old-track",
-            "fingerprint_sha256": "old-fingerprint",
+            "submission_entrypoint_sha256": "checkpoint-submission",
+            "config_sha256": "checkpoint-config",
+            "track_id": "checkpoint-track",
+            "fingerprint_sha256": "checkpoint-fingerprint",
             "n_params": 123,
         },
-        submission_entrypoint_sha256="new-submission",
-        config_sha256="new-config",
+        submission_entrypoint_sha256="runtime-submission",
+        config_sha256="runtime-config",
         track_id="limited_large",
-        fingerprint_sha256="new-fingerprint",
+        fingerprint_sha256="runtime-fingerprint",
         n_params=456,
     )
 

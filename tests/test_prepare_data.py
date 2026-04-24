@@ -49,3 +49,27 @@ def test_download_mmcif_subset_deduplicates_pdb_ids(tmp_path: Path, monkeypatch)
         "https://files.rcsb.org/download/1ABC.cif",
         "https://files.rcsb.org/download/2XYZ.cif",
     ]
+
+
+def test_download_mmcif_subset_strict_fails_on_missing_download(tmp_path: Path, monkeypatch) -> None:
+    module = _load_prepare_data_module()
+    download_mmcif_subset = getattr(module, "_download_mmcif_subset")
+
+    def fake_download_url(url, destination, **kwargs):  # noqa: ANN001, ANN202
+        return False
+
+    monkeypatch.setattr(module, "_download_url", fake_download_url)
+
+    try:
+        download_mmcif_subset(
+            ["1abc_A"],
+            tmp_path,
+            dry_run=False,
+            retries=0,
+            retry_delay_seconds=0.0,
+            strict=True,
+        )
+    except SystemExit as exc:
+        assert "Missing required mmCIF downloads" in str(exc)
+    else:
+        raise AssertionError("strict mmCIF subset download should fail on missing files")

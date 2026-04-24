@@ -47,7 +47,7 @@ Disallowed:
 
 Official template policy:
 - template feature tensors are part of the schema, but official preprocessing uses `T=0`
-- a future template-enabled track must add release-date and homology leakage filtering before templates can affect ranking
+- template-enabled tracks require release-date and homology leakage filtering before templates can affect ranking
 
 Rationale: if templates are enabled without a stronger policy, the contest risks rewarding target-template lookup instead of architectures that learn from limited data.
 
@@ -119,6 +119,16 @@ Official split definition:
 - train: `10,000` chains
 - val: `1,000` chains
 - hidden val: `1,000` chains
+
+Split construction policy:
+- candidate chains are filtered by length, resolution, monomer status, and strict standard-amino-acid sequence content
+- sequence clusters are built with MMseqs2 or a locked TSV produced with the same MMseqs2 identity/coverage settings
+- train, public val, and hidden val must be sequence-cluster-disjoint at the configured identity/coverage threshold
+- different chains from the same PDB entry cannot cross split boundaries
+- structure metadata is required; split allocation is stratified by secondary-structure class, broad domain architecture, length bin, and resolution bin
+- metadata sources include mmCIF/DSSP secondary-structure annotations, atom14 geometry, RCSB records, and CATH/SCOPe/ECOD-style structural classifications when those records cover a chain
+- source hashes, filter counts, clustering method, grouping policy, stratification fields, split distributions, and split-quality metrics are recorded in locks
+- `all.txt` is the public union of train + public val only; hidden chain IDs stay in maintainer-only hidden manifests
 
 Protected official manifests:
 - `data/manifests/train.txt`
@@ -223,6 +233,8 @@ Hidden lock metadata (safe to commit):
 - `leaderboard/official_hidden_assets.lock.json`
 - populate/update it with `python scripts/pin_hidden_assets.py ...`
 
+Hidden manifests and hidden NPZ directories are maintainer-local artifacts. Public files contain only hashes and counts needed to verify the sealed run.
+
 Hidden official runs are split into:
 - prediction stage: hidden features mounted, labels absent
 - scoring stage: saved predictions + hidden labels, no submission hooks
@@ -246,18 +258,18 @@ CI enforces:
 - `ruff`, `mypy`, `pytest`
 - protected manifest PR guard
 - JSON schema checks for leaderboard/result artifacts
-- hidden path hardcode guard in track files
+- hidden path hardcode guard in track files and public lock metadata
 - synthetic smoke run for official train/eval path
 
 Protected manifest PR rule:
-- if `data/manifests/train.txt` or `data/manifests/val.txt` changes,
+- if `data/manifests/train.txt`, `data/manifests/val.txt`, `data/manifests/hidden_val.txt`, or `data/manifests/all.txt` changes,
 - PR fails unless label `manifest-change-approved` is set by maintainers
 
 ## 11) Submitter Self-Check
 
 ```bash
 python scripts/validate_submission.py --submission submissions/<your_name> --track limited_large --strict
-if git diff --name-only origin/main...HEAD | grep -Eq '^data/manifests/(train|val)\.txt$'; then
+if git diff --name-only origin/main...HEAD | grep -Eq '^data/manifests/(train|val|hidden_val|all)\.txt$'; then
   echo "ERROR: PR edits protected manifests (train/val)."
   exit 1
 fi

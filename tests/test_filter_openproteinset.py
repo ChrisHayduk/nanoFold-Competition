@@ -65,6 +65,8 @@ def test_build_manifest_filters_length_resolution_and_single_aa(tmp_path: Path) 
 
     entries = {entry["chain_id"]: entry for entry in manifest["chains"]}
     assert entries["1oky_A"]["accepted"] is True
+    assert "secondary_structure_class" in entries["1oky_A"]
+    assert "secondary_helix_fraction" in entries["1oky_A"]
     assert entries["1tiny_A"]["reject_reasons"] == ["min_length"]
     assert entries["1loq_A"]["reject_reasons"] == ["resolution"]
     assert entries["1poly_A"]["reject_reasons"] == ["single_aa"]
@@ -117,7 +119,7 @@ def test_cluster_tsv_and_accepted_out(tmp_path: Path) -> None:
     assert accepted_out.read_text() == "1oky_A\n"
 
 
-def test_stale_ca_only_labels_are_rejected(tmp_path: Path) -> None:
+def test_ca_only_labels_are_rejected(tmp_path: Path) -> None:
     module = _load_filter_module()
     build_manifest = getattr(module, "build_manifest")
 
@@ -126,11 +128,11 @@ def test_stale_ca_only_labels_are_rejected(tmp_path: Path) -> None:
     features.mkdir()
     labels.mkdir()
     np.savez_compressed(
-        features / "1old_A.npz",
+        features / "1ca_A.npz",
         aatype=np.asarray(list(range(20)) * 3, dtype=np.int32),
     )
     np.savez_compressed(
-        labels / "1old_A.npz",
+        labels / "1ca_A.npz",
         ca_coords=np.zeros((60, 3), dtype=np.float32),
         ca_mask=np.ones((60,), dtype=bool),
     )

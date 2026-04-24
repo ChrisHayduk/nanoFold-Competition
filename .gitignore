@@ -7,6 +7,10 @@ __pycache__/
 *.pt
 /runs/
 /data/openproteinset/*
+/data/hidden_processed_features/
+/data/hidden_processed_labels/
+/data/metadata_sources/
+/data/manifests/hidden_val.txt
 *.npz
 data/processed/1p11_I.error.txt
 data/processed_features/1iz9_B.error.txt

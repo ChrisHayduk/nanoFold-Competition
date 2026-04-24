@@ -113,7 +113,8 @@ def load_config(path: str | Path) -> Dict[str, Any]:
 
 def make_autocast_ctx(device: torch.device, enabled: bool):
     try:
-        return torch.amp.autocast(device_type=device.type, enabled=enabled)
+        amp = getattr(torch, "amp")
+        return amp.autocast(device_type=device.type, enabled=enabled)
     except Exception:
         return torch.cuda.amp.autocast(enabled=enabled)
 

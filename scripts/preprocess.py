@@ -25,8 +25,8 @@ Output (per chain):
     resolution: float32               # Å, 0.0 if unknown
 
 Run-level metadata is written once to ``<processed_features_dir>/preprocess_meta.json``
-capturing CLI flags, projection thresholds, and dependency metadata so future
-fingerprint checks can detect configuration drift.
+capturing CLI flags, projection thresholds, and dependency metadata for
+fingerprint verification.
 """
 
 from __future__ import annotations
@@ -101,6 +101,11 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--min-projection-aligned-fraction", type=float, default=0.90)
     ap.add_argument("--min-projection-valid-ca", type=int, default=32)
     ap.add_argument("--fail-fast", action="store_true")
+    ap.add_argument(
+        "--allow-failures",
+        action="store_true",
+        help="Complete with exit code 0 even if some chains fail. Official preprocessing leaves this off.",
+    )
     return ap.parse_args()
 
 
@@ -557,8 +562,11 @@ def _save_npz(path: Path, arrays: Dict[str, np.ndarray]) -> None:
 
 
 def _write_preprocess_meta(args: argparse.Namespace, out_dir: Path) -> None:
+    stable_args = {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items() if k != "manifest"}
     meta = {
-        "cli_args": {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()},
+        "schema_version": 2,
+        "cli_args": stable_args,
+        "split_manifest": None,
         "dependency_metadata": _dependency_metadata(),
         "git_sha": _git_sha_short(),
         "aligner": {
@@ -731,6 +739,8 @@ def main() -> None:
     print(f"Preprocess complete: ok={n_ok}, fail={n_fail}")
     if n_fail > 0:
         print("Inspect *.error.txt files in", processed_features_dir)
+        if not args.allow_failures:
+            raise SystemExit(1)
 
 
 if __name__ == "__main__":

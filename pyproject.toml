@@ -15,11 +15,11 @@ ignore = [
   "E501",   # keep long command/doc strings readable
   "E402",   # scripts adjust sys.path before importing repo modules
   "B009",   # tests and runtime intentionally use dynamic module attributes
-  "UP015",  # avoid readability churn in old utility scripts
+  "UP015",  # keep utility scripts readable across supported Python installs
   "UP017",
   "UP037",
   "UP045",
-  "UP006",  # allow typing.Dict/List in older modules until a focused modernization pass
+  "UP006",  # allow typing.Dict/List where they keep type-heavy code readable
   "UP035",
 ]
 
@@ -35,3 +35,9 @@ warn_redundant_casts = true
 warn_unreachable = true
 strict_optional = true
 exclude = "(^data/|^runs/|^third_party/)"
+
+[tool.pyright]
+pythonVersion = "3.11"
+include = ["nanofold", "scripts", "tests", "train.py", "eval.py", "predict.py", "score.py"]
+exclude = ["data", "runs", "third_party", ".venv"]
+typeCheckingMode = "basic"

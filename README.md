@@ -66,6 +66,21 @@ Source of truth: `tracks/limited_large.yaml`
 | Rank metric | `foldscore_auc_hidden` |
 | Tie-breaker | `final_hidden_foldscore` |
 
+## Split Curation
+
+Official splits treat proteins as grouped biological examples, not IID rows in a text file:
+
+- candidates are filtered by length, resolution, monomer status, and strict sequence content
+- candidates with non-standard amino-acid tokens are excluded from the official split
+- MMseqs2, or a locked TSV produced with the same MMseqs2 settings, defines sequence-homology groups
+- train, public val, and hidden val are cluster-disjoint and PDB-entry-disjoint
+- representatives are chosen by structure quality before length, so duplicate groups do not over-contribute low-quality chains
+- structure metadata is required before splitting; the official allocation is stratified by secondary-structure class, broad domain architecture, length bin, and resolution bin
+- metadata sources include mmCIF/DSSP secondary-structure annotations, atom14 geometry, RCSB records, and CATH/SCOPe/ECOD-style structural classifications when those records cover a chain
+- the lock records source hashes, filtering counts, clustering mode, grouping policy, stratification fields, split quality metrics, and per-split alpha/beta/mixed distributions
+
+The metadata builder uses atom14 backbone torsions as the coordinate-derived floor when curated annotations do not cover a chain. All metadata signals are used only for split balancing and audit reports, never for scoring.
+
 ## Data Format
 
 Official preprocessing writes split artifacts per chain:
@@ -91,7 +106,7 @@ Preprocessing run metadata is captured in `<processed_features_dir>/preprocess_m
 
 Official scoring requires atom14 labels, and submissions must return `pred_atom14` shaped `(B, L, 14, 3)`. The runtime derives the Cα view from atom14 slot 1 for diagnostics and baseline losses.
 
-The official track disables templates by preprocessing with `T=0`; template tensors remain in the API so a future template-enabled track can add leakage filters explicitly.
+The official track disables templates by preprocessing with `T=0`; template-enabled tracks require explicit leakage filters.
 
 Config schema uses:
 - `data.processed_features_dir`
@@ -123,7 +138,8 @@ git submodule update --init --recursive
 bash scripts/setup_official_data.sh \
   --data-root data/openproteinset \
   --processed-features-dir data/processed_features \
-  --processed-labels-dir data/processed_labels
+  --processed-labels-dir data/processed_labels \
+  --mmcif-mode subset
 
 # 3) optional processed-data audit/filter manifest
 python scripts/filter_openproteinset.py \
@@ -167,15 +183,21 @@ python score.py \
 ## Maintainer Data Refresh
 
 Maintainers can refresh the official public assets with one command. This path:
+- downloads and pins structural metadata sources
+- builds required structure metadata from chain cache, mmCIF/DSSP annotations, atom14 geometry, RCSB records, and structural-classification files
 - regenerates official manifests from locked chain cache inputs
 - syncs manifest hashes/counts across track + docs + lock
-- downloads required OpenFold assets
-- preprocesses split NPZs (`processed_features` + `processed_labels`)
-- rebuilds the official fingerprint
+- downloads required OpenFold assets and manifest mmCIFs with strict missing-file checks
+- preprocesses public and hidden split NPZs
+- rebuilds public and hidden fingerprints
+- writes raw-source, manifest, and hidden-asset locks
 
 ```bash
 bash scripts/full_official_data_refresh.sh --rewrite-lock
 ```
+
+If the metadata builder reports missing mmCIFs, it writes `data/manifests/structure_candidates.txt`; the refresh script uses that manifest to fetch the missing structure files before rebuilding `data/manifests/structure_metadata.json`.
+The hidden manifest and hidden NPZ directories are maintainer-local artifacts; commit only the hash lock metadata produced by `scripts/pin_hidden_assets.py`.
 
 Dry-run preview:
 
@@ -248,8 +270,8 @@ python scripts/validate_submission.py \
   --track limited_large \
   --strict
 
-if git diff --name-only origin/main...HEAD | grep -Eq '^data/manifests/(train|val)\.txt$'; then
-  echo "ERROR: PR edits protected manifests (train/val). Ask maintainer for explicit approval label."
+if git diff --name-only origin/main...HEAD | grep -Eq '^data/manifests/(train|val|hidden_val|all)\.txt$'; then
+  echo "ERROR: PR edits protected manifests. Ask maintainer for explicit approval label."
   exit 1
 fi
 
@@ -257,7 +279,7 @@ echo "Self-check passed."
 ```
 
 CI enforces the same PR guardrail:
-- edits to `data/manifests/train.txt` or `data/manifests/val.txt` fail unless label `manifest-change-approved` is present.
+- edits to `data/manifests/train.txt`, `data/manifests/val.txt`, `data/manifests/hidden_val.txt`, or `data/manifests/all.txt` fail unless label `manifest-change-approved` is present.
 
 ## Repo Map
 

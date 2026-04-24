@@ -39,30 +39,25 @@ def _result_to_entry(result: Dict[str, Any], description_override: str) -> Dict[
         except Exception:
             return float("nan")
 
-    hidden_score = result.get("final_hidden_foldscore", result.get("final_hidden_lddt_ca", float("nan")))
-    public_score = result.get("public_val_foldscore", result.get("public_val_lddt_ca", float("nan")))
-    hidden_lddt = result.get("final_hidden_lddt_ca", result.get("score_hidden_lddt_ca", float("nan")))
-    public_lddt = result.get("public_val_lddt_ca", result.get("score_lddt_ca", float("nan")))
+    hidden_score = result.get("final_hidden_foldscore", float("nan"))
+    public_score = result.get("public_val_foldscore", float("nan"))
+    hidden_lddt = result.get("final_hidden_lddt_ca", float("nan"))
+    public_lddt = result.get("public_val_lddt_ca", float("nan"))
     rank_metric = str(result.get("rank_metric", "foldscore_auc_hidden"))
-    default_rank_score = (
-        result.get("foldscore_auc_hidden", hidden_score)
-        if rank_metric == "foldscore_auc_hidden"
-        else hidden_score if rank_metric == "final_hidden_foldscore"
-        else public_score
-    )
+    default_rank_score = result.get("foldscore_auc_hidden", float("nan"))
     rank_score = result.get("rank_score", default_rank_score)
     rank_tiebreak_score = result.get("rank_tiebreak_score", hidden_score)
     return {
         "rank_metric": rank_metric,
         "rank_score": _to_float(rank_score),
         "rank_tiebreak_score": _to_float(rank_tiebreak_score),
-        "score_hidden_foldscore": _to_float(hidden_score),
-        "score_public_val_foldscore": _to_float(public_score),
+        "final_hidden_foldscore": _to_float(hidden_score),
+        "public_val_foldscore": _to_float(public_score),
         "foldscore_auc_hidden": _to_float(result.get("foldscore_auc_hidden", float("nan"))),
         "foldscore_at_samples": dict(result.get("foldscore_at_samples", {})) if isinstance(result.get("foldscore_at_samples"), dict) else {},
         "foldscore_at_steps": dict(result.get("foldscore_at_steps", {})) if isinstance(result.get("foldscore_at_steps"), dict) else {},
-        "score_hidden_lddt_ca": _to_float(hidden_lddt),
-        "score_public_val_lddt_ca": _to_float(public_lddt),
+        "final_hidden_lddt_ca": _to_float(hidden_lddt),
+        "public_val_lddt_ca": _to_float(public_lddt),
         "lddt_auc_hidden": _to_float(result.get("lddt_auc_hidden", float("nan"))),
         "lddt_at_samples": dict(result.get("lddt_at_samples", {})) if isinstance(result.get("lddt_at_samples"), dict) else {},
         "lddt_at_steps": dict(result.get("lddt_at_steps", {})) if isinstance(result.get("lddt_at_steps"), dict) else {},
@@ -98,7 +93,7 @@ def _rank_entries(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         return score
 
     def tiebreak_value(row: Dict[str, Any]) -> float:
-        score = float(row.get("rank_tiebreak_score", row.get("score_hidden_lddt_ca", float("nan"))))
+        score = float(row.get("rank_tiebreak_score", float("nan")))
         if math.isnan(score):
             return float("-inf")
         return score

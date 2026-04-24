@@ -164,7 +164,7 @@ def _validate_submission_entrypoint(
     cfg: Dict[str, Any],
     config_path: Path,
     submission_dir: Path,
-    allow_placeholders: bool,
+    allow_template_fields: bool,
 ) -> None:
     sub_cfg = cfg.get("submission")
     if not isinstance(sub_cfg, dict):
@@ -178,7 +178,7 @@ def _validate_submission_entrypoint(
         add_error(diags, "`submission` must set exactly one of `path` or `module`.")
         return
 
-    if not allow_placeholders and not has_path:
+    if not allow_template_fields and not has_path:
         add_error(diags, "Submission must set `submission.path` to a local file under the submission directory.")
         return
 
@@ -193,17 +193,17 @@ def _validate_submission_entrypoint(
         if not entry_path.is_file():
             add_error(diags, f"Submission entrypoint is not a file: {entry_path}")
             return
-        if not allow_placeholders and submission_dir not in entry_path.parents:
+        if not allow_template_fields and submission_dir not in entry_path.parents:
             add_error(diags, f"`submission.path` must resolve inside `{submission_dir}` (got `{entry_path}`).")
 
 
-def _make_dummy_batch(crop_size: int, msa_depth: int) -> Dict[str, Any]:
+def _make_synthetic_batch(crop_size: int, msa_depth: int) -> Dict[str, Any]:
     B = 1
     L = min(crop_size, 32)
     N = min(msa_depth, 8)
     T = 1
     return {
-        "chain_id": ["DUMMY_A"],
+        "chain_id": ["SYNTHETIC_A"],
         "aatype": torch.randint(low=0, high=21, size=(B, L), dtype=torch.long),
         "msa": torch.randint(low=0, high=23, size=(B, N, L), dtype=torch.long),
         "deletions": torch.zeros((B, N, L), dtype=torch.long),
@@ -255,14 +255,14 @@ def _validate_submission_interface(
 
     crop_size = int(cfg["data"]["crop_size"])
     msa_depth = int(cfg["data"]["msa_depth"])
-    dummy_batch = _make_dummy_batch(crop_size=crop_size, msa_depth=msa_depth)
+    synthetic_batch = _make_synthetic_batch(crop_size=crop_size, msa_depth=msa_depth)
 
     model.train()
     try:
         _ = run_submission_batch(
             hooks,
             model=model,
-            batch=dummy_batch,
+            batch=synthetic_batch,
             cfg=cfg,
             training=True,
         )
@@ -276,7 +276,7 @@ def _validate_submission_interface(
             _ = run_submission_batch(
                 hooks,
                 model=model,
-                batch=strip_supervision_from_batch(dummy_batch),
+                batch=strip_supervision_from_batch(synthetic_batch),
                 cfg=cfg,
                 training=False,
             )
@@ -355,27 +355,27 @@ def _extract_metadata_value(notes_text: str, field: str) -> str | None:
 def _validate_notes(
     diags: List[Diagnostic],
     notes_text: str,
-    allow_placeholders: bool,
+    allow_template_fields: bool,
     effective_batch_size: int,
     sample_budget: int,
     residue_budget: int,
 ) -> None:
     required_sections = (
-        "## What changed?",
-        "## Why should it help?",
+        "## Submission Summary",
+        "## Method Rationale",
         "## How to run",
     )
     for section in required_sections:
         if section not in notes_text:
             add_error(diags, f"`notes.md` missing section `{section}`")
 
-    placeholder_snippets = (
-        "Describe what you changed relative to baseline.",
-        "Give intuition and (ideally) references / ablations.",
+    template_guidance_snippets = (
+        "Template submission scaffold for participants.",
+        "Summarize the expected gains and intuition behind your method.",
     )
-    for snippet in placeholder_snippets:
-        if snippet in notes_text and not allow_placeholders:
-            add_error(diags, "notes.md still contains template placeholder text; replace with submission-specific details.")
+    for snippet in template_guidance_snippets:
+        if snippet in notes_text and not allow_template_fields:
+            add_error(diags, "notes.md still contains template guidance text; write submission-specific details.")
 
     for field in METADATA_FIELDS:
         value = _extract_metadata_value(notes_text, field)
@@ -383,7 +383,7 @@ def _validate_notes(
             add_warning(diags, f"`notes.md` missing metadata line `- {field}: ...`")
             continue
         if value == "":
-            if allow_placeholders:
+            if allow_template_fields:
                 add_warning(diags, f"`notes.md` metadata `{field}` is empty.")
             else:
                 add_error(diags, f"`notes.md` metadata `{field}` is empty.")
@@ -444,7 +444,7 @@ def validate_submission(submission_dir: Path, strict: bool, track_id: str) -> in
         return 1
 
     submission_name = submission_dir.name
-    allow_placeholders = submission_name == "template"
+    allow_template_fields = submission_name == "template"
 
     config_path = submission_dir / "config.yaml"
     notes_path = submission_dir / "notes.md"
@@ -490,15 +490,21 @@ def validate_submission(submission_dir: Path, strict: bool, track_id: str) -> in
         )
         for msg in policy_errors:
             add_error(diags, msg)
-        _validate_submission_entrypoint(diags, cfg, config_path=config_path, submission_dir=submission_dir, allow_placeholders=allow_placeholders)
+        _validate_submission_entrypoint(
+            diags,
+            cfg,
+            config_path=config_path,
+            submission_dir=submission_dir,
+            allow_template_fields=allow_template_fields,
+        )
         _validate_submission_interface(diags, cfg, config_path=config_path, track_spec=track_spec)
         _validate_submission_artifacts(diags, submission_dir=submission_dir)
         _validate_suspicious_imports(diags, submission_dir=submission_dir)
         run_name = str(cfg.get("run_name", "")).strip()
         if run_name == "":
             add_error(diags, "`run_name` must be non-empty.")
-        if not allow_placeholders and run_name in {"your_name_run1", "baseline"}:
-            add_warning(diags, f"`run_name` looks like a placeholder/default: `{run_name}`")
+        if not allow_template_fields and run_name in {"your_name_run1", "baseline"}:
+            add_warning(diags, f"`run_name` looks like a template/default value: `{run_name}`")
     else:
         effective_batch_size = 0
         sample_budget = 0
@@ -508,7 +514,7 @@ def validate_submission(submission_dir: Path, strict: bool, track_id: str) -> in
         _validate_notes(
             diags,
             notes_text,
-            allow_placeholders=allow_placeholders,
+            allow_template_fields=allow_template_fields,
             effective_batch_size=effective_batch_size,
             sample_budget=sample_budget,
             residue_budget=residue_budget,

@@ -29,6 +29,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from nanofold.data import read_manifest
+from nanofold.structure_metadata import secondary_fractions_from_atom14
 
 DEFAULT_MIN_LENGTH = 40
 DEFAULT_MAX_LENGTH = 256
@@ -132,6 +133,10 @@ def evaluate_chain(
         length = int(aatype.shape[0])
         resolution = float(np.asarray(labels["resolution"]).reshape(()).item())
         single_aa_fraction = max_single_aa_fraction(aatype)
+        secondary_class, helix_fraction, beta_fraction, coil_fraction = secondary_fractions_from_atom14(
+            np.asarray(labels["atom14_positions"]),
+            np.asarray(labels["atom14_mask"]),
+        )
 
     if length < min_length:
         reject_reasons.append("min_length")
@@ -147,6 +152,10 @@ def evaluate_chain(
             "length": length,
             "resolution": resolution,
             "max_single_aa_fraction": round(single_aa_fraction, 4),
+            "secondary_structure_class": secondary_class,
+            "secondary_helix_fraction": round(float(helix_fraction), 4) if helix_fraction is not None else None,
+            "secondary_beta_fraction": round(float(beta_fraction), 4) if beta_fraction is not None else None,
+            "secondary_coil_fraction": round(float(coil_fraction), 4) if coil_fraction is not None else None,
             "accepted": not reject_reasons,
             "reject_reasons": reject_reasons,
         }

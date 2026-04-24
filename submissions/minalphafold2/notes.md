@@ -1,4 +1,4 @@
-## What changed?
+## Submission Summary
 
 This submission uses the upstream `ChrisHayduk/minAlphaFold2` implementation as
 the actual model code.
@@ -12,13 +12,12 @@ official batch tensors into the feature tensors expected by
 `minalphafold.model.AlphaFold2`, calls that model, and returns
 `pred_atom14 = output["atom14_coords"]`.
 
-## Why should it help?
+## Method Rationale
 
 minAlphaFold2 is a direct, readable AlphaFold2-style implementation with an
 Evoformer trunk, recycling, invariant point attention, and structure-module
-atom14 coordinate generation. It gives nanoFold a real biological-prior
-reference submission instead of a placeholder architecture named after larger
-systems.
+atom14 coordinate generation. It gives nanoFold a biological-prior reference
+submission with a compact AlphaFold2-style training stack.
 
 ## Competition compliance checklist
 

@@ -69,7 +69,7 @@ def test_ungap_query_columns_removes_query_gaps() -> None:
     assert target == "ACDE"
     assert new_msa.shape == (2, 4)
     assert new_deletions.shape == (2, 4)
-    # Column 2 was dropped — row 1 column 2 carried 'V' which should now be absent.
+    # Column 2 is dropped because row 1 column 2 carries 'V' in a query gap.
     assert np.array_equal(
         new_msa[1],
         np.array([RESTYPE_TO_ID["A"], RESTYPE_TO_ID["C"], RESTYPE_TO_ID["D"], RESTYPE_TO_ID["E"]], dtype=np.int32),
