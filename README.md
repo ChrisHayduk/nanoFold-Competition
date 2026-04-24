@@ -39,7 +39,7 @@ The final hidden FoldScore is the tie-breaker. Public validation exists for debu
 - sealed prediction/scoring entrypoints that keep hidden labels away from submission code
 - a strict submission API with `build_model`, `build_optimizer`, and `run_batch`
 - dataset fingerprints and manifest checks so official data changes are visible
-- baseline/template submissions that pass the official atom14 contract
+- a pinned minAlphaFold2 reference submission plus a template submission that pass the official atom14 contract
 
 Primary docs:
 - [COMPETITION.md](COMPETITION.md): enforceable rules and official protocol
@@ -111,6 +111,7 @@ This is implemented in:
 # 1) environment
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
+git submodule update --init --recursive
 
 # 2) setup official data using committed manifests
 bash scripts/setup_official_data.sh \
@@ -256,6 +257,7 @@ CI enforces the same PR guardrail:
 - `scripts/run_official.py`: canonical official validate/train/eval/result runner
 - `scripts/run_official_docker.sh`: no-network official container runner
 - `nanofold/submission_runtime.py`: runtime API enforcement
+- `third_party/minAlphaFold2`: pinned upstream minAlphaFold2 implementation used by `submissions/minalphafold2`
 - `leaderboard/`: leaderboard and official lock/fingerprint artifacts
 
 ## Leaderboard
