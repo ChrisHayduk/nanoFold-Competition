@@ -24,6 +24,8 @@ INFERENCE_BATCH_KEYS = frozenset(
         "template_aatype",
         "template_ca_coords",
         "template_ca_mask",
+        "residue_index",
+        "between_segment_residues",
         "residue_mask",
     }
 )

@@ -14,6 +14,8 @@ def _write_feature_npz(path: Path, L: int = 8, N: int = 4, T: int = 1) -> None:
         aatype=np.zeros((L,), dtype=np.int32),
         msa=np.zeros((N, L), dtype=np.int32),
         deletions=np.zeros((N, L), dtype=np.int32),
+        residue_index=np.arange(L, dtype=np.int32),
+        between_segment_residues=np.zeros((L,), dtype=np.int32),
         template_aatype=np.zeros((T, L), dtype=np.int32),
         template_ca_coords=np.zeros((T, L, 3), dtype=np.float32),
         template_ca_mask=np.ones((T, L), dtype=bool),
@@ -64,6 +66,7 @@ def test_processed_npz_shapes_and_collate(tmp_path: Path) -> None:
     assert batch["atom14_positions"].shape == (1, 12, 14, 3)
     assert batch["atom14_mask"].shape == (1, 12, 14)
     assert batch["residue_index"].shape == (1, 12)
+    assert batch["between_segment_residues"].shape == (1, 12)
     assert batch["resolution"].shape == (1,)
 
 
@@ -93,6 +96,7 @@ def test_processed_npz_carries_atom14_when_present(tmp_path: Path) -> None:
     assert batch["atom14_mask"].shape == (1, 10, 14)
     assert bool(batch["atom14_mask"].all())
     assert batch["residue_index"].shape == (1, 10)
+    assert batch["between_segment_residues"].shape == (1, 10)
     assert batch["resolution"].shape == (1,)
     assert float(batch["resolution"][0]) == 2.0
 
@@ -121,3 +125,4 @@ def test_processed_npz_crop_preserves_atom14(tmp_path: Path) -> None:
     assert batch["atom14_positions"].shape == (1, 7, 14, 3)
     assert batch["atom14_mask"].shape == (1, 7, 14)
     assert batch["residue_index"].shape == (1, 7)
+    assert batch["between_segment_residues"].shape == (1, 7)

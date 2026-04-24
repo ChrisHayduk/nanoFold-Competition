@@ -73,7 +73,10 @@ Official preprocessing writes split artifacts per chain:
 - labels: `data/processed_labels/<chain_id>.npz`
 
 Required feature keys:
-- `aatype`, `msa`, `deletions`, `template_aatype`, `template_ca_coords`, `template_ca_mask`
+- `aatype`, `msa`, `deletions`
+- `residue_index` — `(L,)` int32, contiguous 0..L-1 and available during sealed inference
+- `between_segment_residues` — `(L,)` int32, zero for single-chain examples
+- `template_aatype`, `template_ca_coords`, `template_ca_mask`
 
 Required label keys:
 - `ca_coords`, `ca_mask`
@@ -81,7 +84,7 @@ Required label keys:
 - `atom14_mask` — `(L, 14)` bool, True where coordinate was present in mmCIF
 
 Additional label metadata:
-- `residue_index` — `(L,)` int32, contiguous 0..L-1
+- `residue_index` — `(L,)` int32, duplicated for convenience when present
 - `resolution` — `()` float32, Å (0.0 if unknown)
 
 Preprocessing run metadata is captured in `<processed_features_dir>/preprocess_meta.json`. Its SHA256 is folded into the dataset fingerprint, so changes to preprocessing flags, projection thresholds, dependency metadata, or source revision are visible to the verifier.
@@ -121,14 +124,22 @@ bash scripts/setup_official_data.sh \
   --processed-features-dir data/processed_features \
   --processed-labels-dir data/processed_labels
 
-# 3) build official fingerprint (split features+labels)
+# 3) optional processed-data audit/filter manifest
+python scripts/filter_openproteinset.py \
+  --processed-features-dir data/processed_features \
+  --processed-labels-dir data/processed_labels \
+  --manifest data/manifests/all.txt \
+  --manifest-out data/manifests/filter_manifest.json \
+  --accepted-out data/manifests/accepted.txt
+
+# 4) build official fingerprint (split features+labels)
 python scripts/build_fingerprint.py \
   --config configs/official_baseline.yaml \
   --track limited_large \
   --source-lock leaderboard/official_manifest_source.lock.json \
   --output leaderboard/official_dataset_fingerprint.json
 
-# 4) official train + public validation scoring
+# 5) official train + public validation scoring
 python train.py \
   --config configs/official_baseline.yaml \
   --track limited_large \

@@ -14,6 +14,8 @@ def _write_feature_npz(path: Path) -> None:
         aatype=np.zeros((8,), dtype=np.int32),
         msa=np.zeros((4, 8), dtype=np.int32),
         deletions=np.zeros((4, 8), dtype=np.int32),
+        residue_index=np.arange(8, dtype=np.int32),
+        between_segment_residues=np.zeros((8,), dtype=np.int32),
         template_aatype=np.zeros((1, 8), dtype=np.int32),
         template_ca_coords=np.zeros((1, 8, 3), dtype=np.float32),
         template_ca_mask=np.ones((1, 8), dtype=bool),
@@ -87,3 +89,5 @@ def test_features_only_eval_has_no_supervision_keys(tmp_path: Path) -> None:
     item = ds[0]
     assert "ca_coords" not in item
     assert "ca_mask" not in item
+    assert item["residue_index"].shape == (8,)
+    assert item["between_segment_residues"].shape == (8,)

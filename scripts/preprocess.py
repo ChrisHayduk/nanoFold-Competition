@@ -11,6 +11,8 @@ Output (per chain):
     aatype: (L,) int32
     msa: (N,L) int32
     deletions: (N,L) int32
+    residue_index: (L,) int32         # contiguous 0..L-1, available at inference
+    between_segment_residues: (L,) int32
     template_aatype: (T,L) int32
     template_ca_coords: (T,L,3) float32
     template_ca_mask: (T,L) bool
@@ -32,12 +34,11 @@ from __future__ import annotations
 import argparse
 import json
 import re
-import sys
 import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 from Bio.Align import PairwiseAligner
@@ -77,6 +78,15 @@ def parse_args() -> argparse.Namespace:
         help="Output directory for label .npz files",
     )
     ap.add_argument("--msa-name", type=str, default="uniref90_hits.a3m", help="Which MSA file to use")
+    ap.add_argument(
+        "--msa-names",
+        type=str,
+        default="",
+        help=(
+            "Comma-separated MSA files to merge/deduplicate in priority order. "
+            "Defaults to --msa-name when empty."
+        ),
+    )
     ap.add_argument("--max-msa-seqs", type=int, default=2048, help="Cap raw MSA depth to keep files smaller")
     ap.add_argument("--template-hhr-name", type=str, default="pdb70_hits.hhr", help="Template hits file name under chain dir")
     ap.add_argument("--max-templates", type=int, default=1, help="Maximum number of template hits to include per chain")
@@ -115,18 +125,43 @@ class HHRHit:
     chain_id: str
     query_aligned: str
     template_aligned: str
+    aligned_pairs: Tuple[Tuple[int, int], ...]
 
 
 def _parse_hhr_token(token: str) -> Optional[Tuple[str, str]]:
     token = token.strip()
-    m = re.match(r"^([0-9A-Za-z]{4})[_\-]([0-9A-Za-z])$", token)
+    m = re.match(r"^([0-9A-Za-z]{4})[_\-]([0-9A-Za-z]+)$", token)
     if m:
         return m.group(1).lower(), m.group(2)
 
-    m = re.match(r"^([0-9A-Za-z]{4})([0-9A-Za-z])$", token)
+    m = re.match(r"^([0-9A-Za-z]{4})([0-9A-Za-z]+)$", token)
     if m:
         return m.group(1).lower(), m.group(2)
     return None
+
+
+def _alignment_pairs_with_offsets(
+    query_start: int,
+    query_aligned: str,
+    template_start: int,
+    template_aligned: str,
+) -> List[Tuple[int, int]]:
+    if len(query_aligned) != len(template_aligned):
+        raise ValueError("Aligned query/template strings must have the same length.")
+
+    pairs: List[Tuple[int, int]] = []
+    query_index = query_start - 1
+    template_index = template_start - 1
+    for query_char, template_char in zip(query_aligned, template_aligned):
+        query_has = query_char != "-"
+        template_has = template_char != "-"
+        if query_has and template_has:
+            pairs.append((query_index, template_index))
+        if query_has:
+            query_index += 1
+        if template_has:
+            template_index += 1
+    return pairs
 
 
 def _parse_hhr_hits(hhr_path: Path) -> List[HHRHit]:
@@ -134,25 +169,40 @@ def _parse_hhr_hits(hhr_path: Path) -> List[HHRHit]:
     current_template: Tuple[str, str] | None = None
     query_fragments: List[str] = []
     template_fragments: List[str] = []
+    chunk_pairs: List[Tuple[int, str, int, str]] = []
+    pending_query: Tuple[int, str] | None = None
 
     def flush_current() -> None:
-        nonlocal current_template, query_fragments, template_fragments
+        nonlocal current_template, query_fragments, template_fragments, chunk_pairs, pending_query
         if current_template is None:
             return
         query_aligned = "".join(query_fragments)
         template_aligned = "".join(template_fragments)
-        if query_aligned and template_aligned and len(query_aligned) == len(template_aligned):
+        aligned_pairs: List[Tuple[int, int]] = []
+        for query_start, query_chunk, template_start, template_chunk in chunk_pairs:
+            aligned_pairs.extend(
+                _alignment_pairs_with_offsets(
+                    query_start=query_start,
+                    query_aligned=query_chunk,
+                    template_start=template_start,
+                    template_aligned=template_chunk,
+                )
+            )
+        if query_aligned and template_aligned and aligned_pairs:
             hits.append(
                 HHRHit(
                     pdb_id=current_template[0],
                     chain_id=current_template[1],
                     query_aligned=query_aligned,
                     template_aligned=template_aligned,
+                    aligned_pairs=tuple(aligned_pairs),
                 )
             )
         current_template = None
         query_fragments = []
         template_fragments = []
+        chunk_pairs = []
+        pending_query = None
 
     for raw_line in hhr_path.read_text(errors="ignore").splitlines():
         line = raw_line.rstrip()
@@ -170,9 +220,24 @@ def _parse_hhr_hits(hhr_path: Path) -> List[HHRHit]:
         if len(parts) < 4:
             continue
         if parts[0] == "Q" and parts[1] == "query":
-            query_fragments.append(parts[3].strip())
+            query_chunk = parts[3].strip()
+            query_fragments.append(query_chunk)
+            try:
+                pending_query = (int(parts[2]), query_chunk)
+            except ValueError:
+                pending_query = None
         elif parts[0] == "T" and parts[1] not in {"Consensus", "ss_dssp", "ss_pred", "ss_conf"}:
-            template_fragments.append(parts[3].strip())
+            template_chunk = parts[3].strip()
+            template_fragments.append(template_chunk)
+            if pending_query is None:
+                continue
+            try:
+                template_start = int(parts[2])
+            except ValueError:
+                continue
+            query_start, query_chunk = pending_query
+            if len(query_chunk) == len(template_chunk):
+                chunk_pairs.append((query_start, query_chunk, template_start, template_chunk))
 
     flush_current()
     return hits
@@ -231,6 +296,88 @@ def _pairs_from_aligned_strings(query_aligned: str, template_aligned: str) -> Tu
         if t_has:
             t_idx += 1
     return pairs, matches
+
+
+def _resolve_msa_names(msa_name: str, msa_names: str | Sequence[str] | None = None) -> Tuple[str, ...]:
+    if msa_names is None:
+        return (msa_name,)
+    if isinstance(msa_names, str):
+        parsed = tuple(token.strip() for token in msa_names.split(",") if token.strip())
+    else:
+        parsed = tuple(token.strip() for token in msa_names if token.strip())
+    return parsed or (msa_name,)
+
+
+def _find_msa_path(chain_dir: Path, msa_name: str) -> Path | None:
+    direct_candidates = (
+        chain_dir / msa_name,
+        chain_dir / "a3m" / msa_name,
+    )
+    for candidate in direct_candidates:
+        if candidate.exists():
+            return candidate
+    for path in chain_dir.rglob(msa_name):
+        return path
+    return None
+
+
+def _read_merged_msa(
+    chain_dir: Path,
+    *,
+    msa_name: str,
+    msa_names: str | Sequence[str] | None,
+    max_msa_seqs: int,
+) -> Tuple[np.ndarray, np.ndarray, str]:
+    resolved_names = _resolve_msa_names(msa_name, msa_names)
+    merged_rows: List[np.ndarray] = []
+    merged_deletions: List[np.ndarray] = []
+    seen_rows: set[Tuple[bytes, bytes]] = set()
+    loaded_paths: List[Path] = []
+    query_sequence: str | None = None
+    row_limit = max(0, int(max_msa_seqs))
+
+    for source_name in resolved_names:
+        msa_path = _find_msa_path(chain_dir, source_name)
+        if msa_path is None:
+            continue
+
+        a3m = read_a3m(msa_path)
+        source_msa, source_deletions = a3m.to_tokens(max_seqs=row_limit or None)
+        aligned_msa, _ = a3m.to_aligned_msa()
+        query_aligned = aligned_msa[0]
+        source_msa, source_deletions, source_query_sequence = ungap_query_columns(
+            msa=source_msa,
+            deletions=source_deletions,
+            query_aligned=query_aligned,
+        )
+        if query_sequence is None:
+            query_sequence = source_query_sequence
+        elif query_sequence.upper() != source_query_sequence.upper():
+            raise ValueError(
+                f"Mismatched query sequences across MSA sources for {chain_dir.name}: "
+                f"{query_sequence} vs {source_query_sequence}"
+            )
+
+        loaded_paths.append(msa_path)
+        for row, deletion_row in zip(source_msa, source_deletions):
+            dedup_key = (row.tobytes(), deletion_row.tobytes())
+            if dedup_key in seen_rows:
+                continue
+            seen_rows.add(dedup_key)
+            merged_rows.append(row.copy())
+            merged_deletions.append(deletion_row.copy())
+            if row_limit and len(merged_rows) >= row_limit:
+                break
+        if row_limit and len(merged_rows) >= row_limit:
+            break
+
+    if not loaded_paths:
+        expected = ", ".join(str(chain_dir / "a3m" / name) for name in resolved_names)
+        raise FileNotFoundError(f"Missing MSA files: {expected}")
+    if query_sequence is None or not merged_rows:
+        raise ValueError(f"No usable MSA rows found for {chain_dir.name}.")
+
+    return np.stack(merged_rows), np.stack(merged_deletions), query_sequence
 
 
 def _project_atom14_to_query(
@@ -313,11 +460,6 @@ def _extract_template_features(
     for hit in hits:
         if hit.pdb_id == target_pdb_id and hit.chain_id == target_chain_id:
             continue
-        query_seq_from_hhr = hit.query_aligned.replace("-", "")
-        template_seq_from_hhr = hit.template_aligned.replace("-", "")
-        if query_seq_from_hhr.upper() != target_seq.upper():
-            continue
-
         mmcif_path = mmcif_root / f"{hit.pdb_id}.cif"
         if not mmcif_path.exists():
             continue
@@ -333,10 +475,7 @@ def _extract_template_features(
         except Exception:
             continue
 
-        if template_seq_from_hhr.upper() != tpl.sequence.upper():
-            continue
-
-        pairs, _matches = _pairs_from_aligned_strings(hit.query_aligned, hit.template_aligned)
+        pairs = list(hit.aligned_pairs)
         if not pairs:
             continue
 
@@ -460,7 +599,7 @@ def main() -> None:
 
     for cid in tqdm(chain_ids, desc="preprocess"):
         try:
-            pdb_id, chain_id = cid.split("_")
+            pdb_id, chain_id = cid.split("_", 1)
             pdb_id = pdb_id.lower()
 
             # Resolve alignment path:
@@ -469,25 +608,15 @@ def main() -> None:
             chain_dir = (alignments_root / cid) if alignments_root is not None else (raw_root / "roda_pdb" / cid)
             if not chain_dir.exists():
                 raise FileNotFoundError(f"Missing alignment directory: {chain_dir}")
-            msa_path = None
-            for p in chain_dir.rglob(args.msa_name):
-                msa_path = p
-                break
-            if msa_path is None:
-                raise FileNotFoundError(f"Could not find {args.msa_name} under {chain_dir}")
-
             mmcif_path = mmcif_root / f"{pdb_id}.cif"
             if not mmcif_path.exists():
                 raise FileNotFoundError(f"Missing mmCIF: {mmcif_path}")
 
-            a3m = read_a3m(msa_path)
-            msa, deletions = a3m.to_tokens(max_seqs=args.max_msa_seqs)
-            aligned_msa, _ = a3m.to_aligned_msa()
-            query_aligned = aligned_msa[0]
-            msa, deletions, query_sequence = ungap_query_columns(
-                msa=msa,
-                deletions=deletions,
-                query_aligned=query_aligned,
+            msa, deletions, query_sequence = _read_merged_msa(
+                chain_dir,
+                msa_name=args.msa_name,
+                msa_names=args.msa_names,
+                max_msa_seqs=args.max_msa_seqs,
             )
             chain_struct = extract_chain_atoms(
                 mmcif_path=mmcif_path,
@@ -538,6 +667,8 @@ def main() -> None:
                 "aatype": sequence_to_ids(target_seq),
                 "msa": msa.astype(np.int32),
                 "deletions": deletions.astype(np.int32),
+                "residue_index": np.arange(target_L, dtype=np.int32),
+                "between_segment_residues": np.zeros((target_L,), dtype=np.int32),
                 "projection_seq_identity": np.asarray(projection_stats["projection_seq_identity"], dtype=np.float32),
                 "projection_alignment_coverage": np.asarray(
                     projection_stats["projection_alignment_coverage"], dtype=np.float32

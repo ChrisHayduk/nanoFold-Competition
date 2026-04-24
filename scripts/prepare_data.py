@@ -6,6 +6,8 @@ import subprocess
 import time
 from pathlib import Path
 from typing import Dict, List
+from urllib.error import HTTPError, URLError
+from urllib.request import urlopen
 
 """Download a fixed subset of OpenProteinSet/OpenFold training data.
 
@@ -61,6 +63,11 @@ def parse_args() -> argparse.Namespace:
         "--include-mmcif-zip",
         action="store_true",
         help="Also download pdb_mmcif.zip (very large). Consider hosting a smaller mmCIF subset yourself.",
+    )
+    ap.add_argument(
+        "--download-mmcif-subset",
+        action="store_true",
+        help="Download only the manifest PDB mmCIF files from RCSB into pdb_data/mmcif_files.",
     )
     ap.add_argument(
         "--dry-run",
@@ -177,6 +184,74 @@ def _dedupe_keep_order(items: List[str]) -> List[str]:
         out.append(x)
         seen.add(x)
     return out
+
+
+def _structure_url_and_destination(cid: str, data_root: Path) -> tuple[str, Path]:
+    pdb_id = cid.split("_", 1)[0]
+    return (
+        f"https://files.rcsb.org/download/{pdb_id.upper()}.cif",
+        data_root / "pdb_data" / "mmcif_files" / f"{pdb_id.lower()}.cif",
+    )
+
+
+def _download_url(
+    url: str,
+    destination: Path,
+    *,
+    dry_run: bool,
+    retries: int,
+    retry_delay_seconds: float,
+    allow_fail: bool,
+) -> bool:
+    print("+", url, "->", destination)
+    if dry_run:
+        return True
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    attempt = 0
+    while True:
+        try:
+            with urlopen(url) as response:
+                destination.write_bytes(response.read())
+            return True
+        except (HTTPError, URLError, OSError) as exc:
+            attempt += 1
+            if attempt <= retries:
+                wait_s = max(0.0, retry_delay_seconds) * attempt
+                print(f"WARNING: download failed ({exc}), retrying {attempt}/{retries} after {wait_s:.1f}s")
+                time.sleep(wait_s)
+                continue
+            if allow_fail:
+                print(f"WARNING: download failed and will be skipped ({exc})")
+                return False
+            raise
+
+
+def _download_mmcif_subset(
+    chain_ids: List[str],
+    data_root: Path,
+    *,
+    dry_run: bool,
+    retries: int,
+    retry_delay_seconds: float,
+) -> None:
+    seen_pdb_ids: set[str] = set()
+    for cid in chain_ids:
+        pdb_id = cid.split("_", 1)[0].lower()
+        if pdb_id in seen_pdb_ids:
+            continue
+        seen_pdb_ids.add(pdb_id)
+        url, destination = _structure_url_and_destination(cid, data_root)
+        if destination.exists():
+            continue
+        _download_url(
+            url,
+            destination,
+            dry_run=dry_run,
+            retries=retries,
+            retry_delay_seconds=retry_delay_seconds,
+            allow_fail=True,
+        )
 
 
 def _download_chain(
@@ -349,6 +424,14 @@ def main() -> None:
 
     if args.include_mmcif_zip:
         run(["aws", "s3", "cp", f"{args.bucket}/pdb_mmcif.zip", str(data_root), "--no-sign-request"], args.dry_run)
+    if args.download_mmcif_subset:
+        _download_mmcif_subset(
+            chain_ids,
+            data_root,
+            dry_run=args.dry_run,
+            retries=max(0, int(args.download_retries)),
+            retry_delay_seconds=max(0.0, float(args.download_retry_delay_seconds)),
+        )
 
     print("Done. Next: run scripts/preprocess.py to build data/processed/*.npz")
 

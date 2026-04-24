@@ -13,6 +13,8 @@ FEATURE_KEYS = (
     "aatype",
     "msa",
     "deletions",
+    "residue_index",
+    "between_segment_residues",
     "template_aatype",
     "template_ca_coords",
     "template_ca_mask",
@@ -152,12 +154,24 @@ class ProcessedNPZDataset(Dataset):
                 if "template_ca_mask" in feature_data
                 else torch.zeros((0, L), dtype=torch.bool)
             )
+            residue_index = (
+                torch.from_numpy(np.asarray(feature_data["residue_index"], dtype=np.int64))
+                if "residue_index" in feature_data
+                else torch.arange(L, dtype=torch.long)
+            )
+            between_segment_residues = (
+                torch.from_numpy(np.asarray(feature_data["between_segment_residues"], dtype=np.int64))
+                if "between_segment_residues" in feature_data
+                else torch.zeros((L,), dtype=torch.long)
+            )
 
             out: Dict[str, Any] = {
                 "chain_id": chain_id,
                 "aatype": torch.from_numpy(feature_data["aatype"]).long(),  # (L,)
                 "msa": torch.from_numpy(feature_data["msa"]).long(),  # (N,L)
                 "deletions": torch.from_numpy(feature_data["deletions"]).long(),  # (N,L)
+                "residue_index": residue_index,  # (L,)
+                "between_segment_residues": between_segment_residues,  # (L,)
                 "template_aatype": template_aatype,  # (T,L)
                 "template_ca_coords": template_ca_coords,  # (T,L,3)
                 "template_ca_mask": template_ca_mask,  # (T,L)
@@ -181,7 +195,7 @@ class ProcessedNPZDataset(Dataset):
                 out["atom14_mask"] = torch.from_numpy(
                     np.asarray(label_data["atom14_mask"], dtype=bool)
                 )  # (L,14)
-                if "residue_index" in label_data:
+                if "residue_index" in label_data and "residue_index" not in out:
                     out["residue_index"] = torch.from_numpy(
                         np.asarray(label_data["residue_index"], dtype=np.int64)
                     )  # (L,)
@@ -215,6 +229,8 @@ def _crop_single_example(example: Dict[str, torch.Tensor], crop_size: int, crop_
     cropped["template_aatype"] = example["template_aatype"][:, start:end]
     cropped["template_ca_coords"] = example["template_ca_coords"][:, start:end]
     cropped["template_ca_mask"] = example["template_ca_mask"][:, start:end]
+    if "between_segment_residues" in example:
+        cropped["between_segment_residues"] = example["between_segment_residues"][start:end]
     if "ca_coords" in example:
         cropped["ca_coords"] = example["ca_coords"][start:end]
     if "ca_mask" in example:
@@ -279,6 +295,10 @@ def collate_batch(
     has_residue_index = all("residue_index" in ex for ex in examples)
     if any("residue_index" in ex for ex in examples) and not has_residue_index:
         raise ValueError("Inconsistent residue_index presence inside one batch.")
+
+    has_between_segment_residues = all("between_segment_residues" in ex for ex in examples)
+    if any("between_segment_residues" in ex for ex in examples) and not has_between_segment_residues:
+        raise ValueError("Inconsistent between_segment_residues presence inside one batch.")
 
     has_resolution = all("resolution" in ex for ex in examples)
     if any("resolution" in ex for ex in examples) and not has_resolution:
@@ -391,6 +411,10 @@ def collate_batch(
     if has_residue_index:
         out["residue_index"] = torch.stack(
             [pad_1d(item["residue_index"].to(torch.int64), pad_value=0) for item in batch], dim=0
+        )  # (B,L)
+    if has_between_segment_residues:
+        out["between_segment_residues"] = torch.stack(
+            [pad_1d(item["between_segment_residues"].to(torch.int64), pad_value=0) for item in batch], dim=0
         )  # (B,L)
     if has_resolution:
         out["resolution"] = torch.stack(

@@ -35,6 +35,8 @@ def _batch() -> Dict[str, Any]:
         "template_aatype": torch.zeros((B, T, L), dtype=torch.long),
         "template_ca_coords": torch.zeros((B, T, L, 3), dtype=torch.float32),
         "template_ca_mask": torch.ones((B, T, L), dtype=torch.bool),
+        "residue_index": torch.arange(L, dtype=torch.long).expand(B, -1),
+        "between_segment_residues": torch.zeros((B, L), dtype=torch.long),
         "ca_coords": torch.zeros((B, L, 3), dtype=torch.float32),
         "ca_mask": torch.ones((B, L), dtype=torch.bool),
         "atom14_positions": torch.zeros((B, L, 14, 3), dtype=torch.float32),
@@ -113,6 +115,8 @@ def test_strip_supervision_from_batch_for_inference() -> None:
         "template_aatype",
         "template_ca_coords",
         "template_ca_mask",
+        "residue_index",
+        "between_segment_residues",
         "residue_mask",
     }
 

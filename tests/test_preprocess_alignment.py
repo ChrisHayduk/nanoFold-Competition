@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import importlib.util
-from pathlib import Path
 import sys
+from pathlib import Path
 
 import numpy as np
 
@@ -63,10 +63,41 @@ def test_parse_hhr_hits_preserves_file_order_and_alignment_strings(tmp_path: Pat
     assert [(hit.pdb_id, hit.chain_id) for hit in hits] == [("1abc", "A"), ("2bcd", "B")]
     assert hits[0].query_aligned == "AC-D"
     assert hits[0].template_aligned == "ACGD"
+    assert hits[0].aligned_pairs == ((0, 4), (1, 5), (2, 7))
 
     pairs, matches = pairs_from_strings(hits[0].query_aligned, hits[0].template_aligned)
     assert pairs == [(0, 0), (1, 1), (2, 3)]
     assert matches == 3
+
+
+def test_read_merged_msa_deduplicates_multiple_sources(tmp_path: Path) -> None:
+    module = _load_preprocess_module()
+    read_merged_msa = getattr(module, "_read_merged_msa")
+
+    chain_dir = tmp_path / "1abc_A"
+    a3m_dir = chain_dir / "a3m"
+    a3m_dir.mkdir(parents=True)
+    (a3m_dir / "uniref90_hits.a3m").write_text(
+        ">query\nACD\n"
+        ">dup\nACD\n"
+        ">unique1\nA-D\n"
+    )
+    (a3m_dir / "mgnify_hits.a3m").write_text(
+        ">query\nACD\n"
+        ">dup-again\nACD\n"
+        ">unique2\n-CD\n"
+    )
+
+    msa, deletions, query_sequence = read_merged_msa(
+        chain_dir,
+        msa_name="uniref90_hits.a3m",
+        msa_names="uniref90_hits.a3m,mgnify_hits.a3m",
+        max_msa_seqs=8,
+    )
+
+    assert query_sequence == "ACD"
+    assert msa.shape == (3, 3)
+    assert deletions.shape == (3, 3)
 
 
 def test_project_atom14_to_query_reports_alignment_provenance() -> None:

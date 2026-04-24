@@ -37,6 +37,10 @@ REQUIRED_FEATURE_KEYS = (
     "template_ca_coords",
     "template_ca_mask",
 )
+OPTIONAL_FEATURE_KEYS = (
+    "residue_index",
+    "between_segment_residues",
+)
 REQUIRED_LABEL_KEYS = ("ca_coords", "ca_mask", "atom14_positions", "atom14_mask")
 OPTIONAL_LABEL_KEYS = (
     "residue_index",
@@ -143,6 +147,17 @@ def validate_feature_npz_schema(npz_path: str | Path) -> List[str]:
                     "`template_ca_mask` first dimension must match `template_aatype` "
                     f"({template_ca_mask.shape[0]} vs {template_aatype.shape[0]})"
                 )
+
+        for key in OPTIONAL_FEATURE_KEYS:
+            if key not in keys:
+                continue
+            value = data[key]
+            if _dtype_name(value.dtype) not in {"int32", "int64"}:
+                errors.append(f"`{key}` dtype must be int32/int64 (got {_dtype_name(value.dtype)})")
+            if value.ndim != 1:
+                errors.append(f"`{key}` must have shape (L,), got {value.shape}")
+            elif value.shape[0] != L:
+                errors.append(f"`{key}` first dimension must equal len(aatype)={L}, got {value.shape[0]}")
     return errors
 
 

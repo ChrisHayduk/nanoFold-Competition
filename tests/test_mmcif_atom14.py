@@ -22,7 +22,7 @@ def _build_synthetic_mmcif(path: Path, *, chain_id: str = "A") -> None:
     """Write a minimal 3-residue alanine chain to ``path`` as mmCIF."""
     structure = gemmi.Structure()
     structure.name = "synth"
-    model = gemmi.Model("1")
+    model = gemmi.Model(1)
     chain = gemmi.Chain(chain_id)
 
     for seq_index in range(3):
