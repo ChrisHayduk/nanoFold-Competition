@@ -7,6 +7,8 @@ from pathlib import Path
 
 import numpy as np
 
+from nanofold.chain_paths import chain_npz_path
+
 
 def _load_filter_module():
     module_path = Path("scripts/filter_openproteinset.py").resolve()
@@ -21,7 +23,7 @@ def _load_filter_module():
 
 def _write_npzs(feature_dir: Path, label_dir: Path, chain_id: str, *, aatype: list[int], resolution: float) -> None:
     np.savez_compressed(
-        feature_dir / f"{chain_id}.npz",
+        chain_npz_path(feature_dir, chain_id),
         aatype=np.asarray(aatype, dtype=np.int32),
         msa=np.zeros((1, len(aatype)), dtype=np.int32),
         deletions=np.zeros((1, len(aatype)), dtype=np.int32),
@@ -30,7 +32,7 @@ def _write_npzs(feature_dir: Path, label_dir: Path, chain_id: str, *, aatype: li
         template_ca_mask=np.zeros((0, len(aatype)), dtype=bool),
     )
     np.savez_compressed(
-        label_dir / f"{chain_id}.npz",
+        chain_npz_path(label_dir, chain_id),
         ca_coords=np.zeros((len(aatype), 3), dtype=np.float32),
         ca_mask=np.ones((len(aatype),), dtype=bool),
         atom14_positions=np.zeros((len(aatype), 14, 3), dtype=np.float32),
@@ -128,11 +130,11 @@ def test_ca_only_labels_are_rejected(tmp_path: Path) -> None:
     features.mkdir()
     labels.mkdir()
     np.savez_compressed(
-        features / "1ca_A.npz",
+        chain_npz_path(features, "1ca_A"),
         aatype=np.asarray(list(range(20)) * 3, dtype=np.int32),
     )
     np.savez_compressed(
-        labels / "1ca_A.npz",
+        chain_npz_path(labels, "1ca_A"),
         ca_coords=np.zeros((60, 3), dtype=np.float32),
         ca_mask=np.ones((60,), dtype=bool),
     )

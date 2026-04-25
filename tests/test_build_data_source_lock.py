@@ -5,6 +5,8 @@ import json
 import sys
 from pathlib import Path
 
+from nanofold.chain_paths import chain_data_dir
+
 
 def _load_module():
     module_path = Path("scripts/build_data_source_lock.py").resolve()
@@ -17,14 +19,14 @@ def _load_module():
     return module
 
 
-def test_data_source_lock_pins_raw_trees_and_annotates_manifest_lock(tmp_path: Path) -> None:
+def test_data_source_lock_pins_raw_trees_without_public_manifest_annotation(tmp_path: Path) -> None:
     module = _load_module()
     main = getattr(module, "main")
 
     data_root = tmp_path / "data"
     manifests = tmp_path / "manifests"
     mmcif_root = data_root / "pdb_data" / "mmcif_files"
-    chain_dir = data_root / "roda_pdb" / "1abc_A" / "a3m"
+    chain_dir = chain_data_dir(data_root / "roda_pdb", "1abc_A") / "a3m"
     mmcif_root.mkdir(parents=True)
     chain_dir.mkdir(parents=True)
     (mmcif_root / "1abc.cif").write_text("data_1abc\n")
@@ -70,7 +72,7 @@ def test_data_source_lock_pins_raw_trees_and_annotates_manifest_lock(tmp_path: P
     assert lock["raw_assets"]["missing_alignment_file_count"] == 0
     assert lock["raw_assets"]["required_msa_names"] == ["uniref90_hits.a3m"]
     assert lock["raw_assets"]["mmcif_tree_sha256"]
-    assert json.loads(manifest_lock.read_text())["data_source_lock_sha256"]
+    assert "data_source_lock_sha256" not in json.loads(manifest_lock.read_text())
 
 
 def test_data_source_lock_requires_declared_msa_files(tmp_path: Path) -> None:
@@ -80,7 +82,7 @@ def test_data_source_lock_requires_declared_msa_files(tmp_path: Path) -> None:
     data_root = tmp_path / "data"
     manifests = tmp_path / "manifests"
     mmcif_root = data_root / "pdb_data" / "mmcif_files"
-    chain_dir = data_root / "roda_pdb" / "1abc_A" / "a3m"
+    chain_dir = chain_data_dir(data_root / "roda_pdb", "1abc_A") / "a3m"
     mmcif_root.mkdir(parents=True)
     chain_dir.mkdir(parents=True)
     (mmcif_root / "1abc.cif").write_text("data_1abc\n")

@@ -43,6 +43,7 @@ def test_download_mmcif_subset_deduplicates_pdb_ids(tmp_path: Path, monkeypatch)
         dry_run=False,
         retries=0,
         retry_delay_seconds=0.0,
+        workers=1,
     )
 
     assert [url for url, _ in calls] == [
@@ -67,6 +68,7 @@ def test_download_mmcif_subset_strict_fails_on_missing_download(tmp_path: Path, 
             dry_run=False,
             retries=0,
             retry_delay_seconds=0.0,
+            workers=1,
             strict=True,
         )
     except SystemExit as exc:

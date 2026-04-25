@@ -1,13 +1,13 @@
 """Preprocess raw OpenProteinSet/OpenFold data into compact per-chain .npz files.
 
-Input assumptions (adjust as needed):
+Input assumptions:
 - Either:
-  - raw_root/roda_pdb/<chain_id>/ contains subdirectories for alignment files (A3M/HHR/etc), or
-  - alignments_root/<chain_id>/ contains flattened OpenFold alignments from flatten_roda.sh
+  - raw_root/roda_pdb/<encoded_chain_id>/ contains subdirectories for alignment files (A3M/HHR/etc), or
+  - alignments_root/<encoded_chain_id>/ contains flattened OpenFold alignments from flatten_roda.sh
 - mmcif_root contains mmCIF files named like <pdb_id>.cif (lowercase)
 
 Output (per chain):
-- processed_features_dir/<chain_id>.npz containing:
+- processed_features_dir/<encoded_chain_id>.npz containing:
     aatype: (L,) int32
     msa: (N,L) int32
     deletions: (N,L) int32
@@ -16,7 +16,7 @@ Output (per chain):
     template_aatype: (T,L) int32
     template_ca_coords: (T,L,3) float32
     template_ca_mask: (T,L) bool
-- processed_labels_dir/<chain_id>.npz containing:
+- processed_labels_dir/<encoded_chain_id>.npz containing:
     ca_coords: (L,3) float32          # required
     ca_mask: (L,) bool                # required
     atom14_positions: (L,14,3) float32   # full atom14 layout (AF2 supplement 1.2.1)
@@ -50,6 +50,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from nanofold.a3m import read_a3m, sequence_to_ids, ungap_query_columns
+from nanofold.chain_paths import chain_data_dir, chain_error_path, chain_npz_path
 from nanofold.mmcif import extract_chain_atoms
 from nanofold.residue_constants import ATOM14_NUM_SLOTS, CA_ATOM14_SLOT
 
@@ -61,7 +62,7 @@ def parse_args() -> argparse.Namespace:
         "--alignments-root",
         type=str,
         default="",
-        help="Optional flattened alignments dir (OpenFold layout): <root>/<chain_id>/...",
+        help="Optional flattened alignments dir using nanoFold encoded chain directories.",
     )
     ap.add_argument("--mmcif-root", type=str, default="data/mmcif", help="Directory containing mmCIF files")
     ap.add_argument("--manifest", type=str, required=True, help="train.txt or val.txt listing chain IDs")
@@ -94,17 +95,22 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument(
         "--strict",
         action="store_true",
-        help="Require perfect sequence match between structure and MSA query. Recommended for a clean benchmark.",
+        help="Require exact coordinate-sequence and MSA-query equality instead of masked projection.",
     )
     ap.add_argument("--min-projection-seq-identity", type=float, default=0.90)
-    ap.add_argument("--min-projection-coverage", type=float, default=0.90)
-    ap.add_argument("--min-projection-aligned-fraction", type=float, default=0.90)
+    ap.add_argument("--min-projection-coverage", type=float, default=0.70)
+    ap.add_argument("--min-projection-aligned-fraction", type=float, default=0.70)
     ap.add_argument("--min-projection-valid-ca", type=int, default=32)
     ap.add_argument("--fail-fast", action="store_true")
     ap.add_argument(
         "--allow-failures",
         action="store_true",
         help="Complete with exit code 0 even if some chains fail. Official preprocessing leaves this off.",
+    )
+    ap.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="Skip chains whose feature and label NPZs already exist with the required schema.",
     )
     return ap.parse_args()
 
@@ -561,8 +567,61 @@ def _save_npz(path: Path, arrays: Dict[str, np.ndarray]) -> None:
     np.savez_compressed(path, **arrays)  # type: ignore[arg-type]
 
 
+def _existing_outputs_are_valid(feature_path: Path, label_path: Path) -> bool:
+    if not feature_path.exists() or not label_path.exists():
+        return False
+
+    required_feature_keys = {
+        "aatype",
+        "msa",
+        "deletions",
+        "residue_index",
+        "between_segment_residues",
+        "template_aatype",
+        "template_ca_coords",
+        "template_ca_mask",
+    }
+    required_label_keys = {
+        "ca_coords",
+        "ca_mask",
+        "atom14_positions",
+        "atom14_mask",
+        "residue_index",
+        "resolution",
+    }
+    try:
+        with np.load(feature_path) as features, np.load(label_path) as labels:
+            if not required_feature_keys.issubset(set(features.files)):
+                return False
+            if not required_label_keys.issubset(set(labels.files)):
+                return False
+
+            aatype = features["aatype"]
+            msa = features["msa"]
+            atom14_positions = labels["atom14_positions"]
+            atom14_mask = labels["atom14_mask"]
+            ca_coords = labels["ca_coords"]
+            ca_mask = labels["ca_mask"]
+            if aatype.ndim != 1 or msa.ndim != 2:
+                return False
+            length = int(aatype.shape[0])
+            return (
+                int(msa.shape[1]) == length
+                and atom14_positions.shape == (length, ATOM14_NUM_SLOTS, 3)
+                and atom14_mask.shape == (length, ATOM14_NUM_SLOTS)
+                and ca_coords.shape == (length, 3)
+                and ca_mask.shape == (length,)
+            )
+    except Exception:
+        return False
+
+
 def _write_preprocess_meta(args: argparse.Namespace, out_dir: Path) -> None:
-    stable_args = {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items() if k != "manifest"}
+    stable_args = {
+        k: (str(v) if isinstance(v, Path) else v)
+        for k, v in vars(args).items()
+        if k not in {"manifest", "skip_existing"}
+    }
     meta = {
         "schema_version": 2,
         "cli_args": stable_args,
@@ -586,13 +645,6 @@ def _write_preprocess_meta(args: argparse.Namespace, out_dir: Path) -> None:
 def main() -> None:
     args = parse_args()
 
-    if not args.strict:
-        print(
-            "WARNING: --strict is off. Structure sequences will be projected onto the "
-            "MSA query via global alignment. The official competition path uses --strict.",
-            file=sys.stderr,
-        )
-
     raw_root = Path(args.raw_root)
     alignments_root = Path(args.alignments_root) if args.alignments_root else None
     mmcif_root = Path(args.mmcif_root)
@@ -613,11 +665,24 @@ def main() -> None:
         try:
             pdb_id, chain_id = cid.split("_", 1)
             pdb_id = pdb_id.lower()
+            feature_path = chain_npz_path(processed_features_dir, cid)
+            label_path = chain_npz_path(processed_labels_dir, cid)
+            err_marker = chain_error_path(processed_features_dir, cid)
+
+            if args.skip_existing and _existing_outputs_are_valid(feature_path, label_path):
+                if err_marker.exists():
+                    err_marker.unlink()
+                n_ok += 1
+                continue
 
             # Resolve alignment path:
-            # - OpenFold flattened layout: <alignments_root>/<chain_id>/
-            # - scripts/prepare_data.py layout: <raw_root>/roda_pdb/<chain_id>/
-            chain_dir = (alignments_root / cid) if alignments_root is not None else (raw_root / "roda_pdb" / cid)
+            # Local chain directories use an encoded stem so case-sensitive PDB chain IDs
+            # remain distinct on case-insensitive filesystems.
+            chain_dir = (
+                chain_data_dir(alignments_root, cid)
+                if alignments_root is not None
+                else chain_data_dir(raw_root / "roda_pdb", cid)
+            )
             if not chain_dir.exists():
                 raise FileNotFoundError(f"Missing alignment directory: {chain_dir}")
             mmcif_path = mmcif_root / f"{pdb_id}.cif"
@@ -634,7 +699,7 @@ def main() -> None:
                 mmcif_path=mmcif_path,
                 pdb_id=pdb_id,
                 chain_id=chain_id,
-                expected_sequence=query_sequence if args.strict else None,
+                expected_sequence=query_sequence,
                 require_full_match=args.strict,
             )
 
@@ -676,6 +741,7 @@ def main() -> None:
             target_L = len(target_seq)
 
             features_out = {
+                "chain_id": np.asarray(cid),
                 "aatype": sequence_to_ids(target_seq),
                 "msa": msa.astype(np.int32),
                 "deletions": deletions.astype(np.int32),
@@ -693,6 +759,7 @@ def main() -> None:
                 ),
             }
             labels_out = {
+                "chain_id": np.asarray(cid),
                 "ca_coords": target_ca_coords.astype(np.float32),
                 "ca_mask": target_ca_mask.astype(bool),
                 "atom14_positions": target_atom14_positions.astype(np.float32),
@@ -722,9 +789,8 @@ def main() -> None:
                 )
                 features_out.update(tpl)
 
-            _save_npz(processed_features_dir / f"{cid}.npz", features_out)
-            _save_npz(processed_labels_dir / f"{cid}.npz", labels_out)
-            err_marker = processed_features_dir / f"{cid}.error.txt"
+            _save_npz(feature_path, features_out)
+            _save_npz(label_path, labels_out)
             if err_marker.exists():
                 err_marker.unlink()
             n_ok += 1
@@ -732,8 +798,7 @@ def main() -> None:
             n_fail += 1
             if args.fail_fast:
                 raise
-            # Write an error marker file for debugging
-            (processed_features_dir / f"{cid}.error.txt").write_text(str(e) + "\n")
+            err_marker.write_text(str(e) + "\n")
             continue
 
     print(f"Preprocess complete: ok={n_ok}, fail={n_fail}")

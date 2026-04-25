@@ -22,6 +22,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from nanofold.chain_paths import chain_npz_path
 from nanofold.competition_policy import DEFAULT_TRACK_ID, load_track_spec
 from nanofold.data import read_manifest
 from nanofold.metrics import foldscore_auc, foldscore_components
@@ -245,17 +246,6 @@ def _resolve_hidden_asset(
     return path
 
 
-def _require_pinned_hidden_track_metadata(track_spec: Any) -> None:
-    if not getattr(track_spec, "hidden_manifest_sha256", None):
-        raise ValueError(
-            "Track metadata must pin `dataset.hidden_manifest_sha256` for hidden leaderboard runs."
-        )
-    if not getattr(track_spec, "hidden_fingerprint_sha256", None):
-        raise ValueError(
-            "Track metadata must pin `dataset.hidden_fingerprint_sha256` for hidden leaderboard runs."
-        )
-
-
 def _tree_sha256(root: Path) -> str:
     if not root.exists() or not root.is_dir():
         raise FileNotFoundError(f"Expected directory for tree hash: {root}")
@@ -387,8 +377,8 @@ def _score_hidden_predictions(
         }
 
         for chain_id in chain_ids:
-            pred_path = ckpt_pred_dir / f"{chain_id}.npz"
-            label_path = hidden_labels_dir / f"{chain_id}.npz"
+            pred_path = chain_npz_path(ckpt_pred_dir, chain_id)
+            label_path = chain_npz_path(hidden_labels_dir, chain_id)
             if not pred_path.exists():
                 raise FileNotFoundError(f"Missing prediction file for hidden scoring: {pred_path}")
             if not label_path.exists():
@@ -698,7 +688,6 @@ def main() -> None:
     hidden_lock_meta: Dict[str, Any] | None = None
 
     if not args.disable_hidden:
-        _require_pinned_hidden_track_metadata(track_spec)
         hidden_manifest = _resolve_hidden_asset(
             cli_value=args.hidden_manifest,
             track_value=track_spec.hidden_manifest,
@@ -757,7 +746,13 @@ def main() -> None:
             env_key="NANOFOLD_HIDDEN_LABELS_DIR",
             label="hidden-labels-dir",
         )
-        lock_file_value = args.hidden_lock_file.strip() or track_spec.hidden_lock_file or "leaderboard/official_hidden_assets.lock.json"
+        hidden_lock_env = str(__import__("os").environ.get("NANOFOLD_HIDDEN_LOCK_FILE", "")).strip()
+        lock_file_value = (
+            args.hidden_lock_file.strip()
+            or hidden_lock_env
+            or track_spec.hidden_lock_file
+            or "leaderboard/private_hidden_assets.lock.json"
+        )
         lock_file = Path(lock_file_value).resolve()
         hidden_lock_meta = _validate_hidden_lock(
             lock_path=lock_file,

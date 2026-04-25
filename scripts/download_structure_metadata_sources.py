@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import time
@@ -18,7 +19,7 @@ BULK_SOURCES = {
         "path": "cath-domain-list.txt",
     },
     "scope_classification": {
-        "url": "https://scop.berkeley.edu/downloads/parse/dir.cla.scope.2.08-stable.txt",
+        "url": "http://scop.berkeley.edu/downloads/parse/dir.cla.scope.2.08-stable.txt",
         "path": "dir.cla.scope.txt",
     },
     "ecod_domains": {
@@ -46,6 +47,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-unknown-aa-fraction", type=float, default=0.0)
     parser.add_argument("--download-retries", type=int, default=2)
     parser.add_argument("--download-retry-delay-seconds", type=float, default=2.0)
+    parser.add_argument("--include-rcsb-rest", action="store_true")
+    parser.add_argument("--include-dssp-mmcif", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args(argv)
 
@@ -82,24 +85,29 @@ def _download_url(
     retries: int,
     retry_delay_seconds: float,
 ) -> bool:
-    print("+", url, "->", destination)
+    print("+", url, "->", destination, flush=True)
     if dry_run:
+        return True
+    if destination.exists():
+        print(f"  exists: {destination}", flush=True)
         return True
     destination.parent.mkdir(parents=True, exist_ok=True)
     attempt = 0
     while True:
         try:
             with urlopen(url, timeout=60) as response:
-                destination.write_bytes(response.read())
+                tmp = destination.with_suffix(destination.suffix + ".tmp")
+                tmp.write_bytes(response.read())
+                tmp.replace(destination)
             return True
         except (HTTPError, URLError, TimeoutError, OSError) as exc:
             attempt += 1
             if attempt <= retries:
                 wait_s = max(0.0, retry_delay_seconds) * attempt
-                print(f"WARNING: download failed ({exc}), retrying {attempt}/{retries} after {wait_s:.1f}s")
+                print(f"WARNING: download failed ({exc}), retrying {attempt}/{retries} after {wait_s:.1f}s", flush=True)
                 time.sleep(wait_s)
                 continue
-            print(f"ERROR: download failed ({exc})")
+            print(f"ERROR: download failed ({exc})", flush=True)
             return False
 
 
@@ -190,58 +198,68 @@ def _download_rcsb_jsonl(
     retries: int,
     retry_delay_seconds: float,
 ) -> dict[str, Any]:
-    print("+ RCSB REST metadata ->", destination)
+    print("+ RCSB REST metadata ->", destination, flush=True)
     if dry_run:
         return {"path": str(destination), "chain_count": len(chain_ids), "sha256": None, "errors": 0}
+    if destination.exists():
+        return {"path": str(destination), "chain_count": len(chain_ids), "sha256": _sha256(destination), "errors": 0}
     destination.parent.mkdir(parents=True, exist_ok=True)
-    rows: list[str] = []
     errors = 0
     entry_cache: dict[str, dict[str, Any] | None] = {}
-    for chain_id in chain_ids:
-        pdb_id = _pdb_id(chain_id)
-        chain_name = _chain_name(chain_id)
-        entry_url = f"https://data.rcsb.org/rest/v1/core/entry/{pdb_id}"
-        instance_url = f"https://data.rcsb.org/rest/v1/core/polymer_entity_instance/{pdb_id}/{chain_name}"
-        entry = entry_cache.get(pdb_id)
-        if pdb_id not in entry_cache:
-            entry, error = _read_json_url(entry_url, retries=retries, retry_delay_seconds=retry_delay_seconds)
-            entry_cache[pdb_id] = entry
-            if error:
-                errors += 1
-        instance, instance_error = _read_json_url(
-            instance_url,
-            retries=retries,
-            retry_delay_seconds=retry_delay_seconds,
-        )
-        entity = None
-        entity_error = None
-        entity_id = None
-        if isinstance(instance, dict):
-            identifiers = instance.get("rcsb_polymer_entity_instance_container_identifiers")
-            if isinstance(identifiers, dict):
-                entity_id = identifiers.get("entity_id")
-        if entity_id is not None:
-            entity_url = f"https://data.rcsb.org/rest/v1/core/polymer_entity/{pdb_id}/{entity_id}"
-            entity, entity_error = _read_json_url(entity_url, retries=retries, retry_delay_seconds=retry_delay_seconds)
-        if instance_error:
-            errors += 1
-        if entity_error:
-            errors += 1
-        rows.append(
-            json.dumps(
-                {
-                    "chain_id": chain_id,
-                    "entry_url": entry_url,
-                    "instance_url": instance_url,
-                    "entry": entry or {},
-                    "instance": instance or {},
-                    "entity": entity or {},
-                    "errors": [err for err in (instance_error, entity_error) if err],
-                },
-                sort_keys=True,
+    tmp = destination.with_suffix(destination.suffix + ".tmp")
+    with tmp.open("w") as handle:
+        for idx, chain_id in enumerate(chain_ids, start=1):
+            if idx == 1 or idx % 1000 == 0:
+                print(f"  RCSB metadata {idx}/{len(chain_ids)}", flush=True)
+            pdb_id = _pdb_id(chain_id)
+            chain_name = _chain_name(chain_id)
+            entry_url = f"https://data.rcsb.org/rest/v1/core/entry/{pdb_id}"
+            instance_url = f"https://data.rcsb.org/rest/v1/core/polymer_entity_instance/{pdb_id}/{chain_name}"
+            entry = entry_cache.get(pdb_id)
+            if pdb_id not in entry_cache:
+                entry, error = _read_json_url(entry_url, retries=retries, retry_delay_seconds=retry_delay_seconds)
+                entry_cache[pdb_id] = entry
+                if error:
+                    errors += 1
+            instance, instance_error = _read_json_url(
+                instance_url,
+                retries=retries,
+                retry_delay_seconds=retry_delay_seconds,
             )
-        )
-    destination.write_text("\n".join(rows) + ("\n" if rows else ""))
+            entity = None
+            entity_error = None
+            entity_id = None
+            if isinstance(instance, dict):
+                identifiers = instance.get("rcsb_polymer_entity_instance_container_identifiers")
+                if isinstance(identifiers, dict):
+                    entity_id = identifiers.get("entity_id")
+            if entity_id is not None:
+                entity_url = f"https://data.rcsb.org/rest/v1/core/polymer_entity/{pdb_id}/{entity_id}"
+                entity, entity_error = _read_json_url(
+                    entity_url,
+                    retries=retries,
+                    retry_delay_seconds=retry_delay_seconds,
+                )
+            if instance_error:
+                errors += 1
+            if entity_error:
+                errors += 1
+            handle.write(
+                json.dumps(
+                    {
+                        "chain_id": chain_id,
+                        "entry_url": entry_url,
+                        "instance_url": instance_url,
+                        "entry": entry or {},
+                        "instance": instance or {},
+                        "entity": entity or {},
+                        "errors": [err for err in (instance_error, entity_error) if err],
+                    },
+                    sort_keys=True,
+                )
+                + "\n"
+            )
+    tmp.replace(destination)
     return {
         "path": str(destination),
         "chain_count": len(chain_ids),
@@ -260,7 +278,9 @@ def _download_dssp_mmcifs(
 ) -> dict[str, Any]:
     pdb_ids = sorted({_pdb_id(chain_id) for chain_id in chain_ids})
     failures = 0
-    for pdb_id in pdb_ids:
+    for idx, pdb_id in enumerate(pdb_ids, start=1):
+        if idx == 1 or idx % 1000 == 0:
+            print(f"  DSSP mmCIF {idx}/{len(pdb_ids)}", flush=True)
         url = f"https://pdb-redo.eu/dssp/db/{pdb_id}/mmcif"
         destination = destination_dir / f"{pdb_id}.cif"
         if destination.exists():
@@ -294,6 +314,11 @@ def main(argv: list[str] | None = None) -> None:
     args.out_dir.mkdir(parents=True, exist_ok=True)
     sources: dict[str, Any] = {}
     failures: list[str] = []
+    print(
+        f"Metadata source candidate scope: {len(chain_ids)} chains, "
+        f"{len({_pdb_id(chain_id) for chain_id in chain_ids})} PDB entries",
+        flush=True,
+    )
 
     for name, spec in BULK_SOURCES.items():
         destination = args.out_dir / str(spec["path"])
@@ -312,20 +337,42 @@ def main(argv: list[str] | None = None) -> None:
             "sha256": None if args.dry_run or not destination.exists() else _sha256(destination),
         }
 
-    sources["rcsb_chain_metadata"] = _download_rcsb_jsonl(
-        chain_ids,
-        args.out_dir / "rcsb_chain_metadata.jsonl",
-        dry_run=bool(args.dry_run),
-        retries=max(0, int(args.download_retries)),
-        retry_delay_seconds=max(0.0, float(args.download_retry_delay_seconds)),
-    )
-    sources["dssp_mmcif"] = _download_dssp_mmcifs(
-        chain_ids,
-        args.out_dir / "dssp_mmcif",
-        dry_run=bool(args.dry_run),
-        retries=max(0, int(args.download_retries)),
-        retry_delay_seconds=max(0.0, float(args.download_retry_delay_seconds)),
-    )
+    if args.include_rcsb_rest:
+        sources["rcsb_chain_metadata"] = _download_rcsb_jsonl(
+            chain_ids,
+            args.out_dir / "rcsb_chain_metadata.jsonl",
+            dry_run=bool(args.dry_run),
+            retries=max(0, int(args.download_retries)),
+            retry_delay_seconds=max(0.0, float(args.download_retry_delay_seconds)),
+        )
+    else:
+        rcsb_path = args.out_dir / "rcsb_chain_metadata.jsonl"
+        with contextlib.suppress(FileNotFoundError):
+            rcsb_path.unlink()
+        sources["rcsb_chain_metadata"] = {
+            "path": str(rcsb_path),
+            "chain_count": len(chain_ids),
+            "sha256": None,
+            "skipped": True,
+            "reason": "bulk split metadata does not require per-chain REST calls",
+        }
+    if args.include_dssp_mmcif:
+        sources["dssp_mmcif"] = _download_dssp_mmcifs(
+            chain_ids,
+            args.out_dir / "dssp_mmcif",
+            dry_run=bool(args.dry_run),
+            retries=max(0, int(args.download_retries)),
+            retry_delay_seconds=max(0.0, float(args.download_retry_delay_seconds)),
+        )
+    else:
+        sources["dssp_mmcif"] = {
+            "path": str(args.out_dir / "dssp_mmcif"),
+            "pdb_count": len({_pdb_id(chain_id) for chain_id in chain_ids}),
+            "failed_pdb_count": None,
+            "tree_sha256": None,
+            "skipped": True,
+            "reason": "selected-chain mmCIF annotations are derived during preprocessing",
+        }
 
     lock = {
         "generated_at": datetime.now(timezone.utc).isoformat(),

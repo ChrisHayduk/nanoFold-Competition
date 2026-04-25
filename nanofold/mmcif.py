@@ -21,6 +21,7 @@ occupancy, breaking ties in favour of the "no altloc" / "A" conformer.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -119,6 +120,41 @@ def _collect_atom14(
     return positions, mask
 
 
+def _chain_polymer_sequence(chain: gemmi.Chain) -> str:
+    return "".join(
+        one_letter_from_resname(res.name)
+        for res in chain
+        if res.entity_type == gemmi.EntityType.Polymer
+    )
+
+
+def _resolve_chain(
+    model: gemmi.Model,
+    *,
+    chain_id: str,
+    expected_sequence: Optional[str],
+) -> gemmi.Chain:
+    for ch in model:
+        if ch.name == chain_id:
+            return ch
+
+    if expected_sequence:
+        expected = expected_sequence.upper()
+        candidates: list[tuple[float, int, gemmi.Chain]] = []
+        for ch in model:
+            seq = _chain_polymer_sequence(ch).upper()
+            if not seq:
+                continue
+            ratio = SequenceMatcher(a=expected, b=seq, autojunk=False).ratio()
+            candidates.append((ratio, len(seq), ch))
+        if candidates:
+            best_ratio, _, best_chain = max(candidates, key=lambda item: (item[0], item[1]))
+            if best_ratio >= 0.85:
+                return best_chain
+
+    raise KeyError
+
+
 def extract_chain_atoms(
     mmcif_path: str | Path,
     pdb_id: str,
@@ -145,13 +181,10 @@ def extract_chain_atoms(
     st.setup_entities()
 
     model = st[0]
-    chain = None
-    for ch in model:
-        if ch.name == chain_id:
-            chain = ch
-            break
-    if chain is None:
-        raise KeyError(f"Chain '{chain_id}' not found in {mmcif_path}")
+    try:
+        chain = _resolve_chain(model, chain_id=chain_id, expected_sequence=expected_sequence)
+    except KeyError:
+        raise KeyError(f"Chain '{chain_id}' not found in {mmcif_path}") from None
 
     sequence_letters: List[str] = []
     atom14_positions_list: List[np.ndarray] = []

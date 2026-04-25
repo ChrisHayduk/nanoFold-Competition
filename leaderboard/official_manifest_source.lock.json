@@ -8,6 +8,7 @@
     "min_len": 40,
     "max_len": 256,
     "max_resolution": 3.0,
+    "seed": 0,
     "min_seq_id": 0.3,
     "coverage": 0.8,
     "mmseqs_bin": "mmseqs",
@@ -19,16 +20,266 @@
       "length_bin",
       "resolution_bin"
     ],
-    "seed": 0,
     "expected_chain_cache_sha256": "7286d79a9060cd67e16df69deced99bd7aa96d56add30f28d852438dffe3f1ea"
+  },
+  "filtering": {
+    "candidate_count": 221126,
+    "disjoint_unit_count": 13037,
+    "reject_reasons": {
+      "not_accepted_in_structure_metadata": 413308
+    }
+  },
+  "structure_metadata": {
+    "path": "data/manifests/structure_metadata.json",
+    "sha256": "7038cf71815daff6a775b99f09e6eedecac1d79e84dfb925c7e8b86991fd6f74",
+    "source": {
+      "chain_data_cache": "data/openproteinset/pdb_data/data_caches/chain_data_cache.json",
+      "feature_exclusion_list": {
+        "chain_count": 6,
+        "path": "data/manifests/openfold_required_feature_exclusions.txt",
+        "sha256": "c4d797caea1a569a9ee87d01a3bf11e7e98d395f677deddb8ddea1740672b528"
+      },
+      "metadata_source_lock": {
+        "lock_path": "data/metadata_sources/structure_metadata_sources.lock.json",
+        "lock_sha256": "0a6c1ebc88e55f83420266fa680bc42998a71f298d874b70b79cf62bc403d7f4",
+        "sources": {
+          "cath_domain_list": {
+            "path": "data/metadata_sources/cath-domain-list.txt",
+            "sha256": "2f87544bb8844ff37ad1d9348dfe0a23a7c9e4837e0d207733935148e088cc81",
+            "url": "https://download.cathdb.info/cath/releases/latest-release/cath-classification-data/cath-domain-list.txt"
+          },
+          "dssp_mmcif": {
+            "failed_pdb_count": null,
+            "path": "data/metadata_sources/dssp_mmcif",
+            "pdb_count": 81764,
+            "reason": "selected-chain mmCIF annotations are derived during preprocessing",
+            "skipped": true,
+            "tree_sha256": null
+          },
+          "ecod_domains": {
+            "path": "data/metadata_sources/ecod.latest.domains.txt",
+            "sha256": "d64ad6e003cfeb936a5198f1fe074b09c0d7ca419f4867218402dc7c3c06bd78",
+            "url": "http://prodata.swmed.edu/ecod/distributions/ecod.latest.domains.txt"
+          },
+          "rcsb_chain_metadata": {
+            "chain_count": 222879,
+            "path": "data/metadata_sources/rcsb_chain_metadata.jsonl",
+            "reason": "bulk split metadata does not require per-chain REST calls",
+            "sha256": null,
+            "skipped": true
+          },
+          "scope_classification": {
+            "path": "data/metadata_sources/dir.cla.scope.txt",
+            "sha256": "979eceafbc2cb8c50a6549d156d888478a43003e8f9e21e1940d11bcf3d728ca",
+            "url": "http://scop.berkeley.edu/downloads/parse/dir.cla.scope.2.08-stable.txt"
+          }
+        }
+      },
+      "metadata_sources_dir": "data/metadata_sources",
+      "processability_exclusion_list": {
+        "chain_count": 1884,
+        "path": "data/manifests/official_processability_exclusions.txt",
+        "sha256": "9750a87278c262b85bc11ea8f43d911b0cfa8129c708ec5c8d243d512027b090"
+      }
+    }
+  },
+  "clustering": {
+    "method": "mmseqs2",
+    "cluster_count": 16447,
+    "command": [
+      "mmseqs",
+      "easy-cluster",
+      "<chains_fasta>",
+      "<cluster_prefix>",
+      "<work_dir>",
+      "--min-seq-id",
+      "0.3",
+      "-c",
+      "0.8",
+      "--cov-mode",
+      "0",
+      "--threads",
+      "1"
+    ],
+    "mmseqs": "18-8cc5c",
+    "cluster_assignments_sha256": "3044bc870bd3a6d3272b03cc7938e78070fe261fefaeb3cef6e019be94fc1350"
+  },
+  "grouping": {
+    "cluster_disjoint": true,
+    "pdb_disjoint": true
+  },
+  "stratification": {
+    "fields": [
+      "secondary_structure_class",
+      "domain_architecture_class",
+      "length_bin",
+      "resolution_bin"
+    ],
+    "structural_metadata_source": "structure_metadata",
+    "split_distributions": {
+      "train": {
+        "secondary_structure_class": {
+          "alpha": 2815,
+          "alpha_beta": 3983,
+          "beta": 2083,
+          "coil_or_sparse": 137,
+          "mixed_low_confidence": 982
+        },
+        "domain_architecture_class": {
+          "6": 196,
+          "alpha": 2815,
+          "alpha_beta": 3983,
+          "beta": 2083,
+          "coil_or_sparse": 137,
+          "mixed_low_confidence": 776,
+          "other": 10
+        },
+        "length_bin": {
+          "len_040_063": 676,
+          "len_064_095": 1548,
+          "len_096_127": 2027,
+          "len_128_191": 3285,
+          "len_192_256": 2464
+        },
+        "resolution_bin": {
+          "res_1p5_2p0": 3419,
+          "res_2p0_2p5": 1869,
+          "res_2p5_3p0": 783,
+          "res_le_1p5": 1892,
+          "res_unknown": 2037
+        }
+      },
+      "val": {
+        "secondary_structure_class": {
+          "alpha": 275,
+          "alpha_beta": 397,
+          "beta": 208,
+          "coil_or_sparse": 16,
+          "mixed_low_confidence": 104
+        },
+        "domain_architecture_class": {
+          "6": 24,
+          "alpha": 275,
+          "alpha_beta": 397,
+          "beta": 208,
+          "coil_or_sparse": 16,
+          "mixed_low_confidence": 80
+        },
+        "length_bin": {
+          "len_040_063": 70,
+          "len_064_095": 160,
+          "len_096_127": 199,
+          "len_128_191": 326,
+          "len_192_256": 245
+        },
+        "resolution_bin": {
+          "res_1p5_2p0": 341,
+          "res_2p0_2p5": 187,
+          "res_2p5_3p0": 80,
+          "res_le_1p5": 190,
+          "res_unknown": 202
+        }
+      }
+    },
+    "quality_report": {
+      "stratify_fields": [
+        "secondary_structure_class",
+        "domain_architecture_class",
+        "length_bin",
+        "resolution_bin"
+      ],
+      "split_distribution": {
+        "train": {
+          "secondary_structure_class": {
+            "alpha": 2815,
+            "alpha_beta": 3983,
+            "beta": 2083,
+            "coil_or_sparse": 137,
+            "mixed_low_confidence": 982
+          },
+          "domain_architecture_class": {
+            "6": 196,
+            "alpha": 2815,
+            "alpha_beta": 3983,
+            "beta": 2083,
+            "coil_or_sparse": 137,
+            "mixed_low_confidence": 776,
+            "other": 10
+          },
+          "length_bin": {
+            "len_040_063": 676,
+            "len_064_095": 1548,
+            "len_096_127": 2027,
+            "len_128_191": 3285,
+            "len_192_256": 2464
+          },
+          "resolution_bin": {
+            "res_1p5_2p0": 3419,
+            "res_2p0_2p5": 1869,
+            "res_2p5_3p0": 783,
+            "res_le_1p5": 1892,
+            "res_unknown": 2037
+          }
+        },
+        "val": {
+          "secondary_structure_class": {
+            "alpha": 275,
+            "alpha_beta": 397,
+            "beta": 208,
+            "coil_or_sparse": 16,
+            "mixed_low_confidence": 104
+          },
+          "domain_architecture_class": {
+            "6": 24,
+            "alpha": 275,
+            "alpha_beta": 397,
+            "beta": 208,
+            "coil_or_sparse": 16,
+            "mixed_low_confidence": 80
+          },
+          "length_bin": {
+            "len_040_063": 70,
+            "len_064_095": 160,
+            "len_096_127": 199,
+            "len_128_191": 326,
+            "len_192_256": 245
+          },
+          "resolution_bin": {
+            "res_1p5_2p0": 341,
+            "res_2p0_2p5": 187,
+            "res_2p5_3p0": 80,
+            "res_le_1p5": 190,
+            "res_unknown": 202
+          }
+        }
+      },
+      "jensen_shannon_divergence": {
+        "train": {
+          "secondary_structure_class": 6.783441410505965e-07,
+          "domain_architecture_class": 6.179686584396138e-06,
+          "length_bin": 1.1833676144456444e-07,
+          "resolution_bin": 8.061264443554798e-08
+        },
+        "val": {
+          "secondary_structure_class": 0.00016998017746349455,
+          "domain_architecture_class": 0.0007030145150900336,
+          "length_bin": 6.0099716818497336e-05,
+          "resolution_bin": 1.1483855199113848e-05
+        }
+      },
+      "gates": {
+        "max_split_js_divergence": 0.35,
+        "max_unknown_domain_architecture_fraction": 0.75
+      }
+    }
   },
   "outputs": {
     "train_manifest": "data/manifests/train.txt",
     "val_manifest": "data/manifests/val.txt",
     "all_manifest": "data/manifests/all.txt",
-    "train_manifest_sha256": "c3288fe5f855b602921734ea0113a858b09c8acfb28e53468940a5657abe2682",
-    "val_manifest_sha256": "7c279df96fad21e04909bc331466d96118256d3b0f69bccf1c2cc86d957d1f67",
-    "all_manifest_sha256": "2b2a298d078b7a398a5f3379769bdbfb33b27fe39239a5f052e07d24800df778",
+    "train_manifest_sha256": "d36d1f77ba43b7c4509a6e9dfd3f9414e1ce60f8364b24e0086c1734ba6aef6d",
+    "val_manifest_sha256": "d4a0265bcd0a021e116c0c889f21e86bc24006460bcc42dec2f9a80b70c8812b",
+    "all_manifest_sha256": "0d1b21a3536cd0c602be301993fcbacd8ecc5710a459c239f9808d164d0ee85d",
     "train_count": 10000,
     "val_count": 1000,
     "unique_count": 11000

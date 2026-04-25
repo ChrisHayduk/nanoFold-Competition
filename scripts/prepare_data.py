@@ -3,12 +3,20 @@ from __future__ import annotations
 import argparse
 import signal
 import subprocess
+import sys
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from nanofold.chain_paths import chain_data_dir
 
 """Download a fixed subset of OpenProteinSet/OpenFold training data.
 
@@ -24,6 +32,7 @@ Use `--full-chain-dir` to download complete per-chain directories.
 This script assumes:
 - you have `aws` installed
 - your manifests contain chain IDs like `7KDX_A`
+- local per-chain directories are named with nanoFold's encoded chain-id convention
 
 The OpenFold docs describe the bucket layout and a helper script to flatten the RODA directory:
 https://openfold.readthedocs.io/en/latest/OpenFold_Training_Setup.html
@@ -99,9 +108,20 @@ def parse_args() -> argparse.Namespace:
         help="Base delay for download retries in seconds (default: 2.0).",
     )
     ap.add_argument(
+        "--download-workers",
+        type=int,
+        default=32,
+        help="Number of concurrent per-chain/mmCIF downloads (default: 32).",
+    )
+    ap.add_argument(
         "--strict-downloads",
         action="store_true",
         help="Exit non-zero if any manifest chain is missing required MSA/template files after retries.",
+    )
+    ap.add_argument(
+        "--verbose-downloads",
+        action="store_true",
+        help="Print each underlying S3/RCSB download command.",
     )
     return ap.parse_args()
 
@@ -124,8 +144,10 @@ def run(
     retries: int = 0,
     retry_delay_seconds: float = 2.0,
     allow_fail: bool = False,
+    verbose: bool = False,
 ) -> bool:
-    print("+", " ".join(cmd))
+    if verbose or dry_run:
+        print("+", " ".join(cmd))
     if not dry_run:
         attempt = 0
         while True:
@@ -234,8 +256,10 @@ def _download_url(
     retries: int,
     retry_delay_seconds: float,
     allow_fail: bool,
+    verbose: bool = False,
 ) -> bool:
-    print("+", url, "->", destination)
+    if verbose or dry_run:
+        print("+", url, "->", destination)
     if dry_run:
         return True
 
@@ -273,8 +297,11 @@ def _download_mmcif_subset(
     dry_run: bool,
     retries: int,
     retry_delay_seconds: float,
+    workers: int,
     strict: bool = False,
+    verbose: bool = False,
 ) -> None:
+    pdb_ids: list[str] = []
     seen_pdb_ids: set[str] = set()
     missing: list[str] = []
     for cid in chain_ids:
@@ -282,9 +309,12 @@ def _download_mmcif_subset(
         if pdb_id in seen_pdb_ids:
             continue
         seen_pdb_ids.add(pdb_id)
-        url, destination = _structure_url_and_destination(cid, data_root)
+        pdb_ids.append(pdb_id)
+
+    def download_one(pdb_id: str) -> tuple[str, bool]:
+        url, destination = _structure_url_and_destination(f"{pdb_id}_A", data_root)
         if destination.exists():
-            continue
+            return pdb_id, True
         ok = _download_url(
             url,
             destination,
@@ -292,9 +322,39 @@ def _download_mmcif_subset(
             retries=retries,
             retry_delay_seconds=retry_delay_seconds,
             allow_fail=not strict,
+            verbose=verbose,
         )
-        if not ok:
-            missing.append(pdb_id)
+        return pdb_id, ok
+
+    total = len(pdb_ids)
+    workers = max(1, int(workers))
+    if workers == 1 or dry_run:
+        for idx, pdb_id in enumerate(pdb_ids, start=1):
+            _, ok = download_one(pdb_id)
+            if not ok:
+                missing.append(pdb_id)
+            if idx == 1 or idx % 100 == 0 or idx == total:
+                print(f"Processed mmCIF downloads: {idx}/{total}", flush=True)
+    else:
+        print(f"Downloading mmCIF subset with {workers} workers for {total} PDB entries.", flush=True)
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(download_one, pdb_id): pdb_id for pdb_id in pdb_ids}
+            for idx, future in enumerate(as_completed(futures), start=1):
+                pdb_id = futures[future]
+                try:
+                    _, ok = future.result()
+                except Exception as exc:
+                    raise RuntimeError(f"Failed while downloading mmCIF for {pdb_id}") from exc
+                if not ok:
+                    missing.append(pdb_id)
+                if idx == 1 or idx % 100 == 0 or idx == total:
+                    print(f"Processed mmCIF downloads: {idx}/{total}", flush=True)
+
+    if not dry_run:
+        for pdb_id in pdb_ids:
+            _, destination = _structure_url_and_destination(f"{pdb_id}_A", data_root)
+            if not destination.exists() and pdb_id not in missing:
+                missing.append(pdb_id)
     if missing and strict:
         sample = ", ".join(missing[:12])
         raise SystemExit(f"Missing required mmCIF downloads for {len(missing)} PDB entrie(s). Examples: {sample}")
@@ -312,15 +372,26 @@ def _download_chain(
     dry_run: bool,
     retries: int,
     retry_delay_seconds: float,
+    verbose: bool = False,
 ) -> bool:
     s3_path = f"{bucket}/pdb/{cid}"
     if full_chain_dir:
         return run(
-            ["aws", "s3", "cp", s3_path, str(out_dir), "--recursive", "--no-sign-request"],
+            [
+                "aws",
+                "s3",
+                "cp",
+                s3_path,
+                str(out_dir),
+                "--recursive",
+                "--only-show-errors",
+                "--no-sign-request",
+            ],
             dry_run,
             retries=retries,
             retry_delay_seconds=retry_delay_seconds,
             allow_fail=True,
+            verbose=verbose,
         )
 
     cmd = [
@@ -330,6 +401,7 @@ def _download_chain(
         s3_path,
         str(out_dir),
         "--recursive",
+        "--only-show-errors",
         "--exclude",
         "*",
         *[item for name in msa_names for item in ("--include", name, "--include", f"*/{name}")],
@@ -350,6 +422,7 @@ def _download_chain(
         retries=retries,
         retry_delay_seconds=retry_delay_seconds,
         allow_fail=True,
+        verbose=verbose,
     )
 
 
@@ -369,6 +442,180 @@ def _replace_with_symlink(target: Path, source: Path) -> None:
     target.symlink_to(source.resolve())
 
 
+def _process_chain(
+    cid: str,
+    *,
+    roda_root: Path,
+    duplicate_map: Dict[str, List[str]],
+    bucket: str,
+    msa_names: Sequence[str],
+    template_hits_name: str,
+    no_template_hits: bool,
+    full_chain_dir: bool,
+    dry_run: bool,
+    retries: int,
+    retry_delay_seconds: float,
+    verbose: bool = False,
+) -> List[str]:
+    out_dir = chain_data_dir(roda_root, cid)
+    out_dir.parent.mkdir(parents=True, exist_ok=True)
+
+    need_tpl = not no_template_hits
+    has_msa, has_tpl = _has_required_files(out_dir, msa_names, template_hits_name, need_tpl)
+    if has_msa and has_tpl:
+        return []
+
+    candidates = [cid]
+    if cid in duplicate_map:
+        candidates.extend(duplicate_map[cid])
+    candidates = _dedupe_keep_order(candidates)
+
+    chosen_source = None
+    chosen_has_tpl = False
+    fallback_source = None
+    fallback_has_tpl = False
+
+    for source_cid in candidates:
+        source_dir = chain_data_dir(roda_root, source_cid)
+        source_dir.parent.mkdir(parents=True, exist_ok=True)
+        src_msa, src_tpl = _has_required_files(source_dir, msa_names, template_hits_name, need_tpl)
+        if src_msa and fallback_source is None:
+            fallback_source = source_cid
+            fallback_has_tpl = src_tpl
+
+        if src_msa and src_tpl:
+            chosen_source = source_cid
+            chosen_has_tpl = src_tpl
+            break
+
+    if chosen_source is None and fallback_source is None:
+        for source_cid in candidates:
+            source_dir = chain_data_dir(roda_root, source_cid)
+            _download_chain(
+                source_cid,
+                source_dir,
+                bucket=bucket,
+                msa_names=msa_names,
+                template_hits_name=template_hits_name,
+                no_template_hits=no_template_hits,
+                full_chain_dir=full_chain_dir,
+                dry_run=dry_run,
+                retries=retries,
+                retry_delay_seconds=retry_delay_seconds,
+                verbose=verbose,
+            )
+            src_msa, src_tpl = _has_required_files(source_dir, msa_names, template_hits_name, need_tpl)
+            if not src_msa:
+                continue
+
+            if fallback_source is None:
+                fallback_source = source_cid
+                fallback_has_tpl = src_tpl
+            if src_tpl:
+                chosen_source = source_cid
+                chosen_has_tpl = src_tpl
+                break
+
+    if chosen_source is None and fallback_source is not None:
+        chosen_source = fallback_source
+        chosen_has_tpl = fallback_has_tpl
+
+    missing_required: List[str] = []
+    if chosen_source is None:
+        print(f"WARNING: {cid} missing required MSA file(s) after download: {','.join(msa_names)}")
+        missing_required.extend(f"{cid}:{name}" for name in msa_names)
+        if need_tpl:
+            print(f"WARNING: {cid} missing {template_hits_name} after download")
+            missing_required.append(f"{cid}:{template_hits_name}")
+        return missing_required
+
+    if chosen_source != cid and not dry_run:
+        _replace_with_symlink(out_dir, chain_data_dir(roda_root, chosen_source))
+
+    has_msa = all(_has_file(out_dir, name) for name in msa_names)
+    has_tpl = chosen_has_tpl if need_tpl else True
+    if not has_msa:
+        missing_names = [name for name in msa_names if not _has_file(out_dir, name)]
+        print(f"WARNING: {cid} missing required MSA file(s) after download: {','.join(missing_names)}")
+        missing_required.extend(f"{cid}:{name}" for name in missing_names)
+    if not has_tpl:
+        print(f"WARNING: {cid} missing {template_hits_name} after download")
+        missing_required.append(f"{cid}:{template_hits_name}")
+    return missing_required
+
+
+def _download_manifest_chains(
+    chain_ids: List[str],
+    *,
+    roda_root: Path,
+    duplicate_map: Dict[str, List[str]],
+    bucket: str,
+    msa_names: Sequence[str],
+    template_hits_name: str,
+    no_template_hits: bool,
+    full_chain_dir: bool,
+    dry_run: bool,
+    retries: int,
+    retry_delay_seconds: float,
+    workers: int,
+    verbose: bool = False,
+) -> List[str]:
+    missing_required: List[str] = []
+    total = len(chain_ids)
+    workers = max(1, int(workers))
+    if workers == 1 or dry_run:
+        for idx, cid in enumerate(chain_ids, start=1):
+            missing_required.extend(
+                _process_chain(
+                    cid,
+                    roda_root=roda_root,
+                    duplicate_map=duplicate_map,
+                    bucket=bucket,
+                    msa_names=msa_names,
+                    template_hits_name=template_hits_name,
+                    no_template_hits=no_template_hits,
+                    full_chain_dir=full_chain_dir,
+                    dry_run=dry_run,
+                    retries=retries,
+                    retry_delay_seconds=retry_delay_seconds,
+                    verbose=verbose,
+                )
+            )
+            if idx == 1 or idx % 100 == 0 or idx == total:
+                print(f"Processed chain downloads: {idx}/{total}", flush=True)
+        return missing_required
+
+    print(f"Downloading per-chain assets with {workers} workers for {total} chains.", flush=True)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(
+                _process_chain,
+                cid,
+                roda_root=roda_root,
+                duplicate_map=duplicate_map,
+                bucket=bucket,
+                msa_names=msa_names,
+                template_hits_name=template_hits_name,
+                no_template_hits=no_template_hits,
+                full_chain_dir=full_chain_dir,
+                dry_run=dry_run,
+                retries=retries,
+                retry_delay_seconds=retry_delay_seconds,
+                verbose=verbose,
+            ): cid
+            for cid in chain_ids
+        }
+        for idx, future in enumerate(as_completed(futures), start=1):
+            cid = futures[future]
+            try:
+                missing_required.extend(future.result())
+            except Exception as exc:
+                raise RuntimeError(f"Failed while downloading assets for {cid}") from exc
+            if idx == 1 or idx % 100 == 0 or idx == total:
+                print(f"Processed chain downloads: {idx}/{total}", flush=True)
+    return missing_required
+
+
 def main() -> None:
     args = parse_args()
     data_root = Path(args.data_root)
@@ -380,8 +627,6 @@ def main() -> None:
     chain_ids = [ln.strip() for ln in manifest.read_text().splitlines() if ln.strip() and not ln.startswith("#")]
     duplicate_map = _load_duplicate_map(args.duplicate_chains_file)
     msa_names = _normalize_msa_names(args.msa_name, args.msa_names)
-    known_missing_sources = set()
-    missing_required: List[str] = []
 
     if args.only_mmcif_subset:
         _download_mmcif_subset(
@@ -390,102 +635,35 @@ def main() -> None:
             dry_run=args.dry_run,
             retries=max(0, int(args.download_retries)),
             retry_delay_seconds=max(0.0, float(args.download_retry_delay_seconds)),
+            workers=max(1, int(args.download_workers)),
             strict=bool(args.strict_downloads),
+            verbose=bool(args.verbose_downloads),
         )
         print("Done downloading manifest mmCIF subset.")
         return
 
-    for cid in chain_ids:
-        out_dir = roda_root / cid
-        out_dir.parent.mkdir(parents=True, exist_ok=True)
-
-        need_tpl = not args.no_template_hits
-        has_msa, has_tpl = _has_required_files(out_dir, msa_names, args.template_hits_name, need_tpl)
-        if has_msa and has_tpl:
-            continue
-
-        candidates = [cid]
-        if cid in duplicate_map:
-            candidates.extend(duplicate_map[cid])
-        candidates = _dedupe_keep_order(candidates)
-
-        chosen_source = None
-        chosen_has_tpl = False
-        fallback_source = None
-        fallback_has_tpl = False
-
-        # First pass: prefer any already-present local candidate to avoid redundant AWS calls.
-        for source_cid in candidates:
-            source_dir = roda_root / source_cid
-            source_dir.parent.mkdir(parents=True, exist_ok=True)
-            src_msa, src_tpl = _has_required_files(source_dir, msa_names, args.template_hits_name, need_tpl)
-            if src_msa and fallback_source is None:
-                fallback_source = source_cid
-                fallback_has_tpl = src_tpl
-
-            if src_msa and src_tpl:
-                chosen_source = source_cid
-                chosen_has_tpl = src_tpl
-                break
-
-        # Second pass: download only if we still have no suitable local source.
-        if chosen_source is None and fallback_source is None:
-            for source_cid in candidates:
-                if source_cid in known_missing_sources:
-                    continue
-                source_dir = roda_root / source_cid
-                _download_chain(
-                    source_cid,
-                    source_dir,
-                    bucket=args.bucket,
-                    msa_names=msa_names,
-                    template_hits_name=args.template_hits_name,
-                    no_template_hits=args.no_template_hits,
-                    full_chain_dir=args.full_chain_dir,
-                    dry_run=args.dry_run,
-                    retries=max(0, int(args.download_retries)),
-                    retry_delay_seconds=max(0.0, float(args.download_retry_delay_seconds)),
-                )
-                src_msa, src_tpl = _has_required_files(source_dir, msa_names, args.template_hits_name, need_tpl)
-                if not src_msa:
-                    known_missing_sources.add(source_cid)
-                    continue
-
-                if fallback_source is None:
-                    fallback_source = source_cid
-                    fallback_has_tpl = src_tpl
-                if src_tpl:
-                    chosen_source = source_cid
-                    chosen_has_tpl = src_tpl
-                    break
-
-        if chosen_source is None and fallback_source is not None:
-            chosen_source = fallback_source
-            chosen_has_tpl = fallback_has_tpl
-
-        if chosen_source is None:
-            print(f"WARNING: {cid} missing required MSA file(s) after download: {','.join(msa_names)}")
-            missing_required.extend(f"{cid}:{name}" for name in msa_names)
-            if need_tpl:
-                print(f"WARNING: {cid} missing {args.template_hits_name} after download")
-                missing_required.append(f"{cid}:{args.template_hits_name}")
-            continue
-
-        if chosen_source != cid and not args.dry_run:
-            _replace_with_symlink(out_dir, roda_root / chosen_source)
-
-        has_msa = all(_has_file(out_dir, name) for name in msa_names)
-        has_tpl = chosen_has_tpl if need_tpl else True
-        if not has_msa:
-            missing_names = [name for name in msa_names if not _has_file(out_dir, name)]
-            print(f"WARNING: {cid} missing required MSA file(s) after download: {','.join(missing_names)}")
-            missing_required.extend(f"{cid}:{name}" for name in missing_names)
-        if not has_tpl:
-            print(f"WARNING: {cid} missing {args.template_hits_name} after download")
-            missing_required.append(f"{cid}:{args.template_hits_name}")
+    missing_required = _download_manifest_chains(
+        chain_ids,
+        roda_root=roda_root,
+        duplicate_map=duplicate_map,
+        bucket=args.bucket,
+        msa_names=msa_names,
+        template_hits_name=args.template_hits_name,
+        no_template_hits=bool(args.no_template_hits),
+        full_chain_dir=bool(args.full_chain_dir),
+        dry_run=bool(args.dry_run),
+        retries=max(0, int(args.download_retries)),
+        retry_delay_seconds=max(0.0, float(args.download_retry_delay_seconds)),
+        workers=max(1, int(args.download_workers)),
+        verbose=bool(args.verbose_downloads),
+    )
 
     if args.include_mmcif_zip:
-        run(["aws", "s3", "cp", f"{args.bucket}/pdb_mmcif.zip", str(data_root), "--no-sign-request"], args.dry_run)
+        run(
+            ["aws", "s3", "cp", f"{args.bucket}/pdb_mmcif.zip", str(data_root), "--no-sign-request"],
+            args.dry_run,
+            verbose=bool(args.verbose_downloads),
+        )
     if args.download_mmcif_subset:
         _download_mmcif_subset(
             chain_ids,
@@ -493,7 +671,9 @@ def main() -> None:
             dry_run=args.dry_run,
             retries=max(0, int(args.download_retries)),
             retry_delay_seconds=max(0.0, float(args.download_retry_delay_seconds)),
+            workers=max(1, int(args.download_workers)),
             strict=bool(args.strict_downloads),
+            verbose=bool(args.verbose_downloads),
         )
 
     if missing_required and args.strict_downloads:

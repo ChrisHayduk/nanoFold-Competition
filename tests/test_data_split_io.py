@@ -5,6 +5,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from nanofold.chain_paths import chain_npz_path
 from nanofold.data import ProcessedNPZDataset
 
 
@@ -39,7 +40,7 @@ def test_train_path_requires_labels(tmp_path: Path) -> None:
     labels.mkdir()
     manifest = tmp_path / "train.txt"
     manifest.write_text("1abc_A\n")
-    _write_feature_npz(features / "1abc_A.npz")
+    _write_feature_npz(chain_npz_path(features, "1abc_A"))
 
     with pytest.raises(FileNotFoundError):
         _ = ProcessedNPZDataset(
@@ -58,8 +59,8 @@ def test_features_only_eval_rejects_labels_when_forbidden(tmp_path: Path) -> Non
     labels.mkdir()
     manifest = tmp_path / "val.txt"
     manifest.write_text("1abc_A\n")
-    _write_feature_npz(features / "1abc_A.npz")
-    _write_label_npz(labels / "1abc_A.npz")
+    _write_feature_npz(chain_npz_path(features, "1abc_A"))
+    _write_label_npz(chain_npz_path(labels, "1abc_A"))
 
     with pytest.raises(RuntimeError, match="Labels are mounted"):
         _ = ProcessedNPZDataset(
@@ -77,7 +78,7 @@ def test_features_only_eval_has_no_supervision_keys(tmp_path: Path) -> None:
     features.mkdir()
     manifest = tmp_path / "val.txt"
     manifest.write_text("1abc_A\n")
-    _write_feature_npz(features / "1abc_A.npz")
+    _write_feature_npz(chain_npz_path(features, "1abc_A"))
 
     ds = ProcessedNPZDataset(
         processed_features_dir=features,

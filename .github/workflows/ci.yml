@@ -74,6 +74,8 @@ jobs:
         run: pyright --warnings
       - name: Official Hash Sync Check
         run: python scripts/sync_official_manifest_hashes.py --check
+      - name: Public Release Leak Check
+        run: python scripts/check_public_release_leaks.py
       - name: Pytest
         run: pytest
       - name: JSON Schema Checks
@@ -104,41 +106,6 @@ jobs:
               if "track" not in obj:
                   raise SystemExit(f"{result} missing track")
           PY
-      - name: Hidden Path Guardrail
-        run: |
-          python - <<'PY'
-          from __future__ import annotations
-
-          import json
-          from pathlib import Path
-
-          import yaml
-
-          for path in Path("tracks").glob("*.yaml"):
-              raw = yaml.safe_load(path.read_text()) or {}
-              dataset = raw.get("dataset", {}) if isinstance(raw, dict) else {}
-              for key in ("hidden_manifest", "hidden_fingerprint"):
-                  value = dataset.get(key)
-                  if value in (None, "", "null"):
-                      continue
-                  if not isinstance(value, str):
-                      raise SystemExit(f"{path}: dataset.{key} must be string/null")
-                  if Path(value).is_absolute():
-                      raise SystemExit(f"{path}: dataset.{key} must not be an absolute path ({value})")
-          lock_path = Path("leaderboard/official_manifest_source.lock.json")
-          if lock_path.exists():
-              lock = json.loads(lock_path.read_text())
-              for key in ("chain_data_cache_path",):
-                  value = lock.get(key)
-                  if isinstance(value, str) and Path(value).is_absolute():
-                      raise SystemExit(f"{lock_path}: {key} must not be an absolute path ({value})")
-              outputs = lock.get("outputs", {})
-              if isinstance(outputs, dict):
-                  for key, value in outputs.items():
-                      if key.endswith("_manifest") and isinstance(value, str) and Path(value).is_absolute():
-                          raise SystemExit(f"{lock_path}: outputs.{key} must not be an absolute path ({value})")
-          PY
-
   smoke-official:
     runs-on: ubuntu-latest
     needs: lint-type-test

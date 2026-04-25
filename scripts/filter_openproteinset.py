@@ -28,6 +28,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from nanofold.chain_paths import chain_id_from_stem, chain_npz_path
 from nanofold.data import read_manifest
 from nanofold.structure_metadata import secondary_fractions_from_atom14
 
@@ -72,7 +73,7 @@ def discover_chain_ids(
     if manifest_path is not None:
         return read_manifest(manifest_path)
     features_dir = Path(processed_features_dir)
-    return sorted(path.stem for path in features_dir.glob("*.npz"))
+    return sorted(chain_id_from_stem(path.stem) for path in features_dir.glob("chain_*.npz"))
 
 
 def _schema_reject_reasons(
@@ -99,10 +100,8 @@ def evaluate_chain(
     cluster_info: dict[str, tuple[str, int]] | None = None,
 ) -> dict[str, Any]:
     """Evaluate one chain and return a JSON-serializable manifest entry."""
-    features_dir = Path(processed_features_dir)
-    labels_dir = Path(processed_labels_dir)
-    feature_path = features_dir / f"{chain_id}.npz"
-    label_path = labels_dir / f"{chain_id}.npz"
+    feature_path = chain_npz_path(processed_features_dir, chain_id)
+    label_path = chain_npz_path(processed_labels_dir, chain_id)
 
     reject_reasons = _schema_reject_reasons(feature_path, label_path)
     entry: dict[str, Any] = {

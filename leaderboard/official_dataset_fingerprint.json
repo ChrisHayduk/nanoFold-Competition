@@ -1,0 +1,35 @@
+{
+  "chain_ids_sha256": "0d1b21a3536cd0c602be301993fcbacd8ecc5710a459c239f9808d164d0ee85d",
+  "feature_files_sha256": "246c68626423f06ce6c9a4a42fc6476351c938ece1ffee74899008bce832a19a",
+  "label_files_sha256": "a2c0fcba726628ee04beb4a6955aecd0baac7a103e0ddc1e3a863c4cce17e5f8",
+  "manifests": {
+    "train": {
+      "chain_count": 10000,
+      "sha256": "d36d1f77ba43b7c4509a6e9dfd3f9414e1ce60f8364b24e0086c1734ba6aef6d"
+    },
+    "val": {
+      "chain_count": 1000,
+      "sha256": "d4a0265bcd0a021e116c0c889f21e86bc24006460bcc42dec2f9a80b70c8812b"
+    }
+  },
+  "missing_feature_chain_count": 0,
+  "missing_feature_chain_ids": [],
+  "missing_label_chain_count": 0,
+  "missing_label_chain_ids": [],
+  "preprocess_config_sha256": "ded459f4afc5ccfc536144df43394bf7ed7a15f501eb6f5dab3a192d54e892c0",
+  "present_feature_chain_count": 11000,
+  "present_label_chain_count": 11000,
+  "require_labels": true,
+  "source_lock_path": "leaderboard/official_manifest_source.lock.json",
+  "source_lock_sha256": "011cbfa174d3ee9d93990ffbf87c6b176da12b637f5351e6a1727ec69aa9c933",
+  "split_names": [
+    "train",
+    "val"
+  ],
+  "track_id": "limited_large",
+  "train_manifest_chain_count": 10000,
+  "train_manifest_sha256": "d36d1f77ba43b7c4509a6e9dfd3f9414e1ce60f8364b24e0086c1734ba6aef6d",
+  "unique_chain_count": 11000,
+  "val_manifest_chain_count": 1000,
+  "val_manifest_sha256": "d4a0265bcd0a021e116c0c889f21e86bc24006460bcc42dec2f9a80b70c8812b"
+}

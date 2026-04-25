@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from nanofold.chain_paths import chain_npz_path
 from nanofold.dataset_integrity import (
     PREPROCESS_META_FILENAME,
     build_dataset_fingerprint,
@@ -62,8 +63,8 @@ def test_build_fingerprint_requires_present_files_when_requested(tmp_path: Path)
 
     (manifests / "train.txt").write_text("1abc_A\n")
     (manifests / "val.txt").write_text("2def_B\n")
-    _write_feature_npz(features / "1abc_A.npz")
-    _write_label_npz(labels / "1abc_A.npz")
+    _write_feature_npz(chain_npz_path(features, "1abc_A"))
+    _write_label_npz(chain_npz_path(labels, "1abc_A"))
     # 2def_B intentionally missing
 
     with pytest.raises(FileNotFoundError):
@@ -87,10 +88,10 @@ def test_verify_dataset_against_fingerprint_roundtrip(tmp_path: Path) -> None:
 
     (manifests / "train.txt").write_text("1abc_A\n")
     (manifests / "val.txt").write_text("2def_B\n")
-    _write_feature_npz(features / "1abc_A.npz")
-    _write_feature_npz(features / "2def_B.npz")
-    _write_label_npz(labels / "1abc_A.npz")
-    _write_label_npz(labels / "2def_B.npz")
+    _write_feature_npz(chain_npz_path(features, "1abc_A"))
+    _write_feature_npz(chain_npz_path(features, "2def_B"))
+    _write_label_npz(chain_npz_path(labels, "1abc_A"))
+    _write_label_npz(chain_npz_path(labels, "2def_B"))
 
     fingerprint = build_dataset_fingerprint(
         processed_features_dir=features,
@@ -126,7 +127,7 @@ def test_verify_split_against_fingerprint_uses_explicit_manifest_names(tmp_path:
 
     hidden_manifest = manifests / "hidden_val.txt"
     hidden_manifest.write_text("9xyz_A\n")
-    _write_feature_npz(features / "9xyz_A.npz")
+    _write_feature_npz(chain_npz_path(features, "9xyz_A"))
 
     fingerprint = build_split_fingerprint(
         processed_features_dir=features,
@@ -158,10 +159,10 @@ def test_verify_split_against_fingerprint_supports_features_only_comparison(tmp_
 
     (manifests / "train.txt").write_text("1abc_A\n")
     (manifests / "val.txt").write_text("2def_B\n")
-    _write_feature_npz(features / "1abc_A.npz")
-    _write_feature_npz(features / "2def_B.npz")
-    _write_label_npz(labels / "1abc_A.npz")
-    _write_label_npz(labels / "2def_B.npz")
+    _write_feature_npz(chain_npz_path(features, "1abc_A"))
+    _write_feature_npz(chain_npz_path(features, "2def_B"))
+    _write_label_npz(chain_npz_path(labels, "1abc_A"))
+    _write_label_npz(chain_npz_path(labels, "2def_B"))
 
     fingerprint = build_dataset_fingerprint(
         processed_features_dir=features,
@@ -227,10 +228,10 @@ def test_build_fingerprint_captures_preprocess_config_sha256(tmp_path: Path) -> 
 
     (manifests / "train.txt").write_text("1abc_A\n")
     (manifests / "val.txt").write_text("2def_B\n")
-    _write_feature_npz(features / "1abc_A.npz")
-    _write_feature_npz(features / "2def_B.npz")
-    _write_label_npz(labels / "1abc_A.npz")
-    _write_label_npz(labels / "2def_B.npz")
+    _write_feature_npz(chain_npz_path(features, "1abc_A"))
+    _write_feature_npz(chain_npz_path(features, "2def_B"))
+    _write_label_npz(chain_npz_path(labels, "1abc_A"))
+    _write_label_npz(chain_npz_path(labels, "2def_B"))
 
     meta_path = features / PREPROCESS_META_FILENAME
     meta_path.write_text('{"cli_args": {"strict": true}}\n')

@@ -3,9 +3,16 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from nanofold.chain_paths import chain_data_dir
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -26,7 +33,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--manifest-lock",
         type=Path,
         default=Path("leaderboard/official_manifest_source.lock.json"),
-        help="Manifest lock to annotate with this source lock hash.",
+        help="Manifest lock to annotate when --annotate-manifest-lock is set.",
     )
     parser.add_argument(
         "--output",
@@ -43,6 +50,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--enable-templates", action="store_true")
     parser.add_argument("--include-hidden", action="store_true")
     parser.add_argument("--require-complete", action="store_true")
+    parser.add_argument(
+        "--annotate-manifest-lock",
+        action="store_true",
+        help="Private maintainer mode: write this source lock path/hash into --manifest-lock.",
+    )
     return parser.parse_args(argv)
 
 
@@ -111,7 +123,7 @@ def _raw_alignment_files(data_root: Path, chain_ids: list[str]) -> list[Path]:
     roda_root = data_root / "roda_pdb"
     files: list[Path] = []
     for chain_id in chain_ids:
-        chain_root = roda_root / chain_id
+        chain_root = chain_data_dir(roda_root, chain_id)
         if not chain_root.exists():
             continue
         files.extend(path for path in chain_root.rglob("*") if path.is_file())
@@ -121,6 +133,19 @@ def _raw_alignment_files(data_root: Path, chain_ids: list[str]) -> list[Path]:
 def _normalize_msa_names(msa_name: str, msa_names: str) -> list[str]:
     parsed = [token.strip() for token in msa_names.split(",") if token.strip()]
     return parsed or [msa_name]
+
+
+def _structure_metadata_source(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        raw = json.loads(path.read_text())
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    source = raw.get("source")
+    return source if isinstance(source, dict) else {}
 
 
 def _has_file(root: Path, filename: str) -> bool:
@@ -143,7 +168,7 @@ def _missing_alignment_assets(
     missing_files: list[str] = []
     roda_root = data_root / "roda_pdb"
     for chain_id in chain_ids:
-        chain_root = roda_root / chain_id
+        chain_root = chain_data_dir(roda_root, chain_id)
         if not chain_root.exists():
             missing_dirs.append(chain_id)
             missing_files.extend(f"{chain_id}:{msa_name}" for msa_name in msa_names)
@@ -213,6 +238,7 @@ def build_lock(args: argparse.Namespace) -> dict[str, Any]:
         "structure_metadata": {
             "path": _display_path(args.structure_metadata, repo_root=repo_root),
             "sha256": _sha256(args.structure_metadata),
+            "source": _structure_metadata_source(args.structure_metadata),
         },
         "metadata_source_lock": {
             "path": _display_path(args.metadata_source_lock, repo_root=repo_root),
@@ -258,7 +284,8 @@ def main(argv: list[str] | None = None) -> None:
         )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(lock, indent=2, sort_keys=True) + "\n")
-    _annotate_manifest_lock(args.manifest_lock, args.output)
+    if args.annotate_manifest_lock:
+        _annotate_manifest_lock(args.manifest_lock, args.output)
     print(f"Wrote official data source lock: {args.output}")
 
 

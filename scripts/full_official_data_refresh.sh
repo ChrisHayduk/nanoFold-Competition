@@ -29,9 +29,14 @@ Options:
                                       (default: data/metadata_sources)
   --metadata-source-lock <path>       Structure metadata source lock JSON
                                       (default: data/metadata_sources/structure_metadata_sources.lock.json)
+  --feature-exclusion-list <path>     Chain IDs excluded from official splitting because required feature assets are unavailable
+                                      (default: data/manifests/openfold_required_feature_exclusions.txt)
+  --processability-exclusion-list <path>
+                                      Chain IDs excluded from official splitting because atom14 labels fail the processability gate
+                                      (default: data/manifests/official_processability_exclusions.txt)
   --data-source-lock <path>           Raw official data source lock JSON
                                       (default: leaderboard/official_data_source.lock.json)
-  --structure-candidates <path>       Candidate manifest used to fetch mmCIFs for metadata
+  --structure-candidates <path>       Accepted chain universe written by structure metadata build
                                       (default: data/manifests/structure_candidates.txt)
   --lock-file <path>                  Official manifest lock file
                                       (default: leaderboard/official_manifest_source.lock.json)
@@ -42,18 +47,20 @@ Options:
   --hidden-fingerprint-out <path>     Hidden fingerprint output path
                                       (default: leaderboard/official_hidden_fingerprint.json)
   --hidden-lock-file <path>           Hidden asset lock path
-                                      (default: leaderboard/official_hidden_assets.lock.json)
+                                      (default: leaderboard/private_hidden_assets.lock.json)
   --msa-names <csv>                   Comma-separated MSA filenames to download/preprocess
   --rewrite-lock                      Rewrite lock metadata after manifest regeneration
   --skip-manifest-regen               Skip manifest regeneration step
   --skip-setup                        Skip download+preprocess step
   --skip-fingerprint                  Skip fingerprint rebuild step
   --skip-hidden                       Skip hidden split download/preprocess/fingerprint/pinning
+  --resume-preprocess                 Reuse readable feature+label NPZs and preprocess only missing or invalid chains
   --enable-templates                  Pass through to setup_official_data.sh
   --disable-templates                 Pass through to setup_official_data.sh (default)
   --mmcif-mode <mode>                 Pass through to setup_official_data.sh (default: subset)
   --download-retries <int>            Pass through to setup_official_data.sh (default: 2)
   --download-retry-delay-seconds <f>  Pass through to setup_official_data.sh (default: 2.0)
+  --download-workers <int>            Concurrent per-chain and mmCIF downloads (default: 32)
   --dry-run                           Print commands without executing
   -h, --help                          Show this message
 EOF
@@ -73,15 +80,18 @@ CHAIN_DATA_CACHE="data/openproteinset/pdb_data/data_caches/chain_data_cache.json
 STRUCTURE_METADATA="data/manifests/structure_metadata.json"
 METADATA_SOURCES_DIR="data/metadata_sources"
 METADATA_SOURCE_LOCK="data/metadata_sources/structure_metadata_sources.lock.json"
+FEATURE_EXCLUSION_LIST="data/manifests/openfold_required_feature_exclusions.txt"
+PROCESSABILITY_EXCLUSION_LIST="data/manifests/official_processability_exclusions.txt"
 DATA_SOURCE_LOCK="leaderboard/official_data_source.lock.json"
 STRUCTURE_CANDIDATES="data/manifests/structure_candidates.txt"
 LOCK_FILE="leaderboard/official_manifest_source.lock.json"
 TRACK_FILE="tracks/limited_large.yaml"
 FINGERPRINT_OUT="leaderboard/official_dataset_fingerprint.json"
 HIDDEN_FINGERPRINT_OUT="leaderboard/official_hidden_fingerprint.json"
-HIDDEN_LOCK_FILE="leaderboard/official_hidden_assets.lock.json"
+HIDDEN_LOCK_FILE="leaderboard/private_hidden_assets.lock.json"
 DOWNLOAD_RETRIES=2
 DOWNLOAD_RETRY_DELAY_SECONDS=2.0
+DOWNLOAD_WORKERS=32
 MMCIF_MODE="subset"
 MSA_NAMES=""
 USE_TEMPLATES=0
@@ -90,7 +100,9 @@ SKIP_MANIFEST_REGEN=0
 SKIP_SETUP=0
 SKIP_FINGERPRINT=0
 SKIP_HIDDEN=0
+RESUME_PREPROCESS=0
 DRY_RUN=0
+ORIGINAL_ARGS=("$@")
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -136,6 +148,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --metadata-source-lock)
       METADATA_SOURCE_LOCK="$2"
+      shift 2
+      ;;
+    --feature-exclusion-list)
+      FEATURE_EXCLUSION_LIST="$2"
+      shift 2
+      ;;
+    --processability-exclusion-list)
+      PROCESSABILITY_EXCLUSION_LIST="$2"
       shift 2
       ;;
     --data-source-lock)
@@ -186,6 +206,10 @@ while [[ $# -gt 0 ]]; do
       SKIP_HIDDEN=1
       shift 1
       ;;
+    --resume-preprocess)
+      RESUME_PREPROCESS=1
+      shift 1
+      ;;
     --disable-templates)
       USE_TEMPLATES=0
       shift 1
@@ -210,6 +234,10 @@ while [[ $# -gt 0 ]]; do
       DOWNLOAD_RETRY_DELAY_SECONDS="$2"
       shift 2
       ;;
+    --download-workers)
+      DOWNLOAD_WORKERS="$2"
+      shift 2
+      ;;
     --dry-run)
       DRY_RUN=1
       shift 1
@@ -231,6 +259,43 @@ run_cmd() {
   if [[ "$DRY_RUN" -eq 0 ]]; then
     "$@"
   fi
+}
+
+update_processability_exclusions_from_errors() {
+  local error_dir="$1"
+  local update_output
+  local added
+
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    echo "+ python $SCRIPT_DIR/update_processability_exclusions.py --error-dir $error_dir --chain-data-cache $CHAIN_DATA_CACHE --output $PROCESSABILITY_EXCLUSION_LIST"
+    return 1
+  fi
+  if [[ ! -d "$error_dir" ]]; then
+    return 1
+  fi
+
+  update_output="$(
+    python "$SCRIPT_DIR/update_processability_exclusions.py" \
+      --error-dir "$error_dir" \
+      --chain-data-cache "$CHAIN_DATA_CACHE" \
+      --output "$PROCESSABILITY_EXCLUSION_LIST"
+  )"
+  echo "$update_output"
+  added="$(
+    printf '%s\n' "$update_output" \
+      | sed -n 's/^Screened .*; added \([0-9][0-9]*\) processability exclusions\.$/\1/p' \
+      | tail -n 1
+  )"
+  [[ "${added:-0}" -gt 0 ]]
+}
+
+restart_after_processability_update() {
+  if [[ "$SKIP_MANIFEST_REGEN" -eq 1 ]]; then
+    echo "Processability exclusions changed; rerun without --skip-manifest-regen so manifests can be rebuilt."
+    exit 1
+  fi
+  echo "Processability exclusions changed; rebuilding manifests from the locked official inputs."
+  exec bash "$0" "${ORIGINAL_ARGS[@]}" --resume-preprocess
 }
 
 ensure_chain_data_cache() {
@@ -259,6 +324,17 @@ if ! command -v python >/dev/null 2>&1; then
   exit 1
 fi
 
+if [[ "$DRY_RUN" -eq 0 && "$SKIP_MANIFEST_REGEN" -eq 0 ]]; then
+  if [[ -z "${NANOFOLD_HIDDEN_SPLIT_SALT:-}" ]]; then
+    echo "NANOFOLD_HIDDEN_SPLIT_SALT is required for official hidden manifest generation."
+    exit 1
+  fi
+  if [[ "${#NANOFOLD_HIDDEN_SPLIT_SALT}" -lt 32 ]]; then
+    echo "NANOFOLD_HIDDEN_SPLIT_SALT must be at least 32 characters."
+    exit 1
+  fi
+fi
+
 cd "$REPO_ROOT"
 
 if [[ "$DRY_RUN" -eq 1 ]]; then
@@ -268,7 +344,6 @@ fi
 ensure_chain_data_cache
 
 echo "[1/5] Build required structure metadata"
-MMCIF_ROOT="$DATA_ROOT/pdb_data/mmcif_files"
 if [[ "$SKIP_MANIFEST_REGEN" -eq 0 ]]; then
   METADATA_SOURCE_CMD=(
     python "$SCRIPT_DIR/download_structure_metadata_sources.py"
@@ -286,27 +361,13 @@ if [[ "$SKIP_MANIFEST_REGEN" -eq 0 ]]; then
   STRUCTURE_META_CMD=(
     python "$SCRIPT_DIR/build_structure_metadata.py"
     --chain-data-cache "$CHAIN_DATA_CACHE"
-    --mmcif-root "$MMCIF_ROOT"
     --metadata-out "$STRUCTURE_METADATA"
     --metadata-sources-dir "$METADATA_SOURCES_DIR"
     --metadata-source-lock "$METADATA_SOURCE_LOCK"
+    --feature-exclusion-list "$FEATURE_EXCLUSION_LIST"
+    --processability-exclusion-list "$PROCESSABILITY_EXCLUSION_LIST"
     --candidate-manifest-out "$STRUCTURE_CANDIDATES"
   )
-  run_cmd "${STRUCTURE_META_CMD[@]}"
-
-  MMCIF_CANDIDATE_CMD=(
-    python "$SCRIPT_DIR/prepare_data.py"
-    --data-root "$DATA_ROOT"
-    --manifest "$STRUCTURE_CANDIDATES"
-    --only-mmcif-subset
-    --download-retries "$DOWNLOAD_RETRIES"
-    --download-retry-delay-seconds "$DOWNLOAD_RETRY_DELAY_SECONDS"
-    --strict-downloads
-  )
-  if [[ "$DRY_RUN" -eq 1 ]]; then
-    MMCIF_CANDIDATE_CMD+=(--dry-run)
-  fi
-  run_cmd "${MMCIF_CANDIDATE_CMD[@]}"
   run_cmd "${STRUCTURE_META_CMD[@]}"
 else
   echo "Skipping structure metadata rebuild (--skip-manifest-regen)."
@@ -354,6 +415,7 @@ if [[ "$SKIP_SETUP" -eq 0 ]]; then
     --mmcif-mode "$MMCIF_MODE"
     --download-retries "$DOWNLOAD_RETRIES"
     --download-retry-delay-seconds "$DOWNLOAD_RETRY_DELAY_SECONDS"
+    --download-workers "$DOWNLOAD_WORKERS"
   )
   if [[ -n "$MSA_NAMES" ]]; then
     SETUP_CMD+=(--msa-names "$MSA_NAMES")
@@ -363,10 +425,18 @@ if [[ "$SKIP_SETUP" -eq 0 ]]; then
   else
     SETUP_CMD+=(--enable-templates)
   fi
+  if [[ "$RESUME_PREPROCESS" -eq 1 ]]; then
+    SETUP_CMD+=(--resume-preprocess)
+  fi
   if [[ "$DRY_RUN" -eq 1 ]]; then
     SETUP_CMD+=(--dry-run)
   fi
-  run_cmd "${SETUP_CMD[@]}"
+  if ! run_cmd "${SETUP_CMD[@]}"; then
+    if update_processability_exclusions_from_errors "$PROCESSED_FEATURES_DIR"; then
+      restart_after_processability_update
+    fi
+    exit 1
+  fi
 else
   echo "Skipping setup_official_data.sh (--skip-setup)."
 fi
@@ -381,6 +451,7 @@ if [[ "$SKIP_HIDDEN" -eq 0 && "$SKIP_SETUP" -eq 0 ]]; then
     --duplicate-chains-file "$DATA_ROOT/pdb_data/duplicate_pdb_chains.txt"
     --download-retries "$DOWNLOAD_RETRIES"
     --download-retry-delay-seconds "$DOWNLOAD_RETRY_DELAY_SECONDS"
+    --download-workers "$DOWNLOAD_WORKERS"
     --strict-downloads
   )
   if [[ -n "$MSA_NAMES" ]]; then
@@ -402,11 +473,10 @@ if [[ "$SKIP_HIDDEN" -eq 0 && "$SKIP_SETUP" -eq 0 ]]; then
   HIDDEN_PREPROCESS_CMD=(
     python "$SCRIPT_DIR/preprocess.py"
     --raw-root "$DATA_ROOT"
-    --mmcif-root "$MMCIF_ROOT"
+    --mmcif-root "$DATA_ROOT/pdb_data/mmcif_files"
     --processed-features-dir "$HIDDEN_FEATURES_DIR"
     --processed-labels-dir "$HIDDEN_LABELS_DIR"
     --manifest "$HIDDEN_MANIFEST"
-    --strict
   )
   if [[ -n "$MSA_NAMES" ]]; then
     HIDDEN_PREPROCESS_CMD+=(--msa-names "$MSA_NAMES")
@@ -416,12 +486,45 @@ if [[ "$SKIP_HIDDEN" -eq 0 && "$SKIP_SETUP" -eq 0 ]]; then
   else
     HIDDEN_PREPROCESS_CMD+=(--disable-templates)
   fi
-  run_cmd "${HIDDEN_PREPROCESS_CMD[@]}"
+  if [[ "$RESUME_PREPROCESS" -eq 1 ]]; then
+    HIDDEN_PREPROCESS_CMD+=(--skip-existing)
+  fi
+  if ! run_cmd "${HIDDEN_PREPROCESS_CMD[@]}"; then
+    if update_processability_exclusions_from_errors "$HIDDEN_FEATURES_DIR"; then
+      restart_after_processability_update
+    fi
+    exit 1
+  fi
 else
   echo "Skipping hidden split data build (--skip-hidden or --skip-setup)."
 fi
 
-echo "[3c/5] Build raw source lock"
+echo "[3c/5] Sync processed NPZ data to official manifests"
+if [[ "$SKIP_SETUP" -eq 0 ]]; then
+  SYNC_PUBLIC_CMD=(
+    python "$SCRIPT_DIR/sync_processed_npz_files.py"
+    --features-dir "$PROCESSED_FEATURES_DIR"
+    --labels-dir "$PROCESSED_LABELS_DIR"
+    --manifest "$MANIFESTS_DIR/train.txt"
+    --manifest "$MANIFESTS_DIR/val.txt"
+    --remove-errors
+  )
+  run_cmd "${SYNC_PUBLIC_CMD[@]}"
+  if [[ "$SKIP_HIDDEN" -eq 0 ]]; then
+    SYNC_HIDDEN_CMD=(
+      python "$SCRIPT_DIR/sync_processed_npz_files.py"
+      --features-dir "$HIDDEN_FEATURES_DIR"
+      --labels-dir "$HIDDEN_LABELS_DIR"
+      --manifest "$MANIFESTS_DIR/hidden_val.txt"
+      --remove-errors
+    )
+    run_cmd "${SYNC_HIDDEN_CMD[@]}"
+  fi
+else
+  echo "Skipping processed NPZ sync (--skip-setup)."
+fi
+
+echo "[3d/5] Build raw source lock"
 SOURCE_LOCK_CMD=(
   python "$SCRIPT_DIR/build_data_source_lock.py"
   --data-root "$DATA_ROOT"
@@ -480,7 +583,7 @@ if [[ "$SKIP_FINGERPRINT" -eq 0 ]]; then
       --hidden-features-dir "$HIDDEN_FEATURES_DIR"
       --hidden-labels-dir "$HIDDEN_LABELS_DIR"
       --hidden-fingerprint "$HIDDEN_FINGERPRINT_OUT"
-      --track-file "$TRACK_FILE"
+      --track-id "$TRACK_ID"
       --lock-file "$HIDDEN_LOCK_FILE"
     )
     run_cmd "${PIN_HIDDEN_CMD[@]}"

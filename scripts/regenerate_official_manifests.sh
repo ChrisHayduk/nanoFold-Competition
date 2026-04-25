@@ -17,6 +17,8 @@ Options:
                               (default: data/openproteinset/pdb_data/data_caches/chain_data_cache.json)
   --out-dir <path>            Manifest output directory (default: data/manifests)
   --lock-file <path>          Lock metadata path (default: leaderboard/official_manifest_source.lock.json)
+  --private-lock-file <path>  Maintainer-only hidden manifest lock output
+                              (default: leaderboard/private_hidden_manifest_source.lock.json)
   --structure-metadata <path> Structure metadata JSON override
   --rewrite-lock              Rewrite lock metadata at --lock-file after successful generation
   --sync-hashes               Sync manifest SHA256/count references across track + docs + lock
@@ -31,6 +33,7 @@ REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 CHAIN_DATA_CACHE="data/openproteinset/pdb_data/data_caches/chain_data_cache.json"
 OUT_DIR="data/manifests"
 LOCK_FILE="leaderboard/official_manifest_source.lock.json"
+PRIVATE_LOCK_FILE="leaderboard/private_hidden_manifest_source.lock.json"
 STRUCTURE_METADATA_OVERRIDE=""
 REWRITE_LOCK=0
 SYNC_HASHES=0
@@ -48,6 +51,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --lock-file)
       LOCK_FILE="$2"
+      shift 2
+      ;;
+    --private-lock-file)
+      PRIVATE_LOCK_FILE="$2"
       shift 2
       ;;
     --structure-metadata)
@@ -142,6 +149,17 @@ if [[ -n "$STRUCTURE_METADATA_OVERRIDE" ]]; then
   STRUCTURE_METADATA="$STRUCTURE_METADATA_OVERRIDE"
 fi
 
+if [[ "$DRY_RUN" -eq 0 ]]; then
+  if [[ -z "${NANOFOLD_HIDDEN_SPLIT_SALT:-}" ]]; then
+    echo "NANOFOLD_HIDDEN_SPLIT_SALT is required for official hidden manifest generation."
+    exit 1
+  fi
+  if [[ "${#NANOFOLD_HIDDEN_SPLIT_SALT}" -lt 32 ]]; then
+    echo "NANOFOLD_HIDDEN_SPLIT_SALT must be at least 32 characters."
+    exit 1
+  fi
+fi
+
 BUILD_CMD=(
   python "$SCRIPT_DIR/build_manifests.py"
   --chain-data-cache "$CHAIN_DATA_CACHE"
@@ -164,6 +182,7 @@ if [[ -n "$CLUSTER_TSV" ]]; then
 fi
 if [[ "$REWRITE_LOCK" -eq 1 ]]; then
   BUILD_CMD+=(--lock-file "$LOCK_FILE")
+  BUILD_CMD+=(--private-lock-file "$PRIVATE_LOCK_FILE")
 fi
 
 run_cmd "${BUILD_CMD[@]}"

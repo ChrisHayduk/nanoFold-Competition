@@ -16,6 +16,7 @@ import yaml
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+from nanofold.chain_paths import chain_npz_path
 from nanofold.competition_policy import (
     DEFAULT_TRACK_ID,
     OFFICIAL_DATASET_FINGERPRINT_PATH,
@@ -426,7 +427,7 @@ def main() -> None:
                         "masked_length": np.array(masked_length, dtype=np.int32),
                         "ckpt": str(ckpt_path),
                     }
-                    np.savez_compressed(pred_root / f"{chain_id}.npz", **arrays)
+                    np.savez_compressed(chain_npz_path(pred_root, chain_id), **arrays)
                     prediction_count += 1
 
         step = int(ckpt.get("step", 0))

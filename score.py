@@ -9,6 +9,7 @@ from typing import Any, Dict, List
 import numpy as np
 import torch
 
+from nanofold.chain_paths import chain_npz_path
 from nanofold.metrics import foldscore_auc, foldscore_components
 from nanofold.utils import get_env_metadata, utc_now_iso
 
@@ -49,7 +50,7 @@ def _load_label_crop(
     crop_size: int,
     crop_mode: str,
 ) -> Dict[str, torch.Tensor]:
-    label_path = labels_dir / f"{chain_id}.npz"
+    label_path = chain_npz_path(labels_dir, chain_id)
     if not label_path.exists():
         raise FileNotFoundError(f"Missing label file for scoring: {label_path}")
     with np.load(label_path) as data:
@@ -232,7 +233,7 @@ def main() -> None:
         ckpt_start = time.perf_counter()
 
         for chain_id in chain_ids:
-            pred_path = pred_dir / f"{chain_id}.npz"
+            pred_path = chain_npz_path(pred_dir, chain_id)
             if not pred_path.exists():
                 raise FileNotFoundError(f"Missing prediction file for scoring: {pred_path}")
             with np.load(pred_path) as pred_npz:

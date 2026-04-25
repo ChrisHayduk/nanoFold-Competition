@@ -23,8 +23,10 @@ Options:
   --download-retries <int>    Retries per failed aws chain download (default: 2)
   --download-retry-delay-seconds <float>
                               Base delay for retries in seconds (default: 2.0)
+  --download-workers <int>    Concurrent per-chain and mmCIF downloads (default: 32)
   --disable-templates         Skip template-hit download and template preprocessing (default)
   --skip-preprocess           Do not run preprocess.py
+  --resume-preprocess         Reuse readable feature+label NPZs and preprocess only missing or invalid chains
   --force                     Allow overwriting manifest files when copying to --manifests-dir
   --dry-run                   Print commands without executing
   -h, --help                  Show this message
@@ -46,9 +48,11 @@ MSA_NAMES=""
 TEMPLATE_HHR_NAME="pdb70_hits.hhr"
 DOWNLOAD_RETRIES=2
 DOWNLOAD_RETRY_DELAY_SECONDS=2.0
+DOWNLOAD_WORKERS=32
 MMCIF_MODE="subset"
 USE_TEMPLATES=0
 SKIP_PREPROCESS=0
+RESUME_PREPROCESS=0
 FORCE=0
 DRY_RUN=0
 
@@ -98,12 +102,20 @@ while [[ $# -gt 0 ]]; do
       DOWNLOAD_RETRY_DELAY_SECONDS="$2"
       shift 2
       ;;
+    --download-workers)
+      DOWNLOAD_WORKERS="$2"
+      shift 2
+      ;;
     --disable-templates)
       USE_TEMPLATES=0
       shift 1
       ;;
     --skip-preprocess)
       SKIP_PREPROCESS=1
+      shift 1
+      ;;
+    --resume-preprocess)
+      RESUME_PREPROCESS=1
       shift 1
       ;;
     --force)
@@ -179,17 +191,17 @@ print("Verified official manifest hashes for track limited_large.")
 PY
 }
 
-if ! command -v aws >/dev/null 2>&1; then
+if [[ "$DRY_RUN" -eq 0 ]] && ! command -v aws >/dev/null 2>&1; then
   echo "aws CLI not found. Install awscli first."
   exit 1
 fi
 
-if ! command -v unzip >/dev/null 2>&1; then
+if [[ "$DRY_RUN" -eq 0 ]] && ! command -v unzip >/dev/null 2>&1; then
   echo "unzip not found. Install unzip first."
   exit 1
 fi
 
-if ! command -v python >/dev/null 2>&1; then
+if [[ "$DRY_RUN" -eq 0 ]] && ! command -v python >/dev/null 2>&1; then
   echo "python not found. Activate your environment first."
   exit 1
 fi
@@ -252,8 +264,8 @@ fi
 verify_manifest_hashes "$TARGET_TRAIN" "$TARGET_VAL" "$TARGET_ALL"
 
 echo "[1/5] Downloading OpenFold cache metadata from RODA..."
-run_cmd aws s3 cp s3://openfold/data_caches/ "$DATA_CACHES_DIR/" --recursive --no-sign-request
-run_cmd aws s3 cp s3://openfold/duplicate_pdb_chains.txt "$PDB_DIR/" --no-sign-request
+run_cmd aws s3 cp s3://openfold/data_caches/ "$DATA_CACHES_DIR/" --recursive --only-show-errors --no-sign-request
+run_cmd aws s3 cp s3://openfold/duplicate_pdb_chains.txt "$PDB_DIR/" --only-show-errors --no-sign-request
 
 echo "[2/5] Downloading per-chain MSA + template hits for official manifests..."
 PREPARE_CMD=(
@@ -264,6 +276,7 @@ PREPARE_CMD=(
   --msa-name "$MSA_NAME"
   --download-retries "$DOWNLOAD_RETRIES"
   --download-retry-delay-seconds "$DOWNLOAD_RETRY_DELAY_SECONDS"
+  --download-workers "$DOWNLOAD_WORKERS"
   --strict-downloads
 )
 if [[ -n "$MSA_NAMES" ]]; then
@@ -303,7 +316,6 @@ else
     --processed-features-dir "$PROCESSED_FEATURES_DIR"
     --processed-labels-dir "$PROCESSED_LABELS_DIR"
     --msa-name "$MSA_NAME"
-    --strict
   )
   if [[ -n "$MSA_NAMES" ]]; then
     PREPROCESS_COMMON+=(--msa-names "$MSA_NAMES")
@@ -312,6 +324,9 @@ else
     PREPROCESS_COMMON+=(--template-hhr-name "$TEMPLATE_HHR_NAME")
   else
     PREPROCESS_COMMON+=(--disable-templates)
+  fi
+  if [[ "$RESUME_PREPROCESS" -eq 1 ]]; then
+    PREPROCESS_COMMON+=(--skip-existing)
   fi
   run_cmd "${PREPROCESS_COMMON[@]}" --manifest "$TARGET_TRAIN"
   run_cmd "${PREPROCESS_COMMON[@]}" --manifest "$TARGET_VAL"

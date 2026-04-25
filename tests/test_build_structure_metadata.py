@@ -35,7 +35,7 @@ def test_candidate_rows_reject_nonstandard_sequences(tmp_path: Path) -> None:
     assert rejects["unknown_aa_fraction"] == 1
 
 
-def test_build_metadata_reports_missing_mmcif_and_writes_candidate_manifest(tmp_path: Path) -> None:
+def test_build_metadata_writes_deterministic_candidate_manifest(tmp_path: Path) -> None:
     module = _load_structure_metadata_module()
     main = getattr(module, "main")
 
@@ -57,18 +57,119 @@ def test_build_metadata_reports_missing_mmcif_and_writes_candidate_manifest(tmp_
         [
             "--chain-data-cache",
             str(cache),
-            "--mmcif-root",
-            str(tmp_path / "mmcif"),
             "--metadata-out",
             str(metadata),
+            "--metadata-sources-dir",
+            str(tmp_path / "metadata_sources"),
             "--candidate-manifest-out",
             str(candidates),
         ]
     )
 
     obj = json.loads(metadata.read_text())
-    assert obj["summary"]["accepted"] == 0
-    assert obj["summary"]["reject_reasons"]["missing_mmcif"] == 1
+    assert obj["summary"]["accepted"] == 1
+    assert obj["summary"]["rejected"] == 0
+    assert obj["chains"][0]["secondary_structure_source"] == "domain_class_projection:secondary_structure_fallback"
+    assert candidates.read_text() == "1oky_A\n"
+
+
+def test_build_metadata_enforces_required_feature_exclusions(tmp_path: Path) -> None:
+    module = _load_structure_metadata_module()
+    main = getattr(module, "main")
+
+    cache = tmp_path / "chain_data_cache.json"
+    cache.write_text(
+        json.dumps(
+            {
+                "1oky_A": {
+                    "seq": "ARNDCQEGHILKMFPSTWYV" * 3,
+                    "resolution": 2.0,
+                    "oligomeric_count": 1,
+                },
+                "2bad_A": {
+                    "seq": "ARNDCQEGHILKMFPSTWYV" * 3,
+                    "resolution": 2.0,
+                    "oligomeric_count": 1,
+                },
+            }
+        )
+    )
+    exclusions = tmp_path / "feature_exclusions.txt"
+    exclusions.write_text("# required asset coverage\n2bad_A\n")
+    metadata = tmp_path / "structure_metadata.json"
+    candidates = tmp_path / "candidates.txt"
+    main(
+        [
+            "--chain-data-cache",
+            str(cache),
+            "--metadata-out",
+            str(metadata),
+            "--metadata-sources-dir",
+            str(tmp_path / "metadata_sources"),
+            "--feature-exclusion-list",
+            str(exclusions),
+            "--candidate-manifest-out",
+            str(candidates),
+        ]
+    )
+
+    obj = json.loads(metadata.read_text())
+    chains = {item["chain_id"]: item for item in obj["chains"]}
+    assert obj["summary"]["accepted"] == 1
+    assert obj["summary"]["rejected"] == 1
+    assert obj["summary"]["reject_reasons"]["missing_required_feature_asset"] == 1
+    assert obj["source"]["feature_exclusion_list"]["chain_count"] == 1
+    assert chains["2bad_A"]["reject_reasons"] == ["missing_required_feature_asset"]
+    assert candidates.read_text() == "1oky_A\n"
+
+
+def test_build_metadata_enforces_processability_exclusions(tmp_path: Path) -> None:
+    module = _load_structure_metadata_module()
+    main = getattr(module, "main")
+
+    cache = tmp_path / "chain_data_cache.json"
+    cache.write_text(
+        json.dumps(
+            {
+                "1oky_A": {
+                    "seq": "ARNDCQEGHILKMFPSTWYV" * 3,
+                    "resolution": 2.0,
+                    "oligomeric_count": 1,
+                },
+                "2bad_A": {
+                    "seq": "ARNDCQEGHILKMFPSTWYV" * 3,
+                    "resolution": 2.0,
+                    "oligomeric_count": 1,
+                },
+            }
+        )
+    )
+    exclusions = tmp_path / "processability_exclusions.txt"
+    exclusions.write_text("# official atom14 label processability gate\n2bad_A\n")
+    metadata = tmp_path / "structure_metadata.json"
+    candidates = tmp_path / "candidates.txt"
+    main(
+        [
+            "--chain-data-cache",
+            str(cache),
+            "--metadata-out",
+            str(metadata),
+            "--metadata-sources-dir",
+            str(tmp_path / "metadata_sources"),
+            "--processability-exclusion-list",
+            str(exclusions),
+            "--candidate-manifest-out",
+            str(candidates),
+        ]
+    )
+
+    obj = json.loads(metadata.read_text())
+    chains = {item["chain_id"]: item for item in obj["chains"]}
+    assert obj["summary"]["accepted"] == 1
+    assert obj["summary"]["rejected"] == 1
+    assert obj["summary"]["reject_reasons"]["failed_official_label_processability"] == 1
+    assert obj["source"]["processability_exclusion_list"]["chain_count"] == 1
+    assert chains["2bad_A"]["reject_reasons"] == ["failed_official_label_processability"]
     assert candidates.read_text() == "1oky_A\n"
 
 

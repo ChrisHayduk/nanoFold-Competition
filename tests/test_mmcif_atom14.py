@@ -93,3 +93,19 @@ def test_extract_chain_atoms_requires_match_for_expected_sequence(tmp_path: Path
             expected_sequence="AAAA",
             require_full_match=True,
         )
+
+
+def test_extract_chain_atoms_resolves_openfold_chain_key_by_sequence(tmp_path: Path) -> None:
+    mmcif_path = tmp_path / "synth.cif"
+    _build_synthetic_mmcif(mmcif_path, chain_id="A")
+
+    atoms = extract_chain_atoms(
+        mmcif_path=mmcif_path,
+        pdb_id="synth",
+        chain_id="AAA",
+        expected_sequence="MAAA",
+        require_full_match=False,
+    )
+
+    assert atoms.chain_id == "AAA"
+    assert atoms.sequence == "AAA"

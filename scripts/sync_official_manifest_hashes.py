@@ -38,6 +38,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Check-only mode. Exit non-zero if any file is out of sync.",
     )
+    ap.add_argument(
+        "--include-hidden",
+        action="store_true",
+        help="Private maintainer mode: also synchronize hidden manifest hash references.",
+    )
     return ap.parse_args()
 
 
@@ -133,7 +138,7 @@ def _update_competition_doc(path: Path, hashes: ManifestHashes) -> str:
     return text
 
 
-def _update_track_yaml(path: Path, hashes: ManifestHashes) -> str:
+def _update_track_yaml(path: Path, hashes: ManifestHashes, *, include_hidden: bool) -> str:
     text = path.read_text()
     replacements = {
         "train_manifest_sha256": hashes.train,
@@ -149,7 +154,7 @@ def _update_track_yaml(path: Path, hashes: ManifestHashes) -> str:
             rf"\g<1>{value}",
             label=f"track {key}",
         )
-    if hashes.hidden_val is not None:
+    if include_hidden and hashes.hidden_val is not None:
         text = _replace_required(
             text,
             r"(^\s*hidden_manifest_sha256:\s*).*$",
@@ -161,6 +166,13 @@ def _update_track_yaml(path: Path, hashes: ManifestHashes) -> str:
             r"(^\s*hidden_chain_count:\s*).*$",
             rf"\g<1>{hashes.hidden_val_count}",
             label="track hidden_chain_count",
+        )
+    else:
+        text = _replace_required(
+            text,
+            r"(^\s*hidden_manifest_sha256:\s*).*$",
+            r"\g<1>null",
+            label="track hidden_manifest_sha256",
         )
     return text
 
@@ -174,7 +186,7 @@ def _display_path(path: Path, *, lock_file: Path) -> str:
         return os.path.relpath(resolved, start=lock_file.parent.resolve())
 
 
-def _update_lock_json(path: Path, hashes: ManifestHashes, manifests_dir: Path) -> str:
+def _update_lock_json(path: Path, hashes: ManifestHashes, manifests_dir: Path, *, include_hidden: bool) -> str:
     if path.exists():
         raw = json.loads(path.read_text())
     else:
@@ -190,6 +202,9 @@ def _update_lock_json(path: Path, hashes: ManifestHashes, manifests_dir: Path) -
         source_lock_path = Path(str(raw["data_source_lock"]))
         if source_lock_path.is_absolute():
             raw["data_source_lock"] = _display_path(source_lock_path, lock_file=path)
+    if not include_hidden:
+        raw.pop("data_source_lock", None)
+        raw.pop("data_source_lock_sha256", None)
 
     args = raw.get("args")
     if isinstance(args, dict):
@@ -210,18 +225,42 @@ def _update_lock_json(path: Path, hashes: ManifestHashes, manifests_dir: Path) -
     outputs["train_manifest"] = _display_path(train_path, lock_file=path)
     outputs["val_manifest"] = _display_path(val_path, lock_file=path)
     outputs["all_manifest"] = _display_path(all_path, lock_file=path)
-    if hidden_val_path.exists() or "hidden_val_manifest" in outputs:
+    if include_hidden and (hidden_val_path.exists() or "hidden_val_manifest" in outputs):
         outputs["hidden_val_manifest"] = _display_path(hidden_val_path, lock_file=path) if hidden_val_path.exists() else None
+    else:
+        outputs.pop("hidden_val_manifest", None)
     outputs["train_manifest_sha256"] = hashes.train
     outputs["val_manifest_sha256"] = hashes.val
     outputs["all_manifest_sha256"] = hashes.all
-    if hashes.hidden_val is not None or "hidden_val_manifest_sha256" in outputs:
+    if include_hidden and (hashes.hidden_val is not None or "hidden_val_manifest_sha256" in outputs):
         outputs["hidden_val_manifest_sha256"] = hashes.hidden_val
+    else:
+        outputs.pop("hidden_val_manifest_sha256", None)
     outputs["train_count"] = hashes.train_count
     outputs["val_count"] = hashes.val_count
-    if hashes.hidden_val_count is not None or "hidden_val_count" in outputs:
+    if include_hidden and (hashes.hidden_val_count is not None or "hidden_val_count" in outputs):
         outputs["hidden_val_count"] = hashes.hidden_val_count or 0
+    else:
+        outputs.pop("hidden_val_count", None)
+    if not include_hidden:
+        outputs.pop("split_quality_report", None)
+        outputs.pop("split_quality_report_sha256", None)
     outputs["unique_count"] = hashes.unique_count
+
+    if not include_hidden:
+        stratification = raw.get("stratification")
+        if isinstance(stratification, dict):
+            split_distributions = stratification.get("split_distributions")
+            if isinstance(split_distributions, dict):
+                split_distributions.pop("hidden_val", None)
+            quality_report = stratification.get("quality_report")
+            if isinstance(quality_report, dict):
+                quality_report.pop("selected_distribution", None)
+                quality_report.pop("observed", None)
+                for key in ("split_distribution", "jensen_shannon_divergence"):
+                    value = quality_report.get(key)
+                    if isinstance(value, dict):
+                        value.pop("hidden_val", None)
     return json.dumps(raw, indent=2) + "\n"
 
 
@@ -244,8 +283,8 @@ def main() -> None:
 
     hashes = _compute_hashes(manifests_dir)
     updates: Dict[Path, str] = {
-        track_file: _update_track_yaml(track_file, hashes),
-        lock_file: _update_lock_json(lock_file, hashes, manifests_dir),
+        track_file: _update_track_yaml(track_file, hashes, include_hidden=bool(args.include_hidden)),
+        lock_file: _update_lock_json(lock_file, hashes, manifests_dir, include_hidden=bool(args.include_hidden)),
         readme: _update_readme(readme, hashes),
         competition_doc: _update_competition_doc(competition_doc, hashes),
     }

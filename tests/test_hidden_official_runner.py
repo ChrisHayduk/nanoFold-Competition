@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 
 import numpy as np
 import pytest
 import yaml
+
+from nanofold.chain_paths import chain_npz_path
 
 
 def _load_run_official_module():
@@ -37,7 +40,7 @@ def test_hidden_scoring_with_synthetic_predictions(tmp_path: Path) -> None:
     true_atom14 = _atom14_from_ca(true_ca)
     atom14_mask = np.ones((8, 14), dtype=bool)
     np.savez_compressed(
-        labels_dir / "1abc_A.npz",
+        chain_npz_path(labels_dir, "1abc_A"),
         ca_coords=true_ca,
         ca_mask=ca_mask,
         atom14_positions=true_atom14,
@@ -52,14 +55,18 @@ def test_hidden_scoring_with_synthetic_predictions(tmp_path: Path) -> None:
     (pred_root / "ckpt_step_0").mkdir()
     (pred_root / "ckpt_step_1000").mkdir()
     (pred_root / "ckpt_step_2000").mkdir()
-    np.savez_compressed(pred_root / "ckpt_step_0" / "1abc_A.npz", pred_atom14=true_atom14, masked_length=np.array(8))
     np.savez_compressed(
-        pred_root / "ckpt_step_1000" / "1abc_A.npz",
+        chain_npz_path(pred_root / "ckpt_step_0", "1abc_A"),
         pred_atom14=true_atom14,
         masked_length=np.array(8),
     )
     np.savez_compressed(
-        pred_root / "ckpt_step_2000" / "1abc_A.npz",
+        chain_npz_path(pred_root / "ckpt_step_1000", "1abc_A"),
+        pred_atom14=true_atom14,
+        masked_length=np.array(8),
+    )
+    np.savez_compressed(
+        chain_npz_path(pred_root / "ckpt_step_2000", "1abc_A"),
         pred_atom14=true_atom14,
         masked_length=np.array(8),
     )
@@ -100,7 +107,7 @@ def test_hidden_scoring_rejects_non_monotone_sample_axis(tmp_path: Path) -> None
     true_atom14 = _atom14_from_ca(true_ca)
     atom14_mask = np.ones((8, 14), dtype=bool)
     np.savez_compressed(
-        labels_dir / "1abc_A.npz",
+        chain_npz_path(labels_dir, "1abc_A"),
         ca_coords=true_ca,
         ca_mask=ca_mask,
         atom14_positions=true_atom14,
@@ -111,7 +118,7 @@ def test_hidden_scoring_rejects_non_monotone_sample_axis(tmp_path: Path) -> None
     pred_root.mkdir()
     for stem in ("ckpt_step_0", "ckpt_step_1000", "ckpt_step_2000"):
         (pred_root / stem).mkdir()
-        np.savez_compressed(pred_root / stem / "1abc_A.npz", pred_atom14=true_atom14, masked_length=np.array(8))
+        np.savez_compressed(chain_npz_path(pred_root / stem, "1abc_A"), pred_atom14=true_atom14, masked_length=np.array(8))
 
     with pytest.raises(ValueError, match="strictly increasing"):
         score_fn(
@@ -139,8 +146,8 @@ def test_hidden_lock_missing_or_incomplete_fails(tmp_path: Path) -> None:
     hidden_features.mkdir()
     hidden_labels = tmp_path / "hidden_labels"
     hidden_labels.mkdir()
-    (hidden_features / "1abc_A.npz").write_bytes(b"features")
-    (hidden_labels / "1abc_A.npz").write_bytes(b"labels")
+    chain_npz_path(hidden_features, "1abc_A").write_bytes(b"features")
+    chain_npz_path(hidden_labels, "1abc_A").write_bytes(b"labels")
     hidden_fingerprint = tmp_path / "hidden_fingerprint.json"
     hidden_fingerprint.write_text("{}")
 
@@ -228,17 +235,43 @@ def test_hidden_runtime_requires_sealed_env() -> None:
     require_runtime(disable_hidden=False, env={"NANOFOLD_OFFICIAL_SEALED_RUNTIME": "1"})
 
 
-def test_hidden_runtime_requires_track_pinning() -> None:
+def test_hidden_lock_validates_without_public_track_pins(tmp_path: Path) -> None:
     module = _load_run_official_module()
-    require_track = getattr(module, "_require_pinned_hidden_track_metadata")
+    validate_lock = getattr(module, "_validate_hidden_lock")
 
-    with pytest.raises(ValueError, match="hidden_manifest_sha256"):
-        require_track(type("Track", (), {"hidden_manifest_sha256": None, "hidden_fingerprint_sha256": None})())
+    hidden_manifest = tmp_path / "hidden_manifest.txt"
+    hidden_manifest.write_text("1abc_A\n")
+    hidden_features = tmp_path / "hidden_features"
+    hidden_features.mkdir()
+    hidden_labels = tmp_path / "hidden_labels"
+    hidden_labels.mkdir()
+    chain_npz_path(hidden_features, "1abc_A").write_bytes(b"features")
+    chain_npz_path(hidden_labels, "1abc_A").write_bytes(b"labels")
+    hidden_fingerprint = tmp_path / "hidden_fingerprint.json"
+    hidden_fingerprint.write_text("{}")
 
-    with pytest.raises(ValueError, match="hidden_fingerprint_sha256"):
-        require_track(type("Track", (), {"hidden_manifest_sha256": "a" * 64, "hidden_fingerprint_sha256": None})())
+    lock = tmp_path / "hidden.lock.json"
+    lock.write_text(
+        json.dumps(
+            {
+                "hidden_manifest_sha256": module._sha256(hidden_manifest),  # noqa: SLF001
+                "hidden_features_fingerprint_sha256": module._tree_sha256(hidden_features),  # noqa: SLF001
+                "hidden_labels_fingerprint_sha256": module._tree_sha256(hidden_labels),  # noqa: SLF001
+                "hidden_fingerprint_sha256": module._sha256(hidden_fingerprint),  # noqa: SLF001
+            }
+        )
+    )
+    track = type("Track", (), {"hidden_manifest_sha256": None, "hidden_fingerprint_sha256": None})()
 
-    require_track(type("Track", (), {"hidden_manifest_sha256": "a" * 64, "hidden_fingerprint_sha256": "b" * 64})())
+    meta = validate_lock(
+        lock_path=lock,
+        hidden_manifest=hidden_manifest,
+        hidden_features_dir=hidden_features,
+        hidden_labels_dir=hidden_labels,
+        hidden_fingerprint=hidden_fingerprint,
+        track_spec=track,
+    )
+    assert meta["status"] == "validated"
 
 
 def test_official_runner_builds_predict_and_score_commands() -> None:

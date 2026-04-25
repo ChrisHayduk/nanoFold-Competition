@@ -76,16 +76,20 @@ Official splits treat proteins as grouped biological examples, not IID rows in a
 - train, public val, and hidden val are cluster-disjoint and PDB-entry-disjoint
 - representatives are chosen by structure quality before length, so duplicate groups do not over-contribute low-quality chains
 - structure metadata is required before splitting; the official allocation is stratified by secondary-structure class, broad domain architecture, length bin, and resolution bin
-- metadata sources include mmCIF/DSSP secondary-structure annotations, atom14 geometry, RCSB records, and CATH/SCOPe/ECOD-style structural classifications when those records cover a chain
+- metadata sources include pinned CATH, SCOPe, ECOD, and RCSB-style structural classifications when those records cover a chain
+- required OpenFold feature-asset availability is enforced before split generation
 - the lock records source hashes, filtering counts, clustering mode, grouping policy, stratification fields, split quality metrics, and per-split alpha/beta/mixed distributions
 
-The metadata builder uses atom14 backbone torsions as the coordinate-derived floor when curated annotations do not cover a chain. All metadata signals are used only for split balancing and audit reports, never for scoring.
+The metadata builder projects broad secondary-structure fractions from domain architecture classes so every eligible chain has a deterministic split signal before any label mmCIFs are downloaded. All metadata signals are used only for split balancing and audit reports, never for scoring.
 
 ## Data Format
 
 Official preprocessing writes split artifacts per chain:
-- features: `data/processed_features/<chain_id>.npz`
-- labels: `data/processed_labels/<chain_id>.npz`
+- features: `data/processed_features/<encoded_chain_id>.npz`
+- labels: `data/processed_labels/<encoded_chain_id>.npz`
+
+`<encoded_chain_id>` is nanoFold's filesystem-safe chain stem. It preserves
+case-sensitive PDB chain IDs on every supported filesystem.
 
 Required feature keys:
 - `aatype`, `msa`, `deletions`
@@ -130,33 +134,18 @@ This is implemented in:
 ```bash
 # 1) environment
 python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-pip install -r requirements-dev.txt
+pip install -r requirements.txt awscli
 git submodule update --init --recursive
 
-# 2) setup official data using committed manifests
+# 2) download and preprocess the official public data
 bash scripts/setup_official_data.sh \
   --data-root data/openproteinset \
   --processed-features-dir data/processed_features \
   --processed-labels-dir data/processed_labels \
-  --mmcif-mode subset
+  --mmcif-mode subset \
+  --disable-templates
 
-# 3) optional processed-data audit/filter manifest
-python scripts/filter_openproteinset.py \
-  --processed-features-dir data/processed_features \
-  --processed-labels-dir data/processed_labels \
-  --manifest data/manifests/all.txt \
-  --manifest-out data/manifests/filter_manifest.json \
-  --accepted-out data/manifests/accepted.txt
-
-# 4) build official fingerprint (split features+labels)
-python scripts/build_fingerprint.py \
-  --config configs/official_baseline.yaml \
-  --track limited_large \
-  --source-lock leaderboard/official_manifest_source.lock.json \
-  --output leaderboard/official_dataset_fingerprint.json
-
-# 5) official train + public validation scoring
+# 3) official train + public validation scoring
 python train.py \
   --config configs/official_baseline.yaml \
   --track limited_large \
@@ -180,24 +169,37 @@ python score.py \
   --per-chain-out runs/official_limited_large_baseline/per_chain_scores_val.jsonl
 ```
 
+`setup_official_data.sh` is the standard public data path. It verifies the committed manifest hashes, downloads the required OpenFold chain cache/MSAs plus the manifest mmCIF subset, and writes:
+- `data/processed_features/<encoded_chain_id>.npz`
+- `data/processed_labels/<encoded_chain_id>.npz`
+
+If preprocessing is interrupted, rerun the same command with `--resume-preprocess`. The public setup path does not download hidden validation labels or hidden manifests.
+
+System requirements for data setup:
+- `aws` CLI on `PATH` for unsigned OpenFold S3 downloads
+- `unzip` on `PATH`
+- enough local disk for raw OpenFold assets plus processed NPZs; expect tens of GB for the official public split
+
 ## Maintainer Data Refresh
 
-Maintainers can refresh the official public assets with one command. This path:
+Maintainers can refresh the official data assets with one command. This path:
 - downloads and pins structural metadata sources
-- builds required structure metadata from chain cache, mmCIF/DSSP annotations, atom14 geometry, RCSB records, and structural-classification files
-- regenerates official manifests from locked chain cache inputs
+- builds required structure metadata from chain cache, pinned structural-classification files, and required feature-asset coverage
+- regenerates official manifests from locked chain cache inputs plus a private hidden split salt
 - syncs manifest hashes/counts across track + docs + lock
 - downloads required OpenFold assets and manifest mmCIFs with strict missing-file checks
 - preprocesses public and hidden split NPZs
 - rebuilds public and hidden fingerprints
-- writes raw-source, manifest, and hidden-asset locks
+- writes public locks plus ignored maintainer-only hidden locks
 
 ```bash
+export NANOFOLD_HIDDEN_SPLIT_SALT="<maintainer-private-random-string>"
 bash scripts/full_official_data_refresh.sh --rewrite-lock
 ```
 
-If the metadata builder reports missing mmCIFs, it writes `data/manifests/structure_candidates.txt`; the refresh script uses that manifest to fetch the missing structure files before rebuilding `data/manifests/structure_metadata.json`.
-The hidden manifest and hidden NPZ directories are maintainer-local artifacts; commit only the hash lock metadata produced by `scripts/pin_hidden_assets.py`.
+This flow requires MMseqs2 on `PATH`. `NANOFOLD_HIDDEN_SPLIT_SALT` must be at least 32 characters and must never be committed. It regenerates split metadata, public manifests, hidden manifests, public NPZs, hidden NPZs, fingerprints, and lock files from the locked official inputs.
+
+The metadata builder writes `data/manifests/structure_candidates.txt` as the accepted chain universe used for split generation. The hidden manifest, hidden NPZ directories, hidden fingerprints, hidden source locks, and private salt metadata are maintainer-local artifacts; commit only public manifests, the public dataset fingerprint, and sanitized public lock metadata.
 
 Dry-run preview:
 
@@ -214,6 +216,7 @@ Required maintainer env vars for hidden mode:
 - `NANOFOLD_HIDDEN_FEATURES_DIR`
 - `NANOFOLD_HIDDEN_LABELS_DIR`
 - `NANOFOLD_HIDDEN_FINGERPRINT`
+- `NANOFOLD_HIDDEN_LOCK_FILE`
 
 Canonical runner entrypoint:
 
@@ -233,9 +236,7 @@ bash scripts/run_official_docker.sh \
   --update-leaderboard
 ```
 
-Hidden lock metadata (hashes only, no secret paths) is stored in:
-- `leaderboard/official_hidden_assets.lock.json`
-- populate/update it with `python scripts/pin_hidden_assets.py ...`
+Hidden lock metadata is maintainer-local and ignored by git. Populate/update it with `python scripts/pin_hidden_assets.py ...`.
 
 ## Manifest Reproducibility
 
@@ -246,9 +247,9 @@ shasum -a 256 data/manifests/train.txt data/manifests/val.txt data/manifests/all
 ```
 
 Expected `limited_large` values:
-- `train.txt`: `c3288fe5f855b602921734ea0113a858b09c8acfb28e53468940a5657abe2682`
-- `val.txt`: `7c279df96fad21e04909bc331466d96118256d3b0f69bccf1c2cc86d957d1f67`
-- `all.txt`: `2b2a298d078b7a398a5f3379769bdbfb33b27fe39239a5f052e07d24800df778`
+- `train.txt`: `d36d1f77ba43b7c4509a6e9dfd3f9414e1ce60f8364b24e0086c1734ba6aef6d`
+- `val.txt`: `d4a0265bcd0a021e116c0c889f21e86bc24006460bcc42dec2f9a80b70c8812b`
+- `all.txt`: `0d1b21a3536cd0c602be301993fcbacd8ecc5710a459c239f9808d164d0ee85d`
 
 Maintainer-only manifest regeneration:
 
@@ -256,7 +257,7 @@ Maintainer-only manifest regeneration:
 bash scripts/regenerate_official_manifests.sh --rewrite-lock
 ```
 
-Sync hashes/counts across all pinned references (track + lock + docs):
+Sync public hashes/counts across pinned references (track + lock + docs):
 
 ```bash
 python scripts/sync_official_manifest_hashes.py

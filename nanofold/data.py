@@ -8,6 +8,8 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from .chain_paths import chain_npz_path
+
 FEATURE_KEYS = (
     "aatype",
     "msa",
@@ -76,8 +78,8 @@ class ProcessedNPZDataset(Dataset):
         label_conflict_chain_ids: List[str] = []
 
         for chain_id in requested_chain_ids:
-            feature_path = self.processed_features_dir / f"{chain_id}.npz"
-            label_path = (self.processed_labels_dir / f"{chain_id}.npz") if self.processed_labels_dir else None
+            feature_path = chain_npz_path(self.processed_features_dir, chain_id)
+            label_path = chain_npz_path(self.processed_labels_dir, chain_id) if self.processed_labels_dir else None
             has_feature = feature_path.exists()
             has_label = bool(label_path and label_path.exists())
 
@@ -131,7 +133,7 @@ class ProcessedNPZDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         chain_id = self.chain_ids[idx]
-        features_path = self.processed_features_dir / f"{chain_id}.npz"
+        features_path = chain_npz_path(self.processed_features_dir, chain_id)
         if not features_path.exists():
             raise FileNotFoundError(f"Missing feature file: {features_path}")
 
@@ -178,7 +180,7 @@ class ProcessedNPZDataset(Dataset):
 
         if self.include_labels:
             assert self.processed_labels_dir is not None
-            labels_path = self.processed_labels_dir / f"{chain_id}.npz"
+            labels_path = chain_npz_path(self.processed_labels_dir, chain_id)
             if not labels_path.exists():
                 raise FileNotFoundError(f"Missing label file: {labels_path}")
             with np.load(labels_path) as label_data:

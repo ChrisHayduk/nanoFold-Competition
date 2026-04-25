@@ -4,6 +4,7 @@ from pathlib import Path
 
 import numpy as np
 
+from nanofold.chain_paths import chain_npz_path
 from nanofold.data import ProcessedNPZDataset, collate_batch
 from nanofold.dataset_integrity import validate_label_npz_schema, validate_npz_schema
 
@@ -42,8 +43,8 @@ def test_processed_npz_shapes_and_collate(tmp_path: Path) -> None:
     manifest = tmp_path / "train.txt"
     cid = "1abc_A"
     manifest.write_text(f"{cid}\n")
-    feature_path = processed_features / f"{cid}.npz"
-    label_path = processed_labels / f"{cid}.npz"
+    feature_path = chain_npz_path(processed_features, cid)
+    label_path = chain_npz_path(processed_labels, cid)
     _write_feature_npz(feature_path, L=12, N=5, T=2)
     _write_label_npz(label_path, L=12)
 
@@ -78,10 +79,10 @@ def test_processed_npz_carries_atom14_when_present(tmp_path: Path) -> None:
     manifest = tmp_path / "train.txt"
     cid = "2xyz_B"
     manifest.write_text(f"{cid}\n")
-    _write_feature_npz(processed_features / f"{cid}.npz", L=10, N=3, T=1)
-    _write_label_npz(processed_labels / f"{cid}.npz", L=10)
+    _write_feature_npz(chain_npz_path(processed_features, cid), L=10, N=3, T=1)
+    _write_label_npz(chain_npz_path(processed_labels, cid), L=10)
 
-    assert validate_label_npz_schema(processed_labels / f"{cid}.npz") == []
+    assert validate_label_npz_schema(chain_npz_path(processed_labels, cid)) == []
 
     ds = ProcessedNPZDataset(
         processed_features_dir=processed_features,
@@ -109,8 +110,8 @@ def test_processed_npz_crop_preserves_atom14(tmp_path: Path) -> None:
     manifest = tmp_path / "train.txt"
     cid = "3qqq_C"
     manifest.write_text(f"{cid}\n")
-    _write_feature_npz(processed_features / f"{cid}.npz", L=20, N=2, T=1)
-    _write_label_npz(processed_labels / f"{cid}.npz", L=20)
+    _write_feature_npz(chain_npz_path(processed_features, cid), L=20, N=2, T=1)
+    _write_label_npz(chain_npz_path(processed_labels, cid), L=20)
 
     ds = ProcessedNPZDataset(
         processed_features_dir=processed_features,

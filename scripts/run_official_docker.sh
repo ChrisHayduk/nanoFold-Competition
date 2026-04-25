@@ -72,5 +72,6 @@ add_hidden_mount NANOFOLD_HIDDEN_MANIFEST SCORE_ARGS
 add_hidden_mount NANOFOLD_HIDDEN_FEATURES_DIR SCORE_ARGS
 add_hidden_mount NANOFOLD_HIDDEN_LABELS_DIR SCORE_ARGS
 add_hidden_mount NANOFOLD_HIDDEN_FINGERPRINT SCORE_ARGS
+add_hidden_mount NANOFOLD_HIDDEN_LOCK_FILE SCORE_ARGS
 
 run_stage SCORE_ARGS "$@" --score-hidden-only --skip-train

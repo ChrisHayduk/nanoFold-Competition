@@ -4,7 +4,7 @@ import argparse
 import hashlib
 import json
 import math
-import random
+import os
 import shutil
 import subprocess
 import tempfile
@@ -100,6 +100,24 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--max-len", type=int, default=256)
     ap.add_argument("--max-resolution", type=float, default=3.0)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument(
+        "--hidden-split-salt-env",
+        type=str,
+        default="NANOFOLD_HIDDEN_SPLIT_SALT",
+        help=(
+            "Environment variable containing the maintainer-only hidden split salt. "
+            "Required when --hidden-val-size is positive."
+        ),
+    )
+    ap.add_argument(
+        "--hidden-split-salt-file",
+        type=str,
+        default="",
+        help=(
+            "Optional private file containing the hidden split salt. Prefer the environment "
+            "variable in automation so the salt path does not become public metadata."
+        ),
+    )
     ap.add_argument("--min-seq-id", type=float, default=0.30)
     ap.add_argument("--coverage", type=float, default=0.80)
     ap.add_argument("--mmseqs-bin", type=str, default="mmseqs")
@@ -134,7 +152,13 @@ def parse_args() -> argparse.Namespace:
         "--lock-file",
         type=str,
         default="",
-        help="Optional JSON path capturing generation inputs/hashes for reproducibility.",
+        help="Optional public JSON path capturing non-hidden generation inputs/hashes.",
+    )
+    ap.add_argument(
+        "--private-lock-file",
+        type=str,
+        default="",
+        help="Optional maintainer-only JSON path capturing hidden split metadata and salt digest.",
     )
     return ap.parse_args()
 
@@ -211,6 +235,34 @@ def _candidate_field(candidate: Candidate, field_name: str) -> str:
     if value is None:
         return "unknown"
     return str(value)
+
+
+def _stable_random_score(seed: int, salt: str, chain_id: str) -> int:
+    payload = f"{seed}:{salt}:{chain_id}".encode()
+    return int.from_bytes(hashlib.sha256(payload).digest()[:8], byteorder="big", signed=False)
+
+
+def _read_hidden_split_salt(*, salt_env: str, salt_file: str) -> str:
+    if salt_file:
+        salt = Path(salt_file).read_text().strip()
+        source = f"file `{salt_file}`"
+    else:
+        salt = os.environ.get(salt_env, "").strip()
+        source = f"environment variable `{salt_env}`"
+    if not salt:
+        raise RuntimeError(
+            "Hidden split generation requires a maintainer-only salt. "
+            f"Set {source} before generating official hidden manifests."
+        )
+    if len(salt) < 32:
+        raise RuntimeError(
+            "Hidden split salt must be at least 32 characters so it cannot be guessed from public metadata."
+        )
+    return salt
+
+
+def _salt_digest(salt: str) -> str:
+    return hashlib.sha256(salt.encode("utf-8")).hexdigest()
 
 
 def _stratum(candidate: Candidate, fields: tuple[str, ...]) -> tuple[str, ...]:
@@ -334,6 +386,23 @@ def _load_structure_metadata(path: str | Path) -> tuple[set[str], dict[str, dict
     return accepted, metadata
 
 
+def _structure_metadata_source_record(path: str | Path) -> dict[str, Any]:
+    metadata_path = Path(path)
+    record: dict[str, Any] = {
+        "path": str(metadata_path),
+        "sha256": _sha256(metadata_path),
+    }
+    try:
+        raw = json.loads(metadata_path.read_text())
+    except json.JSONDecodeError:
+        return record
+    if isinstance(raw, dict):
+        source = raw.get("source")
+        if isinstance(source, dict):
+            record["source"] = source
+    return record
+
+
 def _load_cluster_tsv(path: str | Path, candidates: set[str]) -> Dict[str, str]:
     cluster_path = Path(path)
     cluster_map: Dict[str, str] = {}
@@ -376,7 +445,7 @@ def _cluster_sequences_mmseqs(
 
         cluster_prefix = tmp_dir / "clusters"
         work_dir = tmp_dir / "work"
-        cmd = [
+        actual_cmd = [
             mmseqs_path,
             "easy-cluster",
             str(fasta_path),
@@ -391,13 +460,28 @@ def _cluster_sequences_mmseqs(
             "--threads",
             "1",
         ]
-        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        lock_cmd = [
+            mmseqs_bin,
+            "easy-cluster",
+            "<chains_fasta>",
+            "<cluster_prefix>",
+            "<work_dir>",
+            "--min-seq-id",
+            str(min_seq_id),
+            "-c",
+            str(coverage),
+            "--cov-mode",
+            "0",
+            "--threads",
+            "1",
+        ]
+        proc = subprocess.run(actual_cmd, capture_output=True, text=True, check=False)
         if proc.returncode != 0:
-            return None, cmd
+            return None, lock_cmd
 
         cluster_tsv = Path(str(cluster_prefix) + "_cluster.tsv")
         if not cluster_tsv.exists():
-            return None, cmd
+            return None, lock_cmd
 
         cluster_map: Dict[str, str] = {}
         for line in cluster_tsv.read_text().splitlines():
@@ -407,8 +491,15 @@ def _cluster_sequences_mmseqs(
             rep, member = line.split("\t")
             cluster_map[member] = rep
         if set(cluster_map.keys()) != set(sequences.keys()):
-            return None, cmd
-        return cluster_map, cmd
+            return None, lock_cmd
+        return cluster_map, lock_cmd
+
+
+def _mmseqs_version(mmseqs_bin: str) -> str | None:
+    proc = subprocess.run([mmseqs_bin, "version"], capture_output=True, text=True, check=False)
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.strip() or None
 
 
 def _cluster_assignments_sha256(cluster_map: Dict[str, str]) -> str:
@@ -506,16 +597,15 @@ def _build_candidates(
     return candidates, reject_reasons, secondary_source
 
 
-def _choose_representative(candidates: list[Candidate], rng: random.Random) -> Candidate:
-    shuffled = list(candidates)
-    rng.shuffle(shuffled)
+def _choose_representative(candidates: list[Candidate], seed: int) -> Candidate:
     return min(
-        shuffled,
+        candidates,
         key=lambda item: (
             1 if item.secondary_structure_class == "unknown" else 0,
             item.resolution if item.resolution and item.resolution < 999.0 else 999.0,
             -item.length,
             item.release_date or "",
+            _stable_random_score(seed, "representative", item.chain_id),
             item.chain_id,
         ),
     )
@@ -526,7 +616,7 @@ def _disjoint_units(
     cluster_map: dict[str, str],
     *,
     disallow_pdb_overlap: bool,
-    rng: random.Random,
+    seed: int,
 ) -> list[Candidate]:
     chain_ids = sorted(candidate.chain_id for candidate in candidates)
     parent = {chain_id: chain_id for chain_id in chain_ids}
@@ -565,7 +655,7 @@ def _disjoint_units(
 
     units: list[Candidate] = []
     for component_members in by_component.values():
-        units.append(_choose_representative(component_members, rng))
+        units.append(_choose_representative(component_members, seed))
     return units
 
 
@@ -619,7 +709,8 @@ def _select_stratified(
     units: list[Candidate],
     *,
     size: int,
-    rng: random.Random,
+    seed: int,
+    salt: str,
     stratify_fields: tuple[str, ...],
 ) -> list[Candidate]:
     if size <= 0:
@@ -630,13 +721,14 @@ def _select_stratified(
     allocation = _allocate_counts_by_stratum(units, size=size, stratify_fields=stratify_fields)
     selected: list[Candidate] = []
     for key, count in sorted(allocation.items()):
-        members = list(by_stratum[key])
-        rng.shuffle(members)
+        members = sorted(
+            by_stratum[key],
+            key=lambda item: (_stable_random_score(seed, f"{salt}:{'|'.join(key)}", item.chain_id), item.chain_id),
+        )
         selected.extend(members[:count])
     if len(selected) != size:
         raise RuntimeError(f"Internal stratified sampling error: requested {size}, selected {len(selected)}")
-    rng.shuffle(selected)
-    return selected
+    return sorted(selected, key=lambda item: (_stable_random_score(seed, f"{salt}:selected", item.chain_id), item.chain_id))
 
 
 def _split_candidates(
@@ -647,13 +739,13 @@ def _split_candidates(
     val_size: int,
     hidden_val_size: int,
     seed: int,
+    hidden_split_salt_digest: str,
     stratify_fields: tuple[str, ...],
     disallow_pdb_overlap: bool,
     cluster_method: str,
     cluster_command: list[str] | None,
     structural_metadata_source: str,
 ) -> SplitResult:
-    rng = random.Random(seed)
     candidate_by_id = {candidate.chain_id: candidate for candidate in candidates}
     candidates_with_clusters = [
         Candidate(
@@ -678,7 +770,7 @@ def _split_candidates(
         candidates_with_clusters,
         cluster_map,
         disallow_pdb_overlap=disallow_pdb_overlap,
-        rng=rng,
+        seed=seed,
     )
     required = int(train_size) + int(val_size) + int(hidden_val_size)
     if len(units) < required:
@@ -687,23 +779,26 @@ def _split_candidates(
             "The candidate source set is too small for the official split contract."
         )
 
-    heldout_size = int(val_size) + int(hidden_val_size)
-    heldout = _select_stratified(units, size=heldout_size, rng=rng, stratify_fields=stratify_fields)
-    heldout_ids = {candidate.chain_id for candidate in heldout}
     if hidden_val_size > 0:
+        if not hidden_split_salt_digest:
+            raise RuntimeError("Hidden split salt digest is required when hidden_val_size is positive.")
         hidden = _select_stratified(
-            heldout,
+            units,
             size=int(hidden_val_size),
-            rng=rng,
+            seed=seed,
+            salt=f"hidden_val:{hidden_split_salt_digest}",
             stratify_fields=stratify_fields,
         )
         hidden_ids = {candidate.chain_id for candidate in hidden}
-        val = [candidate for candidate in heldout if candidate.chain_id not in hidden_ids]
     else:
         hidden = []
-        val = heldout
-    train_pool = [candidate for candidate in units if candidate.chain_id not in heldout_ids]
-    train = _select_stratified(train_pool, size=int(train_size), rng=rng, stratify_fields=stratify_fields)
+        hidden_ids = set()
+
+    public_pool = [candidate for candidate in units if candidate.chain_id not in hidden_ids]
+    val = _select_stratified(public_pool, size=int(val_size), seed=seed, salt="val", stratify_fields=stratify_fields)
+    val_ids = {candidate.chain_id for candidate in val}
+    train_pool = [candidate for candidate in public_pool if candidate.chain_id not in val_ids]
+    train = _select_stratified(train_pool, size=int(train_size), seed=seed, salt="train", stratify_fields=stratify_fields)
 
     selected = {candidate.chain_id: candidate for candidate in train + val + hidden}
     quality_report = _build_quality_report(
@@ -906,6 +1001,11 @@ def main() -> None:
         raise ValueError("--hidden-val-size must be positive for official split generation.")
     if len(candidates) < required_count:
         raise ValueError(f"Not enough candidates after filtering: need {required_count}, have {len(candidates)}")
+    hidden_split_salt = _read_hidden_split_salt(
+        salt_env=str(args.hidden_split_salt_env),
+        salt_file=str(args.hidden_split_salt_file),
+    )
+    hidden_split_salt_digest = _salt_digest(hidden_split_salt)
 
     candidate_ids = [candidate.chain_id for candidate in candidates]
     candidate_sequences: Dict[str, str] = {candidate.chain_id: candidate.sequence for candidate in candidates}
@@ -943,6 +1043,7 @@ def main() -> None:
         val_size=int(args.val_size),
         hidden_val_size=int(args.hidden_val_size),
         seed=int(args.seed),
+        hidden_split_salt_digest=hidden_split_salt_digest,
         stratify_fields=stratify_fields,
         disallow_pdb_overlap=True,
         cluster_method=cluster_method,
@@ -976,8 +1077,18 @@ def main() -> None:
             "train": _split_distribution(result, result.train_ids),
             "val": _split_distribution(result, result.val_ids),
         }
-        if result.hidden_val_ids:
-            split_distributions["hidden_val"] = _split_distribution(result, result.hidden_val_ids)
+        public_selected = {
+            chain_id: result.selected_candidates[chain_id]
+            for chain_id in result.train_ids + result.val_ids
+        }
+        public_quality_report = _build_quality_report(
+            selected_candidates=public_selected,
+            split_ids={
+                "train": result.train_ids,
+                "val": result.val_ids,
+            },
+            stratify_fields=stratify_fields,
+        )
         lock = {
             "chain_data_cache_path": str(cache_path),
             "chain_data_cache_sha256": cache_sha,
@@ -1002,16 +1113,12 @@ def main() -> None:
                 "disjoint_unit_count": result.unit_count,
                 "reject_reasons": dict(sorted(reject_reasons.items())),
             },
+            "structure_metadata": _structure_metadata_source_record(args.structure_metadata),
             "clustering": {
                 "method": cluster_method,
                 "cluster_count": len(set(result.cluster_map.values())),
                 "command": cluster_command,
-                "mmseqs": subprocess.run(
-                    [args.mmseqs_bin, "-" + "-ver" + "sion"],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                ).stdout.strip() if cluster_method == "mmseqs2" else None,
+                "mmseqs": _mmseqs_version(str(args.mmseqs_bin)) if cluster_method == "mmseqs2" else None,
                 "cluster_assignments_sha256": _cluster_assignments_sha256(result.cluster_map),
             },
             "grouping": result.group_policy,
@@ -1019,22 +1126,17 @@ def main() -> None:
                 "fields": list(stratify_fields),
                 "structural_metadata_source": result.structural_metadata_source,
                 "split_distributions": split_distributions,
-                "quality_report": result.quality_report,
+                "quality_report": public_quality_report,
             },
             "outputs": {
                 "train_manifest": str(train_path),
                 "val_manifest": str(val_path),
-                "hidden_val_manifest": str(hidden_val_path) if result.hidden_val_ids else None,
                 "all_manifest": str(all_path),
-                "split_quality_report": str(quality_report_path),
                 "train_manifest_sha256": _sha256(train_path),
                 "val_manifest_sha256": _sha256(val_path),
-                "hidden_val_manifest_sha256": _sha256(hidden_val_path) if result.hidden_val_ids else None,
                 "all_manifest_sha256": _sha256(all_path),
-                "split_quality_report_sha256": _sha256(quality_report_path),
                 "train_count": len(result.train_ids),
                 "val_count": len(result.val_ids),
-                "hidden_val_count": len(result.hidden_val_ids),
                 "unique_count": len(all_ids),
             },
         }
@@ -1042,6 +1144,24 @@ def main() -> None:
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         lock_path.write_text(json.dumps(lock, indent=2) + "\n")
         print(f"Wrote manifest lock file: {lock_path.resolve()}")
+
+    if args.private_lock_file:
+        private_lock = {
+            "notes": "Maintainer-only hidden manifest lock. Do not commit this file.",
+            "chain_data_cache_sha256": cache_sha,
+            "hidden_split_salt_sha256": hidden_split_salt_digest,
+            "hidden_val_count": len(result.hidden_val_ids),
+            "hidden_val_manifest": str(hidden_val_path),
+            "hidden_val_manifest_sha256": _sha256(hidden_val_path),
+            "split_quality_report": str(quality_report_path),
+            "split_quality_report_sha256": _sha256(quality_report_path),
+            "hidden_split_distribution": _split_distribution(result, result.hidden_val_ids),
+            "quality_report": result.quality_report,
+        }
+        private_lock_path = Path(args.private_lock_file)
+        private_lock_path.parent.mkdir(parents=True, exist_ok=True)
+        private_lock_path.write_text(json.dumps(private_lock, indent=2) + "\n")
+        print(f"Wrote private hidden manifest lock file: {private_lock_path.resolve()}")
 
 
 if __name__ == "__main__":

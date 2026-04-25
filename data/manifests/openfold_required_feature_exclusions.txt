@@ -1,0 +1,7 @@
+# Chain IDs excluded from the official split universe because required OpenFold feature assets are unavailable.
+1y0k_A
+2iw0_A
+3odc_A
+3odc_B
+3ode_A
+3ode_B

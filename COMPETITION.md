@@ -59,8 +59,11 @@ Validation and runtime guardrails:
 ## 3) Split Data Contract
 
 Official preprocessing outputs split artifacts per chain:
-- `processed_features/<chain_id>.npz`
-- `processed_labels/<chain_id>.npz`
+- `processed_features/<encoded_chain_id>.npz`
+- `processed_labels/<encoded_chain_id>.npz`
+
+`<encoded_chain_id>` is nanoFold's filesystem-safe chain stem, so case-sensitive
+PDB chain IDs stay distinct on every supported filesystem.
 
 Required feature NPZ keys (per chain):
 - `aatype (L,) int32`
@@ -126,7 +129,8 @@ Split construction policy:
 - train, public val, and hidden val must be sequence-cluster-disjoint at the configured identity/coverage threshold
 - different chains from the same PDB entry cannot cross split boundaries
 - structure metadata is required; split allocation is stratified by secondary-structure class, broad domain architecture, length bin, and resolution bin
-- metadata sources include mmCIF/DSSP secondary-structure annotations, atom14 geometry, RCSB records, and CATH/SCOPe/ECOD-style structural classifications when those records cover a chain
+- metadata sources include pinned CATH, SCOPe, ECOD, and RCSB-style structural classifications when those records cover a chain
+- required OpenFold feature-asset availability is enforced before split generation
 - source hashes, filter counts, clustering method, grouping policy, stratification fields, split distributions, and split-quality metrics are recorded in locks
 - `all.txt` is the public union of train + public val only; hidden chain IDs stay in maintainer-only hidden manifests
 
@@ -136,12 +140,29 @@ Protected official manifests:
 - `data/manifests/all.txt`
 
 Manifest SHA256 digests (track pinned):
-- train: `c3288fe5f855b602921734ea0113a858b09c8acfb28e53468940a5657abe2682`
-- val: `7c279df96fad21e04909bc331466d96118256d3b0f69bccf1c2cc86d957d1f67`
-- all: `2b2a298d078b7a398a5f3379769bdbfb33b27fe39239a5f052e07d24800df778`
+- train: `d36d1f77ba43b7c4509a6e9dfd3f9414e1ce60f8364b24e0086c1734ba6aef6d`
+- val: `d4a0265bcd0a021e116c0c889f21e86bc24006460bcc42dec2f9a80b70c8812b`
+- all: `0d1b21a3536cd0c602be301993fcbacd8ecc5710a459c239f9808d164d0ee85d`
 
 Official setup path (participants):
 - `scripts/setup_official_data.sh`
+
+Participant data setup:
+
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt awscli
+bash scripts/setup_official_data.sh \
+  --data-root data/openproteinset \
+  --processed-features-dir data/processed_features \
+  --processed-labels-dir data/processed_labels \
+  --mmcif-mode subset \
+  --disable-templates
+```
+
+This command verifies the committed public manifest hashes, downloads the required OpenFold chain cache/MSAs and manifest mmCIF subset, then preprocesses train and public validation features plus labels. Rerun it with `--resume-preprocess` after an interrupted preprocessing run.
+
+The setup script expects `aws`, `unzip`, and `python` on `PATH`; it keeps hidden validation assets out of the public setup path.
 
 Maintainer manifest generation path:
 - `scripts/build_manifests.py`
@@ -153,8 +174,11 @@ Maintainer manifest generation path:
 Single end-to-end maintainer flow:
 
 ```bash
+export NANOFOLD_HIDDEN_SPLIT_SALT="<maintainer-private-random-string>"
 bash scripts/full_official_data_refresh.sh --rewrite-lock
 ```
+
+This maintainer flow requires MMseqs2 plus the public setup dependencies. `NANOFOLD_HIDDEN_SPLIT_SALT` must be at least 32 characters and must never be committed. It regenerates split metadata, manifests, public and hidden NPZs, fingerprints, public locks, and ignored maintainer-only hidden locks from the locked official inputs.
 
 ## 6) Fingerprint and Integrity Requirements
 
@@ -228,12 +252,11 @@ Hidden assets are resolved via env (or explicit CLI overrides):
 - `NANOFOLD_HIDDEN_FEATURES_DIR`
 - `NANOFOLD_HIDDEN_LABELS_DIR`
 - `NANOFOLD_HIDDEN_FINGERPRINT`
+- `NANOFOLD_HIDDEN_LOCK_FILE`
 
-Hidden lock metadata (safe to commit):
-- `leaderboard/official_hidden_assets.lock.json`
-- populate/update it with `python scripts/pin_hidden_assets.py ...`
+Hidden lock metadata is maintainer-local and ignored by git. Populate/update it with `python scripts/pin_hidden_assets.py ...`.
 
-Hidden manifests and hidden NPZ directories are maintainer-local artifacts. Public files contain only hashes and counts needed to verify the sealed run.
+Hidden manifests, hidden NPZ directories, hidden fingerprints, hidden source locks, and private split salt metadata are maintainer-local artifacts. Public files contain the public dataset contract and public split counts only.
 
 Hidden official runs are split into:
 - prediction stage: hidden features mounted, labels absent

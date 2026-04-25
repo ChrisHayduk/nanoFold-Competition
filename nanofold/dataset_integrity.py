@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Mapping
 
 import numpy as np
 
+from .chain_paths import chain_npz_path
 from .data import read_manifest
 from .utils import sha256_file
 
@@ -262,7 +263,7 @@ def _files_sha256(
         return None
     hasher = hashlib.sha256()
     for chain_id in chain_ids:
-        npz_path = base_dir / f"{chain_id}.npz"
+        npz_path = chain_npz_path(base_dir, chain_id)
         if not npz_path.exists():
             missing_chain_ids.append(chain_id)
             continue
@@ -291,6 +292,14 @@ def _normalize_manifest_map(manifest_paths: Mapping[str, str | Path]) -> Dict[st
     if not normalized:
         raise ValueError("At least one manifest path is required to build a fingerprint.")
     return normalized
+
+
+def _display_path(path: str | Path) -> str:
+    resolved = Path(path).resolve()
+    try:
+        return str(resolved.relative_to(Path.cwd().resolve())).replace("\\", "/")
+    except ValueError:
+        return str(path)
 
 
 def build_split_fingerprint(
@@ -368,7 +377,7 @@ def build_split_fingerprint(
         "feature_files_sha256": feature_hash,
         "label_files_sha256": label_hash,
         "require_labels": bool(require_labels),
-        "source_lock_path": str(Path(source_lock_path).resolve()) if source_lock_path else None,
+        "source_lock_path": _display_path(source_lock_path) if source_lock_path else None,
         "source_lock_sha256": sha256_file(source_lock_path) if source_lock_path else None,
         "preprocess_config_sha256": preprocess_config_sha256,
     }

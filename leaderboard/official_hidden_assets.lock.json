@@ -1,8 +1,0 @@
-{
-  "track": "limited_large",
-  "notes": "Maintainer-only hidden asset lock. Keep paths private; commit hashes/metadata only.",
-  "hidden_manifest_sha256": null,
-  "hidden_features_fingerprint_sha256": null,
-  "hidden_labels_fingerprint_sha256": null,
-  "hidden_fingerprint_sha256": null
-}

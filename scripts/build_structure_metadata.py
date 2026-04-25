@@ -16,14 +16,11 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from nanofold.mmcif import extract_chain_atoms
 from nanofold.structure_metadata import (
     STRUCTURE_METADATA_SCHEMA_VERSION,
     domain_architecture_from_cath_class,
     domain_architecture_from_scop_sccs,
     normalize_domain_architecture_class,
-    secondary_fractions_from_atom14,
-    secondary_fractions_from_mmcif_annotations,
 )
 
 STANDARD_AAS = set("ARNDCQEGHILKMFPSTWYV")
@@ -32,13 +29,12 @@ STANDARD_AAS = set("ARNDCQEGHILKMFPSTWYV")
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Build required secondary-structure metadata from chain_data_cache + mmCIF atom14 geometry. "
+            "Build required split metadata from chain_data_cache and pinned structural classification sources. "
             "This is the maintainer input consumed by scripts/build_manifests.py."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--chain-data-cache", type=Path, required=True)
-    parser.add_argument("--mmcif-root", type=Path, required=True)
     parser.add_argument("--metadata-out", type=Path, required=True)
     parser.add_argument(
         "--metadata-sources-dir",
@@ -53,10 +49,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Source lock JSON produced by scripts/download_structure_metadata_sources.py.",
     )
     parser.add_argument(
+        "--feature-exclusion-list",
+        type=Path,
+        default=Path("data/manifests/openfold_required_feature_exclusions.txt"),
+        help="Pinned chain IDs whose required official feature assets are unavailable.",
+    )
+    parser.add_argument(
+        "--processability-exclusion-list",
+        type=Path,
+        default=Path("data/manifests/official_processability_exclusions.txt"),
+        help="Pinned chain IDs that fail the official atom14 label processability gate.",
+    )
+    parser.add_argument(
         "--candidate-manifest-out",
         type=Path,
         default=None,
-        help="Optional text manifest of filtered candidate chain IDs, useful for downloading missing mmCIFs.",
+        help="Optional text manifest of accepted chain IDs available for split generation.",
     )
     parser.add_argument("--min-len", type=int, default=40)
     parser.add_argument("--max-len", type=int, default=256)
@@ -384,6 +392,77 @@ def _metadata_source_hashes(source_lock: Path) -> dict[str, Any]:
     }
 
 
+def _load_feature_exclusions(path: Path) -> set[str]:
+    if not path.exists():
+        return set()
+    out: set[str] = set()
+    for raw_line in path.read_text().splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        out.add(line)
+    return out
+
+
+def _feature_exclusion_source(path: Path, chain_ids: set[str]) -> dict[str, Any]:
+    return {
+        "path": str(path),
+        "sha256": _sha256(path) if path.exists() else None,
+        "chain_count": len(chain_ids),
+    }
+
+
+def _derived_secondary_fractions(domain_class: str) -> tuple[str, float, float, float]:
+    cls = normalize_domain_architecture_class(domain_class)
+    if cls == "alpha":
+        return "alpha", 0.70, 0.05, 0.25
+    if cls == "beta":
+        return "beta", 0.05, 0.55, 0.40
+    if cls == "alpha_beta":
+        return "alpha_beta", 0.35, 0.25, 0.40
+    if cls == "coil_or_sparse":
+        return "coil_or_sparse", 0.05, 0.05, 0.90
+    return "mixed_low_confidence", 0.25, 0.15, 0.60
+
+
+def _source_metadata_fields(
+    *,
+    chain_id: str,
+    resolution: float,
+    external_sources: dict[str, dict[str, set[str]]],
+    rcsb_metadata: dict[str, dict[str, Any]],
+) -> tuple[dict[str, Any], str, str, dict[str, bool]]:
+    domain_class, domain_source, domain_source_values = _select_domain_architecture(
+        chain_id,
+        external_sources,
+        fallback_secondary_class="mixed_low_confidence",
+    )
+    derived_cls, derived_helix, derived_beta, derived_coil = _derived_secondary_fractions(domain_class)
+    source_coverage = {
+        source_name: bool(external_sources.get(source_name, {}).get(chain_id))
+        for source_name in ("cath", "scope", "ecod", "rcsb")
+    }
+    source_coverage["domain_class_projection"] = True
+    metadata_source_count = sum(1 for present in source_coverage.values() if present)
+    fields = {
+        "accepted": True,
+        "reject_reasons": [],
+        "secondary_structure_class": derived_cls,
+        "secondary_helix_fraction": round(float(derived_helix), 4),
+        "secondary_beta_fraction": round(float(derived_beta), 4),
+        "secondary_coil_fraction": round(float(derived_coil), 4),
+        "secondary_structure_source": f"domain_class_projection:{domain_source}",
+        "domain_architecture_class": domain_class,
+        "domain_architecture_source": domain_source,
+        "domain_architecture_source_values": domain_source_values,
+        "metadata_source_coverage": source_coverage,
+        "metadata_source_count": metadata_source_count,
+        "rcsb_metadata": rcsb_metadata.get(chain_id, {}),
+        "structure_resolution": float(resolution),
+    }
+    return fields, derived_cls, domain_class, source_coverage
+
+
 def _sha256(path: Path) -> str:
     import hashlib
 
@@ -393,9 +472,10 @@ def _sha256(path: Path) -> str:
 def build_metadata(
     *,
     chain_data_cache: Path,
-    mmcif_root: Path,
     metadata_sources_dir: Path,
     metadata_source_lock: Path,
+    feature_exclusion_list: Path,
+    processability_exclusion_list: Path,
     min_len: int,
     max_len: int,
     max_resolution: float,
@@ -422,13 +502,13 @@ def build_metadata(
     domain_counts: Counter[str] = Counter()
     source_counts: Counter[str] = Counter()
     external_sources, rcsb_metadata = _load_external_sources(metadata_sources_dir)
+    feature_exclusions = _load_feature_exclusions(feature_exclusion_list)
+    processability_exclusions = _load_feature_exclusions(processability_exclusion_list)
 
     for candidate in tqdm(candidates, desc="structure-metadata"):
         chain_id = str(candidate["chain_id"])
         pdb_id = _pdb_id(chain_id)
-        chain_name = _chain_name(chain_id)
-        mmcif_path = mmcif_root / f"{pdb_id}.cif"
-        dssp_mmcif_path = metadata_sources_dir / "dssp_mmcif" / f"{pdb_id}.cif"
+        _chain_name(chain_id)
         entry: dict[str, Any] = {
             "chain_id": chain_id,
             "pdb_id": pdb_id,
@@ -437,72 +517,24 @@ def build_metadata(
             "length": int(candidate["length"]),
             "resolution": float(candidate["resolution"]),
         }
+        if chain_id in feature_exclusions:
+            entry["reject_reasons"] = ["missing_required_feature_asset"]
+            reject_counts["missing_required_feature_asset"] += 1
+            entries.append(entry)
+            continue
+        if chain_id in processability_exclusions:
+            entry["reject_reasons"] = ["failed_official_label_processability"]
+            reject_counts["failed_official_label_processability"] += 1
+            entries.append(entry)
+            continue
         try:
-            if not mmcif_path.exists():
-                raise FileNotFoundError(f"missing_mmcif:{mmcif_path}")
-            atoms = extract_chain_atoms(
-                mmcif_path=mmcif_path,
-                pdb_id=pdb_id,
-                chain_id=chain_name,
-                expected_sequence=str(candidate["sequence"]),
-                require_full_match=True,
+            fields, cls, domain_class, source_coverage = _source_metadata_fields(
+                chain_id=chain_id,
+                resolution=float(candidate["resolution"]),
+                external_sources=external_sources,
+                rcsb_metadata=rcsb_metadata,
             )
-            cls, helix_fraction, beta_fraction, coil_fraction, secondary_source = (
-                secondary_fractions_from_mmcif_annotations(
-                    str(dssp_mmcif_path),
-                    chain_id=chain_name,
-                    length=int(candidate["length"]),
-                )
-                if dssp_mmcif_path.exists()
-                else ("unknown", None, None, None, None)
-            )
-            if cls == "unknown":
-                cls, helix_fraction, beta_fraction, coil_fraction, secondary_source = (
-                    secondary_fractions_from_mmcif_annotations(
-                        str(mmcif_path),
-                        chain_id=chain_name,
-                        length=int(candidate["length"]),
-                    )
-                )
-            if cls == "unknown":
-                cls, helix_fraction, beta_fraction, coil_fraction = secondary_fractions_from_atom14(
-                    atoms.atom14_positions,
-                    atoms.atom14_mask,
-                )
-                secondary_source = "atom14_torsion"
-            if cls == "unknown" or helix_fraction is None or beta_fraction is None or coil_fraction is None:
-                raise ValueError("secondary_structure_unknown")
-            domain_class, domain_source, domain_source_values = _select_domain_architecture(
-                chain_id,
-                external_sources,
-                fallback_secondary_class=cls,
-            )
-            source_coverage = {
-                source_name: bool(external_sources.get(source_name, {}).get(chain_id))
-                for source_name in ("cath", "scope", "ecod", "rcsb")
-            }
-            source_coverage["dssp"] = dssp_mmcif_path.exists()
-            source_coverage["mmcif_annotations"] = secondary_source == "mmcif_annotations"
-            source_coverage["atom14_torsion"] = secondary_source == "atom14_torsion"
-            metadata_source_count = sum(1 for present in source_coverage.values() if present)
-            entry.update(
-                {
-                    "accepted": True,
-                    "reject_reasons": [],
-                    "secondary_structure_class": cls,
-                    "secondary_helix_fraction": round(float(helix_fraction), 4),
-                    "secondary_beta_fraction": round(float(beta_fraction), 4),
-                    "secondary_coil_fraction": round(float(coil_fraction), 4),
-                    "secondary_structure_source": secondary_source,
-                    "domain_architecture_class": domain_class,
-                    "domain_architecture_source": domain_source,
-                    "domain_architecture_source_values": domain_source_values,
-                    "metadata_source_coverage": source_coverage,
-                    "metadata_source_count": metadata_source_count,
-                    "rcsb_metadata": rcsb_metadata.get(chain_id, {}),
-                    "structure_resolution": float(atoms.resolution),
-                }
-            )
+            entry.update(fields)
             secondary_counts[cls] += 1
             domain_counts[domain_class] += 1
             source_counts.update(source for source, present in source_coverage.items() if present)
@@ -519,15 +551,26 @@ def build_metadata(
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "source": {
             "chain_data_cache": str(chain_data_cache),
-            "mmcif_root": str(mmcif_root),
             "metadata_sources_dir": str(metadata_sources_dir),
             "metadata_source_lock": _metadata_source_hashes(metadata_source_lock),
+            "feature_exclusion_list": _feature_exclusion_source(feature_exclusion_list, feature_exclusions),
+            "processability_exclusion_list": _feature_exclusion_source(
+                processability_exclusion_list,
+                processability_exclusions,
+            ),
         },
         "config": {
             "min_len": int(min_len),
             "max_len": int(max_len),
             "max_resolution": float(max_resolution),
             "max_unknown_aa_fraction": float(max_unknown_aa_fraction),
+            "required_feature_assets": ["uniref90_hits.a3m"],
+            "label_processability": {
+                "min_projection_seq_identity": 0.90,
+                "min_projection_coverage": 0.70,
+                "min_projection_aligned_fraction": 0.70,
+                "min_projection_valid_ca": 32,
+            },
         },
         "summary": {
             "candidate_count": len(candidates),
@@ -546,9 +589,10 @@ def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     metadata = build_metadata(
         chain_data_cache=args.chain_data_cache,
-        mmcif_root=args.mmcif_root,
         metadata_sources_dir=args.metadata_sources_dir,
         metadata_source_lock=args.metadata_source_lock,
+        feature_exclusion_list=args.feature_exclusion_list,
+        processability_exclusion_list=args.processability_exclusion_list,
         min_len=int(args.min_len),
         max_len=int(args.max_len),
         max_resolution=float(args.max_resolution),
@@ -560,7 +604,7 @@ def main(argv: list[str] | None = None) -> None:
     args.metadata_out.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
 
     if args.candidate_manifest_out is not None:
-        candidates = [entry["chain_id"] for entry in metadata["chains"]]
+        candidates = [entry["chain_id"] for entry in metadata["chains"] if entry["accepted"]]
         args.candidate_manifest_out.parent.mkdir(parents=True, exist_ok=True)
         args.candidate_manifest_out.write_text("".join(f"{chain_id}\n" for chain_id in candidates))
 
@@ -572,11 +616,6 @@ def main(argv: list[str] | None = None) -> None:
     print(f"[structure-metadata] metadata -> {args.metadata_out}")
     if args.candidate_manifest_out is not None:
         print(f"[structure-metadata] candidates -> {args.candidate_manifest_out}")
-        if summary["reject_reasons"].get("missing_mmcif", 0):
-            print(
-                "[structure-metadata] missing mmCIFs detected; use the candidate manifest with "
-                "scripts/prepare_data.py --download-mmcif-subset to fetch them."
-            )
 
 
 if __name__ == "__main__":

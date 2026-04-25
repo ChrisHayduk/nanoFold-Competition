@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
+
+TEST_HIDDEN_SPLIT_SALT = "test-hidden-split-salt-with-enough-length-000000"
 
 
 def _cache_sha(path: Path) -> str:
@@ -85,6 +88,7 @@ def _run_build(cache_path: Path, out_dir: Path, expected_sha: str) -> subprocess
         text=True,
         capture_output=True,
         check=False,
+        env={**os.environ, "NANOFOLD_HIDDEN_SPLIT_SALT": TEST_HIDDEN_SPLIT_SALT},
     )
 
 
@@ -110,12 +114,15 @@ def _run_build_without_cluster_tsv(cache_path: Path, out_dir: Path, expected_sha
             "0",
             "--structure-metadata",
             str(structure_metadata),
+            "--mmseqs-bin",
+            "__missing_nanofold_mmseqs__",
             "--expected-chain-cache-sha256",
             expected_sha,
         ],
         text=True,
         capture_output=True,
         check=False,
+        env={**os.environ, "NANOFOLD_HIDDEN_SPLIT_SALT": TEST_HIDDEN_SPLIT_SALT},
     )
 
 
@@ -169,6 +176,50 @@ def test_build_manifests_deterministic_with_expected_cache_sha(tmp_path: Path) -
     assert train_a == train_b
     assert val_a == val_b
     assert all_a == all_b
+
+
+def test_build_manifests_requires_private_hidden_split_salt(tmp_path: Path) -> None:
+    cache_path = tmp_path / "chain_data_cache.json"
+    _make_chain_cache(cache_path)
+    expected_sha = _cache_sha(cache_path)
+    chain_ids = list(json.loads(cache_path.read_text()).keys())
+    structure_metadata = tmp_path / "structure_metadata.json"
+    cluster_tsv = tmp_path / "clusters.tsv"
+    _write_structure_metadata(structure_metadata, chain_ids)
+    _write_cluster_tsv(cluster_tsv, chain_ids)
+
+    env = dict(os.environ)
+    env.pop("NANOFOLD_HIDDEN_SPLIT_SALT", None)
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "scripts/build_manifests.py",
+            "--chain-data-cache",
+            str(cache_path),
+            "--out-dir",
+            str(tmp_path / "out_no_salt"),
+            "--train-size",
+            "3",
+            "--val-size",
+            "2",
+            "--hidden-val-size",
+            "1",
+            "--seed",
+            "0",
+            "--structure-metadata",
+            str(structure_metadata),
+            "--cluster-tsv",
+            str(cluster_tsv),
+            "--expected-chain-cache-sha256",
+            expected_sha,
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+        env=env,
+    )
+    assert proc.returncode != 0
+    assert "maintainer-only salt" in (proc.stderr + proc.stdout)
 
 
 def test_build_manifests_requires_mmseqs_or_locked_cluster_tsv(tmp_path: Path) -> None:
@@ -230,6 +281,7 @@ def test_build_manifests_writes_hidden_split_and_stratifies_secondary_classes(tm
         text=True,
         capture_output=True,
         check=False,
+        env={**os.environ, "NANOFOLD_HIDDEN_SPLIT_SALT": TEST_HIDDEN_SPLIT_SALT},
     )
     assert proc.returncode == 0, proc.stderr
     assert (out_dir / "hidden_val.txt").exists()
@@ -239,10 +291,11 @@ def test_build_manifests_writes_hidden_split_and_stratifies_secondary_classes(tm
 
     lock = json.loads(lock_file.read_text())
     distributions = lock["stratification"]["split_distributions"]
-    for split_name in ("train", "val", "hidden_val"):
+    for split_name in ("train", "val"):
         classes = distributions[split_name]["secondary_structure_class"]
         assert classes == {"alpha": 1, "alpha_beta": 1, "beta": 1}
     assert lock["grouping"] == {"cluster_disjoint": True, "pdb_disjoint": True}
-    assert lock["outputs"]["hidden_val_count"] == 3
+    assert "hidden_val_count" not in lock["outputs"]
+    assert "hidden_val" not in lock["stratification"]["split_distributions"]
     assert (out_dir / "split_quality_report.json").exists()
-    assert lock["outputs"]["split_quality_report_sha256"]
+    assert "split_quality_report_sha256" not in lock["outputs"]

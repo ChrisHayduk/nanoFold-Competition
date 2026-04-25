@@ -38,6 +38,9 @@ exclude = "(^data/|^runs/|^third_party/)"
 
 [tool.pyright]
 pythonVersion = "3.11"
+venvPath = "."
+venv = ".venv"
 include = ["nanofold", "scripts", "tests", "train.py", "eval.py", "predict.py", "score.py"]
 exclude = ["data", "runs", "third_party", ".venv"]
 typeCheckingMode = "basic"
+reportPrivateImportUsage = false
