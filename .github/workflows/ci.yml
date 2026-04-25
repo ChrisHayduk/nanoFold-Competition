@@ -19,7 +19,6 @@ jobs:
             const protectedFiles = new Set([
               'data/manifests/train.txt',
               'data/manifests/val.txt',
-              'data/manifests/hidden_val.txt',
               'data/manifests/all.txt',
             ]);
             const approvalLabel = 'manifest-change-approved';

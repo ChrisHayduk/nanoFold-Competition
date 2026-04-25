@@ -87,3 +87,15 @@ def test_public_release_leak_check_rejects_hidden_hashes_and_tracked_hidden_mani
     output = proc.stderr + proc.stdout
     assert "dataset.hidden_manifest_sha256" in output
     assert "data/manifests/hidden_val.txt" in output
+
+
+def test_public_release_leak_check_rejects_private_workspace_files(tmp_path: Path) -> None:
+    tracked = _write_public_repo_fixture(tmp_path)
+    private_manifest = tmp_path / ".nanofold_private/manifests/hidden_val.txt"
+    private_manifest.parent.mkdir(parents=True)
+    private_manifest.write_text("1abc_A\n")
+    tracked.write_text(tracked.read_text() + ".nanofold_private/manifests/hidden_val.txt\n")
+
+    proc = _run_check(tmp_path, tracked)
+    assert proc.returncode != 0
+    assert ".nanofold_private/manifests/hidden_val.txt" in (proc.stderr + proc.stdout)

@@ -38,7 +38,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("leaderboard/official_data_source.lock.json"),
+        default=Path(".nanofold_private/leaderboard/official_data_source.lock.json"),
+    )
+    parser.add_argument(
+        "--hidden-manifest",
+        type=Path,
+        default=Path(".nanofold_private/manifests/hidden_val.txt"),
+        help="Maintainer-only hidden manifest path used when --include-hidden is set.",
     )
     parser.add_argument("--msa-name", default="uniref90_hits.a3m")
     parser.add_argument(
@@ -101,15 +107,19 @@ def _read_manifest(path: Path) -> list[str]:
     return [line.strip() for line in path.read_text().splitlines() if line.strip() and not line.startswith("#")]
 
 
-def _manifest_paths(manifests_dir: Path, *, include_hidden: bool) -> dict[str, Path]:
+def _manifest_paths(
+    manifests_dir: Path,
+    *,
+    include_hidden: bool,
+    hidden_manifest: Path,
+) -> dict[str, Path]:
     out = {
         "train": manifests_dir / "train.txt",
         "val": manifests_dir / "val.txt",
         "all": manifests_dir / "all.txt",
     }
-    hidden = manifests_dir / "hidden_val.txt"
-    if include_hidden or hidden.exists():
-        out["hidden_val"] = hidden
+    if include_hidden:
+        out["hidden_val"] = hidden_manifest
     return out
 
 
@@ -196,7 +206,11 @@ def _annotate_manifest_lock(manifest_lock: Path, source_lock: Path) -> None:
 
 def build_lock(args: argparse.Namespace) -> dict[str, Any]:
     repo_root = Path.cwd()
-    manifests = _manifest_paths(args.manifests_dir, include_hidden=bool(args.include_hidden))
+    manifests = _manifest_paths(
+        args.manifests_dir,
+        include_hidden=bool(args.include_hidden),
+        hidden_manifest=args.hidden_manifest,
+    )
     chain_ids: list[str] = []
     manifest_meta: dict[str, Any] = {}
     missing_manifests: list[str] = []

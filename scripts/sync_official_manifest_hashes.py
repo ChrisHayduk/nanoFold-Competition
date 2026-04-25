@@ -29,10 +29,11 @@ def parse_args() -> argparse.Namespace:
         )
     )
     ap.add_argument("--manifests-dir", type=str, default="data/manifests")
+    ap.add_argument("--hidden-manifest", type=str, default=".nanofold_private/manifests/hidden_val.txt")
     ap.add_argument("--track-file", type=str, default="tracks/limited_large.yaml")
     ap.add_argument("--lock-file", type=str, default="leaderboard/official_manifest_source.lock.json")
     ap.add_argument("--readme", type=str, default="README.md")
-    ap.add_argument("--competition-doc", type=str, default="COMPETITION.md")
+    ap.add_argument("--competition-doc", type=str, default="docs/COMPETITION.md")
     ap.add_argument(
         "--check",
         action="store_true",
@@ -60,11 +61,11 @@ def _read_manifest_ids(path: Path) -> list[str]:
     return ids
 
 
-def _compute_hashes(manifests_dir: Path) -> ManifestHashes:
+def _compute_hashes(manifests_dir: Path, hidden_manifest: Path) -> ManifestHashes:
     train_path = manifests_dir / "train.txt"
     val_path = manifests_dir / "val.txt"
     all_path = manifests_dir / "all.txt"
-    hidden_val_path = manifests_dir / "hidden_val.txt"
+    hidden_val_path = hidden_manifest
     for p in (train_path, val_path, all_path):
         if not p.exists():
             raise FileNotFoundError(f"Missing manifest file: {p}")
@@ -186,7 +187,14 @@ def _display_path(path: Path, *, lock_file: Path) -> str:
         return os.path.relpath(resolved, start=lock_file.parent.resolve())
 
 
-def _update_lock_json(path: Path, hashes: ManifestHashes, manifests_dir: Path, *, include_hidden: bool) -> str:
+def _update_lock_json(
+    path: Path,
+    hashes: ManifestHashes,
+    manifests_dir: Path,
+    hidden_manifest: Path,
+    *,
+    include_hidden: bool,
+) -> str:
     if path.exists():
         raw = json.loads(path.read_text())
     else:
@@ -221,7 +229,7 @@ def _update_lock_json(path: Path, hashes: ManifestHashes, manifests_dir: Path, *
     train_path = manifests_dir / "train.txt"
     val_path = manifests_dir / "val.txt"
     all_path = manifests_dir / "all.txt"
-    hidden_val_path = manifests_dir / "hidden_val.txt"
+    hidden_val_path = hidden_manifest
     outputs["train_manifest"] = _display_path(train_path, lock_file=path)
     outputs["val_manifest"] = _display_path(val_path, lock_file=path)
     outputs["all_manifest"] = _display_path(all_path, lock_file=path)
@@ -276,15 +284,22 @@ def _write_or_check(path: Path, new_text: str, *, check_only: bool) -> bool:
 def main() -> None:
     args = parse_args()
     manifests_dir = Path(args.manifests_dir).resolve()
+    hidden_manifest = Path(args.hidden_manifest).resolve()
     track_file = Path(args.track_file).resolve()
     lock_file = Path(args.lock_file).resolve()
     readme = Path(args.readme).resolve()
     competition_doc = Path(args.competition_doc).resolve()
 
-    hashes = _compute_hashes(manifests_dir)
+    hashes = _compute_hashes(manifests_dir, hidden_manifest)
     updates: Dict[Path, str] = {
         track_file: _update_track_yaml(track_file, hashes, include_hidden=bool(args.include_hidden)),
-        lock_file: _update_lock_json(lock_file, hashes, manifests_dir, include_hidden=bool(args.include_hidden)),
+        lock_file: _update_lock_json(
+            lock_file,
+            hashes,
+            manifests_dir,
+            hidden_manifest,
+            include_hidden=bool(args.include_hidden),
+        ),
         readme: _update_readme(readme, hashes),
         competition_doc: _update_competition_doc(competition_doc, hashes),
     }

@@ -84,7 +84,16 @@ class SplitResult:
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser()
     ap.add_argument("--chain-data-cache", type=str, required=True, help="Path to chain_data_cache.json")
-    ap.add_argument("--out-dir", type=str, required=True, help="Where to write train.txt and val.txt")
+    ap.add_argument("--out-dir", type=str, required=True, help="Where to write public train.txt, val.txt, and all.txt")
+    ap.add_argument(
+        "--hidden-out-dir",
+        type=str,
+        default=".nanofold_private/manifests",
+        help=(
+            "Maintainer-only directory for hidden_val.txt and the full split quality report. "
+            "Keep this path outside tracked public files."
+        ),
+    )
     ap.add_argument("--train-size", type=int, default=10000)
     ap.add_argument("--val-size", type=int, default=1000)
     ap.add_argument(
@@ -1053,12 +1062,14 @@ def main() -> None:
     _assert_split_disjointness(result)
 
     out_dir = Path(args.out_dir)
+    hidden_out_dir = Path(args.hidden_out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    hidden_out_dir.mkdir(parents=True, exist_ok=True)
     train_path = out_dir / "train.txt"
     val_path = out_dir / "val.txt"
-    hidden_val_path = out_dir / "hidden_val.txt"
+    hidden_val_path = hidden_out_dir / "hidden_val.txt"
     all_path = out_dir / "all.txt"
-    quality_report_path = out_dir / "split_quality_report.json"
+    quality_report_path = hidden_out_dir / "split_quality_report.json"
     _write_manifest(train_path, result.train_ids)
     _write_manifest(val_path, result.val_ids)
     _write_manifest(hidden_val_path, result.hidden_val_ids)
@@ -1067,8 +1078,8 @@ def main() -> None:
     quality_report_path.write_text(json.dumps(result.quality_report, indent=2, sort_keys=True) + "\n")
 
     print(
-        f"Wrote {len(result.train_ids)} train + {len(result.val_ids)} val"
-        f"{f' + {len(result.hidden_val_ids)} hidden_val' if result.hidden_val_ids else ''} chains to {out_dir} "
+        f"Wrote {len(result.train_ids)} train + {len(result.val_ids)} val chains to {out_dir} "
+        f"and {len(result.hidden_val_ids)} hidden_val chains to {hidden_out_dir} "
         "(cluster/PDB-disjoint: 0 overlaps)"
     )
 

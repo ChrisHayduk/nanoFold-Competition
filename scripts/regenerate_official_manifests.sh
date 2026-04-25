@@ -16,9 +16,12 @@ Options:
   --chain-data-cache <path>   Path to chain_data_cache.json
                               (default: data/openproteinset/pdb_data/data_caches/chain_data_cache.json)
   --out-dir <path>            Manifest output directory (default: data/manifests)
+  --private-root <path>        Maintainer-only hidden asset root (default: .nanofold_private)
+  --hidden-out-dir <path>      Hidden manifest output directory
+                              (default: <private-root>/manifests)
   --lock-file <path>          Lock metadata path (default: leaderboard/official_manifest_source.lock.json)
   --private-lock-file <path>  Maintainer-only hidden manifest lock output
-                              (default: leaderboard/private_hidden_manifest_source.lock.json)
+                              (default: <private-root>/leaderboard/private_hidden_manifest_source.lock.json)
   --structure-metadata <path> Structure metadata JSON override
   --rewrite-lock              Rewrite lock metadata at --lock-file after successful generation
   --sync-hashes               Sync manifest SHA256/count references across track + docs + lock
@@ -32,8 +35,10 @@ REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 
 CHAIN_DATA_CACHE="data/openproteinset/pdb_data/data_caches/chain_data_cache.json"
 OUT_DIR="data/manifests"
+PRIVATE_ROOT=".nanofold_private"
+HIDDEN_OUT_DIR=""
 LOCK_FILE="leaderboard/official_manifest_source.lock.json"
-PRIVATE_LOCK_FILE="leaderboard/private_hidden_manifest_source.lock.json"
+PRIVATE_LOCK_FILE=""
 STRUCTURE_METADATA_OVERRIDE=""
 REWRITE_LOCK=0
 SYNC_HASHES=0
@@ -47,6 +52,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --out-dir)
       OUT_DIR="$2"
+      shift 2
+      ;;
+    --private-root)
+      PRIVATE_ROOT="$2"
+      shift 2
+      ;;
+    --hidden-out-dir|--hidden-manifests-dir)
+      HIDDEN_OUT_DIR="$2"
       shift 2
       ;;
     --lock-file)
@@ -84,6 +97,13 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+if [[ -z "$HIDDEN_OUT_DIR" ]]; then
+  HIDDEN_OUT_DIR="$PRIVATE_ROOT/manifests"
+fi
+if [[ -z "$PRIVATE_LOCK_FILE" ]]; then
+  PRIVATE_LOCK_FILE="$PRIVATE_ROOT/leaderboard/private_hidden_manifest_source.lock.json"
+fi
 
 run_cmd() {
   echo "+ $*"
@@ -164,6 +184,7 @@ BUILD_CMD=(
   python "$SCRIPT_DIR/build_manifests.py"
   --chain-data-cache "$CHAIN_DATA_CACHE"
   --out-dir "$OUT_DIR"
+  --hidden-out-dir "$HIDDEN_OUT_DIR"
   --train-size "$TRAIN_SIZE"
   --val-size "$VAL_SIZE"
   --hidden-val-size "$HIDDEN_VAL_SIZE"
@@ -190,10 +211,11 @@ run_cmd "${BUILD_CMD[@]}"
 if [[ "$SYNC_HASHES" -eq 1 ]]; then
   run_cmd python "$SCRIPT_DIR/sync_official_manifest_hashes.py" \
     --manifests-dir "$OUT_DIR" \
+    --hidden-manifest "$HIDDEN_OUT_DIR/hidden_val.txt" \
     --track-file "$REPO_ROOT/tracks/limited_large.yaml" \
     --lock-file "$LOCK_FILE" \
     --readme "$REPO_ROOT/README.md" \
-    --competition-doc "$REPO_ROOT/COMPETITION.md"
+    --competition-doc "$REPO_ROOT/docs/COMPETITION.md"
 fi
 
 if [[ "$DRY_RUN" -eq 0 ]]; then

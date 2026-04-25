@@ -17,10 +17,12 @@ Options:
   --track-id <id>                     Track id metadata for fingerprint (default: limited_large)
   --data-root <path>                  Download root (default: data/openproteinset)
   --manifests-dir <path>              Manifest directory (default: data/manifests)
+  --private-root <path>               Maintainer-only hidden asset root (default: .nanofold_private)
+  --hidden-manifests-dir <path>       Hidden manifest directory (default: <private-root>/manifests)
   --processed-features-dir <path>     Feature NPZ output dir (default: data/processed_features)
   --processed-labels-dir <path>       Label NPZ output dir (default: data/processed_labels)
-  --hidden-features-dir <path>        Hidden feature NPZ output dir (default: data/hidden_processed_features)
-  --hidden-labels-dir <path>          Hidden label NPZ output dir (default: data/hidden_processed_labels)
+  --hidden-features-dir <path>        Hidden feature NPZ output dir (default: <private-root>/hidden_processed_features)
+  --hidden-labels-dir <path>          Hidden label NPZ output dir (default: <private-root>/hidden_processed_labels)
   --chain-data-cache <path>           chain_data_cache.json path
                                       (default: data/openproteinset/pdb_data/data_caches/chain_data_cache.json)
   --structure-metadata <path>         Required structure metadata JSON for split generation
@@ -35,7 +37,7 @@ Options:
                                       Chain IDs excluded from official splitting because atom14 labels fail the processability gate
                                       (default: data/manifests/official_processability_exclusions.txt)
   --data-source-lock <path>           Raw official data source lock JSON
-                                      (default: leaderboard/official_data_source.lock.json)
+                                      (default: <private-root>/leaderboard/official_data_source.lock.json)
   --structure-candidates <path>       Accepted chain universe written by structure metadata build
                                       (default: data/manifests/structure_candidates.txt)
   --lock-file <path>                  Official manifest lock file
@@ -45,9 +47,11 @@ Options:
   --fingerprint-out <path>            Fingerprint output path
                                       (default: leaderboard/official_dataset_fingerprint.json)
   --hidden-fingerprint-out <path>     Hidden fingerprint output path
-                                      (default: leaderboard/official_hidden_fingerprint.json)
+                                      (default: <private-root>/leaderboard/official_hidden_fingerprint.json)
   --hidden-lock-file <path>           Hidden asset lock path
-                                      (default: leaderboard/private_hidden_assets.lock.json)
+                                      (default: <private-root>/leaderboard/private_hidden_assets.lock.json)
+  --private-manifest-lock <path>      Hidden manifest source lock path
+                                      (default: <private-root>/leaderboard/private_hidden_manifest_source.lock.json)
   --msa-names <csv>                   Comma-separated MSA filenames to download/preprocess
   --rewrite-lock                      Rewrite lock metadata after manifest regeneration
   --skip-manifest-regen               Skip manifest regeneration step
@@ -72,23 +76,26 @@ REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 TRACK_ID="limited_large"
 DATA_ROOT="data/openproteinset"
 MANIFESTS_DIR="data/manifests"
+PRIVATE_ROOT=".nanofold_private"
+HIDDEN_MANIFESTS_DIR=""
 PROCESSED_FEATURES_DIR="data/processed_features"
 PROCESSED_LABELS_DIR="data/processed_labels"
-HIDDEN_FEATURES_DIR="data/hidden_processed_features"
-HIDDEN_LABELS_DIR="data/hidden_processed_labels"
+HIDDEN_FEATURES_DIR=""
+HIDDEN_LABELS_DIR=""
 CHAIN_DATA_CACHE="data/openproteinset/pdb_data/data_caches/chain_data_cache.json"
 STRUCTURE_METADATA="data/manifests/structure_metadata.json"
 METADATA_SOURCES_DIR="data/metadata_sources"
 METADATA_SOURCE_LOCK="data/metadata_sources/structure_metadata_sources.lock.json"
 FEATURE_EXCLUSION_LIST="data/manifests/openfold_required_feature_exclusions.txt"
 PROCESSABILITY_EXCLUSION_LIST="data/manifests/official_processability_exclusions.txt"
-DATA_SOURCE_LOCK="leaderboard/official_data_source.lock.json"
+DATA_SOURCE_LOCK=""
 STRUCTURE_CANDIDATES="data/manifests/structure_candidates.txt"
 LOCK_FILE="leaderboard/official_manifest_source.lock.json"
 TRACK_FILE="tracks/limited_large.yaml"
 FINGERPRINT_OUT="leaderboard/official_dataset_fingerprint.json"
-HIDDEN_FINGERPRINT_OUT="leaderboard/official_hidden_fingerprint.json"
-HIDDEN_LOCK_FILE="leaderboard/private_hidden_assets.lock.json"
+HIDDEN_FINGERPRINT_OUT=""
+HIDDEN_LOCK_FILE=""
+PRIVATE_MANIFEST_LOCK=""
 DOWNLOAD_RETRIES=2
 DOWNLOAD_RETRY_DELAY_SECONDS=2.0
 DOWNLOAD_WORKERS=32
@@ -116,6 +123,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --manifests-dir)
       MANIFESTS_DIR="$2"
+      shift 2
+      ;;
+    --private-root)
+      PRIVATE_ROOT="$2"
+      shift 2
+      ;;
+    --hidden-manifests-dir|--hidden-out-dir)
+      HIDDEN_MANIFESTS_DIR="$2"
       shift 2
       ;;
     --processed-features-dir)
@@ -186,6 +201,10 @@ while [[ $# -gt 0 ]]; do
       HIDDEN_LOCK_FILE="$2"
       shift 2
       ;;
+    --private-manifest-lock)
+      PRIVATE_MANIFEST_LOCK="$2"
+      shift 2
+      ;;
     --rewrite-lock)
       REWRITE_LOCK=1
       shift 1
@@ -253,6 +272,28 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+if [[ -z "$HIDDEN_MANIFESTS_DIR" ]]; then
+  HIDDEN_MANIFESTS_DIR="$PRIVATE_ROOT/manifests"
+fi
+if [[ -z "$HIDDEN_FEATURES_DIR" ]]; then
+  HIDDEN_FEATURES_DIR="$PRIVATE_ROOT/hidden_processed_features"
+fi
+if [[ -z "$HIDDEN_LABELS_DIR" ]]; then
+  HIDDEN_LABELS_DIR="$PRIVATE_ROOT/hidden_processed_labels"
+fi
+if [[ -z "$DATA_SOURCE_LOCK" ]]; then
+  DATA_SOURCE_LOCK="$PRIVATE_ROOT/leaderboard/official_data_source.lock.json"
+fi
+if [[ -z "$HIDDEN_FINGERPRINT_OUT" ]]; then
+  HIDDEN_FINGERPRINT_OUT="$PRIVATE_ROOT/leaderboard/official_hidden_fingerprint.json"
+fi
+if [[ -z "$HIDDEN_LOCK_FILE" ]]; then
+  HIDDEN_LOCK_FILE="$PRIVATE_ROOT/leaderboard/private_hidden_assets.lock.json"
+fi
+if [[ -z "$PRIVATE_MANIFEST_LOCK" ]]; then
+  PRIVATE_MANIFEST_LOCK="$PRIVATE_ROOT/leaderboard/private_hidden_manifest_source.lock.json"
+fi
 
 run_cmd() {
   echo "+ $*"
@@ -379,7 +420,10 @@ if [[ "$SKIP_MANIFEST_REGEN" -eq 0 ]]; then
     bash "$SCRIPT_DIR/regenerate_official_manifests.sh"
     --chain-data-cache "$CHAIN_DATA_CACHE"
     --out-dir "$MANIFESTS_DIR"
+    --private-root "$PRIVATE_ROOT"
+    --hidden-out-dir "$HIDDEN_MANIFESTS_DIR"
     --lock-file "$LOCK_FILE"
+    --private-lock-file "$PRIVATE_MANIFEST_LOCK"
     --structure-metadata "$STRUCTURE_METADATA"
     --sync-hashes
   )
@@ -396,10 +440,11 @@ else
   else
     python "$SCRIPT_DIR/sync_official_manifest_hashes.py" \
       --manifests-dir "$MANIFESTS_DIR" \
+      --hidden-manifest "$HIDDEN_MANIFESTS_DIR/hidden_val.txt" \
       --track-file "$TRACK_FILE" \
       --lock-file "$LOCK_FILE" \
       --readme "$REPO_ROOT/README.md" \
-      --competition-doc "$REPO_ROOT/COMPETITION.md" \
+      --competition-doc "$REPO_ROOT/docs/COMPETITION.md" \
       --check
   fi
 fi
@@ -443,7 +488,7 @@ fi
 
 echo "[3b/5] Download + preprocess hidden split NPZ data"
 if [[ "$SKIP_HIDDEN" -eq 0 && "$SKIP_SETUP" -eq 0 ]]; then
-  HIDDEN_MANIFEST="$MANIFESTS_DIR/hidden_val.txt"
+  HIDDEN_MANIFEST="$HIDDEN_MANIFESTS_DIR/hidden_val.txt"
   HIDDEN_PREPARE_CMD=(
     python "$SCRIPT_DIR/prepare_data.py"
     --data-root "$DATA_ROOT"
@@ -515,7 +560,7 @@ if [[ "$SKIP_SETUP" -eq 0 ]]; then
       python "$SCRIPT_DIR/sync_processed_npz_files.py"
       --features-dir "$HIDDEN_FEATURES_DIR"
       --labels-dir "$HIDDEN_LABELS_DIR"
-      --manifest "$MANIFESTS_DIR/hidden_val.txt"
+      --manifest "$HIDDEN_MANIFESTS_DIR/hidden_val.txt"
       --remove-errors
     )
     run_cmd "${SYNC_HIDDEN_CMD[@]}"
@@ -533,6 +578,7 @@ SOURCE_LOCK_CMD=(
   --structure-metadata "$STRUCTURE_METADATA"
   --metadata-source-lock "$METADATA_SOURCE_LOCK"
   --manifest-lock "$LOCK_FILE"
+  --hidden-manifest "$HIDDEN_MANIFESTS_DIR/hidden_val.txt"
   --output "$DATA_SOURCE_LOCK"
 )
 if [[ -n "$MSA_NAMES" ]]; then
@@ -571,7 +617,7 @@ if [[ "$SKIP_FINGERPRINT" -eq 0 ]]; then
       python "$SCRIPT_DIR/build_fingerprint.py"
       --processed-features-dir "$HIDDEN_FEATURES_DIR"
       --processed-labels-dir "$HIDDEN_LABELS_DIR"
-      --manifest "hidden_val=$MANIFESTS_DIR/hidden_val.txt"
+      --manifest "hidden_val=$HIDDEN_MANIFESTS_DIR/hidden_val.txt"
       --track "$TRACK_ID"
       --source-lock "$LOCK_FILE"
       --output "$HIDDEN_FINGERPRINT_OUT"
@@ -579,7 +625,7 @@ if [[ "$SKIP_FINGERPRINT" -eq 0 ]]; then
     run_cmd "${HIDDEN_FP_CMD[@]}"
     PIN_HIDDEN_CMD=(
       python "$SCRIPT_DIR/pin_hidden_assets.py"
-      --hidden-manifest "$MANIFESTS_DIR/hidden_val.txt"
+      --hidden-manifest "$HIDDEN_MANIFESTS_DIR/hidden_val.txt"
       --hidden-features-dir "$HIDDEN_FEATURES_DIR"
       --hidden-labels-dir "$HIDDEN_LABELS_DIR"
       --hidden-fingerprint "$HIDDEN_FINGERPRINT_OUT"
@@ -598,10 +644,11 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
 else
   python "$SCRIPT_DIR/sync_official_manifest_hashes.py" \
     --manifests-dir "$MANIFESTS_DIR" \
+    --hidden-manifest "$HIDDEN_MANIFESTS_DIR/hidden_val.txt" \
     --track-file "$TRACK_FILE" \
     --lock-file "$LOCK_FILE" \
     --readme "$REPO_ROOT/README.md" \
-    --competition-doc "$REPO_ROOT/COMPETITION.md" \
+    --competition-doc "$REPO_ROOT/docs/COMPETITION.md" \
     --check
 fi
 
@@ -615,3 +662,4 @@ echo "Fingerprint: $FINGERPRINT_OUT"
 echo "Structure metadata: $STRUCTURE_METADATA"
 echo "Metadata sources: $METADATA_SOURCES_DIR"
 echo "Data source lock: $DATA_SOURCE_LOCK"
+echo "Private hidden workspace: $PRIVATE_ROOT"

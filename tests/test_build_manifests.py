@@ -70,6 +70,8 @@ def _run_build(cache_path: Path, out_dir: Path, expected_sha: str) -> subprocess
             str(cache_path),
             "--out-dir",
             str(out_dir),
+            "--hidden-out-dir",
+            str(out_dir / "private"),
             "--train-size",
             "3",
             "--val-size",
@@ -104,6 +106,8 @@ def _run_build_without_cluster_tsv(cache_path: Path, out_dir: Path, expected_sha
             str(cache_path),
             "--out-dir",
             str(out_dir),
+            "--hidden-out-dir",
+            str(out_dir / "private"),
             "--train-size",
             "3",
             "--val-size",
@@ -198,6 +202,8 @@ def test_build_manifests_requires_private_hidden_split_salt(tmp_path: Path) -> N
             str(cache_path),
             "--out-dir",
             str(tmp_path / "out_no_salt"),
+            "--hidden-out-dir",
+            str(tmp_path / "private_no_salt"),
             "--train-size",
             "3",
             "--val-size",
@@ -252,6 +258,7 @@ def test_build_manifests_writes_hidden_split_and_stratifies_secondary_classes(tm
     _write_cluster_tsv(cluster_tsv, chain_ids)
 
     out_dir = tmp_path / "out_hidden"
+    hidden_out_dir = tmp_path / "private_hidden"
     lock_file = tmp_path / "lock.json"
     proc = subprocess.run(
         [
@@ -261,6 +268,8 @@ def test_build_manifests_writes_hidden_split_and_stratifies_secondary_classes(tm
             str(cache_path),
             "--out-dir",
             str(out_dir),
+            "--hidden-out-dir",
+            str(hidden_out_dir),
             "--train-size",
             "3",
             "--val-size",
@@ -284,10 +293,11 @@ def test_build_manifests_writes_hidden_split_and_stratifies_secondary_classes(tm
         env={**os.environ, "NANOFOLD_HIDDEN_SPLIT_SALT": TEST_HIDDEN_SPLIT_SALT},
     )
     assert proc.returncode == 0, proc.stderr
-    assert (out_dir / "hidden_val.txt").exists()
+    assert not (out_dir / "hidden_val.txt").exists()
+    assert (hidden_out_dir / "hidden_val.txt").exists()
     assert len((out_dir / "train.txt").read_text().splitlines()) == 3
     assert len((out_dir / "val.txt").read_text().splitlines()) == 3
-    assert len((out_dir / "hidden_val.txt").read_text().splitlines()) == 3
+    assert len((hidden_out_dir / "hidden_val.txt").read_text().splitlines()) == 3
 
     lock = json.loads(lock_file.read_text())
     distributions = lock["stratification"]["split_distributions"]
@@ -297,5 +307,6 @@ def test_build_manifests_writes_hidden_split_and_stratifies_secondary_classes(tm
     assert lock["grouping"] == {"cluster_disjoint": True, "pdb_disjoint": True}
     assert "hidden_val_count" not in lock["outputs"]
     assert "hidden_val" not in lock["stratification"]["split_distributions"]
-    assert (out_dir / "split_quality_report.json").exists()
+    assert not (out_dir / "split_quality_report.json").exists()
+    assert (hidden_out_dir / "split_quality_report.json").exists()
     assert "split_quality_report_sha256" not in lock["outputs"]

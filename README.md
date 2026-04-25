@@ -44,8 +44,9 @@ The final hidden FoldScore is the tie-breaker. Public validation exists for debu
 - a pinned minAlphaFold2 reference submission plus a template submission that pass the official atom14 contract
 
 Primary docs:
-- [COMPETITION.md](COMPETITION.md): enforceable rules and official protocol
-- [API.md](API.md): submission/runtime API contract
+- [docs/COMPETITION.md](docs/COMPETITION.md): enforceable rules and official protocol
+- [docs/API.md](docs/API.md): submission/runtime API contract
+- [docs/DATA.md](docs/DATA.md): official data sources, split generation, preprocessing, and sample formats
 
 ## Official Track At A Glance
 
@@ -190,16 +191,33 @@ Maintainers can refresh the official data assets with one command. This path:
 - downloads required OpenFold assets and manifest mmCIFs with strict missing-file checks
 - preprocesses public and hidden split NPZs
 - rebuilds public and hidden fingerprints
-- writes public locks plus ignored maintainer-only hidden locks
+- writes public metadata plus all hidden artifacts under the ignored `.nanofold_private/` workspace
 
 ```bash
 export NANOFOLD_HIDDEN_SPLIT_SALT="<maintainer-private-random-string>"
 bash scripts/full_official_data_refresh.sh --rewrite-lock
 ```
 
-This flow requires MMseqs2 on `PATH`. `NANOFOLD_HIDDEN_SPLIT_SALT` must be at least 32 characters and must never be committed. It regenerates split metadata, public manifests, hidden manifests, public NPZs, hidden NPZs, fingerprints, and lock files from the locked official inputs.
+This flow requires MMseqs2 on `PATH`. `NANOFOLD_HIDDEN_SPLIT_SALT` must be at least 32 characters and must never be committed. It regenerates split metadata, public manifests, public NPZs, the public dataset fingerprint, and maintainer-only hidden assets from the locked official inputs.
 
-The metadata builder writes `data/manifests/structure_candidates.txt` as the accepted chain universe used for split generation. The hidden manifest, hidden NPZ directories, hidden fingerprints, hidden source locks, and private salt metadata are maintainer-local artifacts; commit only public manifests, the public dataset fingerprint, and sanitized public lock metadata.
+Public outputs land in stable, commit-safe paths:
+- `data/manifests/train.txt`
+- `data/manifests/val.txt`
+- `data/manifests/all.txt`
+- `leaderboard/official_dataset_fingerprint.json`
+- `leaderboard/official_manifest_source.lock.json`
+
+Maintainer-only outputs land under `.nanofold_private/`:
+- `.nanofold_private/manifests/hidden_val.txt`
+- `.nanofold_private/manifests/split_quality_report.json`
+- `.nanofold_private/hidden_processed_features/`
+- `.nanofold_private/hidden_processed_labels/`
+- `.nanofold_private/leaderboard/official_hidden_fingerprint.json`
+- `.nanofold_private/leaderboard/private_hidden_assets.lock.json`
+- `.nanofold_private/leaderboard/private_hidden_manifest_source.lock.json`
+- `.nanofold_private/leaderboard/official_data_source.lock.json`
+
+The metadata builder also writes `data/manifests/structure_candidates.txt` as an ignored local audit artifact. Commit only public manifests, the public dataset fingerprint, and sanitized public lock metadata.
 
 Dry-run preview:
 
@@ -211,7 +229,7 @@ bash scripts/full_official_data_refresh.sh --rewrite-lock --dry-run
 
 Hidden leaderboard runs are maintainer-only. The prediction stage sees submission code plus hidden features. The scoring stage sees saved predictions plus hidden labels. Submission code is never imported during hidden scoring.
 
-Required maintainer env vars for hidden mode:
+Hidden mode uses `.nanofold_private/` by default. Override these only when hidden assets live elsewhere:
 - `NANOFOLD_HIDDEN_MANIFEST`
 - `NANOFOLD_HIDDEN_FEATURES_DIR`
 - `NANOFOLD_HIDDEN_LABELS_DIR`
@@ -271,7 +289,7 @@ python scripts/validate_submission.py \
   --track limited_large \
   --strict
 
-if git diff --name-only origin/main...HEAD | grep -Eq '^data/manifests/(train|val|hidden_val|all)\.txt$'; then
+if git diff --name-only origin/main...HEAD | grep -Eq '^data/manifests/(train|val|all)\.txt$'; then
   echo "ERROR: PR edits protected manifests. Ask maintainer for explicit approval label."
   exit 1
 fi
@@ -280,10 +298,11 @@ echo "Self-check passed."
 ```
 
 CI enforces the same PR guardrail:
-- edits to `data/manifests/train.txt`, `data/manifests/val.txt`, `data/manifests/hidden_val.txt`, or `data/manifests/all.txt` fail unless label `manifest-change-approved` is present.
+- edits to `data/manifests/train.txt`, `data/manifests/val.txt`, or `data/manifests/all.txt` fail unless label `manifest-change-approved` is present.
 
 ## Repo Map
 
+- `docs/`: data guide, API contract, and official competition protocol
 - `tracks/`: track policy definitions
 - `configs/`: official/research config profiles
 - `scripts/setup_official_data.sh`: official participant setup

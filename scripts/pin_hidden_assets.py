@@ -13,7 +13,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--hidden-labels-dir", type=str, required=True)
     ap.add_argument("--hidden-fingerprint", type=str, required=True)
     ap.add_argument("--track-id", type=str, default="limited_large")
-    ap.add_argument("--lock-file", type=str, default="leaderboard/private_hidden_assets.lock.json")
+    ap.add_argument("--lock-file", type=str, default=".nanofold_private/leaderboard/private_hidden_assets.lock.json")
     ap.add_argument("--hidden-chain-count", type=int, default=-1)
     return ap.parse_args()
 

@@ -178,7 +178,24 @@ export NANOFOLD_HIDDEN_SPLIT_SALT="<maintainer-private-random-string>"
 bash scripts/full_official_data_refresh.sh --rewrite-lock
 ```
 
-This maintainer flow requires MMseqs2 plus the public setup dependencies. `NANOFOLD_HIDDEN_SPLIT_SALT` must be at least 32 characters and must never be committed. It regenerates split metadata, manifests, public and hidden NPZs, fingerprints, public locks, and ignored maintainer-only hidden locks from the locked official inputs.
+This maintainer flow requires MMseqs2 plus the public setup dependencies. `NANOFOLD_HIDDEN_SPLIT_SALT` must be at least 32 characters and must never be committed. It regenerates split metadata, public manifests, public NPZs, the public dataset fingerprint, and maintainer-only hidden assets from the locked official inputs.
+
+Commit-safe public outputs:
+- `data/manifests/train.txt`
+- `data/manifests/val.txt`
+- `data/manifests/all.txt`
+- `leaderboard/official_dataset_fingerprint.json`
+- `leaderboard/official_manifest_source.lock.json`
+
+Maintainer-only outputs live under the ignored `.nanofold_private/` workspace:
+- `.nanofold_private/manifests/hidden_val.txt`
+- `.nanofold_private/manifests/split_quality_report.json`
+- `.nanofold_private/hidden_processed_features/`
+- `.nanofold_private/hidden_processed_labels/`
+- `.nanofold_private/leaderboard/official_hidden_fingerprint.json`
+- `.nanofold_private/leaderboard/private_hidden_assets.lock.json`
+- `.nanofold_private/leaderboard/private_hidden_manifest_source.lock.json`
+- `.nanofold_private/leaderboard/official_data_source.lock.json`
 
 ## 6) Fingerprint and Integrity Requirements
 
@@ -254,7 +271,7 @@ Hidden assets are resolved via env (or explicit CLI overrides):
 - `NANOFOLD_HIDDEN_FINGERPRINT`
 - `NANOFOLD_HIDDEN_LOCK_FILE`
 
-Hidden lock metadata is maintainer-local and ignored by git. Populate/update it with `python scripts/pin_hidden_assets.py ...`.
+Hidden assets default to `.nanofold_private/`; env vars and CLI flags are only needed when assets live elsewhere. Hidden lock metadata is maintainer-local and ignored by git. Populate/update it with `python scripts/pin_hidden_assets.py ...`.
 
 Hidden manifests, hidden NPZ directories, hidden fingerprints, hidden source locks, and private split salt metadata are maintainer-local artifacts. Public files contain the public dataset contract and public split counts only.
 
@@ -285,14 +302,14 @@ CI enforces:
 - synthetic smoke run for official train/eval path
 
 Protected manifest PR rule:
-- if `data/manifests/train.txt`, `data/manifests/val.txt`, `data/manifests/hidden_val.txt`, or `data/manifests/all.txt` changes,
+- if `data/manifests/train.txt`, `data/manifests/val.txt`, or `data/manifests/all.txt` changes,
 - PR fails unless label `manifest-change-approved` is set by maintainers
 
 ## 11) Submitter Self-Check
 
 ```bash
 python scripts/validate_submission.py --submission submissions/<your_name> --track limited_large --strict
-if git diff --name-only origin/main...HEAD | grep -Eq '^data/manifests/(train|val|hidden_val|all)\.txt$'; then
+if git diff --name-only origin/main...HEAD | grep -Eq '^data/manifests/(train|val|all)\.txt$'; then
   echo "ERROR: PR edits protected manifests (train/val)."
   exit 1
 fi

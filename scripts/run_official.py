@@ -31,6 +31,12 @@ DEFAULT_CHECKPOINT_STEPS = "0,1000,2000,5000,last"
 SEALED_RUNTIME_ENV = "NANOFOLD_OFFICIAL_SEALED_RUNTIME"
 RUNTIME_STAGE_ENV = "NANOFOLD_OFFICIAL_RUNTIME_STAGE"
 HIDDEN_ENV_PREFIX = "NANOFOLD_HIDDEN_"
+PRIVATE_ROOT = Path(".nanofold_private")
+DEFAULT_HIDDEN_MANIFEST = PRIVATE_ROOT / "manifests" / "hidden_val.txt"
+DEFAULT_HIDDEN_FEATURES_DIR = PRIVATE_ROOT / "hidden_processed_features"
+DEFAULT_HIDDEN_LABELS_DIR = PRIVATE_ROOT / "hidden_processed_labels"
+DEFAULT_HIDDEN_FINGERPRINT = PRIVATE_ROOT / "leaderboard" / "official_hidden_fingerprint.json"
+DEFAULT_HIDDEN_LOCK_FILE = PRIVATE_ROOT / "leaderboard" / "private_hidden_assets.lock.json"
 
 
 def parse_args() -> argparse.Namespace:
@@ -233,11 +239,13 @@ def _resolve_hidden_asset(
     *,
     cli_value: str,
     track_value: str | None,
+    default_value: Path | None = None,
     env_key: str,
     label: str,
 ) -> Path:
     env_value = str(__import__("os").environ.get(env_key, "")).strip()
-    value = cli_value.strip() or env_value or (track_value or "").strip()
+    default_text = str(default_value) if default_value is not None else ""
+    value = cli_value.strip() or env_value or (track_value or "").strip() or default_text
     if not value:
         raise ValueError(f"Missing hidden asset for {label}. Set --{label} or environment variable {env_key}.")
     path = Path(value).resolve()
@@ -691,18 +699,21 @@ def main() -> None:
         hidden_manifest = _resolve_hidden_asset(
             cli_value=args.hidden_manifest,
             track_value=track_spec.hidden_manifest,
+            default_value=DEFAULT_HIDDEN_MANIFEST,
             env_key="NANOFOLD_HIDDEN_MANIFEST",
             label="hidden-manifest",
         )
         hidden_features_dir = _resolve_hidden_asset(
             cli_value=args.hidden_features_dir,
             track_value=None,
+            default_value=DEFAULT_HIDDEN_FEATURES_DIR,
             env_key="NANOFOLD_HIDDEN_FEATURES_DIR",
             label="hidden-features-dir",
         )
         hidden_fingerprint = _resolve_hidden_asset(
             cli_value=args.hidden_fingerprint,
             track_value=track_spec.hidden_fingerprint_path,
+            default_value=DEFAULT_HIDDEN_FINGERPRINT,
             env_key="NANOFOLD_HIDDEN_FINGERPRINT",
             label="hidden-fingerprint",
         )
@@ -743,6 +754,7 @@ def main() -> None:
         hidden_labels_dir = _resolve_hidden_asset(
             cli_value=args.hidden_labels_dir,
             track_value=None,
+            default_value=DEFAULT_HIDDEN_LABELS_DIR,
             env_key="NANOFOLD_HIDDEN_LABELS_DIR",
             label="hidden-labels-dir",
         )
@@ -751,7 +763,7 @@ def main() -> None:
             args.hidden_lock_file.strip()
             or hidden_lock_env
             or track_spec.hidden_lock_file
-            or "leaderboard/private_hidden_assets.lock.json"
+            or str(DEFAULT_HIDDEN_LOCK_FILE)
         )
         lock_file = Path(lock_file_value).resolve()
         hidden_lock_meta = _validate_hidden_lock(

@@ -20,6 +20,7 @@ FORBIDDEN_TRACKED_EXACT = {
 }
 
 FORBIDDEN_TRACKED_PREFIXES = (
+    ".nanofold_private/",
     "data/openproteinset/",
     "data/processed_features/",
     "data/processed_labels/",
@@ -39,9 +40,9 @@ PUBLIC_TRACK_HIDDEN_FIELDS = (
 )
 
 ABSOLUTE_LOCAL_PATH_MARKERS = (
-    "/Users/",
-    "/var/folders/",
-    "/private/var/folders/",
+    "/" + "Users/",
+    "/" + "var/" + "folders/",
+    "/" + "private/" + "var/" + "folders/",
 )
 
 TEXT_SUFFIXES = {
