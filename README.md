@@ -8,6 +8,22 @@ The core bet is simple: biological data is expensive. Text and image models ofte
 
 This repo turns that idea into a benchmark. Participants get the same official train set, the same sample budget, and the same hidden evaluation path. Progress should come from better biological priors, better inductive biases, better objectives, better curricula, and better optimization under scarcity.
 
+## Documentation
+
+Start here:
+- [Competition rules and official protocol](docs/COMPETITION.md)
+- [Submission API contract](docs/API.md)
+- [Data sources, splits, preprocessing, and tensor formats](docs/DATA.md)
+
+Useful deep links:
+- [What data sources are used](docs/DATA.md#1-data-sources)
+- [How to download the official public data](docs/DATA.md#2-how-data-is-downloaded)
+- [How train/val/hidden splits are generated](docs/DATA.md#3-how-dataset-splits-are-determined)
+- [How raw data becomes model input](docs/DATA.md#4-how-input-data-is-prepped)
+- [Example model input batch](docs/DATA.md#5-example-model-input-sample)
+- [Required prediction output format](docs/DATA.md#6-output-data-format)
+- [Example model output](docs/DATA.md#7-example-model-output-sample)
+
 ## What Counts As Progress
 
 nanoFold is not meant to be a pretrained-weight contest, a web-retrieval contest, or a race to find near-duplicate templates. The official track is deliberately strict:
@@ -42,11 +58,6 @@ The final hidden FoldScore is the tie-breaker. Public validation exists for debu
 - a strict submission API with `build_model`, `build_optimizer`, and `run_batch`
 - dataset fingerprints and manifest checks so official data changes are visible
 - a pinned minAlphaFold2 reference submission plus a template submission that pass the official atom14 contract
-
-Primary docs:
-- [docs/COMPETITION.md](docs/COMPETITION.md): enforceable rules and official protocol
-- [docs/API.md](docs/API.md): submission/runtime API contract
-- [docs/DATA.md](docs/DATA.md): official data sources, split generation, preprocessing, and sample formats
 
 ## Official Track At A Glance
 
