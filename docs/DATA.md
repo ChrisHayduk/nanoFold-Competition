@@ -296,6 +296,74 @@ Hidden validation is selected first using the private salt digest. Public valida
 
 The public `all.txt` manifest is the union of train and public validation only.
 
+### Targeted public distributions
+
+The split does not target hand-written ideal biological proportions. It targets proportional matching to the eligible, grouped, processable chain universe after all official filters have been applied. That matters because the target should reflect what can actually be downloaded, clustered, and scored under the official rules.
+
+For public documentation, the target below is the public train + public validation union recorded by `leaderboard/official_manifest_source.lock.json`. Hidden aggregate quality is checked by the private maintainer lock, but hidden split details are not published.
+
+The allocator tries to equalize four metadata views:
+
+- `secondary_structure_class`: broad alpha, beta, mixed, sparse, or low-confidence secondary-structure regime
+- `domain_architecture_class`: broad structural/domain architecture after CATH, SCOPe, ECOD, and derived metadata normalization
+- `length_bin`: sequence-length regime within the official `40-256` residue range
+- `resolution_bin`: coordinate-quality regime, including an `unknown` bucket when resolution is unavailable
+
+#### Secondary-structure class
+
+| Bucket | Public target count (%) | Train count (%) | Public val count (%) |
+|---|---:|---:|---:|
+| alpha | `3,090` (28.09%) | `2,815` (28.15%) | `275` (27.50%) |
+| alpha/beta | `4,380` (39.82%) | `3,983` (39.83%) | `397` (39.70%) |
+| beta | `2,291` (20.83%) | `2,083` (20.83%) | `208` (20.80%) |
+| coil/sparse | `153` (1.39%) | `137` (1.37%) | `16` (1.60%) |
+| mixed low-confidence | `1,086` (9.87%) | `982` (9.82%) | `104` (10.40%) |
+
+#### Domain-architecture class
+
+Most domain-architecture buckets correspond directly to broad CATH/SCOPe/ECOD-style classes. Rare source-specific residual labels are preserved as their own buckets so they can be balanced rather than silently folded into a larger class.
+
+| Bucket | Public target count (%) | Train count (%) | Public val count (%) |
+|---|---:|---:|---:|
+| `6` source bucket | `220` (2.00%) | `196` (1.96%) | `24` (2.40%) |
+| alpha | `3,090` (28.09%) | `2,815` (28.15%) | `275` (27.50%) |
+| alpha/beta | `4,380` (39.82%) | `3,983` (39.83%) | `397` (39.70%) |
+| beta | `2,291` (20.83%) | `2,083` (20.83%) | `208` (20.80%) |
+| coil/sparse | `153` (1.39%) | `137` (1.37%) | `16` (1.60%) |
+| mixed low-confidence | `856` (7.78%) | `776` (7.76%) | `80` (8.00%) |
+| other | `10` (0.09%) | `10` (0.10%) | `0` (0.00%) |
+
+#### Length bin
+
+| Bucket | Public target count (%) | Train count (%) | Public val count (%) |
+|---|---:|---:|---:|
+| 40-63 aa | `746` (6.78%) | `676` (6.76%) | `70` (7.00%) |
+| 64-95 aa | `1,708` (15.53%) | `1,548` (15.48%) | `160` (16.00%) |
+| 96-127 aa | `2,226` (20.24%) | `2,027` (20.27%) | `199` (19.90%) |
+| 128-191 aa | `3,611` (32.83%) | `3,285` (32.85%) | `326` (32.60%) |
+| 192-256 aa | `2,709` (24.63%) | `2,464` (24.64%) | `245` (24.50%) |
+
+#### Resolution bin
+
+| Bucket | Public target count (%) | Train count (%) | Public val count (%) |
+|---|---:|---:|---:|
+| <=1.5 A | `2,082` (18.93%) | `1,892` (18.92%) | `190` (19.00%) |
+| 1.5-2.0 A | `3,760` (34.18%) | `3,419` (34.19%) | `341` (34.10%) |
+| 2.0-2.5 A | `2,056` (18.69%) | `1,869` (18.69%) | `187` (18.70%) |
+| 2.5-3.0 A | `863` (7.85%) | `783` (7.83%) | `80` (8.00%) |
+| unknown | `2,239` (20.35%) | `2,037` (20.37%) | `202` (20.20%) |
+
+The resulting public train and validation distributions are very close to the public target. Jensen-Shannon divergence is the split-quality metric used for each balancing field:
+
+| Field | Train JS divergence | Public val JS divergence |
+|---|---:|---:|
+| `secondary_structure_class` | `6.7834414e-07` | `0.00016998018` |
+| `domain_architecture_class` | `6.1796866e-06` | `0.00070301452` |
+| `length_bin` | `1.1833676e-07` | `6.0099717e-05` |
+| `resolution_bin` | `8.0612644e-08` | `1.1483855e-05` |
+
+The official quality gate is `max_split_js_divergence <= 0.35`; the largest public train/val value is `0.00070301452`. The unknown-domain-architecture fraction is `0.0`, below the `0.75` gate.
+
 ### Split quality checks
 
 The split builder records and checks:
