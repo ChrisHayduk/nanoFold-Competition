@@ -119,7 +119,7 @@ jobs:
           pip install -r requirements.txt -r requirements-dev.txt
       - name: Build synthetic smoke dataset and config
         run: |
-          mkdir -p .ci_smoke/processed_features .ci_smoke/processed_labels data/manifests
+          mkdir -p .ci_smoke/processed_features .ci_smoke/processed_labels .ci_smoke/manifests
           python - <<'PY'
           from __future__ import annotations
 
@@ -127,22 +127,26 @@ jobs:
           import numpy as np
           import yaml
 
+          from nanofold.chain_paths import chain_npz_path
+
           cid = "1abc_A"
-          Path("data/manifests/train.txt").write_text(f"{cid}\n")
-          Path("data/manifests/val.txt").write_text(f"{cid}\n")
+          Path(".ci_smoke/manifests/train.txt").write_text(f"{cid}\n")
+          Path(".ci_smoke/manifests/val.txt").write_text(f"{cid}\n")
 
           L, N, T = 128, 8, 1
           np.savez_compressed(
-              Path(".ci_smoke/processed_features") / f"{cid}.npz",
+              chain_npz_path(".ci_smoke/processed_features", cid),
               aatype=np.zeros((L,), dtype=np.int32),
               msa=np.zeros((N, L), dtype=np.int32),
               deletions=np.zeros((N, L), dtype=np.int32),
+              residue_index=np.arange(L, dtype=np.int32),
+              between_segment_residues=np.zeros((L,), dtype=np.int32),
               template_aatype=np.zeros((T, L), dtype=np.int32),
               template_ca_coords=np.zeros((T, L, 3), dtype=np.float32),
               template_ca_mask=np.ones((T, L), dtype=bool),
           )
           np.savez_compressed(
-              Path(".ci_smoke/processed_labels") / f"{cid}.npz",
+              chain_npz_path(".ci_smoke/processed_labels", cid),
               ca_coords=np.zeros((L, 3), dtype=np.float32),
               ca_mask=np.ones((L,), dtype=bool),
               atom14_positions=np.zeros((L, 14, 3), dtype=np.float32),
@@ -159,8 +163,8 @@ jobs:
               "data": {
                   "processed_features_dir": ".ci_smoke/processed_features",
                   "processed_labels_dir": ".ci_smoke/processed_labels",
-                  "train_manifest": "data/manifests/train.txt",
-                  "val_manifest": "data/manifests/val.txt",
+                  "train_manifest": ".ci_smoke/manifests/train.txt",
+                  "val_manifest": ".ci_smoke/manifests/val.txt",
                   "crop_size": 128,
                   "msa_depth": 64,
                   "batch_size": 1,
@@ -203,7 +207,7 @@ jobs:
             --track smoke
       - name: Validate submission smoke contract
         run: |
-          python scripts/validate_submission.py --submission submissions/template --track smoke
+          python scripts/validate_submission.py --submission submissions/template --track limited_large
       - name: Train smoke official run
         run: |
           python train.py \

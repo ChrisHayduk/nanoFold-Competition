@@ -24,6 +24,20 @@ def sha256_file(path: str | Path, chunk_size: int = 1024 * 1024) -> str:
     return hasher.hexdigest()
 
 
+def serialize_numpy_rng_state(state: tuple[Any, ...]) -> tuple[Any, ...]:
+    name, keys, pos, has_gauss, cached_gaussian = state
+    if isinstance(keys, np.ndarray):
+        keys = keys.tolist()
+    return (name, keys, pos, has_gauss, cached_gaussian)
+
+
+def load_torch_checkpoint(path: str | Path, *, map_location: str | torch.device = "cpu") -> Dict[str, Any]:
+    ckpt = torch.load(path, map_location=map_location, weights_only=True)
+    if not isinstance(ckpt, dict):
+        raise TypeError(f"Checkpoint must contain a dictionary payload: {path}")
+    return ckpt
+
+
 def set_seed(seed: int, *, deterministic: bool = False) -> None:
     random.seed(seed)
     np.random.seed(seed)

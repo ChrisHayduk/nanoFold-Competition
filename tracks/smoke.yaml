@@ -3,16 +3,16 @@ name: Smoke Test
 mode: smoke
 official: false
 dataset:
-  train_manifest: data/manifests/train.txt
-  val_manifest: data/manifests/val.txt
+  train_manifest: .ci_smoke/manifests/train.txt
+  val_manifest: .ci_smoke/manifests/val.txt
   hidden_manifest: null
   fingerprint: null
   hidden_fingerprint: null
   hidden_manifest_sha256: null
   hidden_fingerprint_sha256: null
   hidden_lock_file: null
-  train_chain_count: 100
-  val_chain_count: 20
+  train_chain_count: 1
+  val_chain_count: 1
   hidden_chain_count: null
 train:
   seed: 0

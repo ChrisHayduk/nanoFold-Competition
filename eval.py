@@ -34,6 +34,7 @@ from nanofold.submission_runtime import load_submission_hooks, run_submission_ba
 from nanofold.utils import (
     count_parameters,
     get_env_metadata,
+    load_torch_checkpoint,
     make_dataloader_generator,
     seed_worker,
     to_device,
@@ -498,7 +499,7 @@ def main() -> None:
     all_per_chain_rows: List[Dict[str, Any]] = []
 
     for ckpt_idx, ckpt_path in enumerate(checkpoints):
-        ckpt = torch.load(ckpt_path, map_location="cpu")
+        ckpt = load_torch_checkpoint(ckpt_path, map_location="cpu")
         model.load_state_dict(ckpt["model"], strict=True)
         model.eval()
 

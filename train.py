@@ -39,8 +39,10 @@ from nanofold.utils import (
     count_parameters,
     ensure_dir,
     get_env_metadata,
+    load_torch_checkpoint,
     make_dataloader_generator,
     seed_worker,
+    serialize_numpy_rng_state,
     set_seed,
     to_device,
     utc_now_iso,
@@ -455,7 +457,7 @@ def main() -> None:
             "cumulative_residues_seen": cumulative_nonpad_residues_seen,
             "rng_state": {
                 "python": __import__("random").getstate(),
-                "numpy": __import__("numpy").random.get_state(),
+                "numpy": serialize_numpy_rng_state(__import__("numpy").random.get_state()),
                 "torch": torch.get_rng_state(),
                 "torch_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
             },
@@ -473,7 +475,7 @@ def main() -> None:
         resume_path = Path(args.resume)
         if not resume_path.exists():
             raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
-        ckpt = torch.load(resume_path, map_location="cpu")
+        ckpt = load_torch_checkpoint(resume_path, map_location="cpu")
         resume_mismatches = resume_metadata_mismatches(
             ckpt_obj=ckpt,
             submission_entrypoint_sha256=hooks.source_sha256,
