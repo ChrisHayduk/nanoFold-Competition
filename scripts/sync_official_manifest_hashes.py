@@ -30,8 +30,27 @@ def parse_args() -> argparse.Namespace:
     )
     ap.add_argument("--manifests-dir", type=str, default="data/manifests")
     ap.add_argument("--hidden-manifest", type=str, default=".nanofold_private/manifests/hidden_val.txt")
-    ap.add_argument("--track-file", type=str, default="tracks/limited_large.yaml")
+    ap.add_argument(
+        "--track-file",
+        type=str,
+        action="append",
+        default=None,
+        help=(
+            "Track policy YAML to update. Repeat to update multiple tracks. "
+            "Defaults to tracks/limited.yaml, tracks/research_large.yaml, and tracks/unlimited.yaml."
+        ),
+    )
     ap.add_argument("--lock-file", type=str, default="leaderboard/official_manifest_source.lock.json")
+    ap.add_argument(
+        "--fingerprint-file",
+        type=str,
+        action="append",
+        default=None,
+        help=(
+            "Dataset fingerprint JSON to refresh with the manifest source lock hash. "
+            "Repeat to update multiple fingerprints. Defaults to all public track fingerprints."
+        ),
+    )
     ap.add_argument("--readme", type=str, default="README.md")
     ap.add_argument("--competition-doc", type=str, default="docs/COMPETITION.md")
     ap.add_argument(
@@ -272,6 +291,15 @@ def _update_lock_json(
     return json.dumps(raw, indent=2) + "\n"
 
 
+def _update_fingerprint_json(path: Path, *, source_lock_file: Path, source_lock_text: str) -> str:
+    raw = json.loads(path.read_text())
+    if not isinstance(raw, dict):
+        raise ValueError(f"Fingerprint file must be a JSON object: {path}")
+    raw["source_lock_path"] = _display_path(source_lock_file, lock_file=path)
+    raw["source_lock_sha256"] = hashlib.sha256(source_lock_text.encode("utf-8")).hexdigest()
+    return json.dumps(raw, indent=2, sort_keys=True) + "\n"
+
+
 def _write_or_check(path: Path, new_text: str, *, check_only: bool) -> bool:
     old_text = path.read_text() if path.exists() else ""
     changed = old_text != new_text
@@ -285,24 +313,51 @@ def main() -> None:
     args = parse_args()
     manifests_dir = Path(args.manifests_dir).resolve()
     hidden_manifest = Path(args.hidden_manifest).resolve()
-    track_file = Path(args.track_file).resolve()
+    track_files = [
+        Path(item).resolve()
+        for item in (
+            args.track_file
+            if args.track_file is not None
+            else ["tracks/limited.yaml", "tracks/research_large.yaml", "tracks/unlimited.yaml"]
+        )
+    ]
     lock_file = Path(args.lock_file).resolve()
+    fingerprint_files = [
+        Path(item).resolve()
+        for item in (
+            args.fingerprint_file
+            if args.fingerprint_file is not None
+            else [
+                "leaderboard/official_dataset_fingerprint.json",
+                "leaderboard/research_large_dataset_fingerprint.json",
+                "leaderboard/unlimited_dataset_fingerprint.json",
+            ]
+        )
+    ]
     readme = Path(args.readme).resolve()
     competition_doc = Path(args.competition_doc).resolve()
 
     hashes = _compute_hashes(manifests_dir, hidden_manifest)
+    lock_text = _update_lock_json(
+        lock_file,
+        hashes,
+        manifests_dir,
+        hidden_manifest,
+        include_hidden=bool(args.include_hidden),
+    )
     updates: Dict[Path, str] = {
-        track_file: _update_track_yaml(track_file, hashes, include_hidden=bool(args.include_hidden)),
-        lock_file: _update_lock_json(
-            lock_file,
-            hashes,
-            manifests_dir,
-            hidden_manifest,
-            include_hidden=bool(args.include_hidden),
-        ),
+        lock_file: lock_text,
         readme: _update_readme(readme, hashes),
         competition_doc: _update_competition_doc(competition_doc, hashes),
     }
+    for track_file in track_files:
+        updates[track_file] = _update_track_yaml(track_file, hashes, include_hidden=bool(args.include_hidden))
+    for fingerprint_file in fingerprint_files:
+        updates[fingerprint_file] = _update_fingerprint_json(
+            fingerprint_file,
+            source_lock_file=lock_file,
+            source_lock_text=lock_text,
+        )
 
     changed_paths: list[Path] = []
     for path, new_text in updates.items():

@@ -90,7 +90,7 @@ bash scripts/setup_official_data.sh \
 
 That script does five things:
 
-1. Verifies the committed public manifest SHA256 hashes against `tracks/limited_large.yaml`.
+1. Verifies the committed public manifest SHA256 hashes against `tracks/limited.yaml`.
 2. Downloads OpenFold cache metadata from anonymous S3:
    - `s3://openfold/data_caches/`
    - `s3://openfold/duplicate_pdb_chains.txt`
@@ -149,7 +149,7 @@ The split builder uses metadata only. It does not inspect hidden labels to selec
 | Chain sequence | `chain_data_cache.json` | Defines the chain sequence used for filtering and MMseqs2 clustering. | Lets the split block close sequence homologs across train/validation/hidden. |
 | Chain length | `chain_data_cache.json` | Filters to `40 <= L <= 256`; forms `length_bin`. | Keeps the benchmark inside the official crop regime and balances short/medium/long proteins. |
 | Resolution | `chain_data_cache.json` | Filters structures above `3.0A` when known; forms `resolution_bin`. | Reduces label noise and prevents one split from receiving systematically lower-quality coordinates. |
-| Oligomeric count | `chain_data_cache.json` | Filters to monomer chains. | Keeps the first official track focused on single-chain folding rather than missing biological assembly context. |
+| Oligomeric count | `chain_data_cache.json` | Filters to monomer chains. | Keeps official evaluation focused on single-chain folding rather than missing biological assembly context. |
 | Standard amino-acid content | `chain_data_cache.json` | Excludes chains with non-standard sequence tokens. | Keeps input/output semantics clean for the fixed amino-acid vocabulary. |
 | PDB ID | Chain ID prefix | Prevents chains from the same PDB entry crossing split boundaries. | Blocks same-experiment or same-complex leakage that sequence clustering alone may miss. |
 | OpenFold feature availability | `openfold_required_feature_exclusions.txt` plus download checks | Excludes chains without required official MSA assets. | Ensures every selected chain can produce the same feature schema for every participant. |
@@ -392,7 +392,7 @@ The hidden split is not intended to be adversarial. It is intended to be composi
 
 ### What the split is not trying to measure
 
-The first official track intentionally does not measure:
+The official tracks intentionally do not measure:
 
 - template lookup ability
 - external MSA/database retrieval skill
@@ -713,4 +713,4 @@ The scoring code compares `pred_atom14` with label `atom14_positions` using `ato
 0.55 * lDDT-C-alpha + 0.30 * lDDT-backbone-atom14 + 0.15 * lDDT-all-atom14
 ```
 
-Hidden leaderboard rank is `foldscore_auc_hidden`, computed across official checkpoint predictions over the fixed sample budget.
+Hidden leaderboard rank is track-specific. `limited` and `research_large` use `foldscore_auc_hidden`, computed across official checkpoint predictions over the fixed sample budget. `unlimited` uses the final hidden FoldScore.

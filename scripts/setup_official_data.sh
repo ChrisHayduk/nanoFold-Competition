@@ -5,7 +5,7 @@ usage() {
   cat <<'EOF'
 Usage: bash scripts/setup_official_data.sh [options]
 
-This script verifies official manifest SHA256 digests for `limited_large`
+This script verifies official manifest SHA256 digests for `limited`
 before downloading or preprocessing data.
 
 Options:
@@ -147,7 +147,7 @@ run_cmd() {
 
 verify_manifest_hashes() {
   if [[ "$DRY_RUN" -eq 1 ]]; then
-    echo "+ verify official manifest SHA256 digests for track limited_large"
+    echo "+ verify official manifest SHA256 digests for track limited"
     return
   fi
   python - "$REPO_ROOT" "$1" "$2" "$3" <<'PY'
@@ -168,7 +168,7 @@ def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-track = load_track_spec("limited_large")
+track = load_track_spec("limited")
 checks = [
     ("train_manifest", Path(sys.argv[2]), track.train_manifest_sha256),
     ("val_manifest", Path(sys.argv[3]), track.val_manifest_sha256),
@@ -187,7 +187,7 @@ for name, path, expected in checks:
             f"actual:   {actual}\n"
             "Restore committed official manifests before running setup_official_data.sh."
         )
-print("Verified official manifest hashes for track limited_large.")
+print("Verified official manifest hashes for track limited.")
 PY
 }
 

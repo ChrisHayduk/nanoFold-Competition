@@ -121,7 +121,7 @@ def _check_track_file(path: Path, rel: str, errors: list[str]) -> None:
         return
     dataset = raw.get("dataset")
     if not isinstance(dataset, dict):
-        errors.append(f"{rel}: official track is missing dataset mapping.")
+        errors.append(f"{rel}: track policy is missing dataset mapping.")
         return
     for field in PUBLIC_TRACK_HIDDEN_FIELDS:
         value = dataset.get(field)

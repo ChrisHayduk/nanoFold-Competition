@@ -93,6 +93,29 @@ def test_hidden_scoring_with_synthetic_predictions(tmp_path: Path) -> None:
     assert result["foldscore_at_samples"]["2000"] == 1.0
 
 
+def test_rank_metric_value_supports_auc_and_final_hidden() -> None:
+    module = _load_run_official_module()
+    metric_value = getattr(module, "_metric_value")
+    hidden_results = {"foldscore_auc_hidden": 0.7, "final_hidden_foldscore": 0.9}
+    eval_public_summary = {"mean_foldscore": 0.5}
+
+    assert metric_value(
+        "foldscore_auc_hidden",
+        hidden_results=hidden_results,
+        eval_public_summary=eval_public_summary,
+    ) == 0.7
+    assert metric_value(
+        "final_hidden_foldscore",
+        hidden_results=hidden_results,
+        eval_public_summary=eval_public_summary,
+    ) == 0.9
+    assert metric_value(
+        "public_val_foldscore",
+        hidden_results=hidden_results,
+        eval_public_summary=eval_public_summary,
+    ) == 0.5
+
+
 def test_hidden_scoring_rejects_non_monotone_sample_axis(tmp_path: Path) -> None:
     module = _load_run_official_module()
     score_fn = getattr(module, "_score_hidden_predictions")
@@ -283,7 +306,7 @@ def test_official_runner_builds_predict_and_score_commands() -> None:
         python="python",
         config_path=Path("/tmp/config.yaml"),
         split="hidden_val",
-        track_id="limited_large",
+        track_id="limited",
         official=True,
         pred_out_dir=Path("/tmp/preds"),
         save_path=Path("/tmp/predict.json"),

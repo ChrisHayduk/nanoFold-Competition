@@ -420,6 +420,31 @@ def load_fingerprint(path: str | Path) -> Dict[str, Any]:
     return raw
 
 
+def _source_lock_path_for_verification(
+    *,
+    explicit_source_lock_path: str | Path | None,
+    expected_fingerprint: Mapping[str, Any],
+    expected_fingerprint_path: str | Path,
+) -> str | Path | None:
+    if explicit_source_lock_path:
+        return explicit_source_lock_path
+    source_lock = expected_fingerprint.get("source_lock_path")
+    if not isinstance(source_lock, str) or not source_lock.strip():
+        return None
+    source_lock_path = Path(source_lock.strip())
+    if source_lock_path.is_absolute():
+        return source_lock_path
+
+    cwd_candidate = Path.cwd() / source_lock_path
+    if cwd_candidate.exists():
+        return cwd_candidate
+
+    fingerprint_relative_candidate = Path(expected_fingerprint_path).resolve().parent / source_lock_path
+    if fingerprint_relative_candidate.exists():
+        return fingerprint_relative_candidate
+    return source_lock_path
+
+
 def compare_fingerprints(
     actual: Dict[str, Any],
     expected: Dict[str, Any],
@@ -485,6 +510,11 @@ def verify_split_against_fingerprint(
     comparison_mode: str = "exact",
 ) -> Dict[str, Any]:
     expected = load_fingerprint(expected_fingerprint_path)
+    source_lock_path = _source_lock_path_for_verification(
+        explicit_source_lock_path=source_lock_path,
+        expected_fingerprint=expected,
+        expected_fingerprint_path=expected_fingerprint_path,
+    )
     actual = build_split_fingerprint(
         processed_features_dir=processed_features_dir,
         processed_labels_dir=processed_labels_dir,

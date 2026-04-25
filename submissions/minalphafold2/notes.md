@@ -9,15 +9,26 @@ the actual model code.
 
 `submission.py` is intentionally just an adapter. It converts nanoFold's
 official batch tensors into the feature tensors expected by
-`minalphafold.model.AlphaFold2`, calls that model, and returns
-`pred_atom14 = output["atom14_coords"]`.
+`minalphafold.model.AlphaFold2`, derives the upstream AlphaFold2-style
+supervision tensors, trains with `minalphafold.losses.AlphaFoldLoss`, and
+returns `pred_atom14 = output["atom14_coords"]`.
+
+The model architecture is loaded directly from
+`third_party/minAlphaFold2/configs/tiny.toml`.
+
+The training protocol scales AlphaFold2's initial/fine-tune sample ratio into
+the official budget. With `max_steps=10000` and effective batch size `2`,
+fine-tuning starts at step `8696`, leaving `1304` optimizer updates for the
+fine-tune loss. The learning-rate warmup and one-shot decay are scaled from
+the same AlphaFold2 protocol proportions.
 
 ## Method Rationale
 
 minAlphaFold2 is a direct, readable AlphaFold2-style implementation with an
 Evoformer trunk, recycling, invariant point attention, and structure-module
 atom14 coordinate generation. It gives nanoFold a biological-prior reference
-submission with a compact AlphaFold2-style training stack.
+submission with a compact AlphaFold2-style training stack: masked-MSA,
+distogram, backbone and all-atom FAPE, torsion, and pLDDT objectives.
 
 ## Competition compliance checklist
 
@@ -41,6 +52,6 @@ submission with a compact AlphaFold2-style training stack.
 ## How to run
 
 ```bash
-python scripts/validate_submission.py --submission submissions/minalphafold2 --track limited_large --strict
-python train.py --config submissions/minalphafold2/config.yaml --track limited_large --official
+python scripts/validate_submission.py --submission submissions/minalphafold2 --track limited --strict
+python train.py --config submissions/minalphafold2/config.yaml --track limited --official
 ```

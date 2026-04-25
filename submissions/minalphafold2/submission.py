@@ -2,8 +2,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from types import SimpleNamespace
-from typing import Any, Dict, Iterable, Sequence
+from typing import Any, Dict, Iterable, NamedTuple, Sequence
 
 import torch
 
@@ -22,87 +21,161 @@ from minalphafold.data import (  # noqa: E402
     MSA_FEAT_DIM,
     TEMPLATE_ANGLE_DIM,
     TEMPLATE_PAIR_DIM,
-    build_extra_msa_feat,
-    build_msa_feat,
+    build_msa_features,
+    build_supervision,
     build_target_feat,
-    cluster_statistics,
-    sample_cluster_and_extra,
 )
+from minalphafold.losses import AlphaFoldLoss  # noqa: E402
 from minalphafold.model import AlphaFold2  # noqa: E402
+from minalphafold.model_config import ModelConfig  # noqa: E402
+from minalphafold.trainer import load_model_config, loss_inputs_from_batch  # noqa: E402
 
-MODEL_CONFIG_DEFAULTS: Dict[str, Any] = {
-    "c_m": 32,
-    "c_s": 32,
-    "c_z": 16,
-    "c_t": 16,
-    "c_e": 24,
-    "dim": 8,
-    "num_heads": 4,
-    "msa_transition_n": 2,
-    "outer_product_dim": 8,
-    "triangle_mult_c": 16,
-    "triangle_dim": 8,
-    "triangle_num_heads": 2,
-    "pair_transition_n": 2,
-    "template_pair_num_blocks": 1,
-    "template_pair_dropout": 0.0,
-    "template_pointwise_attention_dim": 8,
-    "template_pointwise_num_heads": 2,
-    "template_triangle_mult_c": 16,
-    "template_triangle_attn_c": 8,
-    "template_triangle_attn_num_heads": 2,
-    "template_pair_transition_n": 2,
-    "extra_msa_dim": 8,
-    "extra_msa_dropout": 0.0,
-    "extra_pair_dropout": 0.0,
-    "msa_column_global_attention_dim": 8,
-    "num_extra_msa": 1,
-    "num_evoformer": 1,
-    "evoformer_msa_dropout": 0.0,
-    "evoformer_pair_dropout": 0.0,
-    "structure_module_c": 16,
-    "structure_module_layers": 2,
-    "structure_module_dropout_ipa": 0.0,
-    "structure_module_dropout_transition": 0.0,
-    "sidechain_num_channel": 16,
-    "sidechain_num_residual_block": 2,
-    "position_scale": 10.0,
-    "zero_init": True,
-    "ipa_num_heads": 4,
-    "ipa_c": 8,
-    "ipa_n_query_points": 4,
-    "ipa_n_value_points": 4,
-    "n_dist_bins": 64,
-    "plddt_hidden_dim": 32,
-    "n_plddt_bins": 50,
-    "n_msa_classes": 23,
-    "n_pae_bins": 64,
-}
+DEFAULT_MODEL_CONFIG_PATH = MINALPHAFOLD2_ROOT / "configs" / "tiny.toml"
+AF2_INITIAL_SAMPLES = 10_000_000
+AF2_FINETUNE_SAMPLES = 1_500_000
+AF2_WARMUP_SAMPLES = 128_000
+AF2_LR_DECAY_SAMPLES = 6_400_000
 
 
-def _model_cfg(cfg: Dict[str, Any]) -> SimpleNamespace:
-    raw = dict(MODEL_CONFIG_DEFAULTS)
-    raw.update(dict(cfg.get("model", {})))
-    raw.setdefault("model_profile", "nanoFold_minAlphaFold2")
-    return SimpleNamespace(**raw)
+class AlphaFoldBudgetSchedule(NamedTuple):
+    max_steps: int
+    finetune_start_step: int
+    warmup_steps: int
+    lr_decay_step: int
+    finetune_lr_scale: float
+    lr_decay_factor: float
+
+
+def _bounded_step(value: int, *, max_steps: int) -> int:
+    return max(0, min(int(value), int(max_steps)))
+
+
+def _scaled_step(value_samples: int, total_samples: int, total_steps: int) -> int:
+    if total_samples <= 0:
+        raise ValueError("`total_samples` must be positive.")
+    return int(round(int(total_steps) * float(value_samples) / float(total_samples)))
+
+
+def _af2_budget_schedule(cfg: Dict[str, Any]) -> AlphaFoldBudgetSchedule:
+    train_cfg = cfg.get("train", {})
+    optim_cfg = cfg.get("optim", {})
+    max_steps = int(train_cfg["max_steps"])
+    default_finetune_start = _scaled_step(
+        AF2_INITIAL_SAMPLES,
+        AF2_INITIAL_SAMPLES + AF2_FINETUNE_SAMPLES,
+        max_steps,
+    )
+    finetune_start_step = _bounded_step(
+        int(train_cfg.get("finetune_start_step", default_finetune_start)),
+        max_steps=max_steps,
+    )
+    warmup_steps = _bounded_step(
+        int(
+            train_cfg.get(
+                "warmup_steps",
+                _scaled_step(AF2_WARMUP_SAMPLES, AF2_INITIAL_SAMPLES, finetune_start_step),
+            )
+        ),
+        max_steps=finetune_start_step,
+    )
+    lr_decay_step = _bounded_step(
+        int(
+            train_cfg.get(
+                "lr_decay_step",
+                _scaled_step(AF2_LR_DECAY_SAMPLES, AF2_INITIAL_SAMPLES, finetune_start_step),
+            )
+        ),
+        max_steps=max_steps,
+    )
+    return AlphaFoldBudgetSchedule(
+        max_steps=max_steps,
+        finetune_start_step=finetune_start_step,
+        warmup_steps=warmup_steps,
+        lr_decay_step=lr_decay_step,
+        finetune_lr_scale=float(train_cfg.get("finetune_lr_scale", 0.5)),
+        lr_decay_factor=float(optim_cfg.get("lr_decay_factor", 0.95)),
+    )
+
+
+def _runtime_step(cfg: Dict[str, Any]) -> int:
+    runtime = cfg.get("_runtime", {})
+    if not isinstance(runtime, dict):
+        return 0
+    return int(runtime.get("step", 0))
+
+
+def _use_finetune_loss(cfg: Dict[str, Any]) -> bool:
+    return _runtime_step(cfg) >= _af2_budget_schedule(cfg).finetune_start_step
+
+
+def _model_cfg(cfg: Dict[str, Any]) -> ModelConfig:
+    model_cfg = cfg.get("model", {})
+    profile_path = Path(str(model_cfg.get("profile_path", DEFAULT_MODEL_CONFIG_PATH)))
+    if not profile_path.is_absolute():
+        profile_path = REPO_ROOT / profile_path
+    return load_model_config(profile_path)
 
 
 def build_model(cfg: Dict[str, Any]) -> torch.nn.Module:
-    return AlphaFold2(_model_cfg(cfg))
+    model = AlphaFold2(_model_cfg(cfg))
+    model.nanofold_initial_loss_fn = AlphaFoldLoss(finetune=False)
+    model.nanofold_finetune_loss_fn = AlphaFoldLoss(finetune=True)
+    return model
 
 
 def build_optimizer(cfg: Dict[str, Any], model: torch.nn.Module) -> torch.optim.Optimizer:
     optim_cfg = cfg["optim"]
-    return torch.optim.AdamW(
+    return torch.optim.Adam(
         model.parameters(),
         lr=float(optim_cfg["lr"]),
+        betas=(
+            float(optim_cfg.get("beta1", 0.9)),
+            float(optim_cfg.get("beta2", 0.999)),
+        ),
+        eps=float(optim_cfg.get("eps", 1.0e-6)),
         weight_decay=float(optim_cfg.get("weight_decay", 0.0)),
     )
 
 
+class _AlphaFoldBudgetLRScheduler:
+    def __init__(self, cfg: Dict[str, Any], optimizer: torch.optim.Optimizer):
+        self.optimizer = optimizer
+        self.base_lr = float(cfg["optim"]["lr"])
+        self.schedule = _af2_budget_schedule(cfg)
+        self.completed_steps = 0
+        self._apply_lr()
+
+    def _lr_for_completed_steps(self) -> float:
+        if self.completed_steps >= self.schedule.finetune_start_step:
+            lr = self.base_lr * self.schedule.finetune_lr_scale
+            if self.completed_steps >= self.schedule.lr_decay_step:
+                lr *= self.schedule.lr_decay_factor
+            return lr
+        if self.schedule.warmup_steps > 0 and self.completed_steps < self.schedule.warmup_steps:
+            return self.base_lr * float(self.completed_steps) / float(self.schedule.warmup_steps)
+        if self.completed_steps >= self.schedule.lr_decay_step:
+            return self.base_lr * self.schedule.lr_decay_factor
+        return self.base_lr
+
+    def _apply_lr(self) -> None:
+        lr = self._lr_for_completed_steps()
+        for param_group in self.optimizer.param_groups:
+            param_group["lr"] = lr
+
+    def step(self) -> None:
+        self.completed_steps += 1
+        self._apply_lr()
+
+    def state_dict(self) -> Dict[str, Any]:
+        return {"completed_steps": self.completed_steps}
+
+    def load_state_dict(self, state: Dict[str, Any]) -> None:
+        self.completed_steps = int(state.get("completed_steps", 0))
+        self._apply_lr()
+
+
 def build_scheduler(cfg: Dict[str, Any], optimizer: torch.optim.Optimizer) -> Any:
-    del cfg, optimizer
-    return None
+    return _AlphaFoldBudgetLRScheduler(cfg, optimizer)
 
 
 def _pad_tensor(tensor: torch.Tensor, target_shape: Sequence[int], value: float = 0.0) -> torch.Tensor:
@@ -124,25 +197,17 @@ def _build_single_msa_features(
     extra_msa_depth: int,
     training: bool,
 ) -> Dict[str, torch.Tensor]:
-    cluster_msa, cluster_deletions, extra_msa, extra_deletions = sample_cluster_and_extra(
-        msa,
-        deletions,
+    return build_msa_features(
+        {"msa": msa, "deletions": deletions},
         msa_depth=msa_depth,
         extra_msa_depth=extra_msa_depth,
         training=training,
+        block_delete_training_msa=True,
+        block_delete_msa_fraction=0.3,
+        block_delete_msa_randomize_num_blocks=False,
+        block_delete_msa_num_blocks=5,
+        masked_msa_probability=0.15,
     )
-    cluster_profile, cluster_deletion_mean = cluster_statistics(
-        cluster_msa,
-        cluster_deletions,
-        extra_msa,
-        extra_deletions,
-    )
-    return {
-        "msa_feat": build_msa_feat(cluster_msa, cluster_deletions, cluster_profile, cluster_deletion_mean),
-        "extra_msa_feat": build_extra_msa_feat(extra_msa, extra_deletions),
-        "msa_mask": torch.ones(cluster_msa.shape, dtype=torch.float32, device=msa.device),
-        "extra_msa_mask": torch.ones(extra_msa.shape, dtype=torch.float32, device=msa.device),
-    }
 
 
 def _empty_template_features(batch_size: int, length: int, device: torch.device) -> Dict[str, torch.Tensor]:
@@ -180,12 +245,24 @@ def _build_minalphafold_inputs(
     msa = batch["msa"].detach().cpu().long()
     deletions = batch["deletions"].detach().cpu().long()
     residue_mask = batch["residue_mask"].detach().cpu().float()
+    between_segment_residues = batch.get("between_segment_residues")
+    if between_segment_residues is not None:
+        between_segment_residues = between_segment_residues.detach().cpu().long()
     batch_size, length = aatype.shape
     model_cfg = cfg.get("model", {})
     msa_depth = int(model_cfg.get("msa_depth", cfg.get("data", {}).get("msa_depth", msa.shape[1])))
     extra_msa_depth = int(model_cfg.get("extra_msa_depth", max(0, msa.shape[1] - msa_depth)))
 
-    target_feat = torch.stack([build_target_feat(aatype[i]) for i in range(batch_size)], dim=0)
+    target_feat = torch.stack(
+        [
+            build_target_feat(
+                aatype[i],
+                None if between_segment_residues is None else between_segment_residues[i],
+            )
+            for i in range(batch_size)
+        ],
+        dim=0,
+    )
     residue_index = batch.get("residue_index")
     if residue_index is None:
         residue_index = torch.arange(length, device=aatype.device, dtype=torch.long).expand(batch_size, -1)
@@ -226,7 +303,31 @@ def _build_minalphafold_inputs(
             [item["extra_msa_mask"] for item in msa_features],
             target_shape=(max_extra, length),
         ),
+        "masked_msa_target": _stack_padded(
+            [item["masked_msa_target"] for item in msa_features],
+            target_shape=(max_cluster, length, 23),
+        ),
+        "masked_msa_mask": _stack_padded(
+            [item["masked_msa_mask"] for item in msa_features],
+            target_shape=(max_cluster, length),
+        ),
     }
+    if "atom14_positions" in batch and "atom14_mask" in batch:
+        atom14_positions = batch["atom14_positions"].detach().cpu().float()
+        atom14_mask = (
+            batch["atom14_mask"].detach().cpu().float()
+            * residue_mask[:, :, None]
+        )
+        supervision = [
+            build_supervision(aatype[i], atom14_positions[i], atom14_mask[i])
+            for i in range(batch_size)
+        ]
+        for key in supervision[0]:
+            out[key] = torch.stack([item[key] for item in supervision], dim=0)
+        if "resolution" in batch:
+            out["resolution"] = batch["resolution"].detach().cpu().float()
+        else:
+            out["resolution"] = torch.zeros(batch_size, dtype=torch.float32)
     out.update(_empty_template_features(batch_size=batch_size, length=length, device=aatype.device))
     return {
         key: value.to(device=model_device, non_blocking=True)
@@ -234,13 +335,24 @@ def _build_minalphafold_inputs(
     }
 
 
-def _atom14_masked_mse(pred_atom14: torch.Tensor, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
-    true_atom14 = batch["atom14_positions"].to(device=pred_atom14.device, dtype=pred_atom14.dtype)
-    atom14_mask = batch["atom14_mask"].to(device=pred_atom14.device, dtype=pred_atom14.dtype)
-    residue_mask = batch["residue_mask"].to(device=pred_atom14.device, dtype=pred_atom14.dtype)
-    mask = atom14_mask * residue_mask[:, :, None]
-    squared_error = (pred_atom14 - true_atom14).square().sum(dim=-1)
-    return (squared_error * mask).sum() / mask.sum().clamp(min=1.0)
+def _alphafold_loss(
+    model: torch.nn.Module,
+    features: Dict[str, torch.Tensor],
+    model_out: Dict[str, torch.Tensor],
+    cfg: Dict[str, Any],
+) -> torch.Tensor:
+    if _use_finetune_loss(cfg):
+        loss_fn = getattr(model, "nanofold_finetune_loss_fn", None)
+        if loss_fn is None:
+            loss_fn = AlphaFoldLoss(finetune=True).to(features["aatype"].device)
+            model.nanofold_finetune_loss_fn = loss_fn
+    else:
+        loss_fn = getattr(model, "nanofold_initial_loss_fn", None)
+        if loss_fn is None:
+            loss_fn = AlphaFoldLoss(finetune=False).to(features["aatype"].device)
+            model.nanofold_initial_loss_fn = loss_fn
+    per_example_loss = loss_fn(**loss_inputs_from_batch(features, model_out))
+    return per_example_loss.mean()
 
 
 def run_batch(
@@ -271,12 +383,13 @@ def run_batch(
         dtype=model_out["atom14_coords"].dtype,
     )[:, :, None, None]
 
-    if not training:
+    has_supervision = "atom14_positions" in batch and "atom14_mask" in batch
+    if not has_supervision:
         return {"pred_atom14": pred_atom14}
 
-    loss = _atom14_masked_mse(pred_atom14, batch)
+    loss = _alphafold_loss(model, features, model_out, cfg)
     return {
         "pred_atom14": pred_atom14,
         "loss": loss,
-        "atom14_mse": loss.detach(),
+        "alphafold_loss": loss.detach(),
     }

@@ -12,7 +12,7 @@ from .utils import sha256_file
 EXPECTED_TRAIN_MANIFEST_PARTS = ("data", "manifests", "train.txt")
 EXPECTED_VAL_MANIFEST_PARTS = ("data", "manifests", "val.txt")
 
-DEFAULT_TRACK_ID = "limited_large"
+DEFAULT_TRACK_ID = "limited"
 TRACKS_DIR = Path(__file__).resolve().parents[1] / "tracks"
 
 

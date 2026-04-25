@@ -33,19 +33,19 @@ Useful deep links:
 
 ## What Counts As Progress
 
-nanoFold is not meant to be a pretrained-weight contest, a web-retrieval contest, or a race to find near-duplicate templates. The official track is deliberately strict:
+nanoFold is not meant to be a pretrained-weight contest, a web-retrieval contest, or a race to find near-duplicate templates. The official tracks are deliberately strict:
 
 - fixed official data and manifests
 - no external structures, pretrained weights, external MSA retrieval, or network access
-- no template features in the official track
-- hidden ranking by area under the learning curve, not just final checkpoint score
+- no template features in the official tracks
+- hidden ranking by area under the learning curve for fixed-budget tracks
 - atom14-aware scoring so methods are rewarded for more than Cα traces
 
 The intended question is: **given the same limited training set, who learns useful protein geometry fastest and best?**
 
 ## How The Slowrun Works
 
-Each official run trains for the same sample budget. The hidden leaderboard evaluates multiple checkpoints and ranks by `foldscore_auc_hidden`: trapezoidal area under hidden FoldScore versus cumulative samples seen.
+The `limited` and `research_large` tracks train for fixed sample budgets. Their hidden leaderboards evaluate multiple checkpoints and rank by `foldscore_auc_hidden`: trapezoidal area under hidden FoldScore versus cumulative samples seen.
 
 That makes early learning matter. A model that gets useful structure after 2,000 samples should beat a model that only wakes up at the end, even if their final scores are close. This is the pressure that should surface architectures with better biological priors.
 
@@ -55,20 +55,30 @@ FoldScore combines:
 0.55*lDDT-Ca + 0.30*lDDT-backbone-atom14 + 0.15*lDDT-all-atom14
 ```
 
-The final hidden FoldScore is the tie-breaker. Public validation exists for debugging, not ranking.
+The final hidden FoldScore is the tie-breaker for fixed-budget tracks and the primary rank metric for `unlimited`. Public validation exists for debugging, not ranking.
 
 ## What This Repo Provides
 
-- official track policy in `tracks/limited_large.yaml`
+- official track policy in `tracks/limited.yaml`
 - minAlphaFold2-derived preprocessing for A3M/mmCIF alignment, atom14 labels, residue constants, and template plumbing
 - sealed prediction/scoring entrypoints that keep hidden labels away from submission code
 - a strict submission API with `build_model`, `build_optimizer`, and `run_batch`
 - dataset fingerprints and manifest checks so official data changes are visible
-- a pinned minAlphaFold2 reference submission plus a template submission that pass the official atom14 contract
+- a pinned minAlphaFold2 tiny reference submission plus a template submission that pass the official atom14 contract
 
-## Official Track At A Glance
+## Tracks At A Glance
 
-Source of truth: `tracks/limited_large.yaml`
+Source of truth: `tracks/*.yaml`. All tracks use the same official public train set, public validation set, sealed hidden validation set, atom14 FoldScore, and no-template policy. They differ in how much training budget is allowed and what scientific question the leaderboard is meant to answer.
+
+| Track | Purpose | Fixed training budget | Rank metric | Use this when | Submit with |
+|---|---|---:|---|---|---|
+| `limited` | Main accessible slowrun leaderboard | `20,000` samples (`10,000` steps x effective batch `2`) | `foldscore_auc_hidden` | you want the primary competition result under a small, reproducible budget | `--track limited` |
+| `research_large` | Larger fixed-data research leaderboard | `100,000` samples (`50,000` steps x effective batch `2`) | `foldscore_auc_hidden` | you want to study whether an approach still wins with more optimization while using the same data | `--track research_large` |
+| `unlimited` | Open-ended fixed-data research leaderboard | unrestricted training budget and model size | `final_hidden_foldscore` | you want the best final hidden structure quality while keeping the hidden set sealed and the public data contract fixed | `--track unlimited` |
+
+For all three tracks, set `track: <track_id>` in `submissions/<name>/config.yaml`, validate with `python scripts/validate_submission.py --submission submissions/<name> --track <track_id> --strict`, and open a leaderboard PR naming the intended track. Submit separate configs or separate submission directories when one method targets multiple tracks.
+
+The `limited` constants are:
 
 | Item | Value |
 |---|---:|
@@ -82,7 +92,6 @@ Source of truth: `tracks/limited_large.yaml`
 | Max steps | `10,000` |
 | Sample budget | `20,000` |
 | Residue budget | `5,120,000` |
-| Rank metric | `foldscore_auc_hidden` |
 | Tie-breaker | `final_hidden_foldscore` |
 
 ## Split Curation
@@ -127,9 +136,9 @@ Additional label metadata:
 
 Preprocessing run metadata is captured in `<processed_features_dir>/preprocess_meta.json`. Its SHA256 is folded into the dataset fingerprint, so changes to preprocessing flags, projection thresholds, dependency metadata, or source revision are visible to the verifier.
 
-Official scoring requires atom14 labels, and submissions must return `pred_atom14` shaped `(B, L, 14, 3)`. The runtime derives the Cα view from atom14 slot 1 for diagnostics and baseline losses.
+Official scoring requires atom14 labels, and submissions must return `pred_atom14` shaped `(B, L, 14, 3)`. The runtime derives the Cα view from atom14 slot 1 for diagnostics.
 
-The official track disables templates by preprocessing with `T=0`; template-enabled tracks require explicit leakage filters.
+The official tracks disable templates by preprocessing with `T=0`; template-enabled tracks require explicit leakage filters.
 
 Config schema uses:
 - `data.processed_features_dir`
@@ -154,8 +163,7 @@ The fastest participant path is in [docs/QUICKSTART.md](docs/QUICKSTART.md). It 
 
 - environment setup
 - official public data download and preprocessing
-- first baseline training run
-- minAlphaFold2 reference training
+- first minAlphaFold2 tiny reference training run
 - public validation prediction and scoring
 - creating and validating a new submission
 - submitting a leaderboard pull request
@@ -220,7 +228,7 @@ Canonical runner entrypoint:
 ```bash
 python scripts/run_official.py \
   --submission submissions/<name> \
-  --track limited_large \
+  --track <track_id> \
   --update-leaderboard
 ```
 
@@ -229,7 +237,7 @@ Hidden leaderboard runs require a sealed no-network runtime. The supported path 
 ```bash
 bash scripts/run_official_docker.sh \
   --submission submissions/<name> \
-  --track limited_large \
+  --track <track_id> \
   --update-leaderboard
 ```
 
@@ -243,7 +251,7 @@ Check committed official manifest hashes:
 shasum -a 256 data/manifests/train.txt data/manifests/val.txt data/manifests/all.txt
 ```
 
-Expected `limited_large` values:
+Expected public manifest values for all tracks:
 - `train.txt`: `d36d1f77ba43b7c4509a6e9dfd3f9414e1ce60f8364b24e0086c1734ba6aef6d`
 - `val.txt`: `d4a0265bcd0a021e116c0c889f21e86bc24006460bcc42dec2f9a80b70c8812b`
 - `all.txt`: `0d1b21a3536cd0c602be301993fcbacd8ecc5710a459c239f9808d164d0ee85d`
@@ -265,7 +273,7 @@ python scripts/sync_official_manifest_hashes.py
 ```bash
 python scripts/validate_submission.py \
   --submission submissions/<your_name> \
-  --track limited_large \
+  --track <track_id> \
   --strict
 
 if git diff --name-only origin/main...HEAD | grep -Eq '^data/manifests/(train|val|all)\.txt$'; then
@@ -298,6 +306,9 @@ CI enforces the same PR guardrail:
 ## Leaderboard
 
 <!-- LEADERBOARD_START -->
-| # | FoldScore AUC | Hidden FoldScore | Public FoldScore | Track | Date | Commit | Description |
-|---:|---:|---:|---:|---|---|---|---|
+| Track | Status |
+|---|---|
+| `limited` | No accepted submissions yet |
+| `research_large` | No accepted submissions yet |
+| `unlimited` | No accepted submissions yet |
 <!-- LEADERBOARD_END -->

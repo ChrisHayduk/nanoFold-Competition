@@ -1,5 +1,6 @@
 *.pyc
 .DS_Store
+openfold.pdf
 __pycache__/
 .claude/
 .env

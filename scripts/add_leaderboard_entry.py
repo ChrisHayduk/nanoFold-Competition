@@ -86,6 +86,8 @@ def _dedupe_entries(entries: List[Dict[str, Any]], new_entry: Dict[str, Any]) ->
 
 
 def _rank_entries(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    track_order = {"limited": 0, "research_large": 1, "unlimited": 2}
+
     def score_value(row: Dict[str, Any]) -> float:
         score = float(row.get("rank_score", float("nan")))
         if math.isnan(score):
@@ -98,12 +100,17 @@ def _rank_entries(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             return float("-inf")
         return score
 
-    ranked = sorted(
-        entries,
-        key=lambda x: (-score_value(x), -tiebreak_value(x), str(x.get("date", ""))),
-    )
-    for i, row in enumerate(ranked, start=1):
-        row["rank"] = i
+    ranked: List[Dict[str, Any]] = []
+    tracks = sorted({str(row.get("track", "")) for row in entries}, key=lambda x: (track_order.get(x, 999), x))
+    for track in tracks:
+        track_rows = [row for row in entries if str(row.get("track", "")) == track]
+        track_rows = sorted(
+            track_rows,
+            key=lambda x: (-score_value(x), -tiebreak_value(x), str(x.get("date", ""))),
+        )
+        for i, row in enumerate(track_rows, start=1):
+            row["rank"] = i
+        ranked.extend(track_rows)
     return ranked
 
 

@@ -198,6 +198,49 @@ jobs:
               },
           }
           Path(".ci_smoke/config.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False))
+          smoke_track = {
+              "id": "smoke",
+              "name": "Smoke Test",
+              "mode": "smoke",
+              "official": False,
+              "dataset": {
+                  "train_manifest": ".ci_smoke/manifests/train.txt",
+                  "val_manifest": ".ci_smoke/manifests/val.txt",
+                  "hidden_manifest": None,
+                  "fingerprint": None,
+                  "hidden_fingerprint": None,
+                  "hidden_manifest_sha256": None,
+                  "hidden_fingerprint_sha256": None,
+                  "hidden_lock_file": None,
+                  "train_chain_count": 1,
+                  "val_chain_count": 1,
+                  "hidden_chain_count": None,
+              },
+              "scoring": {
+                  "rank_metric": "foldscore_auc_hidden",
+                  "rank_tiebreak_metric": "final_hidden_foldscore",
+                  "foldscore_weights": {
+                      "lddt_ca": 0.55,
+                      "lddt_backbone_atom14": 0.30,
+                      "lddt_atom14": 0.15,
+                  },
+              },
+              "templates": {
+                  "enabled": False,
+                  "policy": "disabled_to_avoid_template_and_release_date_leakage",
+              },
+              "train": {
+                  "seed": 0,
+                  "crop_size": 128,
+                  "msa_depth": 64,
+                  "effective_batch_size": 2,
+                  "max_steps": 20,
+                  "val_crop_mode": "center",
+                  "val_msa_sample_mode": "top",
+              },
+              "model": {"max_params": None},
+          }
+          Path("tracks/smoke.yaml").write_text(yaml.safe_dump(smoke_track, sort_keys=False))
           PY
       - name: Build smoke fingerprint
         run: |
@@ -207,7 +250,7 @@ jobs:
             --track smoke
       - name: Validate submission smoke contract
         run: |
-          python scripts/validate_submission.py --submission submissions/template --track limited_large
+          python scripts/validate_submission.py --submission submissions/template --track limited
       - name: Train smoke official run
         run: |
           python train.py \

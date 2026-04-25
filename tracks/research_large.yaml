@@ -1,6 +1,6 @@
-id: limited_large
-name: Official Limited Large
-mode: limited
+id: research_large
+name: Research Large
+mode: research
 official: true
 dataset:
   train_manifest: data/manifests/train.txt
@@ -11,7 +11,7 @@ dataset:
   val_manifest_sha256: d4a0265bcd0a021e116c0c889f21e86bc24006460bcc42dec2f9a80b70c8812b
   all_manifest_sha256: 0d1b21a3536cd0c602be301993fcbacd8ecc5710a459c239f9808d164d0ee85d
   hidden_manifest_sha256: null
-  fingerprint: leaderboard/official_dataset_fingerprint.json
+  fingerprint: leaderboard/research_large_dataset_fingerprint.json
   hidden_fingerprint: null
   hidden_fingerprint_sha256: null
   hidden_lock_file: null
@@ -33,7 +33,7 @@ train:
   crop_size: 256
   msa_depth: 192
   effective_batch_size: 2
-  max_steps: 10000
+  max_steps: 50000
   val_crop_mode: center
   val_msa_sample_mode: top
 model:

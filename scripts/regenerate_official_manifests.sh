@@ -9,8 +9,7 @@ Regenerates official manifests using locked args, locked chain cache SHA256,
 and required structure metadata from:
   leaderboard/official_manifest_source.lock.json
 
-Then verifies generated manifest SHA256 digests match:
-  tracks/limited_large.yaml
+Then verifies generated manifest SHA256 digests match the official track policies.
 
 Options:
   --chain-data-cache <path>   Path to chain_data_cache.json
@@ -212,7 +211,9 @@ if [[ "$SYNC_HASHES" -eq 1 ]]; then
   run_cmd python "$SCRIPT_DIR/sync_official_manifest_hashes.py" \
     --manifests-dir "$OUT_DIR" \
     --hidden-manifest "$HIDDEN_OUT_DIR/hidden_val.txt" \
-    --track-file "$REPO_ROOT/tracks/limited_large.yaml" \
+    --track-file "$REPO_ROOT/tracks/limited.yaml" \
+    --track-file "$REPO_ROOT/tracks/research_large.yaml" \
+    --track-file "$REPO_ROOT/tracks/unlimited.yaml" \
     --lock-file "$LOCK_FILE" \
     --readme "$REPO_ROOT/README.md" \
     --competition-doc "$REPO_ROOT/docs/COMPETITION.md"
@@ -238,7 +239,7 @@ def sha256(path: Path) -> str:
 
 
 out_dir = Path(sys.argv[2]).resolve()
-track = load_track_spec("limited_large")
+track = load_track_spec("limited")
 
 checks = [
     ("train_manifest", out_dir / "train.txt", track.train_manifest_sha256),

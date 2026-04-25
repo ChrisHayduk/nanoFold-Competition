@@ -18,13 +18,18 @@ The rest of this document is the enforceable contract for official leaderboard r
 
 ## 1) Track Source of Truth
 
-Track policy is defined in `tracks/*.yaml`.
+Track policy is defined in `tracks/*.yaml`. The public track set is:
 
-Official leaderboard track:
-- `limited_large`
+| Track | Purpose | Data contract | Training budget | Rank metric | Submission selector |
+|---|---|---|---:|---|---|
+| `limited` | primary competition track for accessible data-efficiency work | official train/public val/hidden val only | `20,000` samples (`10,000` steps x effective batch `2`) | `foldscore_auc_hidden` | `--track limited` |
+| `research_large` | larger fixed-data track for methods that need more optimization to show their shape | same official data and hidden evaluation as `limited` | `100,000` samples (`50,000` steps x effective batch `2`) | `foldscore_auc_hidden` | `--track research_large` |
+| `unlimited` | open-ended fixed-data track for best final structure quality under sealed hidden evaluation | same official data and hidden evaluation as `limited` | unrestricted | `final_hidden_foldscore` | `--track unlimited` |
+
+All three tracks use atom14 FoldScore, hidden labels remain sealed, templates are disabled, and public validation is diagnostic only. `limited` and `research_large` are sample-budget slowruns, so they rank by hidden area under the learning curve. `unlimited` is ranked separately by final hidden FoldScore because there is no common sample axis.
 
 Official runs must use:
-- `--track limited_large`
+- `--track <track_id>`
 - `--official`
 
 In official mode the runtime uses **override + validate**:
@@ -222,13 +227,15 @@ Official budget definitions:
 - sample budget: `B_sample = max_steps * effective_batch_size`
 - residue budget: `B_res = max_steps * effective_batch_size * crop_size`
 
-Official constants (`limited_large`):
-- `seed = 0`
-- `crop_size = 256`
-- `msa_depth = 192`
-- `effective_batch_size = 2`
-- `max_steps = 10,000`
-- deterministic val settings (`center`, `top`)
+Track budget constants:
+
+| Track | Seed | Crop size | MSA depth | Effective batch | Max steps | Sample budget | Residue budget | Parameter cap |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `limited` | `0` | `256` | `192` | `2` | `10,000` | `20,000` | `5,120,000` | `50,000,000` |
+| `research_large` | `0` | `256` | `192` | `2` | `50,000` | `100,000` | `25,600,000` | `50,000,000` |
+| `unlimited` | submitter-defined | submitter-defined | submitter-defined | submitter-defined | submitter-defined | unrestricted | unrestricted | unrestricted |
+
+All tracks use deterministic public validation settings (`center`, `top`) when the track defines them.
 
 Runtime reproducibility:
 - deterministic seeding support
@@ -242,7 +249,9 @@ Primary metric:
 - all components use `cutoff=15.0A`, thresholds `[0.5,1.0,2.0,4.0]`, label masks, and equal chain weighting
 
 Leaderboard ranking metric:
-- `foldscore_auc_hidden`, trapezoidal AUC over cumulative samples on `[0, B_sample]`
+- `limited`: `foldscore_auc_hidden`, trapezoidal AUC over cumulative samples on `[0, B_sample]`
+- `research_large`: `foldscore_auc_hidden`, trapezoidal AUC over cumulative samples on `[0, B_sample]`
+- `unlimited`: `final_hidden_foldscore`
 
 Why AUC: the competition is a slowrun, so learning speed matters. A method that learns robust geometry earlier in the sample budget should be rewarded, even when final checkpoint scores are close.
 
@@ -261,7 +270,7 @@ Canonical result artifact:
 Canonical maintainer runner:
 
 ```bash
-python scripts/run_official.py --submission submissions/<name> --track limited_large --update-leaderboard
+python scripts/run_official.py --submission submissions/<name> --track <track_id> --update-leaderboard
 ```
 
 Hidden assets are resolved via env (or explicit CLI overrides):
@@ -289,7 +298,7 @@ Hidden leaderboard runs must execute in a sealed runtime. The supported maintain
 Containerized no-network execution:
 
 ```bash
-bash scripts/run_official_docker.sh --submission submissions/<name> --track limited_large --update-leaderboard
+bash scripts/run_official_docker.sh --submission submissions/<name> --track <track_id> --update-leaderboard
 ```
 
 ## 10) CI and PR Guardrails
@@ -308,10 +317,12 @@ Protected manifest PR rule:
 ## 11) Submitter Self-Check
 
 ```bash
-python scripts/validate_submission.py --submission submissions/<your_name> --track limited_large --strict
+python scripts/validate_submission.py --submission submissions/<your_name> --track <track_id> --strict
 if git diff --name-only origin/main...HEAD | grep -Eq '^data/manifests/(train|val|all)\.txt$'; then
   echo "ERROR: PR edits protected manifests (train/val)."
   exit 1
 fi
 echo "Self-check passed."
 ```
+
+Use the same `<track_id>` in the submission config, local training command, validation command, and pull-request description. Submit separate configs or separate submission directories for the same method on multiple tracks.

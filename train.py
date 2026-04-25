@@ -7,7 +7,7 @@ import sys
 import time
 from functools import partial
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Iterable
 
 import torch
 import torch.nn as nn
@@ -46,6 +46,9 @@ from nanofold.utils import (
     set_seed,
     to_device,
     utc_now_iso,
+)
+from nanofold.utils import (
+    sha256_file as _sha256_file,
 )
 
 
@@ -114,7 +117,51 @@ def normalize_num_workers(n: int) -> int:
     return n
 
 
-from nanofold.utils import sha256_file as _sha256_file
+def _mean_tensors(values: Iterable[torch.Tensor]) -> float:
+    finite_values = [
+        value.float().reshape(())
+        for value in values
+        if torch.isfinite(value.float().reshape(()))
+    ]
+    if not finite_values:
+        return float("nan")
+    return float(torch.stack(finite_values).mean())
+
+
+def _summarize_eval_metrics(
+    scores: list[torch.Tensor],
+    losses: list[torch.Tensor],
+    ca_rmsds: list[torch.Tensor] | None = None,
+    atom14_rmsds: list[torch.Tensor] | None = None,
+) -> Dict[str, float]:
+    metrics = {
+        "val_lddt_ca": _mean_tensors(scores),
+    }
+    if losses:
+        metrics["val_loss"] = _mean_tensors(losses)
+    if ca_rmsds is not None:
+        metrics["val_rmsd_ca"] = _mean_tensors(ca_rmsds)
+    if atom14_rmsds is not None:
+        metrics["val_rmsd_atom14"] = _mean_tensors(atom14_rmsds)
+    return metrics
+
+
+def _cfg_with_runtime(
+    cfg: Dict[str, Any],
+    *,
+    step: int,
+    cumulative_samples_seen: int,
+    max_steps: int,
+    sample_budget: int,
+) -> Dict[str, Any]:
+    runtime_cfg = dict(cfg)
+    runtime_cfg["_runtime"] = {
+        "step": int(step),
+        "cumulative_samples_seen": int(cumulative_samples_seen),
+        "max_steps": int(max_steps),
+        "sample_budget": int(sample_budget),
+    }
+    return runtime_cfg
 
 
 def _guidance_for_missing_data(track_spec: TrackSpec) -> str:
@@ -219,6 +266,78 @@ def batch_lddt_ca(
     for b in range(B):
         scores.append(lddt_ca(pred_ca[b], true_ca[b], ca_mask[b] & residue_mask[b]))
     return torch.stack(scores).mean()
+
+
+@torch.no_grad()
+def masked_kabsch_rmsd(
+    pred_points: torch.Tensor,
+    true_points: torch.Tensor,
+    point_mask: torch.Tensor,
+) -> torch.Tensor:
+    if pred_points.shape != true_points.shape:
+        raise ValueError("`pred_points` and `true_points` must have the same shape.")
+    if pred_points.ndim != 2 or pred_points.shape[-1] != 3:
+        raise ValueError(f"`pred_points` must have shape (N, 3), got {tuple(pred_points.shape)}")
+    if point_mask.ndim != 1 or point_mask.shape[0] != pred_points.shape[0]:
+        raise ValueError("`point_mask` must have shape (N,).")
+
+    device = pred_points.device
+    mask = point_mask.to(device=device, dtype=torch.bool)
+    if int(mask.sum().item()) < 3:
+        return torch.full((), float("nan"), device=device, dtype=pred_points.dtype)
+
+    pred = pred_points[mask].float()
+    true = true_points.to(device=device, dtype=pred_points.dtype)[mask].float()
+    pred_centered = pred - pred.mean(dim=0, keepdim=True)
+    true_centered = true - true.mean(dim=0, keepdim=True)
+
+    covariance = pred_centered.transpose(0, 1) @ true_centered
+    u, _, vh = torch.linalg.svd(covariance, full_matrices=False)
+    correction = torch.ones(3, device=device, dtype=pred_centered.dtype)
+    if torch.det(u @ vh) < 0:
+        correction[-1] = -1.0
+    rotation = u @ torch.diag(correction) @ vh
+    aligned = pred_centered @ rotation
+    squared_error = (aligned - true_centered).square().sum(dim=-1)
+    return torch.sqrt(squared_error.mean().clamp_min(0.0)).to(dtype=pred_points.dtype)
+
+
+@torch.no_grad()
+def batch_rmsd_ca(
+    pred_ca: torch.Tensor,
+    true_ca: torch.Tensor,
+    ca_mask: torch.Tensor,
+    residue_mask: torch.Tensor,
+) -> torch.Tensor:
+    rmsds = [
+        masked_kabsch_rmsd(
+            pred_ca[b],
+            true_ca[b],
+            ca_mask[b] & residue_mask[b],
+        )
+        for b in range(pred_ca.shape[0])
+    ]
+    return torch.nanmean(torch.stack(rmsds))
+
+
+@torch.no_grad()
+def batch_rmsd_atom14(
+    pred_atom14: torch.Tensor,
+    true_atom14: torch.Tensor,
+    atom14_mask: torch.Tensor,
+    residue_mask: torch.Tensor,
+) -> torch.Tensor:
+    rmsds = []
+    for b in range(pred_atom14.shape[0]):
+        mask = atom14_mask[b] & residue_mask[b, :, None]
+        rmsds.append(
+            masked_kabsch_rmsd(
+                pred_atom14[b].reshape(-1, 3),
+                true_atom14[b].reshape(-1, 3),
+                mask.reshape(-1),
+            )
+        )
+    return torch.nanmean(torch.stack(rmsds))
 
 
 def optimizer_zero_grad(optimizer: Any) -> None:
@@ -578,6 +697,15 @@ def main() -> None:
         model.eval()
         scores = []
         losses = []
+        ca_rmsds = []
+        atom14_rmsds = []
+        runtime_cfg = _cfg_with_runtime(
+            cfg,
+            step=step,
+            cumulative_samples_seen=cumulative_samples_seen,
+            max_steps=max_steps,
+            sample_budget=sample_budget,
+        )
         with torch.no_grad():
             for batch in tqdm(val_loader, desc="val", leave=False):
                 batch = to_device(batch, device)
@@ -586,19 +714,26 @@ def main() -> None:
                         hooks,
                         model=model,
                         batch=batch,
-                        cfg=cfg,
+                        cfg=runtime_cfg,
                         training=False,
+                        expose_supervision=True,
                     )
                 pred_ca = out["pred_ca"]
                 score = batch_lddt_ca(pred_ca, batch["ca_coords"], batch["ca_mask"], batch["residue_mask"])
                 scores.append(score.detach().cpu())
+                ca_rmsd = batch_rmsd_ca(pred_ca, batch["ca_coords"], batch["ca_mask"], batch["residue_mask"])
+                atom14_rmsd = batch_rmsd_atom14(
+                    out["pred_atom14"],
+                    batch["atom14_positions"],
+                    batch["atom14_mask"],
+                    batch["residue_mask"],
+                )
+                ca_rmsds.append(ca_rmsd.detach().cpu())
+                atom14_rmsds.append(atom14_rmsd.detach().cpu())
                 if "loss" in out:
                     losses.append(out["loss"].detach().cpu())
         model.train()
-        return {
-            "val_loss": float(torch.stack(losses).mean()) if losses else float("nan"),
-            "val_lddt_ca": float(torch.stack(scores).mean()) if scores else float("nan"),
-        }
+        return _summarize_eval_metrics(scores, losses, ca_rmsds, atom14_rmsds)
 
     while step < max_steps:
         optimizer_zero_grad(opt)
@@ -619,11 +754,18 @@ def main() -> None:
             nonpad_residues_this_step += int(batch["residue_mask"].sum().item())
 
             with make_autocast_ctx(device=device, enabled=use_amp):
+                runtime_cfg = _cfg_with_runtime(
+                    cfg,
+                    step=step,
+                    cumulative_samples_seen=cumulative_samples_seen,
+                    max_steps=max_steps,
+                    sample_budget=sample_budget,
+                )
                 out = run_submission_batch(
                     hooks,
                     model=model,
                     batch=batch,
-                    cfg=cfg,
+                    cfg=runtime_cfg,
                     training=True,
                 )
                 raw_loss = out["loss"]

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 import sys
@@ -17,7 +18,7 @@ def test_sync_manifest_hashes_preserves_yaml_format_and_writes_relative_lock_pat
     track.write_text(
         "\n".join(
             [
-                "id: limited_large",
+                "id: limited",
                 "dataset:",
                 "  train_manifest_sha256: " + "0" * 64,
                 "  val_manifest_sha256: " + "0" * 64,
@@ -37,6 +38,16 @@ def test_sync_manifest_hashes_preserves_yaml_format_and_writes_relative_lock_pat
     )
     lock = tmp_path / "lock.json"
     lock.write_text(json.dumps({"outputs": {}}))
+    fingerprint = tmp_path / "fingerprint.json"
+    fingerprint.write_text(
+        json.dumps(
+            {
+                "source_lock_path": "old-lock.json",
+                "source_lock_sha256": "0" * 64,
+            }
+        )
+        + "\n"
+    )
     readme = tmp_path / "README.md"
     readme.write_text(
         "- `train.txt`: `" + "0" * 64 + "`\n"
@@ -60,6 +71,8 @@ def test_sync_manifest_hashes_preserves_yaml_format_and_writes_relative_lock_pat
             str(track),
             "--lock-file",
             str(lock),
+            "--fingerprint-file",
+            str(fingerprint),
             "--readme",
             str(readme),
             "--competition-doc",
@@ -77,6 +90,9 @@ def test_sync_manifest_hashes_preserves_yaml_format_and_writes_relative_lock_pat
     assert not Path(outputs["train_manifest"]).is_absolute()
     assert outputs["train_count"] == 2
     assert outputs["val_count"] == 1
+    fingerprint_obj = json.loads(fingerprint.read_text())
+    assert fingerprint_obj["source_lock_path"] == "lock.json"
+    assert fingerprint_obj["source_lock_sha256"] == hashlib.sha256(lock.read_bytes()).hexdigest()
 
     check_proc = subprocess.run(
         [
@@ -88,6 +104,8 @@ def test_sync_manifest_hashes_preserves_yaml_format_and_writes_relative_lock_pat
             str(track),
             "--lock-file",
             str(lock),
+            "--fingerprint-file",
+            str(fingerprint),
             "--readme",
             str(readme),
             "--competition-doc",

@@ -100,7 +100,7 @@ def test_verify_dataset_against_fingerprint_roundtrip(tmp_path: Path) -> None:
         val_manifest=manifests / "val.txt",
         require_no_missing=True,
         require_labels=True,
-        track_id="limited_large",
+        track_id="limited",
     )
     fp_path = tmp_path / "fp.json"
     fp_path.write_text(json.dumps(fingerprint))
@@ -113,10 +113,54 @@ def test_verify_dataset_against_fingerprint_roundtrip(tmp_path: Path) -> None:
         expected_fingerprint_path=fp_path,
         require_no_missing=True,
         require_labels=True,
-        track_id="limited_large",
+        track_id="limited",
     )
     assert out["missing_feature_chain_count"] == 0
     assert out["missing_label_chain_count"] == 0
+
+
+def test_verify_dataset_against_fingerprint_uses_recorded_source_lock(tmp_path: Path) -> None:
+    manifests = tmp_path / "manifests"
+    manifests.mkdir()
+    features = tmp_path / "processed_features"
+    labels = tmp_path / "processed_labels"
+    features.mkdir()
+    labels.mkdir()
+    source_lock = tmp_path / "official_manifest_source.lock.json"
+    source_lock.write_text('{"source": "test"}\n')
+
+    (manifests / "train.txt").write_text("1abc_A\n")
+    (manifests / "val.txt").write_text("2def_B\n")
+    _write_feature_npz(chain_npz_path(features, "1abc_A"))
+    _write_feature_npz(chain_npz_path(features, "2def_B"))
+    _write_label_npz(chain_npz_path(labels, "1abc_A"))
+    _write_label_npz(chain_npz_path(labels, "2def_B"))
+
+    fingerprint = build_dataset_fingerprint(
+        processed_features_dir=features,
+        processed_labels_dir=labels,
+        train_manifest=manifests / "train.txt",
+        val_manifest=manifests / "val.txt",
+        require_no_missing=True,
+        require_labels=True,
+        track_id="limited",
+        source_lock_path=source_lock,
+    )
+    fp_path = tmp_path / "fp.json"
+    fp_path.write_text(json.dumps(fingerprint))
+
+    out = verify_dataset_against_fingerprint(
+        processed_features_dir=features,
+        processed_labels_dir=labels,
+        train_manifest=manifests / "train.txt",
+        val_manifest=manifests / "val.txt",
+        expected_fingerprint_path=fp_path,
+        require_no_missing=True,
+        require_labels=True,
+        track_id="limited",
+    )
+
+    assert out["source_lock_sha256"] == fingerprint["source_lock_sha256"]
 
 
 def test_verify_split_against_fingerprint_uses_explicit_manifest_names(tmp_path: Path) -> None:
@@ -171,7 +215,7 @@ def test_verify_split_against_fingerprint_supports_features_only_comparison(tmp_
         val_manifest=manifests / "val.txt",
         require_no_missing=True,
         require_labels=True,
-        track_id="limited_large",
+        track_id="limited",
     )
     fp_path = tmp_path / "fp.json"
     fp_path.write_text(json.dumps(fingerprint))
@@ -183,7 +227,7 @@ def test_verify_split_against_fingerprint_supports_features_only_comparison(tmp_
         expected_fingerprint_path=fp_path,
         require_no_missing=True,
         require_labels=False,
-        track_id="limited_large",
+        track_id="limited",
         comparison_mode="features_only",
     )
     assert out["present_feature_chain_count"] == 2
@@ -243,7 +287,7 @@ def test_build_fingerprint_captures_preprocess_config_sha256(tmp_path: Path) -> 
         val_manifest=manifests / "val.txt",
         require_no_missing=True,
         require_labels=True,
-        track_id="limited_large",
+        track_id="limited",
     )
     assert isinstance(fingerprint["preprocess_config_sha256"], str)
     assert len(fingerprint["preprocess_config_sha256"]) == 64
@@ -257,6 +301,6 @@ def test_build_fingerprint_captures_preprocess_config_sha256(tmp_path: Path) -> 
         val_manifest=manifests / "val.txt",
         require_no_missing=True,
         require_labels=True,
-        track_id="limited_large",
+        track_id="limited",
     )
     assert fingerprint_changed["preprocess_config_sha256"] != fingerprint["preprocess_config_sha256"]
