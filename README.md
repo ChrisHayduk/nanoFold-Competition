@@ -8,21 +8,28 @@ The core bet is simple: biological data is expensive. Text and image models ofte
 
 This repo turns that idea into a benchmark. Participants get the same official train set, the same sample budget, and the same hidden evaluation path. Progress should come from better biological priors, better inductive biases, better objectives, better curricula, and better optimization under scarcity.
 
+## Start Here
+
+New to nanoFold? Follow the [Quickstart](docs/QUICKSTART.md) to set up the environment, download and preprocess the public official data, and start your first training run.
+
 ## Documentation
 
 Start here:
+- [Quickstart: setup, data prep, and first training run](docs/QUICKSTART.md)
 - [Competition rules and official protocol](docs/COMPETITION.md)
 - [Submission API contract](docs/API.md)
 - [Data sources, splits, preprocessing, and tensor formats](docs/DATA.md)
 
 Useful deep links:
-- [What data sources are used](docs/DATA.md#1-data-sources)
-- [How to download the official public data](docs/DATA.md#2-how-data-is-downloaded)
-- [How train/val/hidden splits are generated](docs/DATA.md#3-how-dataset-splits-are-determined)
-- [How raw data becomes model input](docs/DATA.md#4-how-input-data-is-prepped)
-- [Example model input batch](docs/DATA.md#5-example-model-input-sample)
-- [Required prediction output format](docs/DATA.md#6-output-data-format)
-- [Example model output](docs/DATA.md#7-example-model-output-sample)
+- [Download and preprocess public data](docs/QUICKSTART.md#2-download-and-preprocess-public-data)
+- [Start a training run](docs/QUICKSTART.md#3-start-training)
+- [Submit to the leaderboard](docs/QUICKSTART.md#6-submit-to-the-leaderboard)
+- [Allowed and disallowed data](docs/COMPETITION.md#2-allowed-and-disallowed-data)
+- [Scoring and ranking](docs/COMPETITION.md#8-scoring-and-ranking)
+- [Batch contract by mode](docs/API.md#batch-contract-by-mode)
+- [`run_batch` output contract](docs/API.md#run_batch-output-contract)
+- [Dataset split methodology](docs/DATA.md#3-how-dataset-splits-are-determined)
+- [Example model input sample](docs/DATA.md#5-example-model-input-sample)
 
 ## What Counts As Progress
 
@@ -143,54 +150,15 @@ This is implemented in:
 
 ## Quickstart
 
-```bash
-# 1) environment
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt awscli
-git submodule update --init --recursive
+The fastest participant path is in [docs/QUICKSTART.md](docs/QUICKSTART.md). It covers:
 
-# 2) download and preprocess the official public data
-bash scripts/setup_official_data.sh \
-  --data-root data/openproteinset \
-  --processed-features-dir data/processed_features \
-  --processed-labels-dir data/processed_labels \
-  --mmcif-mode subset \
-  --disable-templates
-
-# 3) official train + public validation scoring
-python train.py \
-  --config configs/official_baseline.yaml \
-  --track limited_large \
-  --official
-
-mkdir -p runs/official_limited_large_baseline/_forbid_labels
-python predict.py \
-  --config configs/official_baseline.yaml \
-  --ckpt runs/official_limited_large_baseline/checkpoints/ckpt_last.pt \
-  --split val \
-  --track limited_large \
-  --official \
-  --forbid-labels-dir runs/official_limited_large_baseline/_forbid_labels \
-  --pred-out-dir runs/official_limited_large_baseline/public_predictions \
-  --save runs/official_limited_large_baseline/predict_val.json
-
-python score.py \
-  --prediction-summary runs/official_limited_large_baseline/predict_val.json \
-  --labels-dir data/processed_labels \
-  --save runs/official_limited_large_baseline/eval_val.json \
-  --per-chain-out runs/official_limited_large_baseline/per_chain_scores_val.jsonl
-```
-
-`setup_official_data.sh` is the standard public data path. It verifies the committed manifest hashes, downloads the required OpenFold chain cache/MSAs plus the manifest mmCIF subset, and writes:
-- `data/processed_features/<encoded_chain_id>.npz`
-- `data/processed_labels/<encoded_chain_id>.npz`
-
-If preprocessing is interrupted, rerun the same command with `--resume-preprocess`. The public setup path does not download hidden validation labels or hidden manifests.
-
-System requirements for data setup:
-- `aws` CLI on `PATH` for unsigned OpenFold S3 downloads
-- `unzip` on `PATH`
-- enough local disk for raw OpenFold assets plus processed NPZs; expect tens of GB for the official public split
+- environment setup
+- official public data download and preprocessing
+- first baseline training run
+- minAlphaFold2 reference training
+- public validation prediction and scoring
+- creating and validating a new submission
+- submitting a leaderboard pull request
 
 ## Maintainer Data Refresh
 
