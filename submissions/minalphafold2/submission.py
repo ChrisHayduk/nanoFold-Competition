@@ -120,6 +120,12 @@ def build_model(cfg: Dict[str, Any]) -> torch.nn.Module:
     model = AlphaFold2(_model_cfg(cfg))
     model.nanofold_initial_loss_fn = AlphaFoldLoss(finetune=False)
     model.nanofold_finetune_loss_fn = AlphaFoldLoss(finetune=True)
+    if int(cfg.get("model", {}).get("n_cycles", 1)) <= 1:
+        for module_name in ("recycle_norm_s", "recycle_norm_z"):
+            module = getattr(model, module_name, None)
+            if module is not None:
+                for param in module.parameters():
+                    param.requires_grad_(False)
     return model
 
 

@@ -33,6 +33,15 @@ pip install -r requirements.txt awscli
 git submodule update --init --recursive
 ```
 
+If you prefer conda, keep the environment local to the repo:
+
+```bash
+conda create -p .conda/nanofold python=3.12 pip -y
+conda activate ./.conda/nanofold
+python -m pip install -r requirements.txt awscli
+git submodule update --init --recursive
+```
+
 ## 2) Download And Preprocess Public Data
 
 ```bash
@@ -74,7 +83,15 @@ Outputs land in:
 runs/minalphafold2_reference/
 ```
 
-Official training verifies the public dataset fingerprint before the progress bar starts. On a CPU-only laptop, the full reference run can take a few hours; by default it writes checkpoints and runs public validation every 500 steps.
+Official training verifies the public dataset fingerprint before the progress bar starts. On a CPU-only laptop, the full reference run can take a few hours; by default it writes checkpoints and runs public validation every 1,000 steps.
+
+Training also prints compact status lines during the run with training loss, learning rate, gradient norm, sample-budget progress, residue-budget progress, throughput, elapsed time, and ETA. The same per-step records are written to `runs/minalphafold2_reference/train_metrics.jsonl`.
+
+To restart a run from step 0 and clear stale metrics/checkpoints for that run name, add:
+
+```bash
+--reset-run
+```
 
 On macOS with Python 3.13 or newer, nanoFold automatically uses `data.num_workers=0` for DataLoader stability. That message is informational.
 
@@ -85,6 +102,53 @@ The reference submission loads its model architecture directly from:
 ```text
 third_party/minAlphaFold2/configs/tiny.toml
 ```
+
+### Optional: Run On A Modal GPU
+
+If local training is too slow, run the same official training command on a Modal GPU. This uploads the public processed data to read-only Modal Volumes, stages it onto the remote container's local disk before fingerprint verification and training, and writes checkpoints and metrics to a separate `nanofold-runs` volume.
+
+Install and authenticate Modal locally:
+
+```bash
+pip install modal
+modal setup
+```
+
+Upload the public processed data after step 2 has completed. The default upload format is a pair of tar archives so Modal startup and training avoid thousands of small network-volume reads.
+
+```bash
+modal run scripts/modal_train.py --upload-data --skip-train
+```
+
+Launch the limited-track minAlphaFold2 reference run:
+
+```bash
+NANOFOLD_MODAL_GPU=A10G modal run scripts/modal_train.py \
+  --config submissions/minalphafold2/config.yaml \
+  --track limited \
+  --reset-run
+```
+
+The default GPU is `A10G`. Set `NANOFOLD_MODAL_GPU=L40S` or another Modal-supported GPU type when you want a larger or faster worker.
+
+Remote runs auto-resume from `runs/<run_name>/checkpoints/ckpt_last.pt` in the `nanofold-runs` volume. To continue a run, repeat the same command without `--reset-run`:
+
+```bash
+NANOFOLD_MODAL_GPU=A10G modal run scripts/modal_train.py \
+  --config submissions/minalphafold2/config.yaml \
+  --track limited
+```
+
+Fetch a checkpoint back from Modal when you want to run local public prediction/scoring:
+
+```bash
+mkdir -p runs/minalphafold2_reference/checkpoints
+modal volume get nanofold-runs \
+  minalphafold2_reference/checkpoints/ckpt_last.pt \
+  runs/minalphafold2_reference/checkpoints/ckpt_last.pt
+```
+
+Use separate run names or separate Modal run volumes for concurrent experiments. Do not upload hidden validation assets to Modal; this participant path only uses public train and public validation data.
 
 ## 4) Score Public Validation
 
@@ -160,7 +224,7 @@ Then score it with the same public validation commands from step 4, replacing th
 
 ## 6) Submit To The Leaderboard
 
-Hidden leaderboard scoring is maintainer-run so hidden features, labels, manifests, salts, and lock files never leave the sealed evaluation path.
+Hidden leaderboard scoring and leaderboard updates are maintainer-run so hidden features, labels, manifests, salts, lock files, and official result artifacts never leave the sealed evaluation path. Participants submit a validated, reproducible PR; maintainers create the accepted leaderboard entry after the sealed run.
 
 Submission mechanics are the same for all tracks:
 
@@ -187,6 +251,8 @@ Commit only the submission files needed to reproduce your method, usually:
 - any small helper files imported by `submission.py`
 
 Do not commit data, processed NPZs, hidden files, checkpoints, run directories, local logs, or modified official manifests.
+
+Do not edit `leaderboard/leaderboard.json` or the rendered README leaderboard table in a submission PR. Those files are updated only by the maintainer-run hidden evaluation.
 
 ```bash
 git add submissions/your_name

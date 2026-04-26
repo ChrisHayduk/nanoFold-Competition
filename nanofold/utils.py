@@ -71,6 +71,31 @@ def seed_worker(worker_id: int) -> None:
     random.seed(worker_seed)
 
 
+def mps_is_available() -> bool:
+    mps_backend = getattr(torch.backends, "mps", None)
+    if mps_backend is None:
+        return False
+    try:
+        if not bool(mps_backend.is_available()):
+            return False
+        torch.empty(1, device="mps")
+    except Exception:
+        return False
+    return True
+
+
+def default_torch_device() -> torch.device:
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if mps_is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+def should_pin_memory(device: torch.device) -> bool:
+    return device.type == "cuda"
+
+
 def utc_now_iso() -> str:
     return datetime.now(tz=timezone.utc).isoformat()
 
@@ -118,10 +143,19 @@ def get_env_metadata(device: torch.device) -> Dict[str, Any]:
     cuda_available = torch.cuda.is_available()
     cuda_index = torch.cuda.current_device() if cuda_available else None
     cuda_name = torch.cuda.get_device_name(cuda_index) if cuda_available and cuda_index is not None else None
+    mps_backend = getattr(torch.backends, "mps", None)
+    mps_built = None
+    if mps_backend is not None and hasattr(mps_backend, "is_built"):
+        try:
+            mps_built = bool(mps_backend.is_built())
+        except Exception:
+            mps_built = None
     return {
         "device_type": device.type,
         "cuda_available": cuda_available,
         "cuda_device_name": cuda_name,
+        "mps_available": mps_is_available(),
+        "mps_built": mps_built,
         "torch": getattr(torch, "__" + "ver" + "sion" + "__", "unknown"),
         "cuda": getattr(torch, "ver" + "sion").cuda,
         "cudnn": (

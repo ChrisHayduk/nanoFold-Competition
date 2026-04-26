@@ -13,6 +13,7 @@ __pycache__/
 /.nanofold_private/
 /.pyright/
 /.venv/
+/.conda/
 *.pt
 *.pth
 *.ckpt

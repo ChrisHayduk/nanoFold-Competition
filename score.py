@@ -11,7 +11,7 @@ import torch
 
 from nanofold.chain_paths import chain_npz_path
 from nanofold.metrics import foldscore_auc, foldscore_components
-from nanofold.utils import get_env_metadata, utc_now_iso
+from nanofold.utils import default_torch_device, get_env_metadata, utc_now_iso
 
 HIDDEN_SPLITS = {"hidden_val", "test_hidden"}
 
@@ -301,7 +301,7 @@ def main() -> None:
         "cumulative_samples_seen": int(final_row.get("cumulative_samples_seen", 0)),
         "cumulative_cropped_residues_seen": int(final_row.get("cumulative_cropped_residues_seen", 0)),
         "cumulative_nonpad_residues_seen": int(final_row.get("cumulative_nonpad_residues_seen", 0)),
-        "env": get_env_metadata(torch.device("cuda" if torch.cuda.is_available() else "cpu")),
+        "env": get_env_metadata(default_torch_device()),
         "per_chain_scores_path": str(per_chain_out_path.resolve()) if per_chain_out_path else None,
         "finished_at": utc_now_iso(),
         "score_wall_time_seconds": float(time.perf_counter() - scoring_start),

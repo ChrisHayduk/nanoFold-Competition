@@ -23,6 +23,7 @@ Start here:
 Useful deep links:
 - [Download and preprocess public data](docs/QUICKSTART.md#2-download-and-preprocess-public-data)
 - [Start a training run](docs/QUICKSTART.md#3-start-training)
+- [Run training on a Modal GPU](docs/QUICKSTART.md#optional-run-on-a-modal-gpu)
 - [Submit to the leaderboard](docs/QUICKSTART.md#6-submit-to-the-leaderboard)
 - [Allowed and disallowed data](docs/COMPETITION.md#2-allowed-and-disallowed-data)
 - [Scoring and ranking](docs/COMPETITION.md#8-scoring-and-ranking)
@@ -64,6 +65,7 @@ The final hidden FoldScore is the tie-breaker for fixed-budget tracks and the pr
 - sealed prediction/scoring entrypoints that keep hidden labels away from submission code
 - a strict submission API with `build_model`, `build_optimizer`, and `run_batch`
 - dataset fingerprints and manifest checks so official data changes are visible
+- an optional Modal GPU runner with local-disk data staging for public-data training
 - a pinned minAlphaFold2 tiny reference submission plus a template submission that pass the official atom14 contract
 
 ## Tracks At A Glance
@@ -76,7 +78,7 @@ Source of truth: `tracks/*.yaml`. All tracks use the same official public train 
 | `research_large` | Larger fixed-data research leaderboard | `100,000` samples (`50,000` steps x effective batch `2`) | `foldscore_auc_hidden` | you want to study whether an approach still wins with more optimization while using the same data | `--track research_large` |
 | `unlimited` | Open-ended fixed-data research leaderboard | unrestricted training budget and model size | `final_hidden_foldscore` | you want the best final hidden structure quality while keeping the hidden set sealed and the public data contract fixed | `--track unlimited` |
 
-For all three tracks, set `track: <track_id>` in `submissions/<name>/config.yaml`, validate with `python scripts/validate_submission.py --submission submissions/<name> --track <track_id> --strict`, and open a leaderboard PR naming the intended track. Submit separate configs or separate submission directories when one method targets multiple tracks.
+For all three tracks, set `track: <track_id>` in `submissions/<name>/config.yaml`, validate with `python scripts/validate_submission.py --submission submissions/<name> --track <track_id> --strict`, and open a submission PR naming the intended track. Submit separate configs or separate submission directories when one method targets multiple tracks. Maintainers create accepted leaderboard entries after sealed hidden evaluation; participant PRs should not edit leaderboard artifacts.
 
 The `limited` constants are:
 

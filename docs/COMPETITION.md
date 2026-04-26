@@ -32,6 +32,8 @@ Official runs must use:
 - `--track <track_id>`
 - `--official`
 
+Participants submit code/configuration PRs for a chosen track. Maintainers run the sealed hidden pipeline and update leaderboard artifacts after acceptance; participant PRs must not edit `leaderboard/leaderboard.json` or the rendered leaderboard table.
+
 In official mode the runtime uses **override + validate**:
 - immutable constants from track policy are applied to config first
 - policy validation then checks budget/paths/hashes
