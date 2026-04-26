@@ -302,6 +302,44 @@ def _display_path(path: str | Path) -> str:
         return str(path)
 
 
+def _stable_preprocess_meta_sha256(path: Path) -> str | None:
+    if not path.exists():
+        return None
+    try:
+        raw = json.loads(path.read_text())
+    except json.JSONDecodeError:
+        return sha256_file(path)
+    if not isinstance(raw, dict):
+        return sha256_file(path)
+
+    raw_cli_args = raw.get("cli_args")
+    cli_args: Mapping[str, Any] = raw_cli_args if isinstance(raw_cli_args, dict) else {}
+    stable_cli_keys = (
+        "allow_failures",
+        "disable_templates",
+        "fail_fast",
+        "max_msa_seqs",
+        "max_templates",
+        "min_projection_aligned_fraction",
+        "min_projection_coverage",
+        "min_projection_seq_identity",
+        "min_projection_valid_ca",
+        "msa_name",
+        "msa_names",
+        "strict",
+        "template_hhr_name",
+    )
+    stable = {
+        "aligner": raw.get("aligner"),
+        "atom14_num_slots": raw.get("atom14_num_slots"),
+        "ca_atom14_slot": raw.get("ca_atom14_slot"),
+        "cli_args": {key: cli_args.get(key) for key in stable_cli_keys if key in cli_args},
+        "schema_version": raw.get("schema_version"),
+    }
+    payload = json.dumps(stable, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
 def build_split_fingerprint(
     *,
     processed_features_dir: str | Path,
@@ -360,7 +398,7 @@ def build_split_fingerprint(
         )
 
     preprocess_meta_path = processed_features_dir / PREPROCESS_META_FILENAME
-    preprocess_config_sha256 = sha256_file(preprocess_meta_path) if preprocess_meta_path.exists() else None
+    preprocess_config_sha256 = _stable_preprocess_meta_sha256(preprocess_meta_path)
 
     result: Dict[str, Any] = {
         "track_id": track_id,

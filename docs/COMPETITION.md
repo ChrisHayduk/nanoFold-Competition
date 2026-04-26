@@ -174,18 +174,27 @@ The setup script expects `aws`, `unzip`, and `python` on `PATH`; it keeps hidden
 Maintainer manifest generation path:
 - `scripts/build_manifests.py`
 - `scripts/regenerate_official_manifests.sh`
+- `scripts/build_hidden_manifest.py`
 - `scripts/sync_official_manifest_hashes.py`
 - `scripts/full_official_data_refresh.sh`
 - lock metadata: `leaderboard/official_manifest_source.lock.json`
 
-Single end-to-end maintainer flow:
+The committed public manifests are the participant-facing data contract. Hidden validation is generated privately against that fixed public split:
 
 ```bash
-export NANOFOLD_HIDDEN_SPLIT_SALT="<maintainer-private-random-string>"
-bash scripts/full_official_data_refresh.sh --rewrite-lock
+mkdir -p .nanofold_private/secrets
+python -c "import pathlib,secrets; pathlib.Path('.nanofold_private/secrets/hidden_split_salt.txt').write_text(secrets.token_urlsafe(48) + '\n')"
+chmod 600 .nanofold_private/secrets/hidden_split_salt.txt
+
+python scripts/build_hidden_manifest.py \
+  --hidden-split-salt-file .nanofold_private/secrets/hidden_split_salt.txt
+
+python scripts/verify_hidden_manifest.py
 ```
 
-This maintainer flow requires MMseqs2 plus the public setup dependencies. `NANOFOLD_HIDDEN_SPLIT_SALT` must be at least 32 characters and must never be committed. It regenerates split metadata, public manifests, public NPZs, the public dataset fingerprint, and maintainer-only hidden assets from the locked official inputs.
+This maintainer flow requires MMseqs2 plus the public setup dependencies. The salt must be at least 32 characters and must never be committed. The hidden builder excludes every sequence/PDB component that touches train or public validation, then stratifies hidden validation against the public train+validation distribution.
+
+Private hidden preprocessing failures belong only in `.nanofold_private/manifests/hidden_processability_exclusions.txt`. After adding any failed chain IDs there, rerun `scripts/build_hidden_manifest.py` and `scripts/verify_hidden_manifest.py`.
 
 Commit-safe public outputs:
 - `data/manifests/train.txt`
@@ -197,12 +206,15 @@ Commit-safe public outputs:
 Maintainer-only outputs live under the ignored `.nanofold_private/` workspace:
 - `.nanofold_private/manifests/hidden_val.txt`
 - `.nanofold_private/manifests/split_quality_report.json`
+- `.nanofold_private/manifests/hidden_processability_exclusions.txt`
 - `.nanofold_private/hidden_processed_features/`
 - `.nanofold_private/hidden_processed_labels/`
 - `.nanofold_private/leaderboard/official_hidden_fingerprint.json`
 - `.nanofold_private/leaderboard/private_hidden_assets.lock.json`
 - `.nanofold_private/leaderboard/private_hidden_manifest_source.lock.json`
 - `.nanofold_private/leaderboard/official_data_source.lock.json`
+
+Full public-data rebuilds use `bash scripts/full_official_data_refresh.sh --rewrite-lock` and are reserved for deliberate changes to the official public data contract.
 
 ## 6) Fingerprint and Integrity Requirements
 

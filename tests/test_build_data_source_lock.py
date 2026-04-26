@@ -150,6 +150,7 @@ def test_data_source_lock_requires_hidden_manifest_when_included(tmp_path: Path)
     manifest_lock = tmp_path / "manifest.lock.json"
     manifest_lock.write_text("{}\n")
     out = tmp_path / "official_data_source.lock.json"
+    missing_hidden_manifest = tmp_path / "private" / "manifests" / "hidden_val.txt"
 
     try:
         main(
@@ -168,6 +169,8 @@ def test_data_source_lock_requires_hidden_manifest_when_included(tmp_path: Path)
                 str(manifest_lock),
                 "--output",
                 str(out),
+                "--hidden-manifest",
+                str(missing_hidden_manifest),
                 "--include-hidden",
                 "--require-complete",
             ]

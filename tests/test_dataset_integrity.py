@@ -304,3 +304,69 @@ def test_build_fingerprint_captures_preprocess_config_sha256(tmp_path: Path) -> 
         track_id="limited",
     )
     assert fingerprint_changed["preprocess_config_sha256"] != fingerprint["preprocess_config_sha256"]
+
+
+def test_preprocess_meta_hash_ignores_local_paths_and_dependency_versions(tmp_path: Path) -> None:
+    manifests = tmp_path / "manifests"
+    manifests.mkdir()
+    manifest = manifests / "hidden_val.txt"
+    manifest.write_text("1abc_A\n")
+
+    features_a = tmp_path / "features_a"
+    features_b = tmp_path / "features_b"
+    labels_a = tmp_path / "labels_a"
+    labels_b = tmp_path / "labels_b"
+    for path in (features_a, features_b, labels_a, labels_b):
+        path.mkdir()
+
+    for features, labels in ((features_a, labels_a), (features_b, labels_b)):
+        _write_feature_npz(chain_npz_path(features, "1abc_A"))
+        _write_label_npz(chain_npz_path(labels, "1abc_A"))
+
+    stable_meta = {
+        "aligner": {"match_score": 2.0, "mode": "global"},
+        "atom14_num_slots": 14,
+        "ca_atom14_slot": 1,
+        "cli_args": {
+            "disable_templates": True,
+            "max_msa_seqs": 2048,
+            "max_templates": 1,
+            "msa_name": "uniref90_hits.a3m",
+            "processed_features_dir": "local/path/one",
+            "processed_labels_dir": "local/path/one",
+            "raw_root": "data/openproteinset",
+            "strict": False,
+        },
+        "dependency_metadata": {"numpy": "1.0", "python": "3.11"},
+        "git_sha": "abc",
+        "schema_version": 2,
+    }
+    changed_environment_meta = {
+        **stable_meta,
+        "cli_args": {
+            **stable_meta["cli_args"],
+            "processed_features_dir": "different/local/path",
+            "processed_labels_dir": "different/local/path",
+            "raw_root": "/tmp/private/data",
+        },
+        "dependency_metadata": {"numpy": "2.0", "python": "3.13"},
+        "git_sha": "def",
+    }
+    (features_a / PREPROCESS_META_FILENAME).write_text(json.dumps(stable_meta))
+    (features_b / PREPROCESS_META_FILENAME).write_text(json.dumps(changed_environment_meta))
+
+    fp_a = build_split_fingerprint(
+        processed_features_dir=features_a,
+        processed_labels_dir=labels_a,
+        manifest_paths={"hidden_val": manifest},
+        require_no_missing=True,
+        require_labels=True,
+    )
+    fp_b = build_split_fingerprint(
+        processed_features_dir=features_b,
+        processed_labels_dir=labels_b,
+        manifest_paths={"hidden_val": manifest},
+        require_no_missing=True,
+        require_labels=True,
+    )
+    assert fp_a["preprocess_config_sha256"] == fp_b["preprocess_config_sha256"]

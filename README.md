@@ -170,24 +170,60 @@ The fastest participant path is in [docs/QUICKSTART.md](docs/QUICKSTART.md). It 
 - creating and validating a new submission
 - submitting a leaderboard pull request
 
-## Maintainer Data Refresh
+## Maintainer Hidden Assets
 
-Maintainers can refresh the official data assets with one command. This path:
-- downloads and pins structural metadata sources
-- builds required structure metadata from chain cache, pinned structural-classification files, and required feature-asset coverage
-- regenerates official manifests from locked chain cache inputs plus a private hidden split salt
-- syncs manifest hashes/counts across track + docs + lock
-- downloads required OpenFold assets and manifest mmCIFs with strict missing-file checks
-- preprocesses public and hidden split NPZs
-- rebuilds public and hidden fingerprints
-- writes public metadata plus all hidden artifacts under the ignored `.nanofold_private/` workspace
+The committed public manifests are the participant data contract. Maintainers generate hidden validation privately against that fixed public split:
 
 ```bash
-export NANOFOLD_HIDDEN_SPLIT_SALT="<maintainer-private-random-string>"
-bash scripts/full_official_data_refresh.sh --rewrite-lock
+mkdir -p .nanofold_private/secrets
+python -c "import pathlib,secrets; pathlib.Path('.nanofold_private/secrets/hidden_split_salt.txt').write_text(secrets.token_urlsafe(48) + '\n')"
+chmod 600 .nanofold_private/secrets/hidden_split_salt.txt
+
+python scripts/build_hidden_manifest.py \
+  --hidden-split-salt-file .nanofold_private/secrets/hidden_split_salt.txt
+
+python scripts/verify_hidden_manifest.py
 ```
 
-This flow requires MMseqs2 on `PATH`. `NANOFOLD_HIDDEN_SPLIT_SALT` must be at least 32 characters and must never be committed. It regenerates split metadata, public manifests, public NPZs, the public dataset fingerprint, and maintainer-only hidden assets from the locked official inputs.
+This requires MMseqs2 on `PATH`, the locked OpenProteinSet chain cache, and `data/manifests/structure_metadata.json`. The salt file, hidden manifest, hidden labels, hidden fingerprints, and hidden locks stay under `.nanofold_private/` and must never be committed.
+
+If private hidden preprocessing finds unprocessable structures, record them only in `.nanofold_private/manifests/hidden_processability_exclusions.txt`, rerun `scripts/build_hidden_manifest.py`, and rerun `scripts/verify_hidden_manifest.py`.
+
+After the hidden manifest is written, build the hidden NPZs and pin their fingerprint:
+
+```bash
+python scripts/prepare_data.py \
+  --data-root data/openproteinset \
+  --manifest .nanofold_private/manifests/hidden_val.txt \
+  --duplicate-chains-file data/openproteinset/pdb_data/duplicate_pdb_chains.txt \
+  --strict-downloads \
+  --no-template-hits \
+  --download-mmcif-subset
+
+python scripts/preprocess.py \
+  --raw-root data/openproteinset \
+  --mmcif-root data/openproteinset/pdb_data/mmcif_files \
+  --processed-features-dir .nanofold_private/hidden_processed_features \
+  --processed-labels-dir .nanofold_private/hidden_processed_labels \
+  --manifest .nanofold_private/manifests/hidden_val.txt \
+  --disable-templates
+
+python scripts/build_fingerprint.py \
+  --processed-features-dir .nanofold_private/hidden_processed_features \
+  --processed-labels-dir .nanofold_private/hidden_processed_labels \
+  --manifest hidden_val=.nanofold_private/manifests/hidden_val.txt \
+  --track limited \
+  --source-lock leaderboard/official_manifest_source.lock.json \
+  --output .nanofold_private/leaderboard/official_hidden_fingerprint.json
+
+python scripts/pin_hidden_assets.py \
+  --hidden-manifest .nanofold_private/manifests/hidden_val.txt \
+  --hidden-features-dir .nanofold_private/hidden_processed_features \
+  --hidden-labels-dir .nanofold_private/hidden_processed_labels \
+  --hidden-fingerprint .nanofold_private/leaderboard/official_hidden_fingerprint.json \
+  --track-id limited \
+  --lock-file .nanofold_private/leaderboard/private_hidden_assets.lock.json
+```
 
 Public outputs land in stable, commit-safe paths:
 - `data/manifests/train.txt`
@@ -199,6 +235,7 @@ Public outputs land in stable, commit-safe paths:
 Maintainer-only outputs land under `.nanofold_private/`:
 - `.nanofold_private/manifests/hidden_val.txt`
 - `.nanofold_private/manifests/split_quality_report.json`
+- `.nanofold_private/manifests/hidden_processability_exclusions.txt`
 - `.nanofold_private/hidden_processed_features/`
 - `.nanofold_private/hidden_processed_labels/`
 - `.nanofold_private/leaderboard/official_hidden_fingerprint.json`
@@ -208,10 +245,10 @@ Maintainer-only outputs land under `.nanofold_private/`:
 
 The metadata builder also writes `data/manifests/structure_candidates.txt` as an ignored local audit artifact. Commit only public manifests, the public dataset fingerprint, and sanitized public lock metadata.
 
-Dry-run preview:
+Full public-data rebuilds are maintainer operations for changing the official public data contract:
 
 ```bash
-bash scripts/full_official_data_refresh.sh --rewrite-lock --dry-run
+bash scripts/full_official_data_refresh.sh --rewrite-lock
 ```
 
 ## Hidden Leaderboard Runs
