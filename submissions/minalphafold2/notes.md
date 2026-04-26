@@ -19,10 +19,13 @@ The model architecture is loaded directly from
 The training protocol scales AlphaFold2's initial/fine-tune sample ratio into
 the official budget. With `max_steps=10000` and effective batch size `2`,
 fine-tuning starts at step `8696`, leaving `1304` optimizer updates for the
-fine-tune loss. The learning-rate warmup and one-shot decay are scaled from
-the same AlphaFold2 protocol proportions. The reference config saves
+fine-tune loss. Fine-tune auxiliary loss weights ramp linearly for the next
+500 steps. The learning-rate warmup and one-shot decay are scaled from the
+same AlphaFold2 protocol proportions. The reference config saves
 checkpoints and runs public validation every 1,000 steps, matching the
 checkpoint cadence used for official hidden AUC evaluation.
+Training runs in full precision to match the upstream minAlphaFold2 trainer's
+numerics.
 
 Because the limited-track reference uses a single recycling cycle, the
 recycling LayerNorm parameters are frozen at their initial values. The model

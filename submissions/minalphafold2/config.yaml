@@ -42,7 +42,8 @@ train:
   save_every: 1000
   grad_accum_steps: 2
   finetune_start_step: 8696
+  finetune_ramp_steps: 500
   finetune_lr_scale: 0.5
   warmup_steps: 111
   lr_decay_step: 5565
-  amp: true
+  amp: false

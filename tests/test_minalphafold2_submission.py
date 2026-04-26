@@ -66,10 +66,41 @@ def test_minalphafold2_budget_schedule_scales_af2_protocol_to_track_budget() -> 
 
     assert schedule.max_steps == 10000
     assert schedule.finetune_start_step == 8696
+    assert schedule.finetune_ramp_steps == 500
     assert schedule.warmup_steps == 111
     assert schedule.lr_decay_step == 5565
     assert not submission._use_finetune_loss({**cfg, "_runtime": {"step": 8695}})
     assert submission._use_finetune_loss({**cfg, "_runtime": {"step": 8696}})
+
+
+def test_minalphafold2_finetune_ramp_weight_scales_linearly() -> None:
+    cfg = yaml.safe_load(Path("submissions/minalphafold2/config.yaml").read_text())
+
+    assert submission._finetune_ramp_weight({**cfg, "_runtime": {"step": 8695}}) == pytest.approx(0.0)
+    assert submission._finetune_ramp_weight({**cfg, "_runtime": {"step": 8696}}) == pytest.approx(0.0)
+    assert submission._finetune_ramp_weight({**cfg, "_runtime": {"step": 8946}}) == pytest.approx(0.5)
+    assert submission._finetune_ramp_weight({**cfg, "_runtime": {"step": 9196}}) == pytest.approx(1.0)
+    assert submission._finetune_ramp_weight({**cfg, "_runtime": {"step": 10000}}) == pytest.approx(1.0)
+
+
+def test_minalphafold2_finetune_auxiliary_weights_follow_ramp() -> None:
+    loss_fn = submission.AlphaFoldLoss(finetune=True)
+    target_weights = {
+        attr: float(getattr(loss_fn, attr))
+        for attr in submission.FINETUNE_AUXILIARY_WEIGHT_ATTRS
+    }
+
+    submission._apply_finetune_ramp(loss_fn, 0.0)
+    for attr in submission.FINETUNE_AUXILIARY_WEIGHT_ATTRS:
+        assert float(getattr(loss_fn, attr)) == pytest.approx(0.0)
+
+    submission._apply_finetune_ramp(loss_fn, 0.5)
+    for attr in submission.FINETUNE_AUXILIARY_WEIGHT_ATTRS:
+        assert float(getattr(loss_fn, attr)) == pytest.approx(target_weights[attr] * 0.5)
+
+    submission._apply_finetune_ramp(loss_fn, 1.5)
+    for attr in submission.FINETUNE_AUXILIARY_WEIGHT_ATTRS:
+        assert float(getattr(loss_fn, attr)) == pytest.approx(target_weights[attr])
 
 
 def test_minalphafold2_scheduler_uses_af2_lr_stages() -> None:
@@ -136,3 +167,6 @@ def test_minalphafold2_run_batch_returns_finetune_loss_at_handoff() -> None:
     assert out["pred_atom14"].shape == (1, 8, 14, 3)
     assert out["loss"].requires_grad
     assert torch.isfinite(out["loss"])
+    loss_fn = model.nanofold_finetune_loss_fn
+    for attr in submission.FINETUNE_AUXILIARY_WEIGHT_ATTRS:
+        assert float(getattr(loss_fn, attr)) == pytest.approx(0.0)

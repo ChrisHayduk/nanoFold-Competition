@@ -35,11 +35,18 @@ AF2_INITIAL_SAMPLES = 10_000_000
 AF2_FINETUNE_SAMPLES = 1_500_000
 AF2_WARMUP_SAMPLES = 128_000
 AF2_LR_DECAY_SAMPLES = 6_400_000
+DEFAULT_FINETUNE_RAMP_STEPS = 500
+FINETUNE_AUXILIARY_WEIGHT_ATTRS = (
+    "structural_violation_weight",
+    "experimentally_resolved_weight",
+    "tm_score_weight",
+)
 
 
 class AlphaFoldBudgetSchedule(NamedTuple):
     max_steps: int
     finetune_start_step: int
+    finetune_ramp_steps: int
     warmup_steps: int
     lr_decay_step: int
     finetune_lr_scale: float
@@ -87,9 +94,14 @@ def _af2_budget_schedule(cfg: Dict[str, Any]) -> AlphaFoldBudgetSchedule:
         ),
         max_steps=max_steps,
     )
+    finetune_ramp_steps = max(
+        0,
+        int(train_cfg.get("finetune_ramp_steps", DEFAULT_FINETUNE_RAMP_STEPS)),
+    )
     return AlphaFoldBudgetSchedule(
         max_steps=max_steps,
         finetune_start_step=finetune_start_step,
+        finetune_ramp_steps=finetune_ramp_steps,
         warmup_steps=warmup_steps,
         lr_decay_step=lr_decay_step,
         finetune_lr_scale=float(train_cfg.get("finetune_lr_scale", 0.5)),
@@ -108,6 +120,43 @@ def _use_finetune_loss(cfg: Dict[str, Any]) -> bool:
     return _runtime_step(cfg) >= _af2_budget_schedule(cfg).finetune_start_step
 
 
+def _finetune_ramp_weight(cfg: Dict[str, Any]) -> float:
+    schedule = _af2_budget_schedule(cfg)
+    step = _runtime_step(cfg)
+    if step < schedule.finetune_start_step:
+        return 0.0
+    if schedule.finetune_ramp_steps <= 0:
+        return 1.0
+    return max(
+        0.0,
+        min(
+            1.0,
+            float(step - schedule.finetune_start_step) / float(schedule.finetune_ramp_steps),
+        ),
+    )
+
+
+def _finetune_target_weights(loss_fn: AlphaFoldLoss) -> Dict[str, float]:
+    target_weights = getattr(loss_fn, "nanofold_finetune_target_weights", None)
+    if isinstance(target_weights, dict):
+        return {str(name): float(value) for name, value in target_weights.items()}
+    captured = {
+        attr: float(getattr(loss_fn, attr))
+        for attr in FINETUNE_AUXILIARY_WEIGHT_ATTRS
+        if hasattr(loss_fn, attr)
+    }
+    loss_fn.nanofold_finetune_target_weights = captured
+    return captured
+
+
+def _apply_finetune_ramp(loss_fn: AlphaFoldLoss, ramp_weight: float) -> None:
+    target_weights = _finetune_target_weights(loss_fn)
+    ramp_weight = max(0.0, min(1.0, float(ramp_weight)))
+    for attr, target_weight in target_weights.items():
+        if hasattr(loss_fn, attr):
+            setattr(loss_fn, attr, target_weight * ramp_weight)
+
+
 def _model_cfg(cfg: Dict[str, Any]) -> ModelConfig:
     model_cfg = cfg.get("model", {})
     profile_path = Path(str(model_cfg.get("profile_path", DEFAULT_MODEL_CONFIG_PATH)))
@@ -120,6 +169,7 @@ def build_model(cfg: Dict[str, Any]) -> torch.nn.Module:
     model = AlphaFold2(_model_cfg(cfg))
     model.nanofold_initial_loss_fn = AlphaFoldLoss(finetune=False)
     model.nanofold_finetune_loss_fn = AlphaFoldLoss(finetune=True)
+    _finetune_target_weights(model.nanofold_finetune_loss_fn)
     if int(cfg.get("model", {}).get("n_cycles", 1)) <= 1:
         for module_name in ("recycle_norm_s", "recycle_norm_z"):
             module = getattr(model, module_name, None)
@@ -351,7 +401,9 @@ def _alphafold_loss(
         loss_fn = getattr(model, "nanofold_finetune_loss_fn", None)
         if loss_fn is None:
             loss_fn = AlphaFoldLoss(finetune=True).to(features["aatype"].device)
+            _finetune_target_weights(loss_fn)
             model.nanofold_finetune_loss_fn = loss_fn
+        _apply_finetune_ramp(loss_fn, _finetune_ramp_weight(cfg))
     else:
         loss_fn = getattr(model, "nanofold_initial_loss_fn", None)
         if loss_fn is None:

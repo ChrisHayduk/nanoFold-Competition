@@ -86,6 +86,10 @@ image = (
         str(REPO_ROOT / "leaderboard" / "unlimited_dataset_fingerprint.json"),
         remote_path=str(REMOTE_ROOT / "leaderboard" / "unlimited_dataset_fingerprint.json"),
     )
+    .add_local_file(
+        str(REPO_ROOT / "leaderboard" / "official_manifest_source.lock.json"),
+        remote_path=str(REMOTE_ROOT / "leaderboard" / "official_manifest_source.lock.json"),
+    )
 )
 
 features_volume = modal.Volume.from_name(FEATURES_VOLUME_NAME, create_if_missing=True)
