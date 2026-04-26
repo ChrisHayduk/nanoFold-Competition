@@ -315,6 +315,8 @@ Containerized no-network execution:
 bash scripts/run_official_docker.sh --submission submissions/<name> --track <track_id> --update-leaderboard
 ```
 
+The Docker build copies only source-oriented files into the image. Generated datasets, hidden assets, checkpoints, local environments, and run outputs are excluded from the build context and are supplied through runtime mounts.
+
 ## 10) CI and PR Guardrails
 
 CI enforces:

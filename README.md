@@ -280,6 +280,8 @@ bash scripts/run_official_docker.sh \
   --update-leaderboard
 ```
 
+The Docker image build context intentionally excludes generated datasets, private hidden assets, local Python environments, checkpoints, and run outputs. Hidden data is mounted read-only during the prediction and scoring stages.
+
 Hidden lock metadata is maintainer-local and ignored by git. Populate/update it with `python scripts/pin_hidden_assets.py ...`.
 
 ## Manifest Reproducibility
