@@ -367,9 +367,8 @@ CI enforces the same PR guardrail:
 ## Leaderboard
 
 <!-- LEADERBOARD_START -->
-| Track | Status |
-|---|---|
-| `limited` | No accepted submissions yet |
-| `research_large` | No accepted submissions yet |
-| `unlimited` | No accepted submissions yet |
+### `limited`
+| # | Rank Score | Hidden FoldScore | Public FoldScore | Date | Commit | Description |
+|---:|---:|---:|---:|---|---|---|
+| 1 | 0.2025 | 0.2088 | 0.2095 | 2026-04-27 | `e581e25` | minAlphaFold2 tiny with ramped fine-tune auxiliary losses |
 <!-- LEADERBOARD_END -->
