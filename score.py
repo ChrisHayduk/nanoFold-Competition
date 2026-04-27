@@ -11,7 +11,12 @@ import torch
 from tqdm import tqdm
 
 from nanofold.chain_paths import chain_npz_path
-from nanofold.metrics import foldscore_auc, foldscore_components
+from nanofold.metrics import (
+    FOLDSCORE_COMPONENT_NAMES,
+    FOLDSCORE_CURVE_COMPONENT_NAMES,
+    foldscore_auc,
+    foldscore_components,
+)
 from nanofold.utils import default_torch_device, get_env_metadata, utc_now_iso
 
 HIDDEN_SPLITS = {"hidden_val", "test_hidden"}
@@ -20,6 +25,7 @@ HIDDEN_SPLITS = {"hidden_val", "test_hidden"}
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Score saved predictions against labels.")
     ap.add_argument("--prediction-summary", type=str, required=True, help="Path to predict.py JSON summary.")
+    ap.add_argument("--features-dir", type=str, required=True, help="Directory with feature NPZ files.")
     ap.add_argument("--labels-dir", type=str, required=True, help="Directory with label NPZ files.")
     ap.add_argument("--manifest", type=str, default="", help="Optional manifest override.")
     ap.add_argument("--crop-size", type=int, default=-1, help="Optional crop-size override.")
@@ -124,10 +130,42 @@ def _load_label_crop(
     return cropped
 
 
+def _load_feature_crop(
+    *,
+    features_dir: Path,
+    chain_id: str,
+    crop_size: int,
+    crop_mode: str,
+) -> Dict[str, torch.Tensor]:
+    feature_path = chain_npz_path(features_dir, chain_id)
+    if not feature_path.exists():
+        raise FileNotFoundError(f"Missing feature file for scoring: {feature_path}")
+    with np.load(feature_path) as data:
+        if "aatype" not in data:
+            raise ValueError(f"Feature file {feature_path} is missing required key: aatype")
+        features = {"aatype": torch.from_numpy(np.asarray(data["aatype"], dtype=np.int64))}
+    aatype = features["aatype"]
+    if aatype.ndim != 1:
+        raise ValueError(f"Invalid aatype shape in {feature_path}: {tuple(aatype.shape)}")
+
+    L = int(aatype.shape[0])
+    if L <= crop_size:
+        return features
+    if crop_mode == "center":
+        start = (L - crop_size) // 2
+    elif crop_mode == "random":
+        raise ValueError("Scoring external features with random crop is unsupported; use deterministic crop mode.")
+    else:
+        raise ValueError(f"Unsupported crop_mode={crop_mode!r}")
+    end = start + crop_size
+    return {"aatype": aatype[start:end]}
+
+
 def _score_chain(
     *,
     pred_atom14: torch.Tensor,
     labels: Dict[str, torch.Tensor],
+    features: Dict[str, torch.Tensor],
 ) -> Dict[str, float]:
     has_atom14_labels = "atom14_positions" in labels and "atom14_mask" in labels
     if not has_atom14_labels:
@@ -136,6 +174,7 @@ def _score_chain(
         pred_atom14=pred_atom14,
         true_atom14=labels["atom14_positions"],
         atom14_mask=labels["atom14_mask"],
+        aatype=features["aatype"],
     )
     return {name: float(value.detach().cpu()) for name, value in comps.items()}
 
@@ -184,33 +223,38 @@ def _hidden_curve_metrics(checkpoint_rows: List[Dict[str, Any]], *, sample_budge
         ),
         sample_budget=sample_budget,
     )
-    lddt_auc = foldscore_auc(
-        (
-            (
-                int(row["step"]),
-                int(row["cumulative_samples_seen"]),
-                float(row.get("mean_lddt_ca", row["mean_foldscore"])),
-            )
-            for row in rows
-        ),
-        sample_budget=sample_budget,
-    )
-    return {
+    out = {
         "final_hidden_foldscore": final_hidden,
         "foldscore_auc_hidden": auc_hidden,
         "foldscore_at_steps": {str(int(row["step"])): float(row["mean_foldscore"]) for row in rows},
         "foldscore_at_samples": {
             str(int(row["cumulative_samples_seen"])): float(row["mean_foldscore"]) for row in rows
         },
-        "final_hidden_lddt_ca": float(rows[-1].get("mean_lddt_ca", final_hidden)),
-        "lddt_auc_hidden": lddt_auc,
-        "lddt_at_steps": {str(int(row["step"])): float(row.get("mean_lddt_ca", row["mean_foldscore"])) for row in rows},
-        "lddt_at_samples": {
-            str(int(row["cumulative_samples_seen"])): float(row.get("mean_lddt_ca", row["mean_foldscore"]))
-            for row in rows
-        },
         "checkpoint_metrics_hidden": rows,
     }
+    for name in FOLDSCORE_CURVE_COMPONENT_NAMES:
+        key = f"mean_{name}"
+        out[f"final_hidden_{name}"] = float(rows[-1].get(key, final_hidden))
+        out[f"{name}_auc_hidden"] = foldscore_auc(
+            (
+                (
+                    int(row["step"]),
+                    int(row["cumulative_samples_seen"]),
+                    float(row.get(key, row["mean_foldscore"])),
+                )
+                for row in rows
+            ),
+            sample_budget=sample_budget,
+        )
+        out[f"{name}_at_steps"] = {
+            str(int(row["step"])): float(row.get(key, row["mean_foldscore"])) for row in rows
+        }
+        out[f"{name}_at_samples"] = {
+            str(int(row["cumulative_samples_seen"])): float(row.get(key, row["mean_foldscore"]))
+            for row in rows
+        }
+    out["final_hidden_lddt_ca"] = float(rows[-1].get("mean_lddt_ca", final_hidden))
+    return out
 
 
 def main() -> None:
@@ -235,6 +279,7 @@ def main() -> None:
     if not chain_ids:
         raise ValueError(f"Empty manifest for scoring: {manifest_path}")
 
+    features_dir = Path(args.features_dir).resolve()
     labels_dir = Path(args.labels_dir).resolve()
     pred_root = Path(str(prediction_summary["pred_out_dir"])).resolve()
     crop_size = int(args.crop_size) if args.crop_size > 0 else int(prediction_summary["crop_size"])
@@ -254,12 +299,7 @@ def main() -> None:
         ckpt_path = str(item["ckpt"])
         ckpt_name = Path(ckpt_path).name
         pred_dir = _prediction_subdir(pred_root, ckpt_path, n_ckpts=n_ckpts)
-        chain_metrics: Dict[str, List[float]] = {
-            "foldscore": [],
-            "lddt_ca": [],
-            "lddt_backbone_atom14": [],
-            "lddt_atom14": [],
-        }
+        chain_metrics: Dict[str, List[float]] = {name: [] for name in FOLDSCORE_COMPONENT_NAMES}
         ckpt_start = time.perf_counter()
         print(
             f"Scoring checkpoint {ckpt_index}/{n_ckpts}: {ckpt_name} "
@@ -288,10 +328,18 @@ def main() -> None:
                 crop_size=crop_size,
                 crop_mode=crop_mode,
             )
+            features = _load_feature_crop(
+                features_dir=features_dir,
+                chain_id=chain_id,
+                crop_size=crop_size,
+                crop_mode=crop_mode,
+            )
             labels = _labels_to_device(labels, device=device)
+            features = _labels_to_device(features, device=device)
             metrics = _score_chain(
                 pred_atom14=pred_atom14,
                 labels=labels,
+                features=features,
             )
             for name, value in metrics.items():
                 if not np.isnan(value):
@@ -315,6 +363,8 @@ def main() -> None:
         scored_checkpoints.append(scored_row)
         print(
             f"[{ckpt_name}] mean_foldscore={scored_row['mean_foldscore']:.6f} "
+            f"mean_gdt_ha_ca={scored_row['mean_gdt_ha_ca']:.6f} "
+            f"mean_lddt_atom14={scored_row['mean_lddt_atom14']:.6f} "
             f"mean_lddt_ca={scored_row['mean_lddt_ca']:.6f} "
             f"score_wall_time_seconds={scored_row['score_wall_time_seconds']:.2f}",
             flush=True,
@@ -335,14 +385,11 @@ def main() -> None:
         "track": str(prediction_summary["track"]),
         "official_mode": bool(prediction_summary.get("official_mode", False)),
         "prediction_summary_path": str(prediction_summary_path),
+        "features_dir": str(features_dir),
         "labels_dir": str(labels_dir),
         "manifest_path": str(manifest_path),
         "num_checkpoints": len(scored_checkpoints),
         "checkpoints": scored_checkpoints,
-        "mean_foldscore": float(final_row["mean_foldscore"]),
-        "mean_lddt_ca": float(final_row["mean_lddt_ca"]),
-        "mean_lddt_backbone_atom14": float(final_row.get("mean_lddt_backbone_atom14", float("nan"))),
-        "mean_lddt_atom14": float(final_row.get("mean_lddt_atom14", float("nan"))),
         "num_chains": int(final_row["num_chains"]),
         "effective_batch_size": int(prediction_summary.get("effective_batch_size", 0)),
         "sample_budget": int(prediction_summary.get("sample_budget", 0)),
@@ -355,6 +402,8 @@ def main() -> None:
         "finished_at": utc_now_iso(),
         "score_wall_time_seconds": float(time.perf_counter() - scoring_start),
     }
+    for name in FOLDSCORE_COMPONENT_NAMES:
+        out[f"mean_{name}"] = float(final_row.get(f"mean_{name}", float("nan")))
 
     if split in HIDDEN_SPLITS:
         out.update(

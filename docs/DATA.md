@@ -649,11 +649,12 @@ Prediction NPZ keys:
 
 For multi-checkpoint hidden evaluation, each checkpoint gets its own prediction subdirectory under the prediction root.
 
-`predict.py` also writes a summary JSON when `--save` is provided. Scoring consumes that summary plus the label directory:
+`predict.py` also writes a summary JSON when `--save` is provided. Scoring consumes that summary, the feature directory for residue identities, and the label directory for coordinates:
 
 ```bash
 python score.py \
   --prediction-summary runs/<run_name>/predict_hidden.json \
+  --features-dir .nanofold_private/hidden_processed_features \
   --labels-dir .nanofold_private/hidden_processed_labels \
   --save runs/<run_name>/eval_hidden.json
 ```
@@ -721,10 +722,29 @@ After `predict.py` writes the chain artifact, the NPZ for `1abc_A` would contain
 }
 ```
 
-The scoring code compares `pred_atom14` with label `atom14_positions` using `atom14_mask`. The official FoldScore is:
+The scoring code compares `pred_atom14` with label `atom14_positions` using `atom14_mask`. The official FoldScore is a CASP15-inspired raw composite:
 
 ```text
-0.55 * lDDT-C-alpha + 0.30 * lDDT-backbone-atom14 + 0.15 * lDDT-all-atom14
+FoldScore =
+  0.25 * GDT_HA-C-alpha
++ 0.09375 * (lDDT-all-atom14 + CADaa-atom14 + SG-atom14 + SC-atom14)
++ 0.125 * (MolProbity-clash-atom14 + BB-atom14 + DipDiff-atom14)
 ```
+
+`GDT_HA-C-alpha` is computed from atom14 slot `1` with threshold-specific GDT
+superpositions. `lDDT-all-atom14` is computed from all resolved atom14 slots
+under the label mask while excluding intra-residue atom pairs.
+`CADaa-atom14` scores all-resolved-atom contact preservation. `SG-atom14`
+uses target-centered `6A` atom spheres, local superposition, and residue
+fractions below `2A` and `4A` local RMSD. `SC-atom14` uses residue identities
+to score chi1/chi2 side-chain dihedrals with symmetry and burial weighting.
+`MolProbity-clash-atom14` scores atom-name-aware heavy-atom overlaps above
+`0.4A`. `BB-atom14` scores phi, psi, and omega dihedral agreement with equal
+angle-class weighting. `DipDiff-atom14` scores local three-residue C-alpha/O
+distance windows. `ASE` is not included because the submission contract does
+not ask for model confidence estimates.
+`reLLG_lddt` is not included because it requires crystallographic
+molecular-replacement scoring. C-alpha, GDT_TS, and backbone atom14 lDDT remain
+diagnostic outputs.
 
 Hidden leaderboard rank is track-specific. `limited` and `research_large` use `foldscore_auc_hidden`, computed across official checkpoint predictions over the fixed sample budget. `unlimited` uses the final hidden FoldScore.

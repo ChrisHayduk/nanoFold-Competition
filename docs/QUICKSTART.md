@@ -10,8 +10,8 @@ Use `limited` for your first run. The other tracks use the same public data setu
 
 | Track | Purpose | Budget | Ranking | Local command pattern | PR label/description |
 |---|---|---:|---|---|---|
-| `limited` | main accessible slowrun leaderboard | `20,000` samples | hidden FoldScore AUC | `--track limited --official` | `Track: limited` |
-| `research_large` | larger fixed-data slowrun for deeper optimization studies | `100,000` samples | hidden FoldScore AUC | `--track research_large --official` | `Track: research_large` |
+| `limited` | main accessible slowrun leaderboard | `20,000` samples | hidden CASP15-inspired FoldScore AUC | `--track limited --official` | `Track: limited` |
+| `research_large` | larger fixed-data slowrun for deeper optimization studies | `100,000` samples | hidden CASP15-inspired FoldScore AUC | `--track research_large --official` | `Track: research_large` |
 | `unlimited` | open-ended fixed-data run for best final hidden quality | unrestricted | final hidden FoldScore | `--track unlimited --official` | `Track: unlimited` |
 
 Set the same track in `submissions/<name>/config.yaml`, every `--track` command, and the pull request description. If you want to enter multiple tracks, keep separate configs or separate submission directories so each run is reproducible.
@@ -173,6 +173,7 @@ Then score those predictions:
 ```bash
 python score.py \
   --prediction-summary runs/minalphafold2_reference/predict_val.json \
+  --features-dir data/processed_features \
   --labels-dir data/processed_labels \
   --save runs/minalphafold2_reference/eval_val.json \
   --per-chain-out runs/minalphafold2_reference/per_chain_scores_val.jsonl
@@ -234,6 +235,12 @@ Submission mechanics are the same for all tracks:
 | `research_large` | `python scripts/validate_submission.py --submission submissions/your_name --track research_large --strict` | `bash scripts/run_official_docker.sh --submission submissions/your_name --track research_large --update-leaderboard` |
 | `unlimited` | `python scripts/validate_submission.py --submission submissions/your_name --track unlimited --strict` | `bash scripts/run_official_docker.sh --submission submissions/your_name --track unlimited --update-leaderboard` |
 
+Maintainers can add `--team "<team or individual name>"` to the hidden command
+so the accepted entry renders under the right leaderboard identity. If omitted
+during a PR-triggered GitHub Actions run, nanoFold falls back to the PR author's
+GitHub username. Manual maintainer automation can set
+`NANOFOLD_PR_AUTHOR=<github-username>` for the same fallback.
+
 Before opening a leaderboard PR, run:
 
 ```bash
@@ -263,6 +270,7 @@ git push -u origin submission/your_name
 Open a pull request with:
 
 - title: `Submission: your_name`
+- team or individual researcher name for leaderboard display
 - target track, for example `Track: limited`
 - a short method summary
 - the public validation score path or summary from step 4
@@ -274,6 +282,7 @@ Maintainers will run the sealed official leaderboard command:
 bash scripts/run_official_docker.sh \
   --submission submissions/your_name \
   --track <track_id> \
+  --team "<team or individual name>" \
   --update-leaderboard
 ```
 
@@ -291,6 +300,7 @@ modal run scripts/modal_official.py \
   --submission submissions/your_name \
   --config submissions/your_name/config.yaml \
   --track <track_id> \
+  --team "<team or individual name>" \
   --update-leaderboard
 ```
 

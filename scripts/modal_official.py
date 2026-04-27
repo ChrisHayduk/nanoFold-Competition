@@ -26,6 +26,8 @@ from typing import Any
 import modal  # pyright: ignore[reportMissingImports]
 import yaml
 
+from nanofold.leaderboard_identity import resolve_leaderboard_team
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 REMOTE_ROOT = Path("/root/nanofold")
 
@@ -392,6 +394,7 @@ def run_prediction_stage(
     config: str,
     track: str,
     description: str,
+    team: str,
     checkpoint_steps: str,
     commit: str,
 ) -> None:
@@ -423,6 +426,8 @@ def run_prediction_stage(
         track,
         "--description",
         description,
+        "--team",
+        team,
         "--commit",
         commit,
         "--skip-train",
@@ -458,6 +463,7 @@ def run_scoring_stage(
     config: str,
     track: str,
     description: str,
+    team: str,
     commit: str,
 ) -> dict[str, Any]:
     os.chdir(REMOTE_ROOT)
@@ -486,6 +492,8 @@ def run_scoring_stage(
         track,
         "--description",
         description,
+        "--team",
+        team,
         "--commit",
         commit,
         "--skip-train",
@@ -516,7 +524,7 @@ def _write_local_result(payload: dict[str, Any], *, out_dir: Path) -> Path:
     return target
 
 
-def _update_local_leaderboard(*, result_path: Path, description: str) -> None:
+def _update_local_leaderboard(*, result_path: Path, description: str, team: str) -> None:
     cmd = [
         sys.executable,
         "scripts/add_leaderboard_entry.py",
@@ -528,6 +536,8 @@ def _update_local_leaderboard(*, result_path: Path, description: str) -> None:
         "README.md",
         "--description",
         description,
+        "--team",
+        team,
     ]
     print(f"[modal] updating local leaderboard: {' '.join(cmd)}", flush=True)
     subprocess.run(cmd, cwd=REPO_ROOT, check=True)
@@ -539,6 +549,7 @@ def main(
     config: str = "submissions/minalphafold2/config.yaml",
     track: str = "limited",
     description: str = "",
+    team: str = "",
     commit: str = "",
     checkpoint_steps: str = "0,1000,2000,5000,last",
     upload_public_data: bool = False,
@@ -611,6 +622,10 @@ def main(
     remote_submission = _remote_repo_path(submission)
     remote_config = _remote_repo_path(config)
     run_description = description.strip() or "Modal official hidden evaluation"
+    leaderboard_team = resolve_leaderboard_team(
+        explicit_team=team,
+        submission_name=Path(submission).name,
+    )
     resolved_commit = _resolve_local_commit(commit)
 
     print(f"[modal] app=nanofold-official gpu={GPU_SPEC}", flush=True)
@@ -628,6 +643,7 @@ def main(
             config=remote_config,
             track=track,
             description=run_description,
+            team=leaderboard_team,
             checkpoint_steps=checkpoint_steps,
             commit=resolved_commit,
         )
@@ -638,8 +654,9 @@ def main(
             config=remote_config,
             track=track,
             description=run_description,
+            team=leaderboard_team,
             commit=resolved_commit,
         )
         result_path = _write_local_result(payload, out_dir=(REPO_ROOT / local_result_dir).resolve())
         if update_leaderboard:
-            _update_local_leaderboard(result_path=result_path, description=run_description)
+            _update_local_leaderboard(result_path=result_path, description=run_description, team=leaderboard_team)

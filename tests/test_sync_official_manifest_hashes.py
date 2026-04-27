@@ -29,9 +29,14 @@ def test_sync_manifest_hashes_preserves_yaml_format_and_writes_relative_lock_pat
                 "  hidden_chain_count: 1000",
                 "scoring:",
                 "  foldscore_weights:",
-                "    lddt_ca: 0.55",
-                "    lddt_backbone_atom14: 0.30",
-                "    lddt_atom14: 0.15",
+                "    gdt_ha_ca: 0.25",
+                "    lddt_atom14: 0.09375",
+                "    cad_atom14: 0.09375",
+                "    sg_atom14: 0.09375",
+                "    sc_atom14: 0.09375",
+                "    molprobity_clash_atom14: 0.125",
+                "    bb_atom14: 0.125",
+                "    dipdiff_atom14: 0.125",
             ]
         )
         + "\n"
@@ -83,7 +88,8 @@ def test_sync_manifest_hashes_preserves_yaml_format_and_writes_relative_lock_pat
         check=False,
     )
     assert proc.returncode == 0, proc.stderr
-    assert "lddt_backbone_atom14: 0.30" in track.read_text()
+    assert "gdt_ha_ca: 0.25" in track.read_text()
+    assert "dipdiff_atom14: 0.125" in track.read_text()
 
     lock_obj = json.loads(lock.read_text())
     outputs = lock_obj["outputs"]

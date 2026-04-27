@@ -10,7 +10,7 @@ nanoFold is a protein-folding slowrun: a fixed-data, fixed-budget benchmark for 
 - Protect the scarce-data premise. Do not add external structures, pretrained weights, external MSA retrieval, template lookup, network access, or hidden-label exposure to official execution paths.
 - Keep official data auditable. Manifest generation, preprocessing, split metadata, fingerprints, source locks, and hidden-asset locks must stay deterministic and verifiable.
 - Keep hidden validation sealed. Prediction code may see hidden features only. Scoring code may see labels only after predictions are written. Do not mount labels into submission runtime.
-- Preserve the atom14 contract. Official submissions return `pred_atom14` with shape `(B, L, 14, 3)`. Scoring uses FoldScore over C-alpha, backbone atom14, and all atom14 components.
+- Preserve the atom14 contract. Official submissions return `pred_atom14` with shape `(B, L, 14, 3)`. Scoring uses a CASP15-inspired FoldScore over GDT_HA, all-atom14 lDDT, CADaa contact preservation, SphereGrinder local environments, side-chain geometry, heavy-atom clashes, backbone geometry, and DipDiff local distance windows.
 - Keep the public story clean. Do not describe current code as a migration from older behavior, do not leave backwards-compatibility language for unreleased interfaces, and do not reference obsolete approaches in comments or docs.
 
 ## Engineering Expectations

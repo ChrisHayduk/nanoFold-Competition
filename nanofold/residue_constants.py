@@ -14,12 +14,13 @@ separately.
 
 from __future__ import annotations
 
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import numpy as np
 
 # Canonical AF2 one-letter ordering.
 RESTYPES: List[str] = list("ARNDCQEGHILKMFPSTWYV")
+RESTYPE_ORDER: Dict[str, int] = {restype: idx for idx, restype in enumerate(RESTYPES)}
 
 RESTYPE_1TO3: Dict[str, str] = {
     "A": "ALA", "R": "ARG", "N": "ASN", "D": "ASP", "C": "CYS",
@@ -28,6 +29,7 @@ RESTYPE_1TO3: Dict[str, str] = {
     "S": "SER", "T": "THR", "W": "TRP", "Y": "TYR", "V": "VAL",
 }
 RESTYPE_3TO1: Dict[str, str] = {three: one for one, three in RESTYPE_1TO3.items()}
+RESTYPE_INDEX_TO_3: Tuple[str, ...] = tuple(RESTYPE_1TO3[one] for one in RESTYPES) + ("UNK",)
 
 # Atom14 slot ordering: (N, CA, C, O, then up to 10 sidechain atoms).
 # Slot 0 = N, Slot 1 = CA, Slot 2 = C, Slot 3 = O.
@@ -59,6 +61,45 @@ RESTYPE_NAME_TO_ATOM14_NAMES: Dict[str, List[str]] = {
 ATOM14_INDEX: Dict[str, Dict[str, int]] = {
     residue_name: {atom_name: idx for idx, atom_name in enumerate(atoms) if atom_name}
     for residue_name, atoms in RESTYPE_NAME_TO_ATOM14_NAMES.items()
+}
+
+ATOM14_NAMES_BY_RESTYPE_INDEX: Tuple[Tuple[str, ...], ...] = tuple(
+    tuple(RESTYPE_NAME_TO_ATOM14_NAMES[RESTYPE_1TO3[one]]) for one in RESTYPES
+) + (tuple(RESTYPE_NAME_TO_ATOM14_NAMES["UNK"]),)
+
+# Chi definitions for the first two side-chain torsions used by the official
+# side-chain dihedral score. Residues without the relevant atoms are skipped.
+CHI1_CHI2_ATOM_NAMES: Dict[str, Tuple[Tuple[str, str, str, str], ...]] = {
+    "ALA": (),
+    "ARG": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "CD")),
+    "ASN": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "OD1")),
+    "ASP": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "OD1")),
+    "CYS": (("N", "CA", "CB", "SG"),),
+    "GLN": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "CD")),
+    "GLU": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "CD")),
+    "GLY": (),
+    "HIS": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "ND1")),
+    "ILE": (("N", "CA", "CB", "CG1"), ("CA", "CB", "CG1", "CD1")),
+    "LEU": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "CD1")),
+    "LYS": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "CD")),
+    "MET": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "SD")),
+    "PHE": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "CD1")),
+    "PRO": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "CD")),
+    "SER": (("N", "CA", "CB", "OG"),),
+    "THR": (("N", "CA", "CB", "OG1"),),
+    "TRP": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "CD1")),
+    "TYR": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "CD1")),
+    "VAL": (("N", "CA", "CB", "CG1"),),
+    "UNK": (),
+}
+
+# Some chi definitions are symmetric under a 180 degree flip of terminal atoms.
+CHI_PI_PERIODIC: Dict[Tuple[str, int], bool] = {
+    ("ASP", 1): True,
+    ("PHE", 1): True,
+    ("TYR", 1): True,
+    ("VAL", 0): True,
+    ("LEU", 1): True,
 }
 
 # Canonical atom14 slot for the Cα atom (same for every standard residue).

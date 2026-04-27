@@ -23,6 +23,8 @@ def _load_run_official_module():
 
 def _atom14_from_ca(ca: np.ndarray) -> np.ndarray:
     atom14 = np.repeat(ca[:, None, :], 14, axis=1).astype(np.float32)
+    atom14[:, :, 1] += np.arange(14, dtype=np.float32)[None, :] * 0.1
+    atom14[:, :, 2] += np.arange(14, dtype=np.float32)[None, :] * 0.05
     return atom14
 
 
@@ -35,10 +37,22 @@ def test_hidden_scoring_with_synthetic_predictions(tmp_path: Path) -> None:
 
     labels_dir = tmp_path / "hidden_labels"
     labels_dir.mkdir()
+    features_dir = tmp_path / "hidden_features"
+    features_dir.mkdir()
     true_ca = np.zeros((8, 3), dtype=np.float32)
+    true_ca[:, 0] = np.arange(8, dtype=np.float32) * 3.8
     ca_mask = np.ones((8,), dtype=bool)
     true_atom14 = _atom14_from_ca(true_ca)
     atom14_mask = np.ones((8, 14), dtype=bool)
+    np.savez_compressed(
+        chain_npz_path(features_dir, "1abc_A"),
+        aatype=np.zeros((8,), dtype=np.int32),
+        msa=np.zeros((1, 8), dtype=np.int32),
+        deletions=np.zeros((1, 8), dtype=np.int32),
+        template_aatype=np.zeros((0, 8), dtype=np.int32),
+        template_ca_coords=np.zeros((0, 8, 3), dtype=np.float32),
+        template_ca_mask=np.zeros((0, 8), dtype=bool),
+    )
     np.savez_compressed(
         chain_npz_path(labels_dir, "1abc_A"),
         ca_coords=true_ca,
@@ -73,6 +87,7 @@ def test_hidden_scoring_with_synthetic_predictions(tmp_path: Path) -> None:
 
     result = score_fn(
         hidden_manifest=manifest,
+        hidden_features_dir=features_dir,
         hidden_labels_dir=labels_dir,
         pred_root=pred_root,
         checkpoint_entries=[
@@ -87,6 +102,22 @@ def test_hidden_scoring_with_synthetic_predictions(tmp_path: Path) -> None:
 
     assert result["final_hidden_foldscore"] == 1.0
     assert result["foldscore_auc_hidden"] == 1.0
+    assert result["final_hidden_gdt_ha_ca"] == 1.0
+    assert result["gdt_ha_ca_auc_hidden"] == 1.0
+    assert result["final_hidden_lddt_atom14"] == 1.0
+    assert result["lddt_atom14_auc_hidden"] == 1.0
+    assert result["final_hidden_cad_atom14"] == 1.0
+    assert result["cad_atom14_auc_hidden"] == 1.0
+    assert result["final_hidden_sg_atom14"] == 1.0
+    assert result["sg_atom14_auc_hidden"] == 1.0
+    assert result["final_hidden_sc_atom14"] == 1.0
+    assert result["sc_atom14_auc_hidden"] == 1.0
+    assert result["final_hidden_molprobity_clash_atom14"] == 1.0
+    assert result["molprobity_clash_atom14_auc_hidden"] == 1.0
+    assert result["final_hidden_bb_atom14"] == 1.0
+    assert result["bb_atom14_auc_hidden"] == 1.0
+    assert result["final_hidden_dipdiff_atom14"] == 1.0
+    assert result["dipdiff_atom14_auc_hidden"] == 1.0
     assert result["foldscore_at_steps"]["0"] == 1.0
     assert result["foldscore_at_steps"]["1000"] == 1.0
     assert result["foldscore_at_steps"]["2000"] == 1.0
@@ -125,10 +156,22 @@ def test_hidden_scoring_rejects_non_monotone_sample_axis(tmp_path: Path) -> None
 
     labels_dir = tmp_path / "hidden_labels"
     labels_dir.mkdir()
+    features_dir = tmp_path / "hidden_features"
+    features_dir.mkdir()
     true_ca = np.zeros((8, 3), dtype=np.float32)
+    true_ca[:, 0] = np.arange(8, dtype=np.float32) * 3.8
     ca_mask = np.ones((8,), dtype=bool)
     true_atom14 = _atom14_from_ca(true_ca)
     atom14_mask = np.ones((8, 14), dtype=bool)
+    np.savez_compressed(
+        chain_npz_path(features_dir, "1abc_A"),
+        aatype=np.zeros((8,), dtype=np.int32),
+        msa=np.zeros((1, 8), dtype=np.int32),
+        deletions=np.zeros((1, 8), dtype=np.int32),
+        template_aatype=np.zeros((0, 8), dtype=np.int32),
+        template_ca_coords=np.zeros((0, 8, 3), dtype=np.float32),
+        template_ca_mask=np.zeros((0, 8), dtype=bool),
+    )
     np.savez_compressed(
         chain_npz_path(labels_dir, "1abc_A"),
         ca_coords=true_ca,
@@ -146,6 +189,7 @@ def test_hidden_scoring_rejects_non_monotone_sample_axis(tmp_path: Path) -> None
     with pytest.raises(ValueError, match="strictly increasing"):
         score_fn(
             hidden_manifest=manifest,
+            hidden_features_dir=features_dir,
             hidden_labels_dir=labels_dir,
             pred_root=pred_root,
             checkpoint_entries=[
@@ -319,6 +363,7 @@ def test_official_runner_builds_predict_and_score_commands() -> None:
     score_cmd = build_score(
         python="python",
         prediction_summary=Path("/tmp/predict.json"),
+        features_dir=Path("/tmp/features"),
         labels_dir=Path("/tmp/labels"),
         per_chain_out=Path("/tmp/per_chain.jsonl"),
         save_path=Path("/tmp/score.json"),
@@ -327,3 +372,4 @@ def test_official_runner_builds_predict_and_score_commands() -> None:
     assert predict_cmd[1] == "predict.py"
     assert "--hidden-manifest" in predict_cmd
     assert score_cmd[1] == "score.py"
+    assert "--features-dir" in score_cmd

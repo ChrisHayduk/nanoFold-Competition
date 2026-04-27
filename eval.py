@@ -279,6 +279,36 @@ def _load_label_crop(
     return cropped
 
 
+def _load_feature_crop(
+    *,
+    features_dir: Path,
+    chain_id: str,
+    crop_size: int,
+    crop_mode: str,
+) -> Dict[str, torch.Tensor]:
+    feature_path = features_dir / f"{chain_id}.npz"
+    if not feature_path.exists():
+        raise FileNotFoundError(f"Missing feature file for scoring: {feature_path}")
+    with np.load(feature_path) as data:
+        if "aatype" not in data:
+            raise ValueError(f"Feature file {feature_path} is missing required key: aatype")
+        features = {"aatype": torch.from_numpy(np.asarray(data["aatype"], dtype=np.int64))}
+    aatype = features["aatype"]
+    if aatype.ndim != 1:
+        raise ValueError(f"Invalid aatype shape in {feature_path}: {tuple(aatype.shape)}")
+    L = int(aatype.shape[0])
+    if L <= crop_size:
+        return features
+    if crop_mode == "center":
+        start = (L - crop_size) // 2
+    elif crop_mode == "random":
+        raise ValueError("Scoring external features with random crop is unsupported; use deterministic crop mode.")
+    else:
+        raise ValueError(f"Unsupported crop_mode={crop_mode!r}")
+    end = start + crop_size
+    return {"aatype": aatype[start:end]}
+
+
 def _resolve_checkpoints(args: argparse.Namespace) -> List[Path]:
     explicit: List[Path] = []
     if args.ckpt:
@@ -323,6 +353,7 @@ def _score_chain(
     *,
     pred_atom14: torch.Tensor,
     labels: Dict[str, torch.Tensor],
+    features: Dict[str, torch.Tensor],
 ) -> Dict[str, float]:
     has_atom14_labels = "atom14_positions" in labels and "atom14_mask" in labels
     if not has_atom14_labels:
@@ -331,6 +362,7 @@ def _score_chain(
         pred_atom14=pred_atom14,
         true_atom14=labels["atom14_positions"],
         atom14_mask=labels["atom14_mask"],
+        aatype=features["aatype"],
     )
     return {name: float(value.detach().cpu()) for name, value in comps.items()}
 
@@ -480,6 +512,7 @@ def main() -> None:
         enforce_model_param_limit(track_spec=track_spec, n_params=count_parameters(model))
 
     score_labels_dir = Path(args.score_labels_dir).resolve() if args.score_labels_dir else None
+    score_features_dir = Path(str(data_cfg["processed_features_dir"])).resolve()
     pred_out_dir = Path(args.pred_out_dir).resolve() if args.pred_out_dir else None
     if pred_out_dir:
         pred_out_dir.mkdir(parents=True, exist_ok=True)
@@ -551,9 +584,11 @@ def main() -> None:
                         }
                         label_tensors["atom14_positions"] = batch["atom14_positions"][idx][:masked_length]
                         label_tensors["atom14_mask"] = batch["atom14_mask"][idx][:masked_length]
+                        feature_tensors = {"aatype": batch["aatype"][idx][:masked_length]}
                         chain_metrics = _score_chain(
                             pred_atom14=pred_atom14_cpu[idx][:masked_length],
                             labels=label_tensors,
+                            features=feature_tensors,
                         )
                     elif score_labels_dir is not None:
                         labels = _load_label_crop(
@@ -562,9 +597,16 @@ def main() -> None:
                             crop_size=int(data_cfg["crop_size"]),
                             crop_mode=crop_mode,
                         )
+                        features = _load_feature_crop(
+                            features_dir=score_features_dir,
+                            chain_id=chain_id,
+                            crop_size=int(data_cfg["crop_size"]),
+                            crop_mode=crop_mode,
+                        )
                         chain_metrics = _score_chain(
                             pred_atom14=pred_atom14_cpu[idx][:masked_length],
                             labels=labels,
+                            features=features,
                         )
                     else:
                         chain_metrics = {

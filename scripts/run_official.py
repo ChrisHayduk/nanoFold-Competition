@@ -25,7 +25,13 @@ if str(REPO_ROOT) not in sys.path:
 from nanofold.chain_paths import chain_npz_path
 from nanofold.competition_policy import DEFAULT_TRACK_ID, load_track_spec
 from nanofold.data import read_manifest
-from nanofold.metrics import foldscore_auc, foldscore_components
+from nanofold.leaderboard_identity import resolve_leaderboard_team
+from nanofold.metrics import (
+    FOLDSCORE_COMPONENT_NAMES,
+    FOLDSCORE_CURVE_COMPONENT_NAMES,
+    foldscore_auc,
+    foldscore_components,
+)
 
 DEFAULT_CHECKPOINT_STEPS = "0,1000,2000,5000,last"
 SEALED_RUNTIME_ENV = "NANOFOLD_OFFICIAL_SEALED_RUNTIME"
@@ -47,6 +53,12 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--python", type=str, default=sys.executable, help="Python executable to use.")
     ap.add_argument("--commit", type=str, default="", help="Optional commit hash override.")
     ap.add_argument("--description", type=str, default="", help="Optional leaderboard description.")
+    ap.add_argument(
+        "--team",
+        type=str,
+        default="",
+        help="Optional team or individual submitter name for leaderboard display. If omitted, GitHub PR author metadata may be used.",
+    )
     ap.add_argument("--update-leaderboard", action="store_true", help="Append result into leaderboard JSON and render README.")
     ap.add_argument("--leaderboard", type=str, default="leaderboard/leaderboard.json")
     ap.add_argument("--readme", type=str, default="README.md")
@@ -168,6 +180,7 @@ def _build_score_command(
     *,
     python: str,
     prediction_summary: Path,
+    features_dir: Path,
     labels_dir: Path,
     per_chain_out: Path,
     save_path: Path,
@@ -177,6 +190,8 @@ def _build_score_command(
         "score.py",
         "--prediction-summary",
         str(prediction_summary),
+        "--features-dir",
+        str(features_dir),
         "--labels-dir",
         str(labels_dir),
         "--per-chain-out",
@@ -355,19 +370,21 @@ def _prediction_subdir(pred_root: Path, ckpt_path: str, n_ckpts: int) -> Path:
 def _center_crop_atom14_labels(
     atom14_positions: np.ndarray,
     atom14_mask: np.ndarray,
+    aatype: np.ndarray,
     crop_size: int,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     L = int(atom14_positions.shape[0])
     if L <= crop_size:
-        return atom14_positions, atom14_mask
+        return atom14_positions, atom14_mask, aatype
     start = (L - crop_size) // 2
     end = start + crop_size
-    return atom14_positions[start:end], atom14_mask[start:end]
+    return atom14_positions[start:end], atom14_mask[start:end], aatype[start:end]
 
 
 def _score_hidden_predictions(
     *,
     hidden_manifest: Path,
+    hidden_features_dir: Path,
     hidden_labels_dir: Path,
     pred_root: Path,
     checkpoint_entries: List[Dict[str, Any]],
@@ -389,18 +406,16 @@ def _score_hidden_predictions(
         if cumulative_samples_seen < 0:
             raise ValueError(f"Checkpoint entry is missing `cumulative_samples_seen`: {item}")
         ckpt_pred_dir = _prediction_subdir(pred_root, ckpt_path, n_ckpts=n_ckpts)
-        score_lists: Dict[str, List[float]] = {
-            "foldscore": [],
-            "lddt_ca": [],
-            "lddt_backbone_atom14": [],
-            "lddt_atom14": [],
-        }
+        score_lists: Dict[str, List[float]] = {name: [] for name in FOLDSCORE_COMPONENT_NAMES}
 
         for chain_id in chain_ids:
             pred_path = chain_npz_path(ckpt_pred_dir, chain_id)
+            feature_path = chain_npz_path(hidden_features_dir, chain_id)
             label_path = chain_npz_path(hidden_labels_dir, chain_id)
             if not pred_path.exists():
                 raise FileNotFoundError(f"Missing prediction file for hidden scoring: {pred_path}")
+            if not feature_path.exists():
+                raise FileNotFoundError(f"Missing hidden feature file: {feature_path}")
             if not label_path.exists():
                 raise FileNotFoundError(f"Missing hidden label file: {label_path}")
 
@@ -408,6 +423,10 @@ def _score_hidden_predictions(
                 if "pred_atom14" not in pred_npz:
                     raise ValueError(f"Official hidden scoring requires pred_atom14 in {pred_path}")
                 pred_atom14 = np.asarray(pred_npz["pred_atom14"], dtype=np.float32)
+            with np.load(feature_path) as feature_npz:
+                if "aatype" not in feature_npz:
+                    raise ValueError(f"Official hidden scoring feature file {feature_path} is missing aatype")
+                aatype = np.asarray(feature_npz["aatype"], dtype=np.int64)
             with np.load(label_path) as label_npz:
                 missing_label_keys = [
                     key
@@ -421,21 +440,22 @@ def _score_hidden_predictions(
                     )
                 true_atom14 = np.asarray(label_npz["atom14_positions"], dtype=np.float32)
                 atom14_mask = np.asarray(label_npz["atom14_mask"], dtype=bool)
-            true_atom14, atom14_mask = _center_crop_atom14_labels(true_atom14, atom14_mask, crop_size=crop_size)
+            true_atom14, atom14_mask, aatype = _center_crop_atom14_labels(
+                true_atom14,
+                atom14_mask,
+                aatype,
+                crop_size=crop_size,
+            )
 
             L = min(pred_atom14.shape[0], true_atom14.shape[0], atom14_mask.shape[0])
             if L <= 0:
-                metrics = {
-                    "foldscore": float("nan"),
-                    "lddt_ca": float("nan"),
-                    "lddt_backbone_atom14": float("nan"),
-                    "lddt_atom14": float("nan"),
-                }
+                metrics = {name: float("nan") for name in FOLDSCORE_COMPONENT_NAMES}
             else:
                 comps = foldscore_components(
                     pred_atom14=torch.from_numpy(pred_atom14[:L]),
                     true_atom14=torch.from_numpy(true_atom14[:L]),
                     atom14_mask=torch.from_numpy(atom14_mask[:L]),
+                    aatype=torch.from_numpy(aatype[:L]),
                 )
                 metrics = {name: float(value.detach().cpu()) for name, value in comps.items()}
             for name, value in metrics.items():
@@ -507,47 +527,41 @@ def _score_hidden_predictions(
         ),
         sample_budget=sample_budget,
     )
-    lddt_auc_hidden = foldscore_auc(
-        (
-            (
-                int(row["step"]),
-                int(row["cumulative_samples_seen"]),
-                float(row.get("mean_lddt_ca", row["mean_foldscore"])),
-            )
-            for row in sorted_points
-        ),
-        sample_budget=sample_budget,
-    )
-
-    foldscore_at_steps = {
-        str(int(row["step"])): float(row["mean_foldscore"])
-        for row in sorted_points
-    }
+    foldscore_at_steps = {str(int(row["step"])): float(row["mean_foldscore"]) for row in sorted_points}
     foldscore_at_samples = {
-        str(int(row["cumulative_samples_seen"])): float(row["mean_foldscore"])
-        for row in sorted_points
+        str(int(row["cumulative_samples_seen"])): float(row["mean_foldscore"]) for row in sorted_points
     }
-    lddt_at_steps = {
-        str(int(row["step"])): float(row.get("mean_lddt_ca", row["mean_foldscore"]))
-        for row in sorted_points
-    }
-    lddt_at_samples = {
-        str(int(row["cumulative_samples_seen"])): float(row.get("mean_lddt_ca", row["mean_foldscore"]))
-        for row in sorted_points
-    }
-
-    return {
+    out = {
         "final_hidden_foldscore": final_hidden,
         "foldscore_auc_hidden": auc_hidden,
         "foldscore_at_steps": foldscore_at_steps,
         "foldscore_at_samples": foldscore_at_samples,
-        "final_hidden_lddt_ca": float(sorted_points[-1].get("mean_lddt_ca", final_hidden)),
-        "lddt_auc_hidden": lddt_auc_hidden,
-        "lddt_at_steps": lddt_at_steps,
-        "lddt_at_samples": lddt_at_samples,
         "checkpoint_metrics_hidden": checkpoint_scores,
         "per_chain_scores_hidden_path": str(per_chain_out_path.resolve()),
     }
+    for name in FOLDSCORE_CURVE_COMPONENT_NAMES:
+        key = f"mean_{name}"
+        out[f"final_hidden_{name}"] = float(sorted_points[-1].get(key, final_hidden))
+        out[f"{name}_auc_hidden"] = foldscore_auc(
+            (
+                (
+                    int(row["step"]),
+                    int(row["cumulative_samples_seen"]),
+                    float(row.get(key, row["mean_foldscore"])),
+                )
+                for row in sorted_points
+            ),
+            sample_budget=sample_budget,
+        )
+        out[f"{name}_at_steps"] = {
+            str(int(row["step"])): float(row.get(key, row["mean_foldscore"]))
+            for row in sorted_points
+        }
+        out[f"{name}_at_samples"] = {
+            str(int(row["cumulative_samples_seen"])): float(row.get(key, row["mean_foldscore"]))
+            for row in sorted_points
+        }
+    return out
 
 
 def _write_temp_predict_config(
@@ -651,6 +665,11 @@ def main() -> None:
             raise FileNotFoundError(f"Missing checkpoint after training: {ckpt_last_path}")
 
         score_labels_dir = str(data_cfg.get("processed_labels_dir", "")).strip()
+        score_features_dir = str(data_cfg.get("processed_features_dir", "")).strip()
+        if not score_features_dir:
+            raise ValueError(
+                "Config data.processed_features_dir is required for public validation scoring in the official runner."
+            )
         if not score_labels_dir:
             raise ValueError(
                 "Config data.processed_labels_dir is required for public validation scoring in the official runner."
@@ -674,6 +693,7 @@ def main() -> None:
             _build_score_command(
                 python=args.python,
                 prediction_summary=public_predict_summary_path,
+                features_dir=Path(score_features_dir).resolve(),
                 labels_dir=Path(score_labels_dir).resolve(),
                 per_chain_out=per_chain_public_path,
                 save_path=eval_public_summary_path,
@@ -697,13 +717,14 @@ def main() -> None:
         "foldscore_auc_hidden": float("nan"),
         "foldscore_at_steps": {},
         "foldscore_at_samples": {},
-        "final_hidden_lddt_ca": float("nan"),
-        "lddt_auc_hidden": float("nan"),
-        "lddt_at_steps": {},
-        "lddt_at_samples": {},
         "checkpoint_metrics_hidden": [],
         "per_chain_scores_hidden_path": None,
     }
+    for component_name in FOLDSCORE_CURVE_COMPONENT_NAMES:
+        hidden_results[f"final_hidden_{component_name}"] = float("nan")
+        hidden_results[f"{component_name}_auc_hidden"] = float("nan")
+        hidden_results[f"{component_name}_at_steps"] = {}
+        hidden_results[f"{component_name}_at_samples"] = {}
     hidden_assets_meta: Dict[str, Any] | None = None
     hidden_lock_meta: Dict[str, Any] | None = None
 
@@ -792,6 +813,7 @@ def main() -> None:
             _build_score_command(
                 python=args.python,
                 prediction_summary=hidden_predict_summary_path,
+                features_dir=hidden_features_dir,
                 labels_dir=hidden_labels_dir,
                 per_chain_out=hidden_per_chain_path,
                 save_path=hidden_eval_summary_path,
@@ -804,13 +826,24 @@ def main() -> None:
             "foldscore_auc_hidden": float(hidden_eval_summary.get("foldscore_auc_hidden", float("nan"))),
             "foldscore_at_steps": hidden_eval_summary.get("foldscore_at_steps", {}),
             "foldscore_at_samples": hidden_eval_summary.get("foldscore_at_samples", {}),
-            "final_hidden_lddt_ca": float(hidden_eval_summary.get("final_hidden_lddt_ca", float("nan"))),
-            "lddt_auc_hidden": float(hidden_eval_summary.get("lddt_auc_hidden", float("nan"))),
-            "lddt_at_steps": hidden_eval_summary.get("lddt_at_steps", {}),
-            "lddt_at_samples": hidden_eval_summary.get("lddt_at_samples", {}),
             "checkpoint_metrics_hidden": hidden_eval_summary.get("checkpoint_metrics_hidden", []),
             "per_chain_scores_hidden_path": hidden_eval_summary.get("per_chain_scores_path"),
         }
+        for component_name in FOLDSCORE_CURVE_COMPONENT_NAMES:
+            hidden_results[f"final_hidden_{component_name}"] = float(
+                hidden_eval_summary.get(f"final_hidden_{component_name}", float("nan"))
+            )
+            hidden_results[f"{component_name}_auc_hidden"] = float(
+                hidden_eval_summary.get(f"{component_name}_auc_hidden", float("nan"))
+            )
+            hidden_results[f"{component_name}_at_steps"] = hidden_eval_summary.get(
+                f"{component_name}_at_steps",
+                {},
+            )
+            hidden_results[f"{component_name}_at_samples"] = hidden_eval_summary.get(
+                f"{component_name}_at_samples",
+                {},
+            )
 
         hidden_assets_meta = {
             "manifest_path": str(hidden_manifest),
@@ -843,6 +876,10 @@ def main() -> None:
         hidden_results=hidden_results,
         eval_public_summary=eval_public_summary,
     )
+    leaderboard_team = resolve_leaderboard_team(
+        explicit_team=args.team,
+        submission_name=submission_dir.name,
+    )
 
     result = {
         "run_name": run_name,
@@ -858,13 +895,8 @@ def main() -> None:
         "foldscore_auc_hidden": float(hidden_results["foldscore_auc_hidden"]),
         "foldscore_at_steps": hidden_results["foldscore_at_steps"],
         "foldscore_at_samples": hidden_results.get("foldscore_at_samples", {}),
-        "final_hidden_lddt_ca": float(hidden_results["final_hidden_lddt_ca"]),
-        "lddt_auc_hidden": float(hidden_results["lddt_auc_hidden"]),
-        "lddt_at_steps": hidden_results["lddt_at_steps"],
-        "lddt_at_samples": hidden_results.get("lddt_at_samples", {}),
         "checkpoint_metrics_hidden": hidden_results["checkpoint_metrics_hidden"],
         "public_val_foldscore": float(eval_public_summary["mean_foldscore"]),
-        "public_val_lddt_ca": float(eval_public_summary["mean_lddt_ca"]),
         "public_val_per_chain_summary": public_summary,
         "num_chains_public_val": int(eval_public_summary.get("num_chains", len(public_per_chain_rows))),
         "predict_public_summary_path": str(public_predict_summary_path.resolve()) if public_predict_summary_path.exists() else None,
@@ -911,11 +943,24 @@ def main() -> None:
         },
         "config_sha256": _sha256(config_path),
         "commit": commit,
+        "team": leaderboard_team,
         "description": args.description.strip() or f"Official run for {submission_dir.name}",
         "created_at": datetime.now(tz=timezone.utc).isoformat(),
         "train_env": train_metrics.get("env", {}) if isinstance(train_metrics, dict) else {},
         "eval_public_env": eval_public_summary.get("env", {}) if isinstance(eval_public_summary, dict) else {},
     }
+    for component_name in FOLDSCORE_CURVE_COMPONENT_NAMES:
+        result[f"final_hidden_{component_name}"] = float(
+            hidden_results.get(f"final_hidden_{component_name}", float("nan"))
+        )
+        result[f"{component_name}_auc_hidden"] = float(
+            hidden_results.get(f"{component_name}_auc_hidden", float("nan"))
+        )
+        result[f"{component_name}_at_steps"] = hidden_results.get(f"{component_name}_at_steps", {})
+        result[f"{component_name}_at_samples"] = hidden_results.get(f"{component_name}_at_samples", {})
+        result[f"public_val_{component_name}"] = float(
+            eval_public_summary.get(f"mean_{component_name}", float("nan"))
+        )
     result_path.write_text(json.dumps(result, indent=2) + "\n")
     print(f"Wrote result artifact: {result_path.resolve()}")
 
@@ -932,6 +977,8 @@ def main() -> None:
                 args.readme,
                 "--description",
                 result["description"],
+                "--team",
+                result["team"],
             ]
         )
 

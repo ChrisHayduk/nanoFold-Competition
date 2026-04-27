@@ -26,13 +26,13 @@ Track policy is defined in `tracks/*.yaml`. The public track set is:
 | `research_large` | larger fixed-data track for methods that need more optimization to show their shape | same official data and hidden evaluation as `limited` | `100,000` samples (`50,000` steps x effective batch `2`) | `foldscore_auc_hidden` | `--track research_large` |
 | `unlimited` | open-ended fixed-data track for best final structure quality under sealed hidden evaluation | same official data and hidden evaluation as `limited` | unrestricted | `final_hidden_foldscore` | `--track unlimited` |
 
-All three tracks use atom14 FoldScore, hidden labels remain sealed, templates are disabled, and public validation is diagnostic only. `limited` and `research_large` are sample-budget slowruns, so they rank by hidden area under the learning curve. `unlimited` is ranked separately by final hidden FoldScore because there is no common sample axis.
+All three tracks use CASP15-inspired FoldScore, hidden labels remain sealed, templates are disabled, and public validation is diagnostic only. `limited` and `research_large` are sample-budget slowruns, so they rank by hidden area under the learning curve. `unlimited` is ranked separately by final hidden FoldScore because there is no common sample axis.
 
 Official runs must use:
 - `--track <track_id>`
 - `--official`
 
-Participants submit code/configuration PRs for a chosen track. Maintainers run the sealed hidden pipeline and update leaderboard artifacts after acceptance; participant PRs must not edit `leaderboard/leaderboard.json` or the rendered leaderboard table.
+Participants submit code/configuration PRs for a chosen track and provide the lab, company, project team, or individual researcher name that should appear on the leaderboard. If the maintainer does not pass an explicit team name during PR-triggered GitHub Actions evaluation, nanoFold falls back to the PR author's GitHub username. Manual maintainer automation can set `NANOFOLD_PR_AUTHOR=<github-username>` for the same fallback. Maintainers run the sealed hidden pipeline and update leaderboard artifacts after acceptance; participant PRs must not edit `leaderboard/leaderboard.json` or the rendered leaderboard table.
 
 In official mode the runtime uses **override + validate**:
 - immutable constants from track policy are applied to config first
@@ -259,8 +259,18 @@ Runtime reproducibility:
 ## 8) Scoring and Ranking
 
 Primary metric:
-- `FoldScore = 0.55*lDDT-Ca + 0.30*lDDT-backbone-atom14 + 0.15*lDDT-all-atom14`
-- all components use `cutoff=15.0A`, thresholds `[0.5,1.0,2.0,4.0]`, label masks, and equal chain weighting
+- `FoldScore = 0.25*GDT_HA-Ca + 0.09375*(lDDT-all-atom14 + CADaa-atom14 + SG-atom14 + SC-atom14) + 0.125*(MolProbity-clash-atom14 + BB-atom14 + DipDiff-atom14)`
+- `GDT_HA-Ca` uses C-alpha coordinates from atom14 slot `1`, threshold-specific GDT superpositions, and high-accuracy GDT cutoffs `[0.5, 1.0, 2.0, 4.0]`
+- `lDDT-all-atom14` uses true-structure neighborhood cutoff `15.0A`, lDDT thresholds `[0.5, 1.0, 2.0, 4.0]`, atom14 label masks, no intra-residue atom pairs, and equal chain weighting
+- `CADaa-atom14` scores all-resolved-atom contact preservation
+- `SG-atom14` uses the CASP SphereGrinder radius/cutoff setup: target-centered `6A` atom spheres, local superposition, and the mean of residue fractions below `2A` and `4A` local RMSD
+- `SC-atom14` scores chi1/chi2 side-chain dihedral agreement using residue identity, symmetry-aware terminal groups, heavier chi1 weighting, and target-side burial weighting
+- `MolProbity-clash-atom14` scores atom-name-aware heavy-atom van der Waals overlaps above `0.4A` per 1000 atoms
+- `BB-atom14` scores phi, psi, and omega backbone dihedral agreement with equal angle-class weighting
+- `DipDiff-atom14` scores local three-residue C-alpha/O distance-window agreement
+- The weights are the CASP15 formula weights renormalized over the structure-derived components supported by the official atom14 output contract
+- `ASE` requires submitted confidence estimates and `reLLG_lddt` requires crystallographic molecular-replacement scoring, so they are not official rank components
+- Metric references: [CASP15 assessors formula](https://predictioncenter.org/casp15/zscores_final.cgi?formula=assessors) and [Simpkin et al., 2023](https://pubmed.ncbi.nlm.nih.gov/37746927/)
 
 Leaderboard ranking metric:
 - `limited`: `foldscore_auc_hidden`, trapezoidal AUC over cumulative samples on `[0, B_sample]`
@@ -273,7 +283,8 @@ Secondary metrics:
 - `final_hidden_foldscore`
 - `foldscore_at_steps` (`0`, `1000`, `2000`, `5000`, `last` by default)
 - `foldscore_at_samples`
-- `final_hidden_lddt_ca` and `lddt_at_*` diagnostics
+- `final_hidden_<component>`, `<component>_auc_hidden`, `<component>_at_steps`, and `<component>_at_samples` for each FoldScore component
+- `gdt_ts_ca`, `lddt_ca`, and `lddt_backbone_atom14` diagnostics
 - public val score is retained for diagnostics only
 
 Canonical result artifact:
@@ -284,7 +295,7 @@ Canonical result artifact:
 Canonical maintainer runner:
 
 ```bash
-python scripts/run_official.py --submission submissions/<name> --track <track_id> --update-leaderboard
+python scripts/run_official.py --submission submissions/<name> --track <track_id> --team "<team or individual name>" --update-leaderboard
 ```
 
 Hidden assets are resolved via env (or explicit CLI overrides):
@@ -304,7 +315,7 @@ Hidden official runs are split into:
 
 Official orchestration entrypoints:
 - `predict.py` for prediction only
-- `score.py` for label-only scoring
+- `score.py` for sealed scoring with feature-side residue identities plus labels
 - `scripts/run_official.py` for orchestration
 
 Hidden leaderboard runs must execute in a sealed runtime. The supported maintainer path is:
@@ -312,7 +323,7 @@ Hidden leaderboard runs must execute in a sealed runtime. The supported maintain
 Containerized no-network execution:
 
 ```bash
-bash scripts/run_official_docker.sh --submission submissions/<name> --track <track_id> --update-leaderboard
+bash scripts/run_official_docker.sh --submission submissions/<name> --track <track_id> --team "<team or individual name>" --update-leaderboard
 ```
 
 The Docker build copies only source-oriented files into the image. Generated datasets, hidden assets, checkpoints, local environments, and run outputs are excluded from the build context and are supplied through runtime mounts.
@@ -331,10 +342,11 @@ modal run scripts/modal_official.py \
   --submission submissions/<name> \
   --config submissions/<name>/config.yaml \
   --track <track_id> \
+  --team "<team or individual name>" \
   --update-leaderboard
 ```
 
-Run the upload command the first time a Modal maintainer environment is prepared, or whenever public/hidden assets change. The Modal runner uses separate prediction and scoring functions. The prediction function mounts public data, hidden features, and hidden fingerprints. The scoring function mounts saved predictions, hidden labels, hidden features, hidden fingerprints, and the private hidden lock. Both stages request the configured GPU; scoring uses it for the atom14 FoldScore pairwise-distance calculations.
+Run the upload command the first time a Modal maintainer environment is prepared, or whenever public/hidden assets change. The Modal runner uses separate prediction and scoring functions. The prediction function mounts public data, hidden features, and hidden fingerprints. The scoring function mounts saved predictions, hidden labels, hidden features, hidden fingerprints, and the private hidden lock. Both stages request the configured GPU; scoring uses it for atom14 structural metric calculations.
 
 ## 10) CI and PR Guardrails
 

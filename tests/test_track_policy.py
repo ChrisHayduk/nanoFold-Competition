@@ -6,6 +6,7 @@ from pathlib import Path
 import yaml
 
 from nanofold.competition_policy import load_track_spec, validate_config_against_track
+from nanofold.metrics import FOLDSCORE_WEIGHT_BY_COMPONENT
 
 
 def test_load_official_track() -> None:
@@ -17,6 +18,7 @@ def test_load_official_track() -> None:
     assert track.sample_budget == 20000
     assert track.residue_budget == 5120000
     assert track.official is True
+    assert track.foldscore_weights == FOLDSCORE_WEIGHT_BY_COMPONENT
     assert track.train_manifest_sha256 is not None
     assert track.val_manifest_sha256 is not None
     assert track.all_manifest_sha256 is not None

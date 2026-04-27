@@ -224,9 +224,14 @@ jobs:
                   "rank_metric": "foldscore_auc_hidden",
                   "rank_tiebreak_metric": "final_hidden_foldscore",
                   "foldscore_weights": {
-                      "lddt_ca": 0.55,
-                      "lddt_backbone_atom14": 0.30,
-                      "lddt_atom14": 0.15,
+                      "gdt_ha_ca": 0.25,
+                      "lddt_atom14": 0.09375,
+                      "cad_atom14": 0.09375,
+                      "sg_atom14": 0.09375,
+                      "sc_atom14": 0.09375,
+                      "molprobity_clash_atom14": 0.125,
+                      "bb_atom14": 0.125,
+                      "dipdiff_atom14": 0.125,
                   },
               },
               "templates": {
@@ -281,6 +286,7 @@ jobs:
         run: |
           python score.py \
             --prediction-summary .ci_smoke/predict_multi.json \
+            --features-dir .ci_smoke/processed_features \
             --labels-dir .ci_smoke/processed_labels \
             --per-chain-out .ci_smoke/per_chain.jsonl \
             --save .ci_smoke/eval_multi.json
@@ -301,6 +307,20 @@ jobs:
               raise SystemExit("expected multi-checkpoint eval output")
           if "mean_lddt_ca" not in obj:
               raise SystemExit("eval summary missing mean_lddt_ca")
+          if "mean_gdt_ha_ca" not in obj:
+              raise SystemExit("eval summary missing mean_gdt_ha_ca")
+          if "mean_lddt_atom14" not in obj:
+              raise SystemExit("eval summary missing mean_lddt_atom14")
+          for key in (
+              "mean_cad_atom14",
+              "mean_sg_atom14",
+              "mean_sc_atom14",
+              "mean_molprobity_clash_atom14",
+              "mean_bb_atom14",
+              "mean_dipdiff_atom14",
+          ):
+              if key not in obj:
+                  raise SystemExit(f"eval summary missing {key}")
           if "sample_budget" not in obj:
               raise SystemExit("eval summary missing sample_budget")
           if not any(int(item.get("step", -1)) == 0 for item in obj["checkpoints"]):

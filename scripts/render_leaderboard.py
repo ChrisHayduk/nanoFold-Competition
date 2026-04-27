@@ -24,6 +24,10 @@ def parse_args() -> argparse.Namespace:
 
 
 def render_table(entries: List[Dict[str, Any]]) -> str:
+    def _fmt_text(value: Any) -> str:
+        text = str(value).strip()
+        return text.replace("\n", " ").replace("|", "\\|")
+
     def _fmt_score(value: Any) -> str:
         try:
             f = float(value)
@@ -52,14 +56,17 @@ def render_table(entries: List[Dict[str, Any]]) -> str:
         sorted_entries = sorted(track_entries, key=lambda x: (-_rank_score(x), str(x.get("date", ""))))
         title = track or "unknown"
         lines.append(f"### `{title}`")
-        lines.append("| # | Rank Score | Hidden FoldScore | Public FoldScore | Date | Commit | Description |")
-        lines.append("|---:|---:|---:|---:|---|---|---|")
+        lines.append("| # | Team | Rank Score | Hidden FoldScore | Public FoldScore | Date | Commit | Description |")
+        lines.append("|---:|---|---:|---:|---:|---|---|---|")
         for i, e in enumerate(sorted_entries, start=1):
             commit = e.get("commit", "")[:7]
             hidden = e.get("final_hidden_foldscore", float("nan"))
             public = e.get("public_val_foldscore", float("nan"))
+            team = e.get("team") or e.get("submission_name") or ""
             lines.append(
-                f"| {i} | {_fmt_score(e.get('rank_score', float('nan')))} | {_fmt_score(hidden)} | {_fmt_score(public)} | {e.get('date','')} | `{commit}` | {e.get('description','')} |"
+                f"| {i} | {_fmt_text(team)} | {_fmt_score(e.get('rank_score', float('nan')))} | "
+                f"{_fmt_score(hidden)} | {_fmt_score(public)} | {_fmt_text(e.get('date',''))} | "
+                f"`{_fmt_text(commit)}` | {_fmt_text(e.get('description',''))} |"
             )
     if not lines:
         lines.append("| Track | Status |")

@@ -3,8 +3,16 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import sys
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Mapping
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from nanofold.leaderboard_identity import resolve_leaderboard_team
+from nanofold.metrics import FOLDSCORE_CURVE_COMPONENT_NAMES
 
 
 def parse_args() -> argparse.Namespace:
@@ -12,6 +20,12 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--result", type=str, required=True, help="Path to runs/<name>/result.json")
     ap.add_argument("--leaderboard", type=str, default="leaderboard/leaderboard.json")
     ap.add_argument("--description", type=str, default="", help="Optional description override.")
+    ap.add_argument(
+        "--team",
+        type=str,
+        default="",
+        help="Optional team or individual submitter name override. If omitted, GitHub PR author metadata may be used.",
+    )
     ap.add_argument("--no-render", action="store_true", help="Do not render README leaderboard section.")
     ap.add_argument("--readme", type=str, default="README.md")
     return ap.parse_args()
@@ -26,10 +40,21 @@ def _save_json(path: Path, obj: Any) -> None:
     path.write_text(json.dumps(obj, indent=2) + "\n")
 
 
-def _result_to_entry(result: Dict[str, Any], description_override: str) -> Dict[str, Any]:
+def _result_to_entry(
+    result: Dict[str, Any],
+    description_override: str,
+    team_override: str = "",
+    env: Mapping[str, str] | None = None,
+) -> Dict[str, Any]:
     created_at = str(result.get("created_at", ""))[:10]
     commit = str(result.get("commit", "unknown"))[:7]
     submission = str(result.get("submission_name", "submission"))
+    team = resolve_leaderboard_team(
+        explicit_team=team_override,
+        result_team=str(result.get("team", "")),
+        submission_name=submission,
+        env=env,
+    )
     description = description_override.strip() or str(
         result.get("description", f"Official run for {submission}")
     )
@@ -41,13 +66,11 @@ def _result_to_entry(result: Dict[str, Any], description_override: str) -> Dict[
 
     hidden_score = result.get("final_hidden_foldscore", float("nan"))
     public_score = result.get("public_val_foldscore", float("nan"))
-    hidden_lddt = result.get("final_hidden_lddt_ca", float("nan"))
-    public_lddt = result.get("public_val_lddt_ca", float("nan"))
     rank_metric = str(result.get("rank_metric", "foldscore_auc_hidden"))
     default_rank_score = result.get("foldscore_auc_hidden", float("nan"))
     rank_score = result.get("rank_score", default_rank_score)
     rank_tiebreak_score = result.get("rank_tiebreak_score", hidden_score)
-    return {
+    entry = {
         "rank_metric": rank_metric,
         "rank_score": _to_float(rank_score),
         "rank_tiebreak_score": _to_float(rank_tiebreak_score),
@@ -56,19 +79,30 @@ def _result_to_entry(result: Dict[str, Any], description_override: str) -> Dict[
         "foldscore_auc_hidden": _to_float(result.get("foldscore_auc_hidden", float("nan"))),
         "foldscore_at_samples": dict(result.get("foldscore_at_samples", {})) if isinstance(result.get("foldscore_at_samples"), dict) else {},
         "foldscore_at_steps": dict(result.get("foldscore_at_steps", {})) if isinstance(result.get("foldscore_at_steps"), dict) else {},
-        "final_hidden_lddt_ca": _to_float(hidden_lddt),
-        "public_val_lddt_ca": _to_float(public_lddt),
-        "lddt_auc_hidden": _to_float(result.get("lddt_auc_hidden", float("nan"))),
-        "lddt_at_samples": dict(result.get("lddt_at_samples", {})) if isinstance(result.get("lddt_at_samples"), dict) else {},
-        "lddt_at_steps": dict(result.get("lddt_at_steps", {})) if isinstance(result.get("lddt_at_steps"), dict) else {},
         "sample_budget": int(result.get("sample_budget", 0) or 0),
         "track": str(result.get("track", "limited")),
         "date": created_at,
         "commit": commit,
         "description": description,
+        "team": team,
         "run_name": str(result.get("run_name", "")),
         "submission_name": submission,
     }
+    for component_name in FOLDSCORE_CURVE_COMPONENT_NAMES:
+        entry[f"final_hidden_{component_name}"] = _to_float(
+            result.get(f"final_hidden_{component_name}", float("nan"))
+        )
+        entry[f"public_val_{component_name}"] = _to_float(
+            result.get(f"public_val_{component_name}", float("nan"))
+        )
+        entry[f"{component_name}_auc_hidden"] = _to_float(
+            result.get(f"{component_name}_auc_hidden", float("nan"))
+        )
+        samples = result.get(f"{component_name}_at_samples", {})
+        steps = result.get(f"{component_name}_at_steps", {})
+        entry[f"{component_name}_at_samples"] = dict(samples) if isinstance(samples, dict) else {}
+        entry[f"{component_name}_at_steps"] = dict(steps) if isinstance(steps, dict) else {}
+    return entry
 
 
 def _dedupe_entries(entries: List[Dict[str, Any]], new_entry: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -131,7 +165,7 @@ def main() -> None:
     else:
         entries = []
 
-    new_entry = _result_to_entry(result, args.description)
+    new_entry = _result_to_entry(result, args.description, args.team)
     merged = _dedupe_entries(entries, new_entry)
     ranked = _rank_entries(merged)
     _save_json(leaderboard_path, ranked)

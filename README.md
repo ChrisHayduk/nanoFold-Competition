@@ -50,11 +50,26 @@ The `limited` and `research_large` tracks train for fixed sample budgets. Their 
 
 That makes early learning matter. A model that gets useful structure after 2,000 samples should beat a model that only wakes up at the end, even if their final scores are close. This is the pressure that should surface architectures with better biological priors.
 
-FoldScore combines:
+FoldScore is a CASP15-inspired raw score over the CASP metrics that can be
+computed reproducibly from the official atom14 output contract and official
+residue identities:
 
 ```text
-0.55*lDDT-Ca + 0.30*lDDT-backbone-atom14 + 0.15*lDDT-all-atom14
+FoldScore =
+  0.25*GDT_HA-Ca
++ 0.09375*(lDDT-all-atom14 + CADaa-atom14 + SG-atom14 + SC-atom14)
++ 0.125*(MolProbity-clash-atom14 + BB-atom14 + DipDiff-atom14)
 ```
+
+`GDT_HA-Ca` measures global C-alpha fold accuracy with threshold-specific GDT
+superpositions. The remaining terms measure local all-atom agreement, contact
+preservation, SphereGrinder local motifs, chi1/chi2 side-chain geometry,
+atom-name-aware heavy-atom clashes, phi/psi/omega backbone geometry, and
+three-residue C-alpha/O distance windows. The weights are the CASP15 formula
+weights renormalized over the structure-derived components supported by
+nanoFold. `ASE` requires submitted confidence estimates and `reLLG_lddt`
+requires a crystallographic molecular-replacement scoring path, so they are not
+part of the official rank score.
 
 The final hidden FoldScore is the tie-breaker for fixed-budget tracks and the primary rank metric for `unlimited`. Public validation exists for debugging, not ranking.
 
@@ -70,7 +85,7 @@ The final hidden FoldScore is the tie-breaker for fixed-budget tracks and the pr
 
 ## Tracks At A Glance
 
-Source of truth: `tracks/*.yaml`. All tracks use the same official public train set, public validation set, sealed hidden validation set, atom14 FoldScore, and no-template policy. They differ in how much training budget is allowed and what scientific question the leaderboard is meant to answer.
+Source of truth: `tracks/*.yaml`. All tracks use the same official public train set, public validation set, sealed hidden validation set, CASP15-inspired FoldScore, and no-template policy. They differ in how much training budget is allowed and what scientific question the leaderboard is meant to answer.
 
 | Track | Purpose | Fixed training budget | Rank metric | Use this when | Submit with |
 |---|---|---:|---|---|---|
@@ -79,6 +94,12 @@ Source of truth: `tracks/*.yaml`. All tracks use the same official public train 
 | `unlimited` | Open-ended fixed-data research leaderboard | unrestricted training budget and model size | `final_hidden_foldscore` | you want the best final hidden structure quality while keeping the hidden set sealed and the public data contract fixed | `--track unlimited` |
 
 For all three tracks, set `track: <track_id>` in `submissions/<name>/config.yaml`, validate with `python scripts/validate_submission.py --submission submissions/<name> --track <track_id> --strict`, and open a submission PR naming the intended track. Submit separate configs or separate submission directories when one method targets multiple tracks. Maintainers create accepted leaderboard entries after sealed hidden evaluation; participant PRs should not edit leaderboard artifacts.
+
+Leaderboard entries include a `Team` column. Use a lab, company, project team,
+or individual researcher name consistently across submissions. If `--team` is
+omitted during a PR-triggered GitHub Actions run, nanoFold falls back to the PR
+author's GitHub username. Manual maintainer automation can set
+`NANOFOLD_PR_AUTHOR=<github-username>` for the same fallback.
 
 The `limited` constants are:
 
@@ -268,6 +289,7 @@ Canonical runner entrypoint:
 python scripts/run_official.py \
   --submission submissions/<name> \
   --track <track_id> \
+  --team "<team or individual name>" \
   --update-leaderboard
 ```
 
@@ -277,6 +299,7 @@ Hidden leaderboard runs require a sealed no-network runtime. The supported path 
 bash scripts/run_official_docker.sh \
   --submission submissions/<name> \
   --track <track_id> \
+  --team "<team or individual name>" \
   --update-leaderboard
 ```
 
@@ -296,10 +319,11 @@ modal run scripts/modal_official.py \
   --submission submissions/<name> \
   --config submissions/<name>/config.yaml \
   --track <track_id> \
+  --team "<team or individual name>" \
   --update-leaderboard
 ```
 
-Use the upload command the first time a Modal environment is prepared, or whenever public/hidden assets change. Hidden Modal execution uses separate no-network prediction and scoring functions; hidden labels are not mounted during prediction. Both Modal stages request the configured GPU because atom14 FoldScore scoring is pairwise-distance heavy.
+Use the upload command the first time a Modal environment is prepared, or whenever public/hidden assets change. Hidden Modal execution uses separate no-network prediction and scoring functions; hidden labels are not mounted during prediction. Both Modal stages request the configured GPU because atom14 structural scoring is pairwise-distance heavy.
 
 Hidden lock metadata is maintainer-local and ignored by git. Populate/update it with `python scripts/pin_hidden_assets.py ...`.
 
@@ -367,8 +391,9 @@ CI enforces the same PR guardrail:
 ## Leaderboard
 
 <!-- LEADERBOARD_START -->
-### `limited`
-| # | Rank Score | Hidden FoldScore | Public FoldScore | Date | Commit | Description |
-|---:|---:|---:|---:|---|---|---|
-| 1 | 0.2025 | 0.2088 | 0.2095 | 2026-04-27 | `e581e25` | minAlphaFold2 tiny with ramped fine-tune auxiliary losses |
+| Track | Status |
+|---|---|
+| `limited` | No accepted submissions yet |
+| `research_large` | No accepted submissions yet |
+| `unlimited` | No accepted submissions yet |
 <!-- LEADERBOARD_END -->

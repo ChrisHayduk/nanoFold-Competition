@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 
 
@@ -33,6 +34,46 @@ def test_leaderboard_ranks_entries_within_each_track() -> None:
     assert [row["rank_score"] for row in limited_rows] == [0.4, 0.3]
 
 
+def test_leaderboard_entry_carries_team_metadata() -> None:
+    module = _load_script("scripts/add_leaderboard_entry.py")
+    result_to_entry = getattr(module, "_result_to_entry")
+
+    entry = result_to_entry(
+        {
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "commit": "abcdef012345",
+            "submission_name": "submission_dir",
+            "team": "Protein Geometry Lab",
+            "rank_score": 0.5,
+            "rank_tiebreak_score": 0.4,
+            "final_hidden_foldscore": 0.4,
+            "public_val_foldscore": 0.3,
+        },
+        "",
+    )
+
+    assert entry["team"] == "Protein Geometry Lab"
+
+    overridden = result_to_entry({"submission_name": "submission_dir"}, "", "Independent Researcher")
+    assert overridden["team"] == "Independent Researcher"
+
+
+def test_leaderboard_entry_can_fall_back_to_pr_author(tmp_path) -> None:
+    module = _load_script("scripts/add_leaderboard_entry.py")
+    result_to_entry = getattr(module, "_result_to_entry")
+    event_path = tmp_path / "event.json"
+    event_path.write_text(json.dumps({"pull_request": {"user": {"login": "github-user"}}}))
+
+    entry = result_to_entry(
+        {"submission_name": "submission_dir"},
+        "",
+        "",
+        {"GITHUB_EVENT_PATH": str(event_path)},
+    )
+
+    assert entry["team"] == "github-user"
+
+
 def test_readme_leaderboard_renderer_groups_by_track() -> None:
     module = _load_script("scripts/render_leaderboard.py")
     render_table = getattr(module, "render_table")
@@ -47,6 +88,7 @@ def test_readme_leaderboard_renderer_groups_by_track() -> None:
                 "date": "2026-01-02",
                 "commit": "abcdef0",
                 "description": "open run",
+                "team": "Open Team",
             },
             {
                 "track": "limited",
@@ -56,6 +98,7 @@ def test_readme_leaderboard_renderer_groups_by_track() -> None:
                 "date": "2026-01-01",
                 "commit": "1234567",
                 "description": "small run",
+                "team": "Small Lab",
             },
         ]
     )
@@ -63,4 +106,5 @@ def test_readme_leaderboard_renderer_groups_by_track() -> None:
     assert "### `limited`" in rendered
     assert "### `unlimited`" in rendered
     assert rendered.index("### `limited`") < rendered.index("### `unlimited`")
-    assert "| # | Rank Score | Hidden FoldScore | Public FoldScore | Date | Commit | Description |" in rendered
+    assert "| # | Team | Rank Score | Hidden FoldScore | Public FoldScore | Date | Commit | Description |" in rendered
+    assert "| 1 | Small Lab |" in rendered

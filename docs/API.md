@@ -118,7 +118,7 @@ In `--official` mode runtime enforces:
 - model parameter cap (`model.max_params`) if set
 - official prediction sanitizes `data.processed_labels_dir` before submission hooks are constructed
 
-This keeps the benchmark focused on fixed-data learning. Public validation can be used for debugging, but hidden ranking is sealed and label-only scoring never imports submission hooks.
+This keeps the benchmark focused on fixed-data learning. Public validation can be used for debugging, but hidden ranking is sealed and scoring never imports submission hooks.
 
 ## Budget Definitions
 
@@ -134,20 +134,44 @@ official budget.
 
 ## FoldScore Metric
 
-Official ranking uses equal chain weighting and:
+Official ranking uses equal chain weighting and a CASP15-inspired raw score
+over the CASP metrics that can be computed reproducibly from `pred_atom14` and
+the official residue identities:
 
 ```text
-FoldScore = 0.55*lDDT-Ca + 0.30*lDDT-backbone-atom14 + 0.15*lDDT-all-atom14
+FoldScore =
+  0.25*GDT_HA-Ca
++ 0.09375*(lDDT-all-atom14 + CADaa-atom14 + SG-atom14 + SC-atom14)
++ 0.125*(MolProbity-clash-atom14 + BB-atom14 + DipDiff-atom14)
 ```
 
 Hidden leaderboard ranking is track-specific. `limited` and `research_large` use `foldscore_auc_hidden`, trapezoidal AUC over cumulative samples from `0` to `B_sample`, with `final_hidden_foldscore` as the tie-breaker. `unlimited` uses `final_hidden_foldscore` because it has no shared sample budget.
 
-`lDDT-Ca` remains reported as a diagnostic metric.
+Scoring reads feature-side residue identities to interpret atom14 slots for
+side-chain torsions and atom-name-aware clashes. `ASE` is not included because
+it requires submitted confidence estimates. `reLLG_lddt` is not included
+because it requires crystallographic molecular-replacement scoring.
+
+| Output key | CASP15 role | nanoFold computation |
+|---|---|---|
+| `gdt_ha_ca` | global fold accuracy | C-alpha GDT_HA with threshold-specific GDT superpositions |
+| `lddt_atom14` | local all-atom agreement | lDDT over resolved atom14 coordinates, excluding intra-residue atom pairs |
+| `cad_atom14` | contact-area agreement | all-resolved-atom contact preservation |
+| `sg_atom14` | local atomic environment agreement | target-centered `6A` atom spheres, local superposition, `2A`/`4A` RMSD cutoffs |
+| `sc_atom14` | side-chain geometry | chi1/chi2 agreement with symmetry, chi weighting, and burial weighting |
+| `molprobity_clash_atom14` | model stereochemical plausibility | atom-name-aware heavy-atom van der Waals overlaps above `0.4A` |
+| `bb_atom14` | backbone geometry | phi/psi/omega dihedral agreement with equal angle-class weighting |
+| `dipdiff_atom14` | neighboring-residue geometry | three-residue C-alpha/O local distance-window agreement |
+
+`GDT_TS-Ca`, `lDDT-Ca`, and backbone atom14 lDDT are also reported as diagnostic
+metrics.
 
 Implementation uses:
-- true-structure neighborhood cutoff `15.0A`
-- thresholds `[0.5, 1.0, 2.0, 4.0]`
-- atom/residue mask logic over valid pairs
+- GDT_HA thresholds `[0.5, 1.0, 2.0, 4.0]`
+- lDDT true-structure neighborhood cutoff `15.0A`
+- lDDT thresholds `[0.5, 1.0, 2.0, 4.0]`
+- atom/residue mask logic over valid coordinates and residue identities
+- the CASP15 formula weights renormalized over supported structure-derived components
 
 Sanity vector:
-- if predictions match labels exactly and at least two points are valid, score is `1.0`.
+- if predictions match labels exactly, at least three C-alpha atoms plus valid inter-residue atom14 pairs are present, and the predicted structure has no heavy-atom clashes under the clash component, score is `1.0`.

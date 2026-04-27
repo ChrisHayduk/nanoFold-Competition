@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Tuple
 
 import yaml
 
+from .metrics import FOLDSCORE_WEIGHT_BY_COMPONENT
 from .utils import sha256_file
 
 EXPECTED_TRAIN_MANIFEST_PARTS = ("data", "manifests", "train.txt")
@@ -140,11 +141,7 @@ def load_track_spec(track_id: str = DEFAULT_TRACK_ID) -> TrackSpec:
         rank_tiebreak_metric=_opt_str(scoring.get("rank_tiebreak_metric")),
         foldscore_weights=_float_map(
             scoring.get("foldscore_weights"),
-            default={
-                "lddt_ca": 0.55,
-                "lddt_backbone_atom14": 0.30,
-                "lddt_atom14": 0.15,
-            },
+            default=FOLDSCORE_WEIGHT_BY_COMPONENT,
         ),
         template_policy=_opt_str(templates.get("policy")),
         templates_enabled=_opt_bool(templates.get("enabled"), default=None),

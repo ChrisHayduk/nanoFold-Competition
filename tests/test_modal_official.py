@@ -47,6 +47,9 @@ def test_modal_official_updates_local_leaderboard_from_returned_result() -> None
     assert "scripts/add_leaderboard_entry.py" in text
     assert "--update-leaderboard" not in text
     assert "--commit" in text
+    assert "--team" in text
+    assert "team: str = \"\"" in text
+    assert "resolve_leaderboard_team" in text
     assert "_resolve_local_commit" in text
     assert "upload_only: bool = False" in text
     assert "skip_predict: bool = False" in text
