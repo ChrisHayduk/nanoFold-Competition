@@ -14,7 +14,7 @@ Single maintainer end-to-end flow for official data refresh:
   5) rebuild official dataset fingerprint
 
 Options:
-  --track-id <id>                     Track id metadata for fingerprint (default: limited_large)
+  --track-id <id>                     Track id metadata for fingerprint (default: limited)
   --data-root <path>                  Download root (default: data/openproteinset)
   --manifests-dir <path>              Manifest directory (default: data/manifests)
   --private-root <path>               Maintainer-only hidden asset root (default: .nanofold_private)
@@ -43,7 +43,7 @@ Options:
   --lock-file <path>                  Official manifest lock file
                                       (default: leaderboard/official_manifest_source.lock.json)
   --track-file <path>                 Track policy YAML to update/check
-                                      (default: tracks/limited_large.yaml)
+                                      (default: tracks/limited.yaml)
   --fingerprint-out <path>            Fingerprint output path
                                       (default: leaderboard/official_dataset_fingerprint.json)
   --hidden-fingerprint-out <path>     Hidden fingerprint output path
@@ -73,7 +73,7 @@ EOF
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 
-TRACK_ID="limited_large"
+TRACK_ID="limited"
 DATA_ROOT="data/openproteinset"
 MANIFESTS_DIR="data/manifests"
 PRIVATE_ROOT=".nanofold_private"
@@ -91,7 +91,7 @@ PROCESSABILITY_EXCLUSION_LIST="data/manifests/official_processability_exclusions
 DATA_SOURCE_LOCK=""
 STRUCTURE_CANDIDATES="data/manifests/structure_candidates.txt"
 LOCK_FILE="leaderboard/official_manifest_source.lock.json"
-TRACK_FILE="tracks/limited_large.yaml"
+TRACK_FILE="tracks/limited.yaml"
 FINGERPRINT_OUT="leaderboard/official_dataset_fingerprint.json"
 HIDDEN_FINGERPRINT_OUT=""
 HIDDEN_LOCK_FILE=""
@@ -442,6 +442,8 @@ else
       --manifests-dir "$MANIFESTS_DIR" \
       --hidden-manifest "$HIDDEN_MANIFESTS_DIR/hidden_val.txt" \
       --track-file "$TRACK_FILE" \
+      --track-file "$REPO_ROOT/tracks/research_large.yaml" \
+      --track-file "$REPO_ROOT/tracks/unlimited.yaml" \
       --lock-file "$LOCK_FILE" \
       --readme "$REPO_ROOT/README.md" \
       --competition-doc "$REPO_ROOT/docs/COMPETITION.md" \
@@ -612,6 +614,30 @@ if [[ "$SKIP_FINGERPRINT" -eq 0 ]]; then
     --output "$FINGERPRINT_OUT"
   )
   run_cmd "${FP_CMD[@]}"
+  if [[ "$TRACK_ID" == "limited" ]]; then
+    RESEARCH_FP_CMD=(
+      python "$SCRIPT_DIR/build_fingerprint.py"
+      --processed-features-dir "$PROCESSED_FEATURES_DIR"
+      --processed-labels-dir "$PROCESSED_LABELS_DIR"
+      --train-manifest "$MANIFESTS_DIR/train.txt"
+      --val-manifest "$MANIFESTS_DIR/val.txt"
+      --track "research_large"
+      --source-lock "$LOCK_FILE"
+      --output "$REPO_ROOT/leaderboard/research_large_dataset_fingerprint.json"
+    )
+    run_cmd "${RESEARCH_FP_CMD[@]}"
+    UNLIMITED_FP_CMD=(
+      python "$SCRIPT_DIR/build_fingerprint.py"
+      --processed-features-dir "$PROCESSED_FEATURES_DIR"
+      --processed-labels-dir "$PROCESSED_LABELS_DIR"
+      --train-manifest "$MANIFESTS_DIR/train.txt"
+      --val-manifest "$MANIFESTS_DIR/val.txt"
+      --track "unlimited"
+      --source-lock "$LOCK_FILE"
+      --output "$REPO_ROOT/leaderboard/unlimited_dataset_fingerprint.json"
+    )
+    run_cmd "${UNLIMITED_FP_CMD[@]}"
+  fi
   if [[ "$SKIP_HIDDEN" -eq 0 ]]; then
     HIDDEN_FP_CMD=(
       python "$SCRIPT_DIR/build_fingerprint.py"
@@ -646,6 +672,8 @@ else
     --manifests-dir "$MANIFESTS_DIR" \
     --hidden-manifest "$HIDDEN_MANIFESTS_DIR/hidden_val.txt" \
     --track-file "$TRACK_FILE" \
+    --track-file "$REPO_ROOT/tracks/research_large.yaml" \
+    --track-file "$REPO_ROOT/tracks/unlimited.yaml" \
     --lock-file "$LOCK_FILE" \
     --readme "$REPO_ROOT/README.md" \
     --competition-doc "$REPO_ROOT/docs/COMPETITION.md" \

@@ -1,7 +1,7 @@
-id: unlimited
-name: Unlimited Research
-mode: unlimited
-official: false
+id: limited
+name: Official Limited
+mode: limited
+official: true
 dataset:
   train_manifest: data/manifests/train.txt
   val_manifest: data/manifests/val.txt
@@ -10,17 +10,17 @@ dataset:
   train_manifest_sha256: d36d1f77ba43b7c4509a6e9dfd3f9414e1ce60f8364b24e0086c1734ba6aef6d
   val_manifest_sha256: d4a0265bcd0a021e116c0c889f21e86bc24006460bcc42dec2f9a80b70c8812b
   all_manifest_sha256: 0d1b21a3536cd0c602be301993fcbacd8ecc5710a459c239f9808d164d0ee85d
-  fingerprint: leaderboard/unlimited_dataset_fingerprint.json
-  hidden_fingerprint: null
   hidden_manifest_sha256: null
+  fingerprint: leaderboard/official_dataset_fingerprint.json
+  hidden_fingerprint: null
   hidden_fingerprint_sha256: null
   hidden_lock_file: null
   train_chain_count: 10000
   val_chain_count: 1000
   hidden_chain_count: 1000
 scoring:
-  rank_metric: final_hidden_foldscore
-  rank_tiebreak_metric: null
+  rank_metric: foldscore_auc_hidden
+  rank_tiebreak_metric: final_hidden_foldscore
   foldscore_weights:
     lddt_ca: 0.55
     lddt_backbone_atom14: 0.30
@@ -29,12 +29,12 @@ templates:
   enabled: false
   policy: disabled_to_avoid_template_and_release_date_leakage
 train:
-  seed: null
-  crop_size: null
-  msa_depth: null
-  effective_batch_size: null
-  max_steps: null
-  val_crop_mode: null
-  val_msa_sample_mode: null
+  seed: 0
+  crop_size: 256
+  msa_depth: 192
+  effective_batch_size: 2
+  max_steps: 10000
+  val_crop_mode: center
+  val_msa_sample_mode: top
 model:
-  max_params: null
+  max_params: 50000000

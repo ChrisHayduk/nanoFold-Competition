@@ -1,5 +1,6 @@
 *.pyc
 .DS_Store
+openfold.pdf
 __pycache__/
 .claude/
 .env
@@ -10,8 +11,10 @@ __pycache__/
 .ruff_cache/
 /.ci_smoke/
 /.nanofold_private/
+/.nanofold_hidden*
 /.pyright/
 /.venv/
+/.conda/
 *.pt
 *.pth
 *.ckpt

@@ -222,6 +222,18 @@ def _read_per_chain(path: Path) -> List[Dict[str, Any]]:
     return rows
 
 
+def _metric_value(metric: str | None, *, hidden_results: Dict[str, Any], eval_public_summary: Dict[str, Any]) -> float:
+    if metric is None:
+        return float("nan")
+    if metric == "foldscore_auc_hidden":
+        return float(hidden_results["foldscore_auc_hidden"])
+    if metric == "final_hidden_foldscore":
+        return float(hidden_results["final_hidden_foldscore"])
+    if metric == "public_val_foldscore":
+        return float(eval_public_summary["mean_foldscore"])
+    raise ValueError(f"Unsupported rank metric `{metric}`.")
+
+
 def _parse_checkpoint_steps(text: str) -> List[str]:
     tokens = [tok.strip().lower() for tok in text.split(",") if tok.strip()]
     out: List[str] = []
@@ -816,11 +828,20 @@ def main() -> None:
     train_metrics_path = run_dir / "metrics.json"
     train_metrics = _read_json(train_metrics_path) if train_metrics_path.exists() else {}
 
-    rank_metric = "foldscore_auc_hidden" if not args.disable_hidden else "public_val_foldscore"
-    rank_score = (
-        float(hidden_results["foldscore_auc_hidden"])
-        if not args.disable_hidden
-        else float(eval_public_summary["mean_foldscore"])
+    rank_metric = track_spec.rank_metric or "foldscore_auc_hidden"
+    rank_tiebreak_metric = track_spec.rank_tiebreak_metric
+    if args.disable_hidden:
+        rank_metric = "public_val_foldscore"
+        rank_tiebreak_metric = None
+    rank_score = _metric_value(
+        rank_metric,
+        hidden_results=hidden_results,
+        eval_public_summary=eval_public_summary,
+    )
+    rank_tiebreak_score = _metric_value(
+        rank_tiebreak_metric,
+        hidden_results=hidden_results,
+        eval_public_summary=eval_public_summary,
     )
 
     result = {
@@ -831,12 +852,8 @@ def main() -> None:
         "track": track_spec.track_id,
         "rank_metric": rank_metric,
         "rank_score": rank_score,
-        "rank_tiebreak_metric": "final_hidden_foldscore" if not args.disable_hidden else None,
-        "rank_tiebreak_score": (
-            float(hidden_results["final_hidden_foldscore"])
-            if not args.disable_hidden
-            else float(eval_public_summary["mean_foldscore"])
-        ),
+        "rank_tiebreak_metric": rank_tiebreak_metric,
+        "rank_tiebreak_score": rank_tiebreak_score,
         "final_hidden_foldscore": float(hidden_results["final_hidden_foldscore"]),
         "foldscore_auc_hidden": float(hidden_results["foldscore_auc_hidden"]),
         "foldscore_at_steps": hidden_results["foldscore_at_steps"],

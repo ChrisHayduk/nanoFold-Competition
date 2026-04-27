@@ -7,7 +7,7 @@ import sys
 import time
 from functools import partial
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Iterable
 
 import torch
 import torch.nn as nn
@@ -37,6 +37,7 @@ from nanofold.submission_runtime import (
 from nanofold.utils import (
     RunPaths,
     count_parameters,
+    default_torch_device,
     ensure_dir,
     get_env_metadata,
     load_torch_checkpoint,
@@ -44,8 +45,12 @@ from nanofold.utils import (
     seed_worker,
     serialize_numpy_rng_state,
     set_seed,
+    should_pin_memory,
     to_device,
     utc_now_iso,
+)
+from nanofold.utils import (
+    sha256_file as _sha256_file,
 )
 
 
@@ -66,10 +71,27 @@ def parse_args() -> argparse.Namespace:
         help="Verify dataset fingerprint even outside official mode.",
     )
     ap.add_argument(
+        "--processed-features-dir",
+        type=str,
+        default="",
+        help="Runtime override for data.processed_features_dir.",
+    )
+    ap.add_argument(
+        "--processed-labels-dir",
+        type=str,
+        default="",
+        help="Runtime override for data.processed_labels_dir.",
+    )
+    ap.add_argument(
         "--resume",
         type=str,
         default="",
         help="Optional checkpoint path to resume from.",
+    )
+    ap.add_argument(
+        "--reset-run",
+        action="store_true",
+        help="Clear an existing run directory before starting from step 0.",
     )
     ap.add_argument(
         "--deterministic",
@@ -104,6 +126,16 @@ def make_grad_scaler(enabled: bool):
         return torch.cuda.amp.GradScaler(enabled=enabled)
 
 
+def empty_device_cache(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+        return
+    if device.type == "mps":
+        mps = getattr(torch, "mps", None)
+        if mps is not None and hasattr(mps, "empty_cache"):
+            mps.empty_cache()
+
+
 def normalize_num_workers(n: int) -> int:
     n = int(n)
     if n <= 0:
@@ -114,7 +146,51 @@ def normalize_num_workers(n: int) -> int:
     return n
 
 
-from nanofold.utils import sha256_file as _sha256_file
+def _mean_tensors(values: Iterable[torch.Tensor]) -> float:
+    finite_values = [
+        value.float().reshape(())
+        for value in values
+        if torch.isfinite(value.float().reshape(()))
+    ]
+    if not finite_values:
+        return float("nan")
+    return float(torch.stack(finite_values).mean())
+
+
+def _summarize_eval_metrics(
+    scores: list[torch.Tensor],
+    losses: list[torch.Tensor],
+    ca_rmsds: list[torch.Tensor] | None = None,
+    atom14_rmsds: list[torch.Tensor] | None = None,
+) -> Dict[str, float]:
+    metrics = {
+        "val_lddt_ca": _mean_tensors(scores),
+    }
+    if losses:
+        metrics["val_loss"] = _mean_tensors(losses)
+    if ca_rmsds is not None:
+        metrics["val_rmsd_ca"] = _mean_tensors(ca_rmsds)
+    if atom14_rmsds is not None:
+        metrics["val_rmsd_atom14"] = _mean_tensors(atom14_rmsds)
+    return metrics
+
+
+def _cfg_with_runtime(
+    cfg: Dict[str, Any],
+    *,
+    step: int,
+    cumulative_samples_seen: int,
+    max_steps: int,
+    sample_budget: int,
+) -> Dict[str, Any]:
+    runtime_cfg = dict(cfg)
+    runtime_cfg["_runtime"] = {
+        "step": int(step),
+        "cumulative_samples_seen": int(cumulative_samples_seen),
+        "max_steps": int(max_steps),
+        "sample_budget": int(sample_budget),
+    }
+    return runtime_cfg
 
 
 def _guidance_for_missing_data(track_spec: TrackSpec) -> str:
@@ -155,6 +231,7 @@ def make_loader(
     cfg: Dict[str, Any],
     split: str,
     *,
+    device: torch.device,
     include_labels: bool,
     fail_if_labels_present: bool,
     allow_missing: bool,
@@ -199,7 +276,7 @@ def make_loader(
         batch_size=data_cfg.get("batch_size", 1),
         shuffle=(split == "train"),
         num_workers=num_workers,
-        pin_memory=torch.cuda.is_available(),
+        pin_memory=should_pin_memory(device),
         collate_fn=collate_fn,
         drop_last=(split == "train"),
         worker_init_fn=seed_worker if num_workers > 0 else None,
@@ -219,6 +296,81 @@ def batch_lddt_ca(
     for b in range(B):
         scores.append(lddt_ca(pred_ca[b], true_ca[b], ca_mask[b] & residue_mask[b]))
     return torch.stack(scores).mean()
+
+
+@torch.no_grad()
+def masked_kabsch_rmsd(
+    pred_points: torch.Tensor,
+    true_points: torch.Tensor,
+    point_mask: torch.Tensor,
+) -> torch.Tensor:
+    if pred_points.shape != true_points.shape:
+        raise ValueError("`pred_points` and `true_points` must have the same shape.")
+    if pred_points.ndim != 2 or pred_points.shape[-1] != 3:
+        raise ValueError(f"`pred_points` must have shape (N, 3), got {tuple(pred_points.shape)}")
+    if point_mask.ndim != 1 or point_mask.shape[0] != pred_points.shape[0]:
+        raise ValueError("`point_mask` must have shape (N,).")
+
+    device = torch.device("cpu")
+    pred_points = pred_points.detach().float().cpu()
+    true_points = true_points.detach().float().cpu()
+    point_mask = point_mask.detach().cpu()
+    mask = point_mask.to(device=device, dtype=torch.bool)
+    if int(mask.sum().item()) < 3:
+        return torch.full((), float("nan"), device=device, dtype=pred_points.dtype)
+
+    pred = pred_points[mask]
+    true = true_points[mask]
+    pred_centered = pred - pred.mean(dim=0, keepdim=True)
+    true_centered = true - true.mean(dim=0, keepdim=True)
+
+    covariance = pred_centered.transpose(0, 1) @ true_centered
+    u, _, vh = torch.linalg.svd(covariance, full_matrices=False)
+    correction = torch.ones(3, device=device, dtype=pred_centered.dtype)
+    if torch.det(u @ vh) < 0:
+        correction[-1] = -1.0
+    rotation = u @ torch.diag(correction) @ vh
+    aligned = pred_centered @ rotation
+    squared_error = (aligned - true_centered).square().sum(dim=-1)
+    return torch.sqrt(squared_error.mean().clamp_min(0.0))
+
+
+@torch.no_grad()
+def batch_rmsd_ca(
+    pred_ca: torch.Tensor,
+    true_ca: torch.Tensor,
+    ca_mask: torch.Tensor,
+    residue_mask: torch.Tensor,
+) -> torch.Tensor:
+    rmsds = [
+        masked_kabsch_rmsd(
+            pred_ca[b],
+            true_ca[b],
+            ca_mask[b] & residue_mask[b],
+        )
+        for b in range(pred_ca.shape[0])
+    ]
+    return torch.nanmean(torch.stack(rmsds))
+
+
+@torch.no_grad()
+def batch_rmsd_atom14(
+    pred_atom14: torch.Tensor,
+    true_atom14: torch.Tensor,
+    atom14_mask: torch.Tensor,
+    residue_mask: torch.Tensor,
+) -> torch.Tensor:
+    rmsds = []
+    for b in range(pred_atom14.shape[0]):
+        mask = atom14_mask[b] & residue_mask[b, :, None]
+        rmsds.append(
+            masked_kabsch_rmsd(
+                pred_atom14[b].reshape(-1, 3),
+                true_atom14[b].reshape(-1, 3),
+                mask.reshape(-1),
+            )
+        )
+    return torch.nanmean(torch.stack(rmsds))
 
 
 def optimizer_zero_grad(optimizer: Any) -> None:
@@ -251,6 +403,13 @@ def _grad_norm(model: torch.nn.Module) -> float:
     return math.sqrt(total) if total > 0 else 0.0
 
 
+def _first_nonfinite_gradient(model: torch.nn.Module) -> str | None:
+    for name, param in model.named_parameters():
+        if param.grad is not None and not torch.isfinite(param.grad).all():
+            return name
+    return None
+
+
 def _current_lr(optimizer: Any) -> float:
     groups = getattr(optimizer, "param_groups", None)
     if isinstance(groups, list) and groups:
@@ -259,6 +418,120 @@ def _current_lr(optimizer: Any) -> float:
         except Exception:
             return float("nan")
     return float("nan")
+
+
+def _format_duration(seconds: float) -> str:
+    if not math.isfinite(seconds) or seconds < 0:
+        return "unknown"
+    seconds_i = int(round(seconds))
+    hours, rem = divmod(seconds_i, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m{secs:02d}s"
+    if minutes:
+        return f"{minutes}m{secs:02d}s"
+    return f"{secs}s"
+
+
+def _format_train_status(
+    *,
+    step_record: Dict[str, Any],
+    max_steps: int,
+    run_elapsed_seconds: float,
+    steps_completed_this_run: int,
+) -> str:
+    step = int(step_record["step"])
+    step_fraction = step / float(max_steps) if max_steps > 0 else float("nan")
+    sample_fraction = float(step_record["sample_budget_fraction"])
+    residue_fraction = float(step_record["nonpad_residue_budget_fraction"])
+    avg_step_seconds = (
+        run_elapsed_seconds / float(steps_completed_this_run)
+        if steps_completed_this_run > 0
+        else float("nan")
+    )
+    eta_seconds = max(max_steps - step, 0) * avg_step_seconds
+    return (
+        f"[train] step {step}/{max_steps} ({step_fraction:.1%}) "
+        f"loss={float(step_record['train_loss']):.4f} "
+        f"lr={float(step_record['lr']):.3e} "
+        f"grad_norm={float(step_record['grad_norm']):.4f} "
+        f"samples={int(step_record['cumulative_samples_seen'])} ({sample_fraction:.1%}) "
+        f"residues={int(step_record['cumulative_nonpad_residues_seen'])} ({residue_fraction:.1%}) "
+        f"step_time={float(step_record['step_seconds']):.2f}s "
+        f"samples/s={float(step_record['samples_per_sec']):.2f} "
+        f"elapsed={_format_duration(run_elapsed_seconds)} "
+        f"eta={_format_duration(eta_seconds)}"
+    )
+
+
+def _format_eval_status(val_metrics: Dict[str, Any]) -> str:
+    return (
+        f"[eval] step {int(val_metrics['step'])} "
+        f"val_loss={float(val_metrics.get('val_loss', float('nan'))):.4f} "
+        f"val_lddt_ca={float(val_metrics.get('val_lddt_ca', float('nan'))):.4f} "
+        f"val_rmsd_ca={float(val_metrics.get('val_rmsd_ca', float('nan'))):.3f} "
+        f"val_rmsd_atom14={float(val_metrics.get('val_rmsd_atom14', float('nan'))):.3f} "
+        f"train_loss={float(val_metrics.get('train_loss', float('nan'))):.4f}"
+    )
+
+
+def _reset_run_outputs(paths: RunPaths, step_metrics_path: Path) -> None:
+    for path in (paths.metrics_path, paths.log_path, step_metrics_path):
+        if path.exists():
+            path.unlink()
+    for path in paths.ckpt_dir.glob("ckpt_step_*.pt"):
+        path.unlink()
+    last_ckpt = paths.ckpt_dir / "ckpt_last.pt"
+    if last_ckpt.exists():
+        last_ckpt.unlink()
+
+
+def _truncate_step_metrics(path: Path, *, max_step: int) -> int:
+    if not path.exists():
+        return 0
+    kept_lines: list[str] = []
+    removed = 0
+    for line in path.read_text().splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            record = json.loads(stripped)
+            record_step = int(record.get("step", max_step))
+        except Exception:
+            kept_lines.append(line)
+            continue
+        if record_step <= max_step:
+            kept_lines.append(line)
+        else:
+            removed += 1
+    if removed:
+        path.write_text("\n".join(kept_lines) + ("\n" if kept_lines else ""))
+    return removed
+
+
+def _truncate_metric_history(metrics: Dict[str, Any], *, max_step: int) -> int:
+    history = metrics.get("history")
+    if not isinstance(history, list):
+        return 0
+    kept_history = []
+    removed = 0
+    for item in history:
+        if not isinstance(item, dict):
+            kept_history.append(item)
+            continue
+        try:
+            item_step = int(item.get("step", max_step))
+        except Exception:
+            kept_history.append(item)
+            continue
+        if item_step <= max_step:
+            kept_history.append(item)
+        else:
+            removed += 1
+    if removed:
+        metrics["history"] = kept_history
+    return removed
 
 
 def _verify_dataset(
@@ -282,10 +555,18 @@ def _verify_dataset(
 
 def main() -> None:
     args = parse_args()
+    if args.reset_run and args.resume:
+        raise ValueError("`--reset-run` cannot be combined with `--resume`.")
+
     config_path = Path(args.config).resolve()
     raw_cfg = load_config(args.config)
     track_spec = load_track_spec(args.track)
     cfg = apply_track_policy(raw_cfg, track_spec=track_spec) if args.official else raw_cfg
+    data_cfg = cfg.setdefault("data", {})
+    if args.processed_features_dir:
+        data_cfg["processed_features_dir"] = args.processed_features_dir
+    if args.processed_labels_dir:
+        data_cfg["processed_labels_dir"] = args.processed_labels_dir
 
     deterministic = bool(args.deterministic or args.official)
 
@@ -297,6 +578,11 @@ def main() -> None:
             enforce_manifest_paths=True,
             enforce_manifest_hashes=True,
         )
+        print(
+            f"Official mode enabled for track `{track_spec.track_id}`. "
+            f"Verifying dataset fingerprint: {Path(fingerprint_path).resolve()}",
+            flush=True,
+        )
         try:
             _verify_dataset(
                 cfg=cfg,
@@ -306,10 +592,7 @@ def main() -> None:
             )
         except FileNotFoundError as exc:
             raise RuntimeError(f"{exc}\n\n{_guidance_for_missing_data(track_spec)}") from exc
-        print(
-            f"Official mode enabled for track `{track_spec.track_id}`. "
-            f"Dataset fingerprint matched: {Path(fingerprint_path).resolve()}"
-        )
+        print(f"Dataset fingerprint matched: {Path(fingerprint_path).resolve()}", flush=True)
     elif args.verify_fingerprint:
         _verify_dataset(
             cfg=cfg,
@@ -325,18 +608,22 @@ def main() -> None:
     ensure_dir(paths.run_dir)
     ensure_dir(paths.ckpt_dir)
     step_metrics_path = paths.run_dir / "train_metrics.jsonl"
+    if args.reset_run:
+        _reset_run_outputs(paths, step_metrics_path)
 
     seed = int(cfg.get("seed", 0))
     set_seed(seed, deterministic=deterministic)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = default_torch_device()
     env_meta = get_env_metadata(device)
+    print(f"Using device: {device}")
 
     allow_missing = not bool(args.official)
     try:
         train_loader = make_loader(
             cfg,
             split="train",
+            device=device,
             include_labels=True,
             fail_if_labels_present=False,
             allow_missing=allow_missing,
@@ -345,6 +632,7 @@ def main() -> None:
         val_loader = make_loader(
             cfg,
             split="val",
+            device=device,
             include_labels=True,
             fail_if_labels_present=False,
             allow_missing=allow_missing,
@@ -382,6 +670,12 @@ def main() -> None:
     eval_every = int(tcfg.get("eval_every", 500))
     save_every = int(tcfg.get("save_every", 500))
     grad_accum_steps = int(tcfg.get("grad_accum_steps", 1))
+    if log_every <= 0:
+        raise ValueError("`train.log_every` must be >= 1")
+    if eval_every <= 0:
+        raise ValueError("`train.eval_every` must be >= 1")
+    if save_every <= 0:
+        raise ValueError("`train.save_every` must be >= 1")
     if grad_accum_steps <= 0:
         raise ValueError("`train.grad_accum_steps` must be >= 1")
     grad_clip = float(cfg.get("optim", {}).get("grad_clip_norm", 0.0))
@@ -427,6 +721,12 @@ def main() -> None:
         "cumulative_nonpad_residues_seen": 0,
         "cumulative_residues_seen": 0,
     }
+
+    if args.reset_run:
+        print(f"Reset run outputs: {paths.run_dir}")
+    if not args.resume:
+        step_metrics_path.write_text("")
+        Path(paths.metrics_path).write_text(json.dumps(metrics, indent=2))
 
     start_step = 0
     cumulative_samples_seen = 0
@@ -525,11 +825,17 @@ def main() -> None:
             except Exception:
                 pass
         print(f"Resumed from {resume_path} at step {start_step}")
+        removed_step_metrics = _truncate_step_metrics(step_metrics_path, max_step=start_step)
+        if removed_step_metrics:
+            print(f"Truncated {removed_step_metrics} stale per-step metric rows newer than checkpoint step {start_step}.")
         if paths.metrics_path.exists():
             try:
                 existing_metrics = json.loads(paths.metrics_path.read_text())
                 if isinstance(existing_metrics, dict):
                     metrics.update(existing_metrics)
+                    removed_history = _truncate_metric_history(metrics, max_step=start_step)
+                    if removed_history:
+                        print(f"Truncated {removed_history} stale eval history rows newer than checkpoint step {start_step}.")
                     metrics["resumed_from"] = str(resume_path.resolve())
                     metrics["updated_at"] = utc_now_iso()
                     metrics["submission_entrypoint_path"] = hooks.source_path
@@ -543,15 +849,13 @@ def main() -> None:
                         str(Path(fingerprint_path).resolve()) if (args.official or args.verify_fingerprint) else None
                     )
                     metrics["fingerprint_sha256"] = fingerprint_sha256
-                    cumulative_samples_seen = int(metrics.get("cumulative_samples_seen", cumulative_samples_seen))
-                    cumulative_cropped_residues_seen = int(
-                        metrics.get("cumulative_cropped_residues_seen", cumulative_cropped_residues_seen)
-                    )
-                    cumulative_nonpad_residues_seen = int(
-                        metrics.get("cumulative_nonpad_residues_seen", cumulative_nonpad_residues_seen)
-                    )
             except Exception:
                 pass
+        metrics["cumulative_samples_seen"] = cumulative_samples_seen
+        metrics["cumulative_cropped_residues_seen"] = cumulative_cropped_residues_seen
+        metrics["cumulative_nonpad_residues_seen"] = cumulative_nonpad_residues_seen
+        metrics["cumulative_residues_seen"] = cumulative_nonpad_residues_seen
+        Path(paths.metrics_path).write_text(json.dumps(metrics, indent=2))
     else:
         _save_checkpoint_files(step_value=0)
 
@@ -568,7 +872,30 @@ def main() -> None:
         return
 
     model.train()
-    pbar = tqdm(total=max_steps - step, desc="train", dynamic_ncols=True)
+    print(
+        "Run summary: "
+        f"track={track_spec.track_id} max_steps={max_steps} "
+        f"effective_batch_size={effective_batch_size} sample_budget={sample_budget} "
+        f"crop_size={crop_size} residue_budget={residue_budget} "
+        f"log_every={log_every} eval_every={eval_every} save_every={save_every}"
+    )
+    print(f"Per-step metrics: {step_metrics_path}")
+    print(f"Checkpoints: {paths.ckpt_dir}")
+    sys.stdout.flush()
+    show_progress = sys.stderr.isatty()
+
+    def log_line(message: str) -> None:
+        if show_progress:
+            tqdm.write(message)
+        else:
+            print(message)
+
+    pbar = tqdm(
+        total=max_steps - step,
+        desc="train",
+        dynamic_ncols=True,
+        disable=not show_progress,
+    )
 
     train_iter = iter(train_loader)
     step_start = time.perf_counter()
@@ -578,27 +905,44 @@ def main() -> None:
         model.eval()
         scores = []
         losses = []
+        ca_rmsds = []
+        atom14_rmsds = []
+        runtime_cfg = _cfg_with_runtime(
+            cfg,
+            step=step,
+            cumulative_samples_seen=cumulative_samples_seen,
+            max_steps=max_steps,
+            sample_budget=sample_budget,
+        )
         with torch.no_grad():
-            for batch in tqdm(val_loader, desc="val", leave=False):
+            for batch in tqdm(val_loader, desc="val", leave=False, disable=not show_progress):
                 batch = to_device(batch, device)
                 with make_autocast_ctx(device=device, enabled=use_amp):
                     out = run_submission_batch(
                         hooks,
                         model=model,
                         batch=batch,
-                        cfg=cfg,
+                        cfg=runtime_cfg,
                         training=False,
+                        expose_supervision=True,
                     )
                 pred_ca = out["pred_ca"]
                 score = batch_lddt_ca(pred_ca, batch["ca_coords"], batch["ca_mask"], batch["residue_mask"])
                 scores.append(score.detach().cpu())
+                ca_rmsd = batch_rmsd_ca(pred_ca, batch["ca_coords"], batch["ca_mask"], batch["residue_mask"])
+                atom14_rmsd = batch_rmsd_atom14(
+                    out["pred_atom14"],
+                    batch["atom14_positions"],
+                    batch["atom14_mask"],
+                    batch["residue_mask"],
+                )
+                ca_rmsds.append(ca_rmsd.detach().cpu())
+                atom14_rmsds.append(atom14_rmsd.detach().cpu())
                 if "loss" in out:
                     losses.append(out["loss"].detach().cpu())
         model.train()
-        return {
-            "val_loss": float(torch.stack(losses).mean()) if losses else float("nan"),
-            "val_lddt_ca": float(torch.stack(scores).mean()) if scores else float("nan"),
-        }
+        empty_device_cache(device)
+        return _summarize_eval_metrics(scores, losses, ca_rmsds, atom14_rmsds)
 
     while step < max_steps:
         optimizer_zero_grad(opt)
@@ -619,11 +963,18 @@ def main() -> None:
             nonpad_residues_this_step += int(batch["residue_mask"].sum().item())
 
             with make_autocast_ctx(device=device, enabled=use_amp):
+                runtime_cfg = _cfg_with_runtime(
+                    cfg,
+                    step=step,
+                    cumulative_samples_seen=cumulative_samples_seen,
+                    max_steps=max_steps,
+                    sample_budget=sample_budget,
+                )
                 out = run_submission_batch(
                     hooks,
                     model=model,
                     batch=batch,
-                    cfg=cfg,
+                    cfg=runtime_cfg,
                     training=True,
                 )
                 raw_loss = out["loss"]
@@ -643,12 +994,16 @@ def main() -> None:
             scaler.scale(loss).backward()
             running_loss += float(raw_loss.detach().cpu())
 
+        scaler.unscale_(opt)
+        bad_grad = _first_nonfinite_gradient(model)
+        if bad_grad is not None:
+            raise RuntimeError(f"Non-finite gradient detected in `{bad_grad}` before optimizer step.")
         if grad_clip and grad_clip > 0:
-            scaler.unscale_(opt)
             grad_norm = float(nn.utils.clip_grad_norm_(model.parameters(), grad_clip).item())
         else:
-            scaler.unscale_(opt)
             grad_norm = _grad_norm(model)
+        if not math.isfinite(grad_norm):
+            raise RuntimeError("Non-finite gradient norm detected before optimizer step.")
 
         scaler.step(opt)
         scaler.update()
@@ -665,6 +1020,8 @@ def main() -> None:
         now = time.perf_counter()
         step_seconds = max(now - step_start, 1e-8)
         step_start = now
+        run_elapsed_seconds = now - run_start
+        steps_completed_this_run = step - start_step
         steps_per_sec = 1.0 / step_seconds
         theoretical_residues_per_sec = (effective_batch_size * crop_size) / step_seconds
         samples_per_sec = samples_this_step / step_seconds
@@ -705,10 +1062,27 @@ def main() -> None:
         with step_metrics_path.open("a") as f:
             f.write(json.dumps(step_record) + "\n")
 
-        if step % log_every == 0:
-            pbar.set_postfix(loss=train_loss, lr=f"{lr:.3e}", gnorm=f"{grad_norm:.3f}")
+        should_log = (
+            step == start_step + 1
+            or steps_completed_this_run <= 5
+            or step % log_every == 0
+            or step == max_steps
+        )
+        if should_log:
+            pbar.set_postfix(loss=f"{train_loss:.4f}", lr=f"{lr:.3e}", gnorm=f"{grad_norm:.3f}")
+            log_line(
+                _format_train_status(
+                    step_record=step_record,
+                    max_steps=max_steps,
+                    run_elapsed_seconds=run_elapsed_seconds,
+                    steps_completed_this_run=steps_completed_this_run,
+                )
+            )
+            sys.stdout.flush()
 
         if step % eval_every == 0 or step == max_steps:
+            log_line(f"[eval] step {step}: starting public validation")
+            sys.stdout.flush()
             val_metrics = run_eval()
             val_metrics["step"] = step
             val_metrics["train_loss"] = train_loss
@@ -738,10 +1112,13 @@ def main() -> None:
             metrics["cumulative_nonpad_residues_seen"] = cumulative_nonpad_residues_seen
             metrics["cumulative_residues_seen"] = cumulative_nonpad_residues_seen
             Path(paths.metrics_path).write_text(json.dumps(metrics, indent=2))
-            print("Eval:", val_metrics)
+            log_line(_format_eval_status(val_metrics))
+            sys.stdout.flush()
 
         if step % save_every == 0 or step == max_steps:
             _save_checkpoint_files(step_value=step)
+            log_line(f"[checkpoint] step {step}: wrote {paths.ckpt_dir / 'ckpt_last.pt'}")
+            sys.stdout.flush()
 
     pbar.close()
     metrics["cumulative_samples_seen"] = cumulative_samples_seen

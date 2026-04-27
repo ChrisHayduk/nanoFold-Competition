@@ -12,7 +12,7 @@ def _write_public_repo_fixture(root: Path) -> Path:
     (root / "tracks").mkdir()
     (root / "leaderboard").mkdir()
     track = {
-        "id": "limited_large",
+        "id": "limited",
         "official": True,
         "dataset": {
             "hidden_manifest": None,
@@ -22,7 +22,7 @@ def _write_public_repo_fixture(root: Path) -> Path:
             "hidden_lock_file": None,
         },
     }
-    (root / "tracks/limited_large.yaml").write_text(yaml.safe_dump(track, sort_keys=False))
+    (root / "tracks/limited.yaml").write_text(yaml.safe_dump(track, sort_keys=False))
     (root / "leaderboard/official_hidden_assets.lock.json").write_text(
         json.dumps(
             {
@@ -40,7 +40,7 @@ def _write_public_repo_fixture(root: Path) -> Path:
     tracked.write_text(
         "\n".join(
             [
-                "tracks/limited_large.yaml",
+                "tracks/limited.yaml",
                 "leaderboard/official_hidden_assets.lock.json",
                 "leaderboard/official_manifest_source.lock.json",
             ]
@@ -74,7 +74,7 @@ def test_public_release_leak_check_accepts_sanitized_public_metadata(tmp_path: P
 
 def test_public_release_leak_check_rejects_hidden_hashes_and_tracked_hidden_manifest(tmp_path: Path) -> None:
     tracked = _write_public_repo_fixture(tmp_path)
-    track_path = tmp_path / "tracks/limited_large.yaml"
+    track_path = tmp_path / "tracks/limited.yaml"
     raw = yaml.safe_load(track_path.read_text())
     raw["dataset"]["hidden_manifest_sha256"] = "a" * 64
     track_path.write_text(yaml.safe_dump(raw, sort_keys=False))

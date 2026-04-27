@@ -126,6 +126,12 @@ This keeps the benchmark focused on fixed-data learning. Public validation can b
 - `B_sample = train.max_steps * effective_batch_size`
 - `B_res = train.max_steps * effective_batch_size * data.crop_size`
 
+During `train.py`, the `cfg` passed to `run_batch` also includes
+`cfg["_runtime"]` with `step`, `cumulative_samples_seen`, `max_steps`, and
+`sample_budget`. Submissions can use this for schedule changes such as
+stage-specific losses or learning-rate handoffs while staying inside the
+official budget.
+
 ## FoldScore Metric
 
 Official ranking uses equal chain weighting and:
@@ -134,7 +140,7 @@ Official ranking uses equal chain weighting and:
 FoldScore = 0.55*lDDT-Ca + 0.30*lDDT-backbone-atom14 + 0.15*lDDT-all-atom14
 ```
 
-Hidden leaderboard ranking is `foldscore_auc_hidden`, trapezoidal AUC over cumulative samples from `0` to `B_sample`. The tie-breaker is `final_hidden_foldscore`.
+Hidden leaderboard ranking is track-specific. `limited` and `research_large` use `foldscore_auc_hidden`, trapezoidal AUC over cumulative samples from `0` to `B_sample`, with `final_hidden_foldscore` as the tie-breaker. `unlimited` uses `final_hidden_foldscore` because it has no shared sample budget.
 
 `lDDT-Ca` remains reported as a diagnostic metric.
 

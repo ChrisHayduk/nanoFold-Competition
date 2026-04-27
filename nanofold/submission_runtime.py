@@ -173,9 +173,11 @@ def run_submission_batch(
     batch: Dict[str, Any],
     cfg: Dict[str, Any],
     training: bool,
+    *,
+    expose_supervision: bool = False,
 ) -> Dict[str, torch.Tensor]:
     run_batch_input = batch
-    if not training:
+    if not training and not expose_supervision:
         # Runtime-level safety: never expose supervision tensors to submission code
         # in inference mode, even if a caller accidentally passes them through.
         run_batch_input = strip_supervision_from_batch(batch)

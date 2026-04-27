@@ -18,7 +18,7 @@ Summarize the expected gains and intuition behind your method.
 - [x] Model outputs atom14 coordinates per residue (`(L, 14, 3)` in Angstrom).
 - [x] `run_batch(..., training=False)` does not depend on supervision labels (`ca_coords`, `ca_mask`).
 
-## Required run metadata (limited track)
+## Required run metadata (`limited`)
 
 - max_steps: 10000
 - effective_batch_size: 2
@@ -33,6 +33,19 @@ Summarize the expected gains and intuition behind your method.
 ## How to run
 
 ```bash
-python train.py --config submissions/<your_name>/config.yaml --track limited_large
-python eval.py --config submissions/<your_name>/config.yaml --ckpt runs/your_name_run1/checkpoints/ckpt_last.pt --track limited_large
+python train.py --config submissions/<your_name>/config.yaml --track limited --official
+python predict.py \
+  --config submissions/<your_name>/config.yaml \
+  --ckpt runs/<run_name>/checkpoints/ckpt_last.pt \
+  --split val \
+  --track limited \
+  --official \
+  --forbid-labels-dir runs/<run_name>/_forbid_labels \
+  --pred-out-dir runs/<run_name>/public_predictions \
+  --save runs/<run_name>/predict_val.json
+python score.py \
+  --prediction-summary runs/<run_name>/predict_val.json \
+  --labels-dir data/processed_labels \
+  --save runs/<run_name>/eval_val.json \
+  --per-chain-out runs/<run_name>/per_chain_scores_val.jsonl
 ```

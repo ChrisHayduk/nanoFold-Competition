@@ -1,0 +1,46 @@
+# Keep official runner images source-oriented. Data and private assets are
+# mounted by scripts/run_official_docker.sh at runtime, not copied at build time.
+
+.git/
+.DS_Store
+
+# Python/local tooling
+.venv/
+.conda/
+__pycache__/
+**/__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyright/
+.ci_smoke/
+
+# Private maintainer assets and generated data
+.nanofold_private/
+data/openproteinset/
+data/processed/
+data/processed_features/
+data/processed_labels/
+data/hidden_processed_features/
+data/hidden_processed_labels/
+data/metadata_sources/
+data/manifests/hidden_val.txt
+data/manifests/split_quality_report.json
+data/manifests/structure_candidates.txt
+data/manifests/structure_metadata.json
+
+# Training/evaluation outputs
+runs/
+artifacts/
+wandb/
+lightning_logs/
+secrets/
+
+# Large/generated files
+*.npz
+*.pt
+*.pth
+*.ckpt
+*.log
+*.error.txt
+openfold.pdf

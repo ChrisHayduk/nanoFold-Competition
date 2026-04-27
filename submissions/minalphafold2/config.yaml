@@ -1,5 +1,5 @@
 run_name: minalphafold2_reference
-track: limited_large
+track: limited
 seed: 0
 
 submission:
@@ -20,66 +20,30 @@ data:
   val_msa_sample_mode: top
 
 model:
-  c_m: 32
-  c_s: 32
-  c_z: 16
-  c_t: 16
-  c_e: 24
-  dim: 8
-  num_heads: 4
-  msa_transition_n: 2
-  outer_product_dim: 8
-  triangle_mult_c: 16
-  triangle_dim: 8
-  triangle_num_heads: 2
-  pair_transition_n: 2
-  template_pair_num_blocks: 1
-  template_pair_dropout: 0.0
-  template_pointwise_attention_dim: 8
-  template_pointwise_num_heads: 2
-  template_triangle_mult_c: 16
-  template_triangle_attn_c: 8
-  template_triangle_attn_num_heads: 2
-  template_pair_transition_n: 2
-  extra_msa_dim: 8
-  extra_msa_dropout: 0.0
-  extra_pair_dropout: 0.0
-  msa_column_global_attention_dim: 8
-  num_extra_msa: 1
-  num_evoformer: 1
-  evoformer_msa_dropout: 0.0
-  evoformer_pair_dropout: 0.0
-  structure_module_c: 16
-  structure_module_layers: 2
-  structure_module_dropout_ipa: 0.0
-  structure_module_dropout_transition: 0.0
-  sidechain_num_channel: 16
-  sidechain_num_residual_block: 2
-  position_scale: 10.0
-  zero_init: true
-  ipa_num_heads: 4
-  ipa_c: 8
-  ipa_n_query_points: 4
-  ipa_n_value_points: 4
-  n_dist_bins: 64
-  plddt_hidden_dim: 32
-  n_plddt_bins: 50
-  n_msa_classes: 23
-  n_pae_bins: 64
+  profile_path: third_party/minAlphaFold2/configs/tiny.toml
   msa_depth: 192
   extra_msa_depth: 64
   n_cycles: 1
   n_ensemble: 1
 
 optim:
-  lr: 2.5e-4
-  weight_decay: 1.0e-3
-  grad_clip_norm: 1.0
+  lr: 1.0e-3
+  weight_decay: 0.0
+  beta1: 0.9
+  beta2: 0.999
+  eps: 1.0e-6
+  grad_clip_norm: 0.1
+  lr_decay_factor: 0.95
 
 train:
   max_steps: 10000
-  log_every: 50
-  eval_every: 500
-  save_every: 500
+  log_every: 10
+  eval_every: 1000
+  save_every: 1000
   grad_accum_steps: 2
-  amp: true
+  finetune_start_step: 8696
+  finetune_ramp_steps: 500
+  finetune_lr_scale: 0.5
+  warmup_steps: 111
+  lr_decay_step: 5565
+  amp: false

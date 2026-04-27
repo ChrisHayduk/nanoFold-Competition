@@ -14,7 +14,7 @@ def test_resume_metadata_mismatches_detects_all_key_differences() -> None:
         },
         submission_entrypoint_sha256="runtime-submission",
         config_sha256="runtime-config",
-        track_id="limited_large",
+        track_id="limited",
         fingerprint_sha256="runtime-fingerprint",
         n_params=456,
     )
@@ -31,13 +31,13 @@ def test_resume_metadata_mismatches_requires_track_id() -> None:
         ckpt_obj={
             "submission_entrypoint_sha256": "same",
             "config_sha256": "same",
-            "track": "limited_large",
+            "track": "limited",
             "fingerprint_sha256": None,
             "n_params": 42,
         },
         submission_entrypoint_sha256="same",
         config_sha256="same",
-        track_id="limited_large",
+        track_id="limited",
         fingerprint_sha256=None,
         n_params=42,
     )

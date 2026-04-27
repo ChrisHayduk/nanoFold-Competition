@@ -23,6 +23,7 @@ Start here:
 Useful deep links:
 - [Download and preprocess public data](docs/QUICKSTART.md#2-download-and-preprocess-public-data)
 - [Start a training run](docs/QUICKSTART.md#3-start-training)
+- [Run training on a Modal GPU](docs/QUICKSTART.md#optional-run-on-a-modal-gpu)
 - [Submit to the leaderboard](docs/QUICKSTART.md#6-submit-to-the-leaderboard)
 - [Allowed and disallowed data](docs/COMPETITION.md#2-allowed-and-disallowed-data)
 - [Scoring and ranking](docs/COMPETITION.md#8-scoring-and-ranking)
@@ -33,19 +34,19 @@ Useful deep links:
 
 ## What Counts As Progress
 
-nanoFold is not meant to be a pretrained-weight contest, a web-retrieval contest, or a race to find near-duplicate templates. The official track is deliberately strict:
+nanoFold is not meant to be a pretrained-weight contest, a web-retrieval contest, or a race to find near-duplicate templates. The official tracks are deliberately strict:
 
 - fixed official data and manifests
 - no external structures, pretrained weights, external MSA retrieval, or network access
-- no template features in the official track
-- hidden ranking by area under the learning curve, not just final checkpoint score
+- no template features in the official tracks
+- hidden ranking by area under the learning curve for fixed-budget tracks
 - atom14-aware scoring so methods are rewarded for more than Cα traces
 
 The intended question is: **given the same limited training set, who learns useful protein geometry fastest and best?**
 
 ## How The Slowrun Works
 
-Each official run trains for the same sample budget. The hidden leaderboard evaluates multiple checkpoints and ranks by `foldscore_auc_hidden`: trapezoidal area under hidden FoldScore versus cumulative samples seen.
+The `limited` and `research_large` tracks train for fixed sample budgets. Their hidden leaderboards evaluate multiple checkpoints and rank by `foldscore_auc_hidden`: trapezoidal area under hidden FoldScore versus cumulative samples seen.
 
 That makes early learning matter. A model that gets useful structure after 2,000 samples should beat a model that only wakes up at the end, even if their final scores are close. This is the pressure that should surface architectures with better biological priors.
 
@@ -55,20 +56,31 @@ FoldScore combines:
 0.55*lDDT-Ca + 0.30*lDDT-backbone-atom14 + 0.15*lDDT-all-atom14
 ```
 
-The final hidden FoldScore is the tie-breaker. Public validation exists for debugging, not ranking.
+The final hidden FoldScore is the tie-breaker for fixed-budget tracks and the primary rank metric for `unlimited`. Public validation exists for debugging, not ranking.
 
 ## What This Repo Provides
 
-- official track policy in `tracks/limited_large.yaml`
+- official track policy in `tracks/limited.yaml`
 - minAlphaFold2-derived preprocessing for A3M/mmCIF alignment, atom14 labels, residue constants, and template plumbing
 - sealed prediction/scoring entrypoints that keep hidden labels away from submission code
 - a strict submission API with `build_model`, `build_optimizer`, and `run_batch`
 - dataset fingerprints and manifest checks so official data changes are visible
-- a pinned minAlphaFold2 reference submission plus a template submission that pass the official atom14 contract
+- an optional Modal GPU runner with local-disk data staging for public-data training
+- a pinned minAlphaFold2 tiny reference submission plus a template submission that pass the official atom14 contract
 
-## Official Track At A Glance
+## Tracks At A Glance
 
-Source of truth: `tracks/limited_large.yaml`
+Source of truth: `tracks/*.yaml`. All tracks use the same official public train set, public validation set, sealed hidden validation set, atom14 FoldScore, and no-template policy. They differ in how much training budget is allowed and what scientific question the leaderboard is meant to answer.
+
+| Track | Purpose | Fixed training budget | Rank metric | Use this when | Submit with |
+|---|---|---:|---|---|---|
+| `limited` | Main accessible slowrun leaderboard | `20,000` samples (`10,000` steps x effective batch `2`) | `foldscore_auc_hidden` | you want the primary competition result under a small, reproducible budget | `--track limited` |
+| `research_large` | Larger fixed-data research leaderboard | `100,000` samples (`50,000` steps x effective batch `2`) | `foldscore_auc_hidden` | you want to study whether an approach still wins with more optimization while using the same data | `--track research_large` |
+| `unlimited` | Open-ended fixed-data research leaderboard | unrestricted training budget and model size | `final_hidden_foldscore` | you want the best final hidden structure quality while keeping the hidden set sealed and the public data contract fixed | `--track unlimited` |
+
+For all three tracks, set `track: <track_id>` in `submissions/<name>/config.yaml`, validate with `python scripts/validate_submission.py --submission submissions/<name> --track <track_id> --strict`, and open a submission PR naming the intended track. Submit separate configs or separate submission directories when one method targets multiple tracks. Maintainers create accepted leaderboard entries after sealed hidden evaluation; participant PRs should not edit leaderboard artifacts.
+
+The `limited` constants are:
 
 | Item | Value |
 |---|---:|
@@ -82,7 +94,6 @@ Source of truth: `tracks/limited_large.yaml`
 | Max steps | `10,000` |
 | Sample budget | `20,000` |
 | Residue budget | `5,120,000` |
-| Rank metric | `foldscore_auc_hidden` |
 | Tie-breaker | `final_hidden_foldscore` |
 
 ## Split Curation
@@ -127,9 +138,9 @@ Additional label metadata:
 
 Preprocessing run metadata is captured in `<processed_features_dir>/preprocess_meta.json`. Its SHA256 is folded into the dataset fingerprint, so changes to preprocessing flags, projection thresholds, dependency metadata, or source revision are visible to the verifier.
 
-Official scoring requires atom14 labels, and submissions must return `pred_atom14` shaped `(B, L, 14, 3)`. The runtime derives the Cα view from atom14 slot 1 for diagnostics and baseline losses.
+Official scoring requires atom14 labels, and submissions must return `pred_atom14` shaped `(B, L, 14, 3)`. The runtime derives the Cα view from atom14 slot 1 for diagnostics.
 
-The official track disables templates by preprocessing with `T=0`; template-enabled tracks require explicit leakage filters.
+The official tracks disable templates by preprocessing with `T=0`; template-enabled tracks require explicit leakage filters.
 
 Config schema uses:
 - `data.processed_features_dir`
@@ -154,30 +165,65 @@ The fastest participant path is in [docs/QUICKSTART.md](docs/QUICKSTART.md). It 
 
 - environment setup
 - official public data download and preprocessing
-- first baseline training run
-- minAlphaFold2 reference training
+- first minAlphaFold2 tiny reference training run
 - public validation prediction and scoring
 - creating and validating a new submission
 - submitting a leaderboard pull request
 
-## Maintainer Data Refresh
+## Maintainer Hidden Assets
 
-Maintainers can refresh the official data assets with one command. This path:
-- downloads and pins structural metadata sources
-- builds required structure metadata from chain cache, pinned structural-classification files, and required feature-asset coverage
-- regenerates official manifests from locked chain cache inputs plus a private hidden split salt
-- syncs manifest hashes/counts across track + docs + lock
-- downloads required OpenFold assets and manifest mmCIFs with strict missing-file checks
-- preprocesses public and hidden split NPZs
-- rebuilds public and hidden fingerprints
-- writes public metadata plus all hidden artifacts under the ignored `.nanofold_private/` workspace
+The committed public manifests are the participant data contract. Maintainers generate hidden validation privately against that fixed public split:
 
 ```bash
-export NANOFOLD_HIDDEN_SPLIT_SALT="<maintainer-private-random-string>"
-bash scripts/full_official_data_refresh.sh --rewrite-lock
+mkdir -p .nanofold_private/secrets
+python -c "import pathlib,secrets; pathlib.Path('.nanofold_private/secrets/hidden_split_salt.txt').write_text(secrets.token_urlsafe(48) + '\n')"
+chmod 600 .nanofold_private/secrets/hidden_split_salt.txt
+
+python scripts/build_hidden_manifest.py \
+  --hidden-split-salt-file .nanofold_private/secrets/hidden_split_salt.txt
+
+python scripts/verify_hidden_manifest.py
 ```
 
-This flow requires MMseqs2 on `PATH`. `NANOFOLD_HIDDEN_SPLIT_SALT` must be at least 32 characters and must never be committed. It regenerates split metadata, public manifests, public NPZs, the public dataset fingerprint, and maintainer-only hidden assets from the locked official inputs.
+This requires MMseqs2 on `PATH`, the locked OpenProteinSet chain cache, and `data/manifests/structure_metadata.json`. The salt file, hidden manifest, hidden labels, hidden fingerprints, and hidden locks stay under `.nanofold_private/` and must never be committed.
+
+If private hidden preprocessing finds unprocessable structures, record them only in `.nanofold_private/manifests/hidden_processability_exclusions.txt`, rerun `scripts/build_hidden_manifest.py`, and rerun `scripts/verify_hidden_manifest.py`.
+
+After the hidden manifest is written, build the hidden NPZs and pin their fingerprint:
+
+```bash
+python scripts/prepare_data.py \
+  --data-root data/openproteinset \
+  --manifest .nanofold_private/manifests/hidden_val.txt \
+  --duplicate-chains-file data/openproteinset/pdb_data/duplicate_pdb_chains.txt \
+  --strict-downloads \
+  --no-template-hits \
+  --download-mmcif-subset
+
+python scripts/preprocess.py \
+  --raw-root data/openproteinset \
+  --mmcif-root data/openproteinset/pdb_data/mmcif_files \
+  --processed-features-dir .nanofold_private/hidden_processed_features \
+  --processed-labels-dir .nanofold_private/hidden_processed_labels \
+  --manifest .nanofold_private/manifests/hidden_val.txt \
+  --disable-templates
+
+python scripts/build_fingerprint.py \
+  --processed-features-dir .nanofold_private/hidden_processed_features \
+  --processed-labels-dir .nanofold_private/hidden_processed_labels \
+  --manifest hidden_val=.nanofold_private/manifests/hidden_val.txt \
+  --track limited \
+  --source-lock leaderboard/official_manifest_source.lock.json \
+  --output .nanofold_private/leaderboard/official_hidden_fingerprint.json
+
+python scripts/pin_hidden_assets.py \
+  --hidden-manifest .nanofold_private/manifests/hidden_val.txt \
+  --hidden-features-dir .nanofold_private/hidden_processed_features \
+  --hidden-labels-dir .nanofold_private/hidden_processed_labels \
+  --hidden-fingerprint .nanofold_private/leaderboard/official_hidden_fingerprint.json \
+  --track-id limited \
+  --lock-file .nanofold_private/leaderboard/private_hidden_assets.lock.json
+```
 
 Public outputs land in stable, commit-safe paths:
 - `data/manifests/train.txt`
@@ -189,6 +235,7 @@ Public outputs land in stable, commit-safe paths:
 Maintainer-only outputs land under `.nanofold_private/`:
 - `.nanofold_private/manifests/hidden_val.txt`
 - `.nanofold_private/manifests/split_quality_report.json`
+- `.nanofold_private/manifests/hidden_processability_exclusions.txt`
 - `.nanofold_private/hidden_processed_features/`
 - `.nanofold_private/hidden_processed_labels/`
 - `.nanofold_private/leaderboard/official_hidden_fingerprint.json`
@@ -198,10 +245,10 @@ Maintainer-only outputs land under `.nanofold_private/`:
 
 The metadata builder also writes `data/manifests/structure_candidates.txt` as an ignored local audit artifact. Commit only public manifests, the public dataset fingerprint, and sanitized public lock metadata.
 
-Dry-run preview:
+Full public-data rebuilds are maintainer operations for changing the official public data contract:
 
 ```bash
-bash scripts/full_official_data_refresh.sh --rewrite-lock --dry-run
+bash scripts/full_official_data_refresh.sh --rewrite-lock
 ```
 
 ## Hidden Leaderboard Runs
@@ -220,7 +267,7 @@ Canonical runner entrypoint:
 ```bash
 python scripts/run_official.py \
   --submission submissions/<name> \
-  --track limited_large \
+  --track <track_id> \
   --update-leaderboard
 ```
 
@@ -229,9 +276,30 @@ Hidden leaderboard runs require a sealed no-network runtime. The supported path 
 ```bash
 bash scripts/run_official_docker.sh \
   --submission submissions/<name> \
-  --track limited_large \
+  --track <track_id> \
   --update-leaderboard
 ```
+
+The Docker image build context intentionally excludes generated datasets, private hidden assets, local Python environments, checkpoints, and run outputs. Hidden data is mounted read-only during the prediction and scoring stages.
+
+Maintainers can run the same two-stage hidden evaluation on Modal when the checkpoint already lives in the `nanofold-runs` Modal volume:
+
+```bash
+modal run scripts/modal_official.py \
+  --upload-public-data \
+  --upload-hidden-assets \
+  --upload-only
+```
+
+```bash
+modal run scripts/modal_official.py \
+  --submission submissions/<name> \
+  --config submissions/<name>/config.yaml \
+  --track <track_id> \
+  --update-leaderboard
+```
+
+Use the upload command the first time a Modal environment is prepared, or whenever public/hidden assets change. Hidden Modal execution uses separate no-network prediction and scoring functions; hidden labels are not mounted during prediction. Both Modal stages request the configured GPU because atom14 FoldScore scoring is pairwise-distance heavy.
 
 Hidden lock metadata is maintainer-local and ignored by git. Populate/update it with `python scripts/pin_hidden_assets.py ...`.
 
@@ -243,7 +311,7 @@ Check committed official manifest hashes:
 shasum -a 256 data/manifests/train.txt data/manifests/val.txt data/manifests/all.txt
 ```
 
-Expected `limited_large` values:
+Expected public manifest values for all tracks:
 - `train.txt`: `d36d1f77ba43b7c4509a6e9dfd3f9414e1ce60f8364b24e0086c1734ba6aef6d`
 - `val.txt`: `d4a0265bcd0a021e116c0c889f21e86bc24006460bcc42dec2f9a80b70c8812b`
 - `all.txt`: `0d1b21a3536cd0c602be301993fcbacd8ecc5710a459c239f9808d164d0ee85d`
@@ -265,7 +333,7 @@ python scripts/sync_official_manifest_hashes.py
 ```bash
 python scripts/validate_submission.py \
   --submission submissions/<your_name> \
-  --track limited_large \
+  --track <track_id> \
   --strict
 
 if git diff --name-only origin/main...HEAD | grep -Eq '^data/manifests/(train|val|all)\.txt$'; then
@@ -291,6 +359,7 @@ CI enforces the same PR guardrail:
 - `scripts/build_fingerprint.py`: split dataset fingerprint generator
 - `scripts/run_official.py`: canonical official validate/train/eval/result runner
 - `scripts/run_official_docker.sh`: no-network official container runner
+- `scripts/modal_official.py`: maintainer-only Modal hidden evaluation runner
 - `nanofold/submission_runtime.py`: runtime API enforcement
 - `third_party/minAlphaFold2`: pinned upstream minAlphaFold2 implementation used by `submissions/minalphafold2`
 - `leaderboard/`: leaderboard and official lock/fingerprint artifacts
@@ -298,6 +367,8 @@ CI enforces the same PR guardrail:
 ## Leaderboard
 
 <!-- LEADERBOARD_START -->
-| # | FoldScore AUC | Hidden FoldScore | Public FoldScore | Track | Date | Commit | Description |
-|---:|---:|---:|---:|---|---|---|---|
+### `limited`
+| # | Rank Score | Hidden FoldScore | Public FoldScore | Date | Commit | Description |
+|---:|---:|---:|---:|---|---|---|
+| 1 | 0.2025 | 0.2088 | 0.2095 | 2026-04-27 | `e581e25` | minAlphaFold2 tiny with ramped fine-tune auxiliary losses |
 <!-- LEADERBOARD_END -->

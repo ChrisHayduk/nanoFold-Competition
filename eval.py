@@ -33,10 +33,12 @@ from nanofold.metrics import foldscore_components
 from nanofold.submission_runtime import load_submission_hooks, run_submission_batch
 from nanofold.utils import (
     count_parameters,
+    default_torch_device,
     get_env_metadata,
     load_torch_checkpoint,
     make_dataloader_generator,
     seed_worker,
+    should_pin_memory,
     to_device,
     utc_now_iso,
 )
@@ -405,7 +407,8 @@ def main() -> None:
     checkpoints = _resolve_checkpoints(args)
 
     hooks = load_submission_hooks(predict_cfg, config_path, allowed_root=config_path.parent)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = default_torch_device()
+    print(f"Using device: {device}")
     use_amp = bool(predict_cfg.get("train", {}).get("amp", False)) and device.type == "cuda"
     seed = int(predict_cfg.get("seed", 0))
 
@@ -463,7 +466,7 @@ def main() -> None:
         batch_size=data_cfg.get("batch_size", 1),
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=torch.cuda.is_available(),
+        pin_memory=should_pin_memory(device),
         collate_fn=collate_fn,
         worker_init_fn=seed_worker if num_workers > 0 else None,
         generator=make_dataloader_generator(seed + 17),

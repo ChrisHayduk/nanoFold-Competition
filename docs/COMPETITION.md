@@ -18,14 +18,21 @@ The rest of this document is the enforceable contract for official leaderboard r
 
 ## 1) Track Source of Truth
 
-Track policy is defined in `tracks/*.yaml`.
+Track policy is defined in `tracks/*.yaml`. The public track set is:
 
-Official leaderboard track:
-- `limited_large`
+| Track | Purpose | Data contract | Training budget | Rank metric | Submission selector |
+|---|---|---|---:|---|---|
+| `limited` | primary competition track for accessible data-efficiency work | official train/public val/hidden val only | `20,000` samples (`10,000` steps x effective batch `2`) | `foldscore_auc_hidden` | `--track limited` |
+| `research_large` | larger fixed-data track for methods that need more optimization to show their shape | same official data and hidden evaluation as `limited` | `100,000` samples (`50,000` steps x effective batch `2`) | `foldscore_auc_hidden` | `--track research_large` |
+| `unlimited` | open-ended fixed-data track for best final structure quality under sealed hidden evaluation | same official data and hidden evaluation as `limited` | unrestricted | `final_hidden_foldscore` | `--track unlimited` |
+
+All three tracks use atom14 FoldScore, hidden labels remain sealed, templates are disabled, and public validation is diagnostic only. `limited` and `research_large` are sample-budget slowruns, so they rank by hidden area under the learning curve. `unlimited` is ranked separately by final hidden FoldScore because there is no common sample axis.
 
 Official runs must use:
-- `--track limited_large`
+- `--track <track_id>`
 - `--official`
+
+Participants submit code/configuration PRs for a chosen track. Maintainers run the sealed hidden pipeline and update leaderboard artifacts after acceptance; participant PRs must not edit `leaderboard/leaderboard.json` or the rendered leaderboard table.
 
 In official mode the runtime uses **override + validate**:
 - immutable constants from track policy are applied to config first
@@ -167,18 +174,27 @@ The setup script expects `aws`, `unzip`, and `python` on `PATH`; it keeps hidden
 Maintainer manifest generation path:
 - `scripts/build_manifests.py`
 - `scripts/regenerate_official_manifests.sh`
+- `scripts/build_hidden_manifest.py`
 - `scripts/sync_official_manifest_hashes.py`
 - `scripts/full_official_data_refresh.sh`
 - lock metadata: `leaderboard/official_manifest_source.lock.json`
 
-Single end-to-end maintainer flow:
+The committed public manifests are the participant-facing data contract. Hidden validation is generated privately against that fixed public split:
 
 ```bash
-export NANOFOLD_HIDDEN_SPLIT_SALT="<maintainer-private-random-string>"
-bash scripts/full_official_data_refresh.sh --rewrite-lock
+mkdir -p .nanofold_private/secrets
+python -c "import pathlib,secrets; pathlib.Path('.nanofold_private/secrets/hidden_split_salt.txt').write_text(secrets.token_urlsafe(48) + '\n')"
+chmod 600 .nanofold_private/secrets/hidden_split_salt.txt
+
+python scripts/build_hidden_manifest.py \
+  --hidden-split-salt-file .nanofold_private/secrets/hidden_split_salt.txt
+
+python scripts/verify_hidden_manifest.py
 ```
 
-This maintainer flow requires MMseqs2 plus the public setup dependencies. `NANOFOLD_HIDDEN_SPLIT_SALT` must be at least 32 characters and must never be committed. It regenerates split metadata, public manifests, public NPZs, the public dataset fingerprint, and maintainer-only hidden assets from the locked official inputs.
+This maintainer flow requires MMseqs2 plus the public setup dependencies. The salt must be at least 32 characters and must never be committed. The hidden builder excludes every sequence/PDB component that touches train or public validation, then stratifies hidden validation against the public train+validation distribution.
+
+Private hidden preprocessing failures belong only in `.nanofold_private/manifests/hidden_processability_exclusions.txt`. After adding any failed chain IDs there, rerun `scripts/build_hidden_manifest.py` and `scripts/verify_hidden_manifest.py`.
 
 Commit-safe public outputs:
 - `data/manifests/train.txt`
@@ -190,12 +206,15 @@ Commit-safe public outputs:
 Maintainer-only outputs live under the ignored `.nanofold_private/` workspace:
 - `.nanofold_private/manifests/hidden_val.txt`
 - `.nanofold_private/manifests/split_quality_report.json`
+- `.nanofold_private/manifests/hidden_processability_exclusions.txt`
 - `.nanofold_private/hidden_processed_features/`
 - `.nanofold_private/hidden_processed_labels/`
 - `.nanofold_private/leaderboard/official_hidden_fingerprint.json`
 - `.nanofold_private/leaderboard/private_hidden_assets.lock.json`
 - `.nanofold_private/leaderboard/private_hidden_manifest_source.lock.json`
 - `.nanofold_private/leaderboard/official_data_source.lock.json`
+
+Full public-data rebuilds use `bash scripts/full_official_data_refresh.sh --rewrite-lock` and are reserved for deliberate changes to the official public data contract.
 
 ## 6) Fingerprint and Integrity Requirements
 
@@ -222,13 +241,15 @@ Official budget definitions:
 - sample budget: `B_sample = max_steps * effective_batch_size`
 - residue budget: `B_res = max_steps * effective_batch_size * crop_size`
 
-Official constants (`limited_large`):
-- `seed = 0`
-- `crop_size = 256`
-- `msa_depth = 192`
-- `effective_batch_size = 2`
-- `max_steps = 10,000`
-- deterministic val settings (`center`, `top`)
+Track budget constants:
+
+| Track | Seed | Crop size | MSA depth | Effective batch | Max steps | Sample budget | Residue budget | Parameter cap |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `limited` | `0` | `256` | `192` | `2` | `10,000` | `20,000` | `5,120,000` | `50,000,000` |
+| `research_large` | `0` | `256` | `192` | `2` | `50,000` | `100,000` | `25,600,000` | `50,000,000` |
+| `unlimited` | submitter-defined | submitter-defined | submitter-defined | submitter-defined | submitter-defined | unrestricted | unrestricted | unrestricted |
+
+All tracks use deterministic public validation settings (`center`, `top`) when the track defines them.
 
 Runtime reproducibility:
 - deterministic seeding support
@@ -242,7 +263,9 @@ Primary metric:
 - all components use `cutoff=15.0A`, thresholds `[0.5,1.0,2.0,4.0]`, label masks, and equal chain weighting
 
 Leaderboard ranking metric:
-- `foldscore_auc_hidden`, trapezoidal AUC over cumulative samples on `[0, B_sample]`
+- `limited`: `foldscore_auc_hidden`, trapezoidal AUC over cumulative samples on `[0, B_sample]`
+- `research_large`: `foldscore_auc_hidden`, trapezoidal AUC over cumulative samples on `[0, B_sample]`
+- `unlimited`: `final_hidden_foldscore`
 
 Why AUC: the competition is a slowrun, so learning speed matters. A method that learns robust geometry earlier in the sample budget should be rewarded, even when final checkpoint scores are close.
 
@@ -261,7 +284,7 @@ Canonical result artifact:
 Canonical maintainer runner:
 
 ```bash
-python scripts/run_official.py --submission submissions/<name> --track limited_large --update-leaderboard
+python scripts/run_official.py --submission submissions/<name> --track <track_id> --update-leaderboard
 ```
 
 Hidden assets are resolved via env (or explicit CLI overrides):
@@ -289,8 +312,29 @@ Hidden leaderboard runs must execute in a sealed runtime. The supported maintain
 Containerized no-network execution:
 
 ```bash
-bash scripts/run_official_docker.sh --submission submissions/<name> --track limited_large --update-leaderboard
+bash scripts/run_official_docker.sh --submission submissions/<name> --track <track_id> --update-leaderboard
 ```
+
+The Docker build copies only source-oriented files into the image. Generated datasets, hidden assets, checkpoints, local environments, and run outputs are excluded from the build context and are supplied through runtime mounts.
+
+Modal no-network execution for checkpoints already stored in the `nanofold-runs` Modal volume:
+
+```bash
+modal run scripts/modal_official.py \
+  --upload-public-data \
+  --upload-hidden-assets \
+  --upload-only
+```
+
+```bash
+modal run scripts/modal_official.py \
+  --submission submissions/<name> \
+  --config submissions/<name>/config.yaml \
+  --track <track_id> \
+  --update-leaderboard
+```
+
+Run the upload command the first time a Modal maintainer environment is prepared, or whenever public/hidden assets change. The Modal runner uses separate prediction and scoring functions. The prediction function mounts public data, hidden features, and hidden fingerprints. The scoring function mounts saved predictions, hidden labels, hidden features, hidden fingerprints, and the private hidden lock. Both stages request the configured GPU; scoring uses it for the atom14 FoldScore pairwise-distance calculations.
 
 ## 10) CI and PR Guardrails
 
@@ -308,10 +352,12 @@ Protected manifest PR rule:
 ## 11) Submitter Self-Check
 
 ```bash
-python scripts/validate_submission.py --submission submissions/<your_name> --track limited_large --strict
+python scripts/validate_submission.py --submission submissions/<your_name> --track <track_id> --strict
 if git diff --name-only origin/main...HEAD | grep -Eq '^data/manifests/(train|val|all)\.txt$'; then
   echo "ERROR: PR edits protected manifests (train/val)."
   exit 1
 fi
 echo "Self-check passed."
 ```
+
+Use the same `<track_id>` in the submission config, local training command, validation command, and pull-request description. Submit separate configs or separate submission directories for the same method on multiple tracks.

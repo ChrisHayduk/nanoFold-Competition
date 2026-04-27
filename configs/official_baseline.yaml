@@ -1,9 +1,9 @@
-# Canonical maintainer profile for the official limited track (Large).
+# Canonical maintainer profile for the official limited track.
 # This keeps the baseline model/optimizer choices, but enforces official
 # data-budget constants and validation protocol settings.
 
-run_name: official_limited_large_baseline
-track: limited_large
+run_name: official_limited_baseline
+track: limited
 seed: 0
 
 submission:

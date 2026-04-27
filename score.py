@@ -8,10 +8,11 @@ from typing import Any, Dict, List
 
 import numpy as np
 import torch
+from tqdm import tqdm
 
 from nanofold.chain_paths import chain_npz_path
 from nanofold.metrics import foldscore_auc, foldscore_components
-from nanofold.utils import get_env_metadata, utc_now_iso
+from nanofold.utils import default_torch_device, get_env_metadata, utc_now_iso
 
 HIDDEN_SPLITS = {"hidden_val", "test_hidden"}
 
@@ -40,7 +41,30 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Optional path to write scoring summary JSON.",
     )
+    ap.add_argument(
+        "--device",
+        type=str,
+        default="",
+        help="Scoring device override. Defaults to CUDA, then MPS, then CPU.",
+    )
     return ap.parse_args()
+
+
+def _resolve_score_device(device_name: str) -> torch.device:
+    if not device_name.strip():
+        return default_torch_device()
+    device = torch.device(device_name.strip())
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise ValueError("Requested CUDA scoring device, but torch.cuda.is_available() is false.")
+    if device.type == "mps":
+        mps_backend = getattr(torch.backends, "mps", None)
+        if mps_backend is None or not bool(mps_backend.is_available()):
+            raise ValueError("Requested MPS scoring device, but MPS is not available.")
+    return device
+
+
+def _labels_to_device(labels: Dict[str, torch.Tensor], device: torch.device) -> Dict[str, torch.Tensor]:
+    return {key: value.to(device=device, non_blocking=device.type == "cuda") for key, value in labels.items()}
 
 
 def _load_label_crop(
@@ -217,12 +241,18 @@ def main() -> None:
     crop_mode = args.crop_mode.strip() or str(prediction_summary.get("crop_mode", "center"))
     split = str(prediction_summary["split"])
     n_ckpts = len(checkpoints)
+    device = _resolve_score_device(str(args.device))
     per_chain_rows: List[Dict[str, Any]] = []
     scored_checkpoints: List[Dict[str, Any]] = []
     scoring_start = time.perf_counter()
+    print(
+        f"Scoring {split}: {len(chain_ids)} chains x {n_ckpts} checkpoint(s) on {device}",
+        flush=True,
+    )
 
-    for item in checkpoints:
+    for ckpt_index, item in enumerate(checkpoints, start=1):
         ckpt_path = str(item["ckpt"])
+        ckpt_name = Path(ckpt_path).name
         pred_dir = _prediction_subdir(pred_root, ckpt_path, n_ckpts=n_ckpts)
         chain_metrics: Dict[str, List[float]] = {
             "foldscore": [],
@@ -231,21 +261,34 @@ def main() -> None:
             "lddt_atom14": [],
         }
         ckpt_start = time.perf_counter()
+        print(
+            f"Scoring checkpoint {ckpt_index}/{n_ckpts}: {ckpt_name} "
+            f"({len(chain_ids)} chains)",
+            flush=True,
+        )
 
-        for chain_id in chain_ids:
+        for chain_id in tqdm(
+            chain_ids,
+            desc=f"score:{split}:{ckpt_name}",
+            dynamic_ncols=True,
+        ):
             pred_path = chain_npz_path(pred_dir, chain_id)
             if not pred_path.exists():
                 raise FileNotFoundError(f"Missing prediction file for scoring: {pred_path}")
             with np.load(pred_path) as pred_npz:
                 if "pred_atom14" not in pred_npz:
                     raise ValueError(f"Prediction file is missing required `pred_atom14`: {pred_path}")
-                pred_atom14 = torch.from_numpy(np.asarray(pred_npz["pred_atom14"], dtype=np.float32))
+                pred_atom14 = torch.from_numpy(np.asarray(pred_npz["pred_atom14"], dtype=np.float32)).to(
+                    device=device,
+                    non_blocking=device.type == "cuda",
+                )
             labels = _load_label_crop(
                 labels_dir=labels_dir,
                 chain_id=chain_id,
                 crop_size=crop_size,
                 crop_mode=crop_mode,
             )
+            labels = _labels_to_device(labels, device=device)
             metrics = _score_chain(
                 pred_atom14=pred_atom14,
                 labels=labels,
@@ -270,6 +313,12 @@ def main() -> None:
         scored_row["num_chains"] = len(chain_ids)
         scored_row["score_wall_time_seconds"] = float(time.perf_counter() - ckpt_start)
         scored_checkpoints.append(scored_row)
+        print(
+            f"[{ckpt_name}] mean_foldscore={scored_row['mean_foldscore']:.6f} "
+            f"mean_lddt_ca={scored_row['mean_lddt_ca']:.6f} "
+            f"score_wall_time_seconds={scored_row['score_wall_time_seconds']:.2f}",
+            flush=True,
+        )
 
     per_chain_out_path = Path(args.per_chain_out).resolve() if args.per_chain_out else None
     if per_chain_out_path:
@@ -301,7 +350,7 @@ def main() -> None:
         "cumulative_samples_seen": int(final_row.get("cumulative_samples_seen", 0)),
         "cumulative_cropped_residues_seen": int(final_row.get("cumulative_cropped_residues_seen", 0)),
         "cumulative_nonpad_residues_seen": int(final_row.get("cumulative_nonpad_residues_seen", 0)),
-        "env": get_env_metadata(torch.device("cuda" if torch.cuda.is_available() else "cpu")),
+        "env": get_env_metadata(device),
         "per_chain_scores_path": str(per_chain_out_path.resolve()) if per_chain_out_path else None,
         "finished_at": utc_now_iso(),
         "score_wall_time_seconds": float(time.perf_counter() - scoring_start),

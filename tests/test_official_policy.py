@@ -20,7 +20,7 @@ def _load_official_cfg() -> dict:
 
 
 def test_apply_track_policy_overrides_immutable_fields() -> None:
-    track = load_track_spec("limited_large")
+    track = load_track_spec("limited")
     cfg = _load_official_cfg()
     cfg["seed"] = 123
     cfg["data"]["crop_size"] = 999
@@ -42,7 +42,7 @@ def test_apply_track_policy_overrides_immutable_fields() -> None:
 
 
 def test_validate_track_policy_passes_after_apply() -> None:
-    track = load_track_spec("limited_large")
+    track = load_track_spec("limited")
     cfg = _load_official_cfg()
     cfg["data"]["crop_size"] = 128
     applied = apply_track_policy(cfg, track_spec=track)
@@ -56,7 +56,7 @@ def test_validate_track_policy_passes_after_apply() -> None:
 
 
 def test_model_param_limit_is_enforced() -> None:
-    track = load_track_spec("limited_large")
+    track = load_track_spec("limited")
     assert track.max_params is not None
     enforce_model_param_limit(track_spec=track, n_params=int(track.max_params))
     with pytest.raises(ValueError):

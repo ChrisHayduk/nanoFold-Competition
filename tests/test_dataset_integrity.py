@@ -100,7 +100,7 @@ def test_verify_dataset_against_fingerprint_roundtrip(tmp_path: Path) -> None:
         val_manifest=manifests / "val.txt",
         require_no_missing=True,
         require_labels=True,
-        track_id="limited_large",
+        track_id="limited",
     )
     fp_path = tmp_path / "fp.json"
     fp_path.write_text(json.dumps(fingerprint))
@@ -113,10 +113,54 @@ def test_verify_dataset_against_fingerprint_roundtrip(tmp_path: Path) -> None:
         expected_fingerprint_path=fp_path,
         require_no_missing=True,
         require_labels=True,
-        track_id="limited_large",
+        track_id="limited",
     )
     assert out["missing_feature_chain_count"] == 0
     assert out["missing_label_chain_count"] == 0
+
+
+def test_verify_dataset_against_fingerprint_uses_recorded_source_lock(tmp_path: Path) -> None:
+    manifests = tmp_path / "manifests"
+    manifests.mkdir()
+    features = tmp_path / "processed_features"
+    labels = tmp_path / "processed_labels"
+    features.mkdir()
+    labels.mkdir()
+    source_lock = tmp_path / "official_manifest_source.lock.json"
+    source_lock.write_text('{"source": "test"}\n')
+
+    (manifests / "train.txt").write_text("1abc_A\n")
+    (manifests / "val.txt").write_text("2def_B\n")
+    _write_feature_npz(chain_npz_path(features, "1abc_A"))
+    _write_feature_npz(chain_npz_path(features, "2def_B"))
+    _write_label_npz(chain_npz_path(labels, "1abc_A"))
+    _write_label_npz(chain_npz_path(labels, "2def_B"))
+
+    fingerprint = build_dataset_fingerprint(
+        processed_features_dir=features,
+        processed_labels_dir=labels,
+        train_manifest=manifests / "train.txt",
+        val_manifest=manifests / "val.txt",
+        require_no_missing=True,
+        require_labels=True,
+        track_id="limited",
+        source_lock_path=source_lock,
+    )
+    fp_path = tmp_path / "fp.json"
+    fp_path.write_text(json.dumps(fingerprint))
+
+    out = verify_dataset_against_fingerprint(
+        processed_features_dir=features,
+        processed_labels_dir=labels,
+        train_manifest=manifests / "train.txt",
+        val_manifest=manifests / "val.txt",
+        expected_fingerprint_path=fp_path,
+        require_no_missing=True,
+        require_labels=True,
+        track_id="limited",
+    )
+
+    assert out["source_lock_sha256"] == fingerprint["source_lock_sha256"]
 
 
 def test_verify_split_against_fingerprint_uses_explicit_manifest_names(tmp_path: Path) -> None:
@@ -171,7 +215,7 @@ def test_verify_split_against_fingerprint_supports_features_only_comparison(tmp_
         val_manifest=manifests / "val.txt",
         require_no_missing=True,
         require_labels=True,
-        track_id="limited_large",
+        track_id="limited",
     )
     fp_path = tmp_path / "fp.json"
     fp_path.write_text(json.dumps(fingerprint))
@@ -183,7 +227,7 @@ def test_verify_split_against_fingerprint_supports_features_only_comparison(tmp_
         expected_fingerprint_path=fp_path,
         require_no_missing=True,
         require_labels=False,
-        track_id="limited_large",
+        track_id="limited",
         comparison_mode="features_only",
     )
     assert out["present_feature_chain_count"] == 2
@@ -243,7 +287,7 @@ def test_build_fingerprint_captures_preprocess_config_sha256(tmp_path: Path) -> 
         val_manifest=manifests / "val.txt",
         require_no_missing=True,
         require_labels=True,
-        track_id="limited_large",
+        track_id="limited",
     )
     assert isinstance(fingerprint["preprocess_config_sha256"], str)
     assert len(fingerprint["preprocess_config_sha256"]) == 64
@@ -257,6 +301,72 @@ def test_build_fingerprint_captures_preprocess_config_sha256(tmp_path: Path) -> 
         val_manifest=manifests / "val.txt",
         require_no_missing=True,
         require_labels=True,
-        track_id="limited_large",
+        track_id="limited",
     )
     assert fingerprint_changed["preprocess_config_sha256"] != fingerprint["preprocess_config_sha256"]
+
+
+def test_preprocess_meta_hash_ignores_local_paths_and_dependency_versions(tmp_path: Path) -> None:
+    manifests = tmp_path / "manifests"
+    manifests.mkdir()
+    manifest = manifests / "hidden_val.txt"
+    manifest.write_text("1abc_A\n")
+
+    features_a = tmp_path / "features_a"
+    features_b = tmp_path / "features_b"
+    labels_a = tmp_path / "labels_a"
+    labels_b = tmp_path / "labels_b"
+    for path in (features_a, features_b, labels_a, labels_b):
+        path.mkdir()
+
+    for features, labels in ((features_a, labels_a), (features_b, labels_b)):
+        _write_feature_npz(chain_npz_path(features, "1abc_A"))
+        _write_label_npz(chain_npz_path(labels, "1abc_A"))
+
+    stable_meta = {
+        "aligner": {"match_score": 2.0, "mode": "global"},
+        "atom14_num_slots": 14,
+        "ca_atom14_slot": 1,
+        "cli_args": {
+            "disable_templates": True,
+            "max_msa_seqs": 2048,
+            "max_templates": 1,
+            "msa_name": "uniref90_hits.a3m",
+            "processed_features_dir": "local/path/one",
+            "processed_labels_dir": "local/path/one",
+            "raw_root": "data/openproteinset",
+            "strict": False,
+        },
+        "dependency_metadata": {"numpy": "1.0", "python": "3.11"},
+        "git_sha": "abc",
+        "schema_version": 2,
+    }
+    changed_environment_meta = {
+        **stable_meta,
+        "cli_args": {
+            **stable_meta["cli_args"],
+            "processed_features_dir": "different/local/path",
+            "processed_labels_dir": "different/local/path",
+            "raw_root": "/tmp/private/data",
+        },
+        "dependency_metadata": {"numpy": "2.0", "python": "3.13"},
+        "git_sha": "def",
+    }
+    (features_a / PREPROCESS_META_FILENAME).write_text(json.dumps(stable_meta))
+    (features_b / PREPROCESS_META_FILENAME).write_text(json.dumps(changed_environment_meta))
+
+    fp_a = build_split_fingerprint(
+        processed_features_dir=features_a,
+        processed_labels_dir=labels_a,
+        manifest_paths={"hidden_val": manifest},
+        require_no_missing=True,
+        require_labels=True,
+    )
+    fp_b = build_split_fingerprint(
+        processed_features_dir=features_b,
+        processed_labels_dir=labels_b,
+        manifest_paths={"hidden_val": manifest},
+        require_no_missing=True,
+        require_labels=True,
+    )
+    assert fp_a["preprocess_config_sha256"] == fp_b["preprocess_config_sha256"]
