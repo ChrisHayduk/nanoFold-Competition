@@ -282,6 +282,25 @@ bash scripts/run_official_docker.sh \
 
 The Docker image build context intentionally excludes generated datasets, private hidden assets, local Python environments, checkpoints, and run outputs. Hidden data is mounted read-only during the prediction and scoring stages.
 
+Maintainers can run the same two-stage hidden evaluation on Modal when the checkpoint already lives in the `nanofold-runs` Modal volume:
+
+```bash
+modal run scripts/modal_official.py \
+  --upload-public-data \
+  --upload-hidden-assets \
+  --upload-only
+```
+
+```bash
+modal run scripts/modal_official.py \
+  --submission submissions/<name> \
+  --config submissions/<name>/config.yaml \
+  --track <track_id> \
+  --update-leaderboard
+```
+
+Use the upload command the first time a Modal environment is prepared, or whenever public/hidden assets change. Hidden Modal execution uses separate no-network prediction and scoring functions; hidden labels are not mounted during prediction. Both Modal stages request the configured GPU because atom14 FoldScore scoring is pairwise-distance heavy.
+
 Hidden lock metadata is maintainer-local and ignored by git. Populate/update it with `python scripts/pin_hidden_assets.py ...`.
 
 ## Manifest Reproducibility
@@ -340,6 +359,7 @@ CI enforces the same PR guardrail:
 - `scripts/build_fingerprint.py`: split dataset fingerprint generator
 - `scripts/run_official.py`: canonical official validate/train/eval/result runner
 - `scripts/run_official_docker.sh`: no-network official container runner
+- `scripts/modal_official.py`: maintainer-only Modal hidden evaluation runner
 - `nanofold/submission_runtime.py`: runtime API enforcement
 - `third_party/minAlphaFold2`: pinned upstream minAlphaFold2 implementation used by `submissions/minalphafold2`
 - `leaderboard/`: leaderboard and official lock/fingerprint artifacts

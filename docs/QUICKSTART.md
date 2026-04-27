@@ -148,7 +148,7 @@ modal volume get nanofold-runs \
   runs/minalphafold2_reference/checkpoints/ckpt_last.pt
 ```
 
-Use separate run names or separate Modal run volumes for concurrent experiments. Do not upload hidden validation assets to Modal; this participant path only uses public train and public validation data.
+Use separate run names or separate Modal run volumes for concurrent experiments. Do not upload hidden validation assets in participant workflows; this path only uses public train and public validation data.
 
 ## 4) Score Public Validation
 
@@ -273,6 +273,23 @@ Maintainers will run the sealed official leaderboard command:
 ```bash
 bash scripts/run_official_docker.sh \
   --submission submissions/your_name \
+  --track <track_id> \
+  --update-leaderboard
+```
+
+When the checkpoint is already in Modal's `nanofold-runs` volume, maintainers can run the sealed hidden evaluation there instead:
+
+```bash
+modal run scripts/modal_official.py \
+  --upload-public-data \
+  --upload-hidden-assets \
+  --upload-only
+```
+
+```bash
+modal run scripts/modal_official.py \
+  --submission submissions/your_name \
+  --config submissions/your_name/config.yaml \
   --track <track_id> \
   --update-leaderboard
 ```

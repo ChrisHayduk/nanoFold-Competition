@@ -317,6 +317,25 @@ bash scripts/run_official_docker.sh --submission submissions/<name> --track <tra
 
 The Docker build copies only source-oriented files into the image. Generated datasets, hidden assets, checkpoints, local environments, and run outputs are excluded from the build context and are supplied through runtime mounts.
 
+Modal no-network execution for checkpoints already stored in the `nanofold-runs` Modal volume:
+
+```bash
+modal run scripts/modal_official.py \
+  --upload-public-data \
+  --upload-hidden-assets \
+  --upload-only
+```
+
+```bash
+modal run scripts/modal_official.py \
+  --submission submissions/<name> \
+  --config submissions/<name>/config.yaml \
+  --track <track_id> \
+  --update-leaderboard
+```
+
+Run the upload command the first time a Modal maintainer environment is prepared, or whenever public/hidden assets change. The Modal runner uses separate prediction and scoring functions. The prediction function mounts public data, hidden features, and hidden fingerprints. The scoring function mounts saved predictions, hidden labels, hidden features, hidden fingerprints, and the private hidden lock. Both stages request the configured GPU; scoring uses it for the atom14 FoldScore pairwise-distance calculations.
+
 ## 10) CI and PR Guardrails
 
 CI enforces:
