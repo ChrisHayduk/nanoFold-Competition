@@ -7,6 +7,8 @@ import pytest
 import torch
 import yaml
 
+from nanofold.competition_policy import load_track_spec
+from nanofold.utils import count_parameters
 from submissions.minalphafold2 import submission
 
 
@@ -59,6 +61,18 @@ def test_minalphafold2_reference_loads_upstream_tiny_toml() -> None:
     assert model.config == expected
 
 
+def test_minalphafold2_full_profile_fits_limited_param_cap() -> None:
+    cfg = yaml.safe_load(Path("submissions/minalphafold2_full/config.yaml").read_text())
+    track = load_track_spec("limited")
+
+    n_params = count_parameters(submission.build_model(cfg))
+
+    assert cfg["model"]["profile_path"] == "third_party/minAlphaFold2/configs/alphafold2.toml"
+    assert n_params > 50_000_000
+    assert track.max_params == 100_000_000
+    assert n_params <= int(track.max_params)
+
+
 def test_minalphafold2_budget_schedule_scales_af2_protocol_to_track_budget() -> None:
     cfg = yaml.safe_load(Path("submissions/minalphafold2/config.yaml").read_text())
 
@@ -101,6 +115,33 @@ def test_minalphafold2_finetune_auxiliary_weights_follow_ramp() -> None:
     submission._apply_finetune_ramp(loss_fn, 1.5)
     for attr in submission.FINETUNE_AUXILIARY_WEIGHT_ATTRS:
         assert float(getattr(loss_fn, attr)) == pytest.approx(target_weights[attr])
+
+
+def test_minalphafold2_handoff_blends_initial_and_finetune_losses(monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = yaml.safe_load(Path("submissions/minalphafold2/config.yaml").read_text())
+
+    class ConstantLoss(torch.nn.Module):
+        def __init__(self, value: float) -> None:
+            super().__init__()
+            self.value = torch.nn.Parameter(torch.tensor(value))
+
+        def forward(self, **_: Any) -> torch.Tensor:
+            return self.value.reshape(1)
+
+    model = torch.nn.Module()
+    model.nanofold_initial_loss_fn = ConstantLoss(2.0)
+    model.nanofold_finetune_loss_fn = ConstantLoss(6.0)
+    features = {"aatype": torch.zeros((1, 1), dtype=torch.long)}
+    monkeypatch.setattr(submission, "loss_inputs_from_batch", lambda features, model_out: {})
+
+    cfg["_runtime"] = {"step": 8695}
+    assert float(submission._alphafold_loss(model, features, {}, cfg).detach()) == pytest.approx(2.0)
+
+    cfg["_runtime"] = {"step": 8946}
+    assert float(submission._alphafold_loss(model, features, {}, cfg).detach()) == pytest.approx(4.0)
+
+    cfg["_runtime"] = {"step": 9196}
+    assert float(submission._alphafold_loss(model, features, {}, cfg).detach()) == pytest.approx(6.0)
 
 
 def test_minalphafold2_scheduler_uses_af2_lr_stages() -> None:
@@ -169,4 +210,4 @@ def test_minalphafold2_run_batch_returns_finetune_loss_at_handoff() -> None:
     assert torch.isfinite(out["loss"])
     loss_fn = model.nanofold_finetune_loss_fn
     for attr in submission.FINETUNE_AUXILIARY_WEIGHT_ATTRS:
-        assert float(getattr(loss_fn, attr)) == pytest.approx(0.0)
+        assert float(getattr(loss_fn, attr)) > 0.0

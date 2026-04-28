@@ -57,7 +57,7 @@ def test_validate_track_policy_passes_after_apply() -> None:
 
 def test_model_param_limit_is_enforced() -> None:
     track = load_track_spec("limited")
-    assert track.max_params is not None
+    assert track.max_params == 100_000_000
     enforce_model_param_limit(track_spec=track, n_params=int(track.max_params))
     with pytest.raises(ValueError):
         enforce_model_param_limit(track_spec=track, n_params=int(track.max_params) + 1)

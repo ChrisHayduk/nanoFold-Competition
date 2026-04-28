@@ -1,0 +1,49 @@
+run_name: minalphafold2_full_limited
+track: limited
+seed: 0
+
+submission:
+  path: submission.py
+
+data:
+  processed_features_dir: data/processed_features
+  processed_labels_dir: data/processed_labels
+  train_manifest: data/manifests/train.txt
+  val_manifest: data/manifests/val.txt
+  crop_size: 256
+  msa_depth: 192
+  batch_size: 1
+  num_workers: 2
+  train_crop_mode: random
+  val_crop_mode: center
+  train_msa_sample_mode: random
+  val_msa_sample_mode: top
+
+model:
+  profile_path: third_party/minAlphaFold2/configs/alphafold2.toml
+  msa_depth: 192
+  extra_msa_depth: 64
+  n_cycles: 3
+  n_ensemble: 1
+
+optim:
+  lr: 1.0e-3
+  weight_decay: 0.0
+  beta1: 0.9
+  beta2: 0.999
+  eps: 1.0e-6
+  grad_clip_norm: 0.1
+  lr_decay_factor: 0.95
+
+train:
+  max_steps: 10000
+  log_every: 10
+  eval_every: 1000
+  save_every: 1000
+  grad_accum_steps: 2
+  finetune_start_step: 8696
+  finetune_ramp_steps: 1000
+  finetune_lr_scale: 0.5
+  warmup_steps: 111
+  lr_decay_step: 5565
+  amp: false

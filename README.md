@@ -115,6 +115,7 @@ The `limited` constants are:
 | Max steps | `10,000` |
 | Sample budget | `20,000` |
 | Residue budget | `5,120,000` |
+| Parameter cap | `100,000,000` trainable parameters |
 | Tie-breaker | `final_hidden_foldscore` |
 
 ## Split Curation

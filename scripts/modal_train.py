@@ -274,7 +274,7 @@ def _append_auto_resume(argv: list[str], *, config_path: Path) -> list[str]:
     },
     timeout=60 * 60 * 24,
 )
-def run_train(argv: list[str], *, remote_config_path: str, auto_resume: bool) -> None:
+def run_train(argv: list[str], *, remote_config_path: str, auto_resume: bool, requested_gpu: str) -> None:
     os.chdir(REMOTE_ROOT)
     staged_features, staged_labels = _stage_public_data()
     argv = [
@@ -287,7 +287,7 @@ def run_train(argv: list[str], *, remote_config_path: str, auto_resume: bool) ->
     if auto_resume:
         argv = _append_auto_resume(argv, config_path=Path(remote_config_path))
 
-    print(f"[modal] gpu={GPU_SPEC}", flush=True)
+    print(f"[modal] gpu={requested_gpu}", flush=True)
     print(f"[modal] command: {sys.executable} train.py {' '.join(argv)}", flush=True)
     env = dict(os.environ)
     env["PYTHONUNBUFFERED"] = "1"
@@ -362,4 +362,4 @@ def main(
     print(f"[modal] app=nanofold-train gpu={GPU_SPEC}", flush=True)
     print(f"[modal] data volumes: features={FEATURES_VOLUME_NAME} labels={LABELS_VOLUME_NAME}", flush=True)
     print(f"[modal] runs volume: {RUNS_VOLUME_NAME}", flush=True)
-    run_train.remote(argv, remote_config_path=remote_config_path, auto_resume=auto_resume)
+    run_train.remote(argv, remote_config_path=remote_config_path, auto_resume=auto_resume, requested_gpu=GPU_SPEC)

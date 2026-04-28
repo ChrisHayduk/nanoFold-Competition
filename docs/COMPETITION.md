@@ -245,8 +245,8 @@ Track budget constants:
 
 | Track | Seed | Crop size | MSA depth | Effective batch | Max steps | Sample budget | Residue budget | Parameter cap |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| `limited` | `0` | `256` | `192` | `2` | `10,000` | `20,000` | `5,120,000` | `50,000,000` |
-| `research_large` | `0` | `256` | `192` | `2` | `50,000` | `100,000` | `25,600,000` | `50,000,000` |
+| `limited` | `0` | `256` | `192` | `2` | `10,000` | `20,000` | `5,120,000` | `100,000,000` |
+| `research_large` | `0` | `256` | `192` | `2` | `50,000` | `100,000` | `25,600,000` | `100,000,000` |
 | `unlimited` | submitter-defined | submitter-defined | submitter-defined | submitter-defined | submitter-defined | unrestricted | unrestricted | unrestricted |
 
 All tracks use deterministic public validation settings (`center`, `top`) when the track defines them.
