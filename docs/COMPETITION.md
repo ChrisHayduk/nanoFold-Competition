@@ -346,6 +346,38 @@ modal run scripts/modal_official.py \
   --update-leaderboard
 ```
 
+For long Modal evaluations, maintainers can detach prediction and scoring separately and then update the local leaderboard from the result stored in the `nanofold-runs` volume:
+
+```bash
+modal run --detach scripts/modal_official.py \
+  --submission submissions/<name> \
+  --config submissions/<name>/config.yaml \
+  --track <track_id> \
+  --team "<team or individual name>" \
+  --skip-score \
+  --background-predict
+```
+
+```bash
+modal run --detach scripts/modal_official.py \
+  --submission submissions/<name> \
+  --config submissions/<name>/config.yaml \
+  --track <track_id> \
+  --team "<team or individual name>" \
+  --skip-predict \
+  --background-score
+```
+
+```bash
+modal volume get nanofold-runs <run_name>/modal_official_result.json runs/<run_name>/modal_official_result.json
+python scripts/add_leaderboard_entry.py \
+  --result runs/<run_name>/modal_official_result.json \
+  --leaderboard leaderboard/leaderboard.json \
+  --readme README.md \
+  --description "<leaderboard description>" \
+  --team "<team or individual name>"
+```
+
 Run the upload command the first time a Modal maintainer environment is prepared, or whenever public/hidden assets change. The Modal runner uses separate prediction and scoring functions. The prediction function mounts public data, hidden features, and hidden fingerprints. The scoring function mounts saved predictions, hidden labels, hidden features, hidden fingerprints, and the private hidden lock. Both stages request the configured GPU; scoring uses it for atom14 structural metric calculations.
 
 ## 10) CI and PR Guardrails

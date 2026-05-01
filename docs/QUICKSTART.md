@@ -304,6 +304,38 @@ modal run scripts/modal_official.py \
   --update-leaderboard
 ```
 
+For long Modal evaluations, maintainers can detach the two stages and update the leaderboard from the result artifact written to the `nanofold-runs` volume:
+
+```bash
+modal run --detach scripts/modal_official.py \
+  --submission submissions/your_name \
+  --config submissions/your_name/config.yaml \
+  --track <track_id> \
+  --team "<team or individual name>" \
+  --skip-score \
+  --background-predict
+```
+
+```bash
+modal run --detach scripts/modal_official.py \
+  --submission submissions/your_name \
+  --config submissions/your_name/config.yaml \
+  --track <track_id> \
+  --team "<team or individual name>" \
+  --skip-predict \
+  --background-score
+```
+
+```bash
+modal volume get nanofold-runs <run_name>/modal_official_result.json runs/<run_name>/modal_official_result.json
+python scripts/add_leaderboard_entry.py \
+  --result runs/<run_name>/modal_official_result.json \
+  --leaderboard leaderboard/leaderboard.json \
+  --readme README.md \
+  --description "<leaderboard description>" \
+  --team "<team or individual name>"
+```
+
 That hidden run produces the official rank score for the selected track and updates the leaderboard artifacts if accepted.
 
 ## Where To Go Next

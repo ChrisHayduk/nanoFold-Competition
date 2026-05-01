@@ -54,6 +54,7 @@ HIDDEN_LABELS_ARCHIVE_NAME = "hidden_processed_labels.tar"
 HIDDEN_MANIFEST_VOLUME_PATH = Path("/hidden_val.txt")
 HIDDEN_FINGERPRINT_VOLUME_PATH = Path("/official_hidden_fingerprint.json")
 HIDDEN_LOCK_VOLUME_PATH = Path("/private_hidden_assets.lock.json")
+MODAL_RESULT_NAME = "modal_official_result.json"
 
 app = modal.App("nanofold-official")
 
@@ -375,6 +376,19 @@ def _result_payload(*, config_path: Path) -> dict[str, Any]:
     }
 
 
+def _write_remote_result(payload: dict[str, Any]) -> Path:
+    run_name = str(payload["run_name"])
+    target = REMOTE_ROOT / "runs" / run_name / MODAL_RESULT_NAME
+    target.write_text(str(payload["result_json"]))
+    print(f"[modal] wrote result artifact to runs volume: {target}", flush=True)
+    return target
+
+
+def _print_background_call(*, label: str, call: Any) -> None:
+    print(f"[modal] spawned {label} call: {call.object_id}", flush=True)
+    print(f"[modal] call dashboard: {call.get_dashboard_url()}", flush=True)
+
+
 @app.function(
     image=image,
     gpu=GPU_SPEC,
@@ -441,8 +455,10 @@ def run_prediction_stage(
         "--checkpoint-steps",
         checkpoint_steps,
     ]
-    _run_command(cmd, env=env)
-    runs_volume.commit()
+    try:
+        _run_command(cmd, env=env)
+    finally:
+        runs_volume.commit()
 
 
 @app.function(
@@ -509,15 +525,19 @@ def run_scoring_stage(
         "--hidden-lock-file",
         str(hidden_lock),
     ]
-    _run_command(cmd, env=env)
-    runs_volume.commit()
-    return _result_payload(config_path=Path(config))
+    try:
+        _run_command(cmd, env=env)
+        payload = _result_payload(config_path=Path(config))
+        _write_remote_result(payload)
+    finally:
+        runs_volume.commit()
+    return payload
 
 
 def _write_local_result(payload: dict[str, Any], *, out_dir: Path) -> Path:
     run_name = str(payload["run_name"])
     result_json = str(payload["result_json"])
-    target = out_dir / run_name / "modal_official_result.json"
+    target = out_dir / run_name / MODAL_RESULT_NAME
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(result_json)
     print(f"[modal] wrote local result artifact: {target}", flush=True)
@@ -558,6 +578,8 @@ def main(
     skip_predict: bool = False,
     skip_score: bool = False,
     update_leaderboard: bool = False,
+    background_predict: bool = False,
+    background_score: bool = False,
     public_features_dir: str = "data/processed_features",
     public_labels_dir: str = "data/processed_labels",
     hidden_manifest: str = ".nanofold_private/manifests/hidden_val.txt",
@@ -637,26 +659,48 @@ def main(
     )
     print(f"[modal] runs volume: {RUNS_VOLUME_NAME}", flush=True)
 
-    if not skip_predict:
-        run_prediction_stage.remote(
-            submission=remote_submission,
-            config=remote_config,
-            track=track,
-            description=run_description,
-            team=leaderboard_team,
-            checkpoint_steps=checkpoint_steps,
-            commit=resolved_commit,
+    if background_predict and not skip_score:
+        raise SystemExit("background_predict must be used with skip_score; rerun later with skip_predict to score.")
+    if background_score and not skip_predict:
+        raise SystemExit("background_score must be used with skip_predict after prediction artifacts already exist.")
+    if background_score and update_leaderboard:
+        raise SystemExit(
+            "background_score writes the result to the runs volume. Download that result and update the leaderboard locally."
         )
 
+    if not skip_predict:
+        prediction_kwargs = {
+            "submission": remote_submission,
+            "config": remote_config,
+            "track": track,
+            "description": run_description,
+            "team": leaderboard_team,
+            "checkpoint_steps": checkpoint_steps,
+            "commit": resolved_commit,
+        }
+        if background_predict:
+            call = run_prediction_stage.spawn(**prediction_kwargs)
+            _print_background_call(label="official prediction", call=call)
+        else:
+            run_prediction_stage.remote(**prediction_kwargs)
+
     if not skip_score:
-        payload = run_scoring_stage.remote(
-            submission=remote_submission,
-            config=remote_config,
-            track=track,
-            description=run_description,
-            team=leaderboard_team,
-            commit=resolved_commit,
-        )
+        scoring_kwargs = {
+            "submission": remote_submission,
+            "config": remote_config,
+            "track": track,
+            "description": run_description,
+            "team": leaderboard_team,
+            "commit": resolved_commit,
+        }
+        if background_score:
+            call = run_scoring_stage.spawn(**scoring_kwargs)
+            _print_background_call(label="official scoring", call=call)
+            run_name = _run_name_from_config((REPO_ROOT / _repo_relative(config)).resolve())
+            volume_path = f"/{run_name}/{MODAL_RESULT_NAME}"
+            print(f"[modal] result will be written to `{RUNS_VOLUME_NAME}`:{volume_path}", flush=True)
+            return
+        payload = run_scoring_stage.remote(**scoring_kwargs)
         result_path = _write_local_result(payload, out_dir=(REPO_ROOT / local_result_dir).resolve())
         if update_leaderboard:
             _update_local_leaderboard(result_path=result_path, description=run_description, team=leaderboard_team)

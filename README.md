@@ -324,6 +324,38 @@ modal run scripts/modal_official.py \
   --update-leaderboard
 ```
 
+For long Modal runs, launch the prediction and scoring stages as detached calls, then download the durable result artifact and update the local leaderboard:
+
+```bash
+modal run --detach scripts/modal_official.py \
+  --submission submissions/<name> \
+  --config submissions/<name>/config.yaml \
+  --track <track_id> \
+  --team "<team or individual name>" \
+  --skip-score \
+  --background-predict
+```
+
+```bash
+modal run --detach scripts/modal_official.py \
+  --submission submissions/<name> \
+  --config submissions/<name>/config.yaml \
+  --track <track_id> \
+  --team "<team or individual name>" \
+  --skip-predict \
+  --background-score
+```
+
+```bash
+modal volume get nanofold-runs <run_name>/modal_official_result.json runs/<run_name>/modal_official_result.json
+python scripts/add_leaderboard_entry.py \
+  --result runs/<run_name>/modal_official_result.json \
+  --leaderboard leaderboard/leaderboard.json \
+  --readme README.md \
+  --description "<leaderboard description>" \
+  --team "<team or individual name>"
+```
+
 Use the upload command the first time a Modal environment is prepared, or whenever public/hidden assets change. Hidden Modal execution uses separate no-network prediction and scoring functions; hidden labels are not mounted during prediction. Both Modal stages request the configured GPU because atom14 structural scoring is pairwise-distance heavy.
 
 Hidden lock metadata is maintainer-local and ignored by git. Populate/update it with `python scripts/pin_hidden_assets.py ...`.
@@ -392,9 +424,8 @@ CI enforces the same PR guardrail:
 ## Leaderboard
 
 <!-- LEADERBOARD_START -->
-| Track | Status |
-|---|---|
-| `limited` | No accepted submissions yet |
-| `research_large` | No accepted submissions yet |
-| `unlimited` | No accepted submissions yet |
+### `limited`
+| # | Team | Rank Score | Hidden FoldScore | Public FoldScore | Date | Commit | Description |
+|---:|---|---:|---:|---:|---|---|---|
+| 1 | nanoFold Maintainers | 0.2634 | 0.3423 | 0.3426 | 2026-05-01 | `85f8c9c` | minAlphaFold2 full profile limited-track benchmark |
 <!-- LEADERBOARD_END -->
