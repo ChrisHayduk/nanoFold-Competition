@@ -147,6 +147,10 @@ FoldScore =
 
 Hidden leaderboard ranking is track-specific. `limited` and `research_large` use `foldscore_auc_hidden`, trapezoidal AUC over cumulative samples from `0` to `B_sample`, with `final_hidden_foldscore` as the tie-breaker. `unlimited` uses `final_hidden_foldscore` because it has no shared sample budget.
 
+Leaderboard JSON entries include `name` and `submission_path` fields. The
+rendered README leaderboard hyperlinks `name` to `submission_path` for the
+accepted submission implementation.
+
 Scoring reads feature-side residue identities to interpret atom14 slots for
 side-chain torsions and atom-name-aware clashes. `ASE` is not included because
 it requires submitted confidence estimates. `reLLG_lddt` is not included

@@ -12,6 +12,8 @@ __pycache__/
 /.ci_smoke/
 /.nanofold_private/
 /.nanofold_hidden*
+/.nanofold_hf_cache/
+/hf_dataset_export/
 /.pyright/
 /.venv/
 /.conda/

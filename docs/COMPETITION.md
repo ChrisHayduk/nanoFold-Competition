@@ -32,7 +32,7 @@ Official runs must use:
 - `--track <track_id>`
 - `--official`
 
-Participants submit code/configuration PRs for a chosen track and provide the lab, company, project team, or individual researcher name that should appear on the leaderboard. If the maintainer does not pass an explicit team name during PR-triggered GitHub Actions evaluation, nanoFold falls back to the PR author's GitHub username. Manual maintainer automation can set `NANOFOLD_PR_AUTHOR=<github-username>` for the same fallback. Maintainers run the sealed hidden pipeline and update leaderboard artifacts after acceptance; participant PRs must not edit `leaderboard/leaderboard.json` or the rendered leaderboard table.
+Participants submit code/configuration PRs for a chosen track and provide the lab, company, project team, or individual researcher name that should appear on the leaderboard. Each accepted entry renders a linked submission `Name` plus that leaderboard identity. If the maintainer does not pass an explicit team name during PR-triggered GitHub Actions evaluation, nanoFold falls back to the PR author's GitHub username. Manual maintainer automation can set `NANOFOLD_PR_AUTHOR=<github-username>` for the same fallback. Maintainers run the sealed hidden pipeline and update leaderboard artifacts after acceptance; participant PRs must not edit `leaderboard/leaderboard.json` or the rendered leaderboard table.
 
 In official mode the runtime uses **override + validate**:
 - immutable constants from track policy are applied to config first
@@ -289,6 +289,10 @@ Secondary metrics:
 
 Canonical result artifact:
 - `runs/<run_name>/result.json`
+
+Rendered leaderboard entries include `name` and `submission_path` fields. The
+README renderer uses them for the linked `Name` column so readers can inspect
+the accepted submission implementation directly.
 
 ## 9) Official Hidden Pipeline
 

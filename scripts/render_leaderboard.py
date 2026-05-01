@@ -28,6 +28,20 @@ def render_table(entries: List[Dict[str, Any]]) -> str:
         text = str(value).strip()
         return text.replace("\n", " ").replace("|", "\\|")
 
+    def _fmt_link_label(value: Any) -> str:
+        return _fmt_text(value).replace("[", "\\[").replace("]", "\\]")
+
+    def _fmt_href(value: Any) -> str:
+        return str(value).strip().replace("\n", "").replace(" ", "%20").replace("(", "%28").replace(")", "%29")
+
+    def _submission_link(entry: Dict[str, Any]) -> str:
+        name = entry.get("name") or entry.get("submission_name") or entry.get("team") or ""
+        submission_name = str(entry.get("submission_name", "") or "").strip()
+        path = entry.get("submission_path") or (f"submissions/{submission_name}" if submission_name else "")
+        label = _fmt_link_label(name)
+        href = _fmt_href(path)
+        return f"[{label}]({href})" if label and href else label
+
     def _fmt_score(value: Any) -> str:
         try:
             f = float(value)
@@ -56,15 +70,15 @@ def render_table(entries: List[Dict[str, Any]]) -> str:
         sorted_entries = sorted(track_entries, key=lambda x: (-_rank_score(x), str(x.get("date", ""))))
         title = track or "unknown"
         lines.append(f"### `{title}`")
-        lines.append("| # | Team | Rank Score | Hidden FoldScore | Public FoldScore | Date | Commit | Description |")
-        lines.append("|---:|---|---:|---:|---:|---|---|---|")
+        lines.append("| # | Name | Team | Rank Score | Hidden FoldScore | Public FoldScore | Date | Commit | Description |")
+        lines.append("|---:|---|---|---:|---:|---:|---|---|---|")
         for i, e in enumerate(sorted_entries, start=1):
             commit = e.get("commit", "")[:7]
             hidden = e.get("final_hidden_foldscore", float("nan"))
             public = e.get("public_val_foldscore", float("nan"))
             team = e.get("team") or e.get("submission_name") or ""
             lines.append(
-                f"| {i} | {_fmt_text(team)} | {_fmt_score(e.get('rank_score', float('nan')))} | "
+                f"| {i} | {_submission_link(e)} | {_fmt_text(team)} | {_fmt_score(e.get('rank_score', float('nan')))} | "
                 f"{_fmt_score(hidden)} | {_fmt_score(public)} | {_fmt_text(e.get('date',''))} | "
                 f"`{_fmt_text(commit)}` | {_fmt_text(e.get('description',''))} |"
             )

@@ -53,9 +53,34 @@ def test_leaderboard_entry_carries_team_metadata() -> None:
     )
 
     assert entry["team"] == "Protein Geometry Lab"
+    assert entry["name"] == "submission_dir"
+    assert entry["submission_path"] == "submissions/submission_dir"
 
-    overridden = result_to_entry({"submission_name": "submission_dir"}, "", "Independent Researcher")
+    overridden = result_to_entry(
+        {"submission_name": "submission_dir", "name": "Readable Name"},
+        "",
+        "Independent Researcher",
+    )
     assert overridden["team"] == "Independent Researcher"
+    assert overridden["name"] == "Readable Name"
+
+
+def test_leaderboard_entry_uses_repo_relative_submission_path() -> None:
+    module = _load_script("scripts/add_leaderboard_entry.py")
+    result_to_entry = getattr(module, "_result_to_entry")
+
+    submission_dir = Path("submissions/submission_dir").resolve()
+    entry = result_to_entry(
+        {
+            "submission_name": "submission_dir",
+            "submission_dir": str(submission_dir),
+        },
+        "",
+        "",
+        {},
+    )
+
+    assert entry["submission_path"] == "submissions/submission_dir"
 
 
 def test_leaderboard_entry_can_fall_back_to_pr_author(tmp_path) -> None:
@@ -82,6 +107,8 @@ def test_readme_leaderboard_renderer_groups_by_track() -> None:
         [
             {
                 "track": "unlimited",
+                "name": "open_submission",
+                "submission_path": "submissions/open_submission",
                 "rank_score": 0.8,
                 "final_hidden_foldscore": 0.8,
                 "public_val_foldscore": 0.6,
@@ -92,6 +119,8 @@ def test_readme_leaderboard_renderer_groups_by_track() -> None:
             },
             {
                 "track": "limited",
+                "name": "small_submission",
+                "submission_path": "submissions/small_submission",
                 "rank_score": 0.5,
                 "final_hidden_foldscore": 0.7,
                 "public_val_foldscore": 0.4,
@@ -106,5 +135,5 @@ def test_readme_leaderboard_renderer_groups_by_track() -> None:
     assert "### `limited`" in rendered
     assert "### `unlimited`" in rendered
     assert rendered.index("### `limited`") < rendered.index("### `unlimited`")
-    assert "| # | Team | Rank Score | Hidden FoldScore | Public FoldScore | Date | Commit | Description |" in rendered
-    assert "| 1 | Small Lab |" in rendered
+    assert "| # | Name | Team | Rank Score | Hidden FoldScore | Public FoldScore | Date | Commit | Description |" in rendered
+    assert "| 1 | [small_submission](submissions/small_submission) | Small Lab |" in rendered

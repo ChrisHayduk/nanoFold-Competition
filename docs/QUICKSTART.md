@@ -236,9 +236,10 @@ Submission mechanics are the same for all tracks:
 | `unlimited` | `python scripts/validate_submission.py --submission submissions/your_name --track unlimited --strict` | `bash scripts/run_official_docker.sh --submission submissions/your_name --track unlimited --update-leaderboard` |
 
 Maintainers can add `--team "<team or individual name>"` to the hidden command
-so the accepted entry renders under the right leaderboard identity. If omitted
-during a PR-triggered GitHub Actions run, nanoFold falls back to the PR author's
-GitHub username. Manual maintainer automation can set
+so the accepted entry renders under the right leaderboard identity. The rendered
+leaderboard also links the entry name to the accepted `submissions/<name>`
+directory. If omitted during a PR-triggered GitHub Actions run, nanoFold falls
+back to the PR author's GitHub username. Manual maintainer automation can set
 `NANOFOLD_PR_AUTHOR=<github-username>` for the same fallback.
 
 Before opening a leaderboard PR, run:

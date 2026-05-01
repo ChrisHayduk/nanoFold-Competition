@@ -95,10 +95,11 @@ Source of truth: `tracks/*.yaml`. All tracks use the same official public train 
 
 For all three tracks, set `track: <track_id>` in `submissions/<name>/config.yaml`, validate with `python scripts/validate_submission.py --submission submissions/<name> --track <track_id> --strict`, and open a submission PR naming the intended track. Submit separate configs or separate submission directories when one method targets multiple tracks. Maintainers create accepted leaderboard entries after sealed hidden evaluation; participant PRs should not edit leaderboard artifacts.
 
-Leaderboard entries include a `Team` column. Use a lab, company, project team,
-or individual researcher name consistently across submissions. If `--team` is
-omitted during a PR-triggered GitHub Actions run, nanoFold falls back to the PR
-author's GitHub username. Manual maintainer automation can set
+Leaderboard entries include a linked `Name` column pointing to the accepted
+submission directory and a `Team` column for identity. Use a lab, company,
+project team, or individual researcher name consistently across submissions. If
+`--team` is omitted during a PR-triggered GitHub Actions run, nanoFold falls
+back to the PR author's GitHub username. Manual maintainer automation can set
 `NANOFOLD_PR_AUTHOR=<github-username>` for the same fallback.
 
 The `limited` constants are:
@@ -425,7 +426,7 @@ CI enforces the same PR guardrail:
 
 <!-- LEADERBOARD_START -->
 ### `limited`
-| # | Team | Rank Score | Hidden FoldScore | Public FoldScore | Date | Commit | Description |
-|---:|---|---:|---:|---:|---|---|---|
-| 1 | nanoFold Maintainers | 0.2634 | 0.3423 | 0.3426 | 2026-05-01 | `85f8c9c` | minAlphaFold2 full profile limited-track benchmark |
+| # | Name | Team | Rank Score | Hidden FoldScore | Public FoldScore | Date | Commit | Description |
+|---:|---|---|---:|---:|---:|---|---|---|
+| 1 | [minalphafold2_full](submissions/minalphafold2_full) | nanoFold Maintainers | 0.2634 | 0.3423 | 0.3426 | 2026-05-01 | `85f8c9c` | minAlphaFold2 full profile limited-track benchmark |
 <!-- LEADERBOARD_END -->

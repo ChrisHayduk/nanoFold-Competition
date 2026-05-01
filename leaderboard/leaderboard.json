@@ -25,6 +25,8 @@
     "date": "2026-05-01",
     "commit": "85f8c9c",
     "description": "minAlphaFold2 full profile limited-track benchmark",
+    "name": "minalphafold2_full",
+    "submission_path": "submissions/minalphafold2_full",
     "team": "nanoFold Maintainers",
     "run_name": "minalphafold2_full_limited",
     "submission_name": "minalphafold2_full",

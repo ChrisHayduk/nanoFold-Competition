@@ -58,6 +58,26 @@ leaderboard/official_dataset_fingerprint.json
 leaderboard/official_manifest_source.lock.json
 ```
 
+The public train/validation tensors can also be published as a Hugging Face
+dataset with one row per chain and one column per processed tensor:
+
+```bash
+python -m pip install -U datasets huggingface_hub hf_xet pyarrow
+hf auth login
+
+python scripts/upload_hf_public_dataset.py \
+  --repo-id <org-or-user>/nanofold-public \
+  --private \
+  --cache-dir .nanofold_hf_cache
+```
+
+The uploader reads only the public train and validation manifests, expands the
+processed feature/label NPZ fields into typed Hugging Face columns, pushes the
+result as Parquet shards, and uploads a dataset README plus public manifest and
+fingerprint metadata. Run `--dry-run --readme-out hf_dataset_export/README.md`
+first to validate the public inputs and inspect the generated dataset card
+without contacting Hugging Face.
+
 Maintainer-only hidden outputs:
 
 ```text

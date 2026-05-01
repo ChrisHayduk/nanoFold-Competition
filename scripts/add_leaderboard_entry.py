@@ -40,6 +40,20 @@ def _save_json(path: Path, obj: Any) -> None:
     path.write_text(json.dumps(obj, indent=2) + "\n")
 
 
+def _submission_path_from_result(result: Mapping[str, Any], submission_name: str) -> str:
+    submission_dir = str(result.get("submission_dir", "") or "").strip()
+    if submission_dir:
+        path = Path(submission_dir)
+        if path.is_absolute():
+            try:
+                return path.resolve().relative_to(REPO_ROOT).as_posix()
+            except ValueError:
+                pass
+        else:
+            return path.as_posix()
+    return f"submissions/{submission_name}"
+
+
 def _result_to_entry(
     result: Dict[str, Any],
     description_override: str,
@@ -49,6 +63,8 @@ def _result_to_entry(
     created_at = str(result.get("created_at", ""))[:10]
     commit = str(result.get("commit", "unknown"))[:7]
     submission = str(result.get("submission_name", "submission"))
+    name = str(result.get("name", "") or submission).strip() or submission
+    submission_path = _submission_path_from_result(result, submission)
     team = resolve_leaderboard_team(
         explicit_team=team_override,
         result_team=str(result.get("team", "")),
@@ -84,6 +100,8 @@ def _result_to_entry(
         "date": created_at,
         "commit": commit,
         "description": description,
+        "name": name,
+        "submission_path": submission_path,
         "team": team,
         "run_name": str(result.get("run_name", "")),
         "submission_name": submission,
