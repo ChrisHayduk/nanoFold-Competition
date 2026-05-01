@@ -11,6 +11,7 @@ def test_leaderboard_team_prefers_explicit_then_result_then_submission() -> None
             explicit_team="Protein Geometry Lab",
             result_team="PR Author",
             submission_name="submission_dir",
+            env={},
         )
         == "Protein Geometry Lab"
     )
@@ -18,10 +19,11 @@ def test_leaderboard_team_prefers_explicit_then_result_then_submission() -> None
         resolve_leaderboard_team(
             result_team="PR Author",
             submission_name="submission_dir",
+            env={},
         )
         == "PR Author"
     )
-    assert resolve_leaderboard_team(submission_name="submission_dir") == "submission_dir"
+    assert resolve_leaderboard_team(submission_name="submission_dir", env={}) == "submission_dir"
 
 
 def test_github_pr_author_comes_from_pull_request_event(tmp_path) -> None:

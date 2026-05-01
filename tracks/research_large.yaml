@@ -42,4 +42,4 @@ train:
   val_crop_mode: center
   val_msa_sample_mode: top
 model:
-  max_params: 50000000
+  max_params: 100000000

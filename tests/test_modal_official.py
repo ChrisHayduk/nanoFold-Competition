@@ -54,3 +54,13 @@ def test_modal_official_updates_local_leaderboard_from_returned_result() -> None
     assert "upload_only: bool = False" in text
     assert "skip_predict: bool = False" in text
     assert "skip_score: bool = False" in text
+
+
+def test_modal_official_supports_detached_long_running_stages() -> None:
+    text = _script_text()
+    assert "background_predict: bool = False" in text
+    assert "background_score: bool = False" in text
+    assert "run_prediction_stage.spawn" in text
+    assert "run_scoring_stage.spawn" in text
+    assert "writes the result to the runs volume" in text
+    assert "_write_remote_result(payload)" in text

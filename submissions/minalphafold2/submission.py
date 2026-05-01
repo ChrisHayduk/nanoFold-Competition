@@ -157,6 +157,23 @@ def _apply_finetune_ramp(loss_fn: AlphaFoldLoss, ramp_weight: float) -> None:
             setattr(loss_fn, attr, target_weight * ramp_weight)
 
 
+def _initial_loss_fn(model: torch.nn.Module, features: Dict[str, torch.Tensor]) -> AlphaFoldLoss:
+    loss_fn = getattr(model, "nanofold_initial_loss_fn", None)
+    if loss_fn is None:
+        loss_fn = AlphaFoldLoss(finetune=False).to(features["aatype"].device)
+        model.nanofold_initial_loss_fn = loss_fn
+    return loss_fn
+
+
+def _finetune_loss_fn(model: torch.nn.Module, features: Dict[str, torch.Tensor]) -> AlphaFoldLoss:
+    loss_fn = getattr(model, "nanofold_finetune_loss_fn", None)
+    if loss_fn is None:
+        loss_fn = AlphaFoldLoss(finetune=True).to(features["aatype"].device)
+        _finetune_target_weights(loss_fn)
+        model.nanofold_finetune_loss_fn = loss_fn
+    return loss_fn
+
+
 def _model_cfg(cfg: Dict[str, Any]) -> ModelConfig:
     model_cfg = cfg.get("model", {})
     profile_path = Path(str(model_cfg.get("profile_path", DEFAULT_MODEL_CONFIG_PATH)))
@@ -397,20 +414,20 @@ def _alphafold_loss(
     model_out: Dict[str, torch.Tensor],
     cfg: Dict[str, Any],
 ) -> torch.Tensor:
-    if _use_finetune_loss(cfg):
-        loss_fn = getattr(model, "nanofold_finetune_loss_fn", None)
-        if loss_fn is None:
-            loss_fn = AlphaFoldLoss(finetune=True).to(features["aatype"].device)
-            _finetune_target_weights(loss_fn)
-            model.nanofold_finetune_loss_fn = loss_fn
-        _apply_finetune_ramp(loss_fn, _finetune_ramp_weight(cfg))
-    else:
-        loss_fn = getattr(model, "nanofold_initial_loss_fn", None)
-        if loss_fn is None:
-            loss_fn = AlphaFoldLoss(finetune=False).to(features["aatype"].device)
-            model.nanofold_initial_loss_fn = loss_fn
-    per_example_loss = loss_fn(**loss_inputs_from_batch(features, model_out))
-    return per_example_loss.mean()
+    loss_inputs = loss_inputs_from_batch(features, model_out)
+    if not _use_finetune_loss(cfg):
+        return _initial_loss_fn(model, features)(**loss_inputs).mean()
+
+    ramp_weight = _finetune_ramp_weight(cfg)
+    if ramp_weight <= 0.0:
+        return _initial_loss_fn(model, features)(**loss_inputs).mean()
+    if ramp_weight >= 1.0:
+        return _finetune_loss_fn(model, features)(**loss_inputs).mean()
+
+    initial_loss = _initial_loss_fn(model, features)(**loss_inputs)
+    finetune_loss = _finetune_loss_fn(model, features)(**loss_inputs)
+    blended_loss = initial_loss.lerp(finetune_loss, ramp_weight)
+    return blended_loss.mean()
 
 
 def run_batch(
