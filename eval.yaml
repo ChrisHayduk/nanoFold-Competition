@@ -1,0 +1,14 @@
+name: NanoFold Public FoldScore
+description: >
+  Fixed-data protein-folding benchmark on the NanoFold public validation split.
+  Models are evaluated by mean FoldScore over one atom14 prediction per public
+  validation chain. FoldScore is NanoFold's CASP15-inspired composite over
+  GDT_HA-Ca, all-atom14 lDDT, CADaa, SphereGrinder local environments,
+  side-chain geometry, heavy-atom clashes, backbone geometry, and DipDiff local
+  distance windows.
+evaluation_framework: nanofold
+
+tasks:
+  - id: public_validation_foldscore
+    config: default
+    split: validation

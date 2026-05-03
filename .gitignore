@@ -25,6 +25,10 @@ __pycache__/
 /runs/
 /wandb/
 /lightning_logs/
+/neurips_paper/coverage_work/
+/neurips_paper/archive/
+/neurips_paper/results_private/
+/neurips_paper/runpod_sync/
 /secrets/
 /data/openproteinset/*
 /data/processed_features/
@@ -55,3 +59,5 @@ data/processed_features/5emf_B.error.txt
 data/processed_features/5emg_A.error.txt
 data/processed_features/6ann_C.error.txt
 data/processed_features/6su0_A.error.txt
+af2_paper.pdf
+/neurips_paper

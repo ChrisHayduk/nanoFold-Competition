@@ -74,9 +74,21 @@ python scripts/upload_hf_public_dataset.py \
 The uploader reads only the public train and validation manifests, expands the
 processed feature/label NPZ fields into typed Hugging Face columns, pushes the
 result as Parquet shards, and uploads a dataset README plus public manifest and
-fingerprint metadata. Run `--dry-run --readme-out hf_dataset_export/README.md`
-first to validate the public inputs and inspect the generated dataset card
-without contacting Hugging Face.
+fingerprint metadata. If `eval.yaml` is present, the uploader also publishes it
+at the dataset repo root so the Hub can treat the public validation split as the
+`public_validation_foldscore` benchmark task. That task reports mean FoldScore
+over the fixed public validation chains; official hidden ranking remains sealed
+and track-specific.
+
+Run `--dry-run --readme-out hf_dataset_export/README.md` first to validate the
+public inputs and inspect the generated dataset card without contacting Hugging
+Face.
+
+Hugging Face benchmark aggregation is still a beta feature. The root
+`eval.yaml` declares NanoFold's intended `nanofold` evaluation framework and
+the `public_validation_foldscore` task. If the Hub requires allow-listing for
+the dataset to display the Benchmark tag, request HF registration rather than
+changing the metric semantics to fit an unrelated evaluation framework.
 
 Maintainer-only hidden outputs:
 
@@ -301,7 +313,7 @@ length_bin
 resolution_bin
 ```
 
-It allocates each split proportionally across those strata, then checks split quality with Jensen-Shannon divergence gates and unknown-domain coverage gates.
+It allocates each split proportionally across those strata, then checks split quality with Jensen-Shannon divergence gates and unknown-domain coverage gates. Split-comparability analysis uses the same fields to compare train, public validation, hidden validation, and the eligible source pool.
 
 The public allocator works in three stages:
 
@@ -387,7 +399,7 @@ Most domain-architecture buckets correspond directly to broad CATH/SCOPe/ECOD-st
 | 2.5-3.0 A | `863` (7.85%) | `783` (7.83%) | `80` (8.00%) |
 | unknown | `2,239` (20.35%) | `2,037` (20.37%) | `202` (20.20%) |
 
-The resulting public train and validation distributions are very close to the public target. Jensen-Shannon divergence is the split-quality metric used for each balancing field:
+The resulting public train and validation distributions are very close to the public target. Jensen-Shannon divergence is the enforced split-quality metric used for each balancing field:
 
 | Field | Train JS divergence | Public val JS divergence |
 |---|---:|---:|
@@ -397,6 +409,38 @@ The resulting public train and validation distributions are very close to the pu
 | `resolution_bin` | `8.0612644e-08` | `1.1483855e-05` |
 
 The official quality gate is `max_split_js_divergence <= 0.35`; the largest public train/val value is `0.00070301452`. The unknown-domain-architecture fraction is `0.0`, below the `0.75` gate.
+
+The split-comparability run also reports two descriptive distance metrics for each split and each balancing field:
+
+- `total_variation_distance`: half the sum of absolute bin-frequency differences between a split and the selected reference distribution. This gives one aggregate distribution-shift value per metadata field.
+- `max_bin_deviation`: the largest absolute bin-frequency difference between a split and the selected reference distribution. This highlights the single bucket with the strongest skew, even when aggregate shift is small.
+
+The source-pool comparison is unit-weighted after MMseqs2 sequence clustering and PDB-entry grouping, because those `13,037` disjoint units are what the splitter samples. Raw chain-pool diagnostics were also computed, but raw PDB chain rows overweight duplicate families and are not the headline balance target. Max bin deviation is reported as a fraction of the split; for example, `0.0068133006` means `0.68133006` percentage points.
+
+| Split vs eligible disjoint-unit source pool | Field | JS divergence | Total variation distance | Max bin deviation |
+|---|---|---:|---:|---:|
+| Train | `secondary_structure_class` | `1.1124689e-06` | `0.00067809312` | `0.00047813147` |
+| Train | `domain_architecture_class` | `1.1964903e-05` | `0.00067809312` | `0.00033695636` |
+| Train | `length_bin` | `1.6082197e-07` | `0.00042614098` | `0.00035702232` |
+| Train | `resolution_bin` | `1.2029919e-07` | `0.00039483010` | `0.00033368873` |
+| Public val | `secondary_structure_class` | `0.00017820814` | `0.0087780931` | `0.0068133006` |
+| Public val | `domain_architecture_class` | `0.00067542980` | `0.0095451408` | `0.0068133006` |
+| Public val | `length_bin` | `6.0198881e-05` | `0.0074027767` | `0.0049796732` |
+| Public val | `resolution_bin` | `1.0596222e-05` | `0.0024537854` | `0.0018045563` |
+| Hidden val | `secondary_structure_class` | `3.4636641e-05` | `0.0022219069` | `0.0015000384` |
+| Hidden val | `domain_architecture_class` | `0.00044374653` | `0.0037500959` | `0.0015281890` |
+| Hidden val | `length_bin` | `2.5168859e-05` | `0.0044027767` | `0.0024231035` |
+| Hidden val | `resolution_bin` | `2.0079247e-05` | `0.0041263327` | `0.0034336887` |
+
+The same run checks pairwise split comparability. The table below reports the worst field for each pair:
+
+| Pairwise comparison | Max JS divergence | Max total variation distance | Max bin deviation |
+|---|---:|---:|---:|
+| Train vs public val | `0.00076614113` | `0.0091` | `0.0065` |
+| Train vs hidden val | `0.00057253960` | `0.0046` | `0.0031` |
+| Public val vs hidden val | `0.00055627728` | `0.0110` | `0.0070` |
+
+Only aggregate hidden comparability scalars are shown here. Hidden chain IDs, per-bin hidden distributions, salts, fingerprints, labels, and private locks remain sealed.
 
 ### Split quality checks
 
@@ -413,6 +457,8 @@ The split builder records and checks:
 - Jensen-Shannon divergence between each split and the selected overall distribution
 - unknown-domain-architecture fraction
 - train/val/hidden chain counts and manifest hashes
+
+The comparability diagnostics include total variation distance and max bin deviation, but the enforced public gate remains Jensen-Shannon divergence unless a future official lock promotes those diagnostics to gates.
 
 The public lock is sanitized so it contains the public contract and public split metadata. The private hidden locks contain hidden manifest hashes, hidden distribution details, and hidden fingerprint hashes.
 

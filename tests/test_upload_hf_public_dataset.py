@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from argparse import Namespace
 from pathlib import Path
+from typing import Any
 
 import numpy as np
+import yaml
 
 from nanofold.chain_paths import chain_npz_path
-from scripts.upload_hf_public_dataset import generate_rows, render_dataset_card
+from scripts.upload_hf_public_dataset import _upload_auxiliary_files, generate_rows, render_dataset_card
 
 
 def _write_npz_pair(features_dir: Path, labels_dir: Path, chain_id: str, *, length: int = 4, msa_depth: int = 2) -> None:
@@ -90,3 +93,62 @@ def test_render_dataset_card_documents_columns_and_sampling() -> None:
     assert "`msa`" in card
     assert "`atom14_positions`" in card
     assert "smaller protein-folding models" in card
+
+
+def test_eval_yaml_declares_public_foldscore_task() -> None:
+    config = yaml.safe_load(Path("eval.yaml").read_text())
+
+    assert config["name"] == "NanoFold Public FoldScore"
+    assert config["evaluation_framework"] == "nanofold"
+    assert "FoldScore" in config["description"]
+    assert config["tasks"] == [
+        {
+            "id": "public_validation_foldscore",
+            "config": "default",
+            "split": "validation",
+        }
+    ]
+
+
+class _FakeApi:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    def upload_file(self, **kwargs: Any) -> None:
+        self.calls.append(kwargs)
+
+
+class _FakeHub:
+    def __init__(self) -> None:
+        self.api = _FakeApi()
+
+    def HfApi(self) -> _FakeApi:
+        return self.api
+
+
+def test_upload_auxiliary_files_includes_eval_yaml(tmp_path: Path) -> None:
+    paths = {
+        "eval_yaml": tmp_path / "eval.yaml",
+        "train_manifest": tmp_path / "train.txt",
+        "val_manifest": tmp_path / "val.txt",
+        "all_manifest": tmp_path / "all.txt",
+        "fingerprint": tmp_path / "fingerprint.json",
+        "manifest_lock": tmp_path / "manifest.lock.json",
+    }
+    for path in paths.values():
+        path.write_text("ok\n")
+    args = Namespace(repo_id="ChrisHayduk/nanofold-public", **paths)
+    hub = _FakeHub()
+
+    _upload_auxiliary_files(args, hub, "readme")
+
+    uploaded_paths = [call["path_in_repo"] for call in hub.api.calls]
+    assert uploaded_paths == [
+        "README.md",
+        "eval.yaml",
+        "manifests/train.txt",
+        "manifests/val.txt",
+        "manifests/all.txt",
+        "metadata/official_dataset_fingerprint.json",
+        "metadata/official_manifest_source.lock.json",
+    ]

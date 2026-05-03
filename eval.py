@@ -15,6 +15,7 @@ import yaml
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+from nanofold.chain_paths import chain_npz_path
 from nanofold.competition_policy import (
     DEFAULT_TRACK_ID,
     OFFICIAL_DATASET_FINGERPRINT_PATH,
@@ -29,7 +30,7 @@ from nanofold.competition_policy import (
 )
 from nanofold.data import ProcessedNPZDataset, collate_batch
 from nanofold.dataset_integrity import verify_split_against_fingerprint
-from nanofold.metrics import foldscore_components
+from nanofold.metrics import FOLDSCORE_COMPONENT_NAMES, foldscore_components
 from nanofold.submission_runtime import load_submission_hooks, run_submission_batch
 from nanofold.utils import (
     count_parameters,
@@ -230,7 +231,7 @@ def _load_label_crop(
     crop_size: int,
     crop_mode: str,
 ) -> Dict[str, torch.Tensor]:
-    label_path = labels_dir / f"{chain_id}.npz"
+    label_path = chain_npz_path(labels_dir, chain_id)
     if not label_path.exists():
         raise FileNotFoundError(f"Missing label file for scoring: {label_path}")
     with np.load(label_path) as data:
@@ -286,7 +287,7 @@ def _load_feature_crop(
     crop_size: int,
     crop_mode: str,
 ) -> Dict[str, torch.Tensor]:
-    feature_path = features_dir / f"{chain_id}.npz"
+    feature_path = chain_npz_path(features_dir, chain_id)
     if not feature_path.exists():
         raise FileNotFoundError(f"Missing feature file for scoring: {feature_path}")
     with np.load(feature_path) as data:
@@ -365,6 +366,19 @@ def _score_chain(
         aatype=features["aatype"],
     )
     return {name: float(value.detach().cpu()) for name, value in comps.items()}
+
+
+def _scalar_output_metrics(out: Dict[str, Any]) -> Dict[str, torch.Tensor]:
+    metrics: Dict[str, torch.Tensor] = {}
+    for key, value in out.items():
+        if key in {"loss", "pred_atom14", "pred_ca"}:
+            continue
+        if not torch.is_tensor(value) or value.numel() == 0:
+            continue
+        scalar = value.detach().float().mean().cpu()
+        if torch.isfinite(scalar):
+            metrics[str(key)] = scalar
+    return metrics
 
 
 def _prediction_path_for_ckpt(pred_out_dir: Path, ckpt: Path, multi: bool) -> Path:
@@ -540,6 +554,7 @@ def main() -> None:
         model.eval()
 
         losses: List[torch.Tensor] = []
+        scalar_metrics: Dict[str, List[torch.Tensor]] = {}
         per_chain_rows: List[Dict[str, Any]] = []
 
         save_pred_root = None
@@ -559,10 +574,13 @@ def main() -> None:
                         batch=batch_device,
                         cfg=predict_cfg,
                         training=False,
+                        expose_supervision=include_labels,
                     )
                 pred_atom14_cpu = run_out["pred_atom14"].detach().cpu()
                 if "loss" in run_out:
                     losses.append(run_out["loss"].detach().cpu())
+                for metric_name, metric_value in _scalar_output_metrics(run_out).items():
+                    scalar_metrics.setdefault(metric_name, []).append(metric_value)
 
                 residue_mask = batch["residue_mask"].detach().cpu()
                 for idx, chain_id in enumerate(chain_ids):
@@ -575,7 +593,7 @@ def main() -> None:
                             "masked_length": np.array(masked_length, dtype=np.int32),
                             "ckpt": str(ckpt_path),
                         }
-                        np.savez_compressed(save_pred_root / f"{chain_id}.npz", **arrays)
+                        np.savez_compressed(chain_npz_path(save_pred_root, chain_id), **arrays)
 
                     if include_labels:
                         label_tensors: Dict[str, torch.Tensor] = {
@@ -627,10 +645,23 @@ def main() -> None:
                     per_chain_rows.append(row)
                     all_per_chain_rows.append(row)
 
-        lddt_values = [float(item["lddt_ca"]) for item in per_chain_rows if not np.isnan(item["lddt_ca"])]
-        mean_lddt = float(sum(lddt_values) / len(lddt_values)) if lddt_values else float("nan")
-        foldscore_values = [float(item["foldscore"]) for item in per_chain_rows if not np.isnan(item["foldscore"])]
-        mean_foldscore = float(sum(foldscore_values) / len(foldscore_values)) if foldscore_values else float("nan")
+        component_means: Dict[str, float] = {}
+        for component_name in FOLDSCORE_COMPONENT_NAMES:
+            values = [
+                float(item[component_name])
+                for item in per_chain_rows
+                if component_name in item and not np.isnan(float(item[component_name]))
+            ]
+            component_means[f"mean_{component_name}"] = (
+                float(sum(values) / len(values)) if values else float("nan")
+            )
+        mean_lddt = component_means["mean_lddt_ca"]
+        mean_foldscore = component_means["mean_foldscore"]
+        scalar_means = {
+            f"mean_{name}": float(torch.stack(values).mean())
+            for name, values in scalar_metrics.items()
+            if values
+        }
         eval_seconds = float(time.perf_counter() - start)
         step = int(ckpt.get("step", 0))
         cumulative_samples_seen = int(ckpt.get("cumulative_samples_seen", step * effective_batch_size))
@@ -649,6 +680,8 @@ def main() -> None:
             "mean_loss": float(torch.stack(losses).mean()) if losses else float("nan"),
             "mean_foldscore": mean_foldscore,
             "mean_lddt_ca": mean_lddt,
+            **component_means,
+            **scalar_means,
             "num_chains": len(per_chain_rows),
             "eval_wall_time_seconds": eval_seconds,
             "cumulative_samples_seen": cumulative_samples_seen,
@@ -701,6 +734,9 @@ def main() -> None:
         "predict_config_sanitized": bool(args.official),
         "finished_at": utc_now_iso(),
     }
+    for key, value in final_ckpt_result.items():
+        if key.startswith("mean_") and key not in out:
+            out[key] = value
     print(json.dumps(out, indent=2))
 
     if args.save:

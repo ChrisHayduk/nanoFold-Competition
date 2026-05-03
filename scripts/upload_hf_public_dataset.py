@@ -33,6 +33,7 @@ DEFAULT_FEATURES_DIR = Path("data/processed_features")
 DEFAULT_LABELS_DIR = Path("data/processed_labels")
 DEFAULT_FINGERPRINT = Path("leaderboard/official_dataset_fingerprint.json")
 DEFAULT_MANIFEST_LOCK = Path("leaderboard/official_manifest_source.lock.json")
+DEFAULT_EVAL_YAML = Path("eval.yaml")
 
 OPTIONAL_DEPENDENCY_MESSAGE = (
     "Install the optional Hugging Face upload dependencies first:\n"
@@ -84,6 +85,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--processed-labels-dir", type=Path, default=DEFAULT_LABELS_DIR)
     parser.add_argument("--fingerprint", type=Path, default=DEFAULT_FINGERPRINT)
     parser.add_argument("--manifest-lock", type=Path, default=DEFAULT_MANIFEST_LOCK)
+    parser.add_argument(
+        "--eval-yaml",
+        type=Path,
+        default=DEFAULT_EVAL_YAML,
+        help="Optional Hugging Face benchmark eval.yaml to upload at the dataset repo root when present.",
+    )
     parser.add_argument(
         "--cache-dir",
         type=Path,
@@ -500,6 +507,7 @@ def _upload_auxiliary_files(args: argparse.Namespace, huggingface_hub: Any, read
         commit_message="Add NanoFold public dataset card",
     )
     auxiliary_files = (
+        (args.eval_yaml, "eval.yaml"),
         (args.train_manifest, "manifests/train.txt"),
         (args.val_manifest, "manifests/val.txt"),
         (args.all_manifest, "manifests/all.txt"),

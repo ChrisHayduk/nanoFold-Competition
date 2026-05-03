@@ -29,7 +29,7 @@ from nanofold.competition_policy import (
 )
 from nanofold.data import ProcessedNPZDataset, collate_batch
 from nanofold.dataset_integrity import verify_dataset_against_fingerprint
-from nanofold.metrics import lddt_ca
+from nanofold.metrics import FOLDSCORE_COMPONENT_NAMES, foldscore_components, lddt_ca
 from nanofold.submission_runtime import (
     load_submission_hooks,
     run_submission_batch,
@@ -157,11 +157,31 @@ def _mean_tensors(values: Iterable[torch.Tensor]) -> float:
     return float(torch.stack(finite_values).mean())
 
 
+def _scalar_output_metrics(out: Dict[str, Any]) -> Dict[str, torch.Tensor]:
+    metrics: Dict[str, torch.Tensor] = {}
+    for key, value in out.items():
+        if key in {"loss", "pred_atom14", "pred_ca"}:
+            continue
+        if not torch.is_tensor(value) or value.numel() == 0:
+            continue
+        scalar = value.detach().float().mean().cpu()
+        if torch.isfinite(scalar):
+            metrics[str(key)] = scalar
+    return metrics
+
+
+def _append_scalar_output_metrics(target: Dict[str, list[torch.Tensor]], out: Dict[str, Any]) -> None:
+    for key, value in _scalar_output_metrics(out).items():
+        target.setdefault(key, []).append(value)
+
+
 def _summarize_eval_metrics(
     scores: list[torch.Tensor],
     losses: list[torch.Tensor],
     ca_rmsds: list[torch.Tensor] | None = None,
     atom14_rmsds: list[torch.Tensor] | None = None,
+    scalar_metrics: Dict[str, list[torch.Tensor]] | None = None,
+    foldscore_metric_values: Dict[str, list[torch.Tensor]] | None = None,
 ) -> Dict[str, float]:
     metrics = {
         "val_lddt_ca": _mean_tensors(scores),
@@ -172,6 +192,12 @@ def _summarize_eval_metrics(
         metrics["val_rmsd_ca"] = _mean_tensors(ca_rmsds)
     if atom14_rmsds is not None:
         metrics["val_rmsd_atom14"] = _mean_tensors(atom14_rmsds)
+    if scalar_metrics is not None:
+        for name, values in sorted(scalar_metrics.items()):
+            metrics[f"val_{name}"] = _mean_tensors(values)
+    if foldscore_metric_values is not None:
+        for name, values in sorted(foldscore_metric_values.items()):
+            metrics[f"val_{name}"] = _mean_tensors(values)
     return metrics
 
 
@@ -680,6 +706,7 @@ def main() -> None:
         raise ValueError("`train.grad_accum_steps` must be >= 1")
     grad_clip = float(cfg.get("optim", {}).get("grad_clip_norm", 0.0))
     use_amp = bool(tcfg.get("amp", False)) and device.type == "cuda"
+    eval_foldscore_components = bool(tcfg.get("eval_foldscore_components", False))
 
     scaler = make_grad_scaler(enabled=use_amp)
 
@@ -903,10 +930,14 @@ def main() -> None:
 
     def run_eval() -> Dict[str, float]:
         model.eval()
-        scores = []
-        losses = []
-        ca_rmsds = []
-        atom14_rmsds = []
+        scores: list[torch.Tensor] = []
+        losses: list[torch.Tensor] = []
+        ca_rmsds: list[torch.Tensor] = []
+        atom14_rmsds: list[torch.Tensor] = []
+        scalar_metrics: Dict[str, list[torch.Tensor]] = {}
+        foldscore_metric_values: Dict[str, list[torch.Tensor]] = {
+            name: [] for name in FOLDSCORE_COMPONENT_NAMES
+        } if eval_foldscore_components else {}
         runtime_cfg = _cfg_with_runtime(
             cfg,
             step=step,
@@ -940,13 +971,35 @@ def main() -> None:
                 atom14_rmsds.append(atom14_rmsd.detach().cpu())
                 if "loss" in out:
                     losses.append(out["loss"].detach().cpu())
+                _append_scalar_output_metrics(scalar_metrics, out)
+                if eval_foldscore_components:
+                    pred_atom14 = out["pred_atom14"]
+                    true_atom14 = batch["atom14_positions"]
+                    atom14_mask = batch["atom14_mask"] & batch["residue_mask"][:, :, None]
+                    for batch_idx in range(pred_atom14.shape[0]):
+                        comps = foldscore_components(
+                            pred_atom14=pred_atom14[batch_idx],
+                            true_atom14=true_atom14[batch_idx],
+                            atom14_mask=atom14_mask[batch_idx],
+                            aatype=batch["aatype"][batch_idx],
+                        )
+                        for name, value in comps.items():
+                            foldscore_metric_values.setdefault(name, []).append(value.detach().cpu())
         model.train()
         empty_device_cache(device)
-        return _summarize_eval_metrics(scores, losses, ca_rmsds, atom14_rmsds)
+        return _summarize_eval_metrics(
+            scores,
+            losses,
+            ca_rmsds,
+            atom14_rmsds,
+            scalar_metrics=scalar_metrics,
+            foldscore_metric_values=foldscore_metric_values if eval_foldscore_components else None,
+        )
 
     while step < max_steps:
         optimizer_zero_grad(opt)
         running_loss = 0.0
+        scalar_metric_sums: Dict[str, float] = {}
         samples_this_step = 0
         cropped_residues_this_step = 0
         nonpad_residues_this_step = 0
@@ -978,6 +1031,11 @@ def main() -> None:
                     training=True,
                 )
                 raw_loss = out["loss"]
+                for metric_name, metric_value in _scalar_output_metrics(out).items():
+                    scalar_metric_sums[metric_name] = (
+                        scalar_metric_sums.get(metric_name, 0.0)
+                        + float(metric_value)
+                    )
                 if not raw_loss.requires_grad:
                     # Some batches may have no valid supervision and return a constant
                     # scalar loss. Anchor it to model outputs so backward() stays valid.
@@ -1059,6 +1117,8 @@ def main() -> None:
                 cumulative_nonpad_residues_seen / float(residue_budget)
             ) if residue_budget > 0 else float("nan"),
         }
+        for metric_name, metric_sum in sorted(scalar_metric_sums.items()):
+            step_record[f"train_{metric_name}"] = metric_sum / float(grad_accum_steps)
         with step_metrics_path.open("a") as f:
             f.write(json.dumps(step_record) + "\n")
 
