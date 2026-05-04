@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import torch
+import yaml
 
 from neurips_paper.submission_common.minalphafold2_experiment import (
     _fape_clamp_weight,
     _n_cycles_for_batch,
 )
+from submissions.minalphafold2 import submission as base_submission
 
 
 def _features(batch_size: int = 2) -> dict[str, torch.Tensor]:
@@ -74,3 +78,15 @@ def test_paper_fape_samplewise_mode_is_only_for_explicit_ablation() -> None:
     assert set(train_weight.tolist()) <= {0.0, 1.0}
     assert eval_weight is not None
     assert torch.isclose(eval_weight, torch.tensor(0.9))
+
+
+def test_no_finetune_loss_paper_config_keeps_initial_loss_through_budget() -> None:
+    config_path = Path(
+        "neurips_paper/submissions_paper240k_round2/no_finetune_loss_medium_paper240k/config.yaml"
+    )
+    cfg = yaml.safe_load(config_path.read_text())
+
+    assert base_submission._finetune_ramp_weight({**cfg, "_runtime": {"step": 0}}) == 0.0
+    assert not base_submission._use_finetune_loss({**cfg, "_runtime": {"step": 29999}})
+    assert base_submission._finetune_ramp_weight({**cfg, "_runtime": {"step": 30000}}) == 0.0
+    assert base_submission._af2_budget_schedule(cfg).finetune_lr_scale == 1.0
