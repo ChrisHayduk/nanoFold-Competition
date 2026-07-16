@@ -27,7 +27,7 @@ from nanofold.competition_policy import (
     enforce_model_param_limit,
     load_track_spec,
 )
-from nanofold.data import ProcessedNPZDataset, collate_batch
+from nanofold.data import LengthBucketBatchSampler, ProcessedNPZDataset, collate_batch
 from nanofold.dataset_integrity import verify_dataset_against_fingerprint
 from nanofold.metrics import FOLDSCORE_COMPONENT_NAMES, foldscore_components, lddt_ca
 from nanofold.submission_runtime import (
@@ -296,17 +296,29 @@ def make_loader(
     )
     num_workers = normalize_num_workers(int(data_cfg.get("num_workers", 0)))
     generator = make_dataloader_generator(generator_seed)
-
+    batch_size = int(data_cfg.get("batch_size", 1))
+    common_kwargs: Dict[str, Any] = {
+        "num_workers": num_workers,
+        "pin_memory": should_pin_memory(device),
+        "collate_fn": collate_fn,
+        "worker_init_fn": seed_worker if num_workers > 0 else None,
+        "generator": generator,
+    }
+    if split == "train" and bool(data_cfg.get("bucket_by_length", False)):
+        sampler = LengthBucketBatchSampler(
+            ds.sequence_lengths(),
+            batch_size=batch_size,
+            generator=make_dataloader_generator(generator_seed),
+            bucket_size=int(data_cfg.get("length_bucket_size", 16)),
+            drop_last=True,
+        )
+        return DataLoader(ds, batch_sampler=sampler, **common_kwargs)
     return DataLoader(
         ds,
-        batch_size=data_cfg.get("batch_size", 1),
+        batch_size=batch_size,
         shuffle=(split == "train"),
-        num_workers=num_workers,
-        pin_memory=should_pin_memory(device),
-        collate_fn=collate_fn,
         drop_last=(split == "train"),
-        worker_init_fn=seed_worker if num_workers > 0 else None,
-        generator=generator,
+        **common_kwargs,
     )
 
 

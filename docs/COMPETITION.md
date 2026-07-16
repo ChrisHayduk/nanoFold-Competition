@@ -293,6 +293,10 @@ Runtime reproducibility:
 - deterministic DataLoader generator + worker seeding
 - checkpoint stores/restores RNG state for resume path
 
+Submissions may enable length-bucketed training batches. This only changes the deterministic order
+in which the fixed public samples are grouped, reducing padding in pairwise computation; it does
+not add data or alter the sample/residue budget. Public validation remains center-cropped and top-MSA.
+
 ## 8) Scoring and Ranking
 
 Primary metric:

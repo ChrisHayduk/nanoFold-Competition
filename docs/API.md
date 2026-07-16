@@ -45,6 +45,13 @@ Competition submissions should use `submission.path` under `submissions/<name>/`
 - `data.crop_size`
 - `data.msa_depth`
 - `data.batch_size`
+- `data.num_workers`
+- `data.bucket_by_length`
+- `data.length_bucket_size`
+
+When `data.bucket_by_length` is enabled for training, the loader keeps nearby sequence lengths in
+the same shuffled mini-batches. This reduces padding in the pairwise trunk without changing the
+sample or residue budget; public validation keeps its deterministic ordering.
 
 ## Batch Contract by Mode
 

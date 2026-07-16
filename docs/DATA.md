@@ -235,6 +235,10 @@ MMseqs2 provides the scalable sequence clustering step. The official policy uses
 
 The exclusion lists are included because a scientifically elegant split is useless if selected chains cannot be downloaded or scored. They make the split operationally reproducible: all selected chains must have official input features and reliable atom14 labels.
 
+Training loaders may optionally use the stored chain lengths to form deterministic length buckets. This
+is a padding/throughput optimization over the same manifest and tensors; it does not modify preprocessing,
+split membership, or official budget accounting.
+
 ### Candidate filtering
 
 A chain is eligible only if it passes the official gates:

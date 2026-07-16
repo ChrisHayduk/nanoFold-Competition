@@ -1,0 +1,89 @@
+run_name: compact_pairformer_ipa_muon_limited
+track: limited
+seed: 0
+
+submission:
+  path: submission.py
+
+data:
+  processed_features_dir: data/processed_features
+  processed_labels_dir: data/processed_labels
+  train_manifest: data/manifests/train.txt
+  val_manifest: data/manifests/val.txt
+  crop_size: 256
+  msa_depth: 192
+  batch_size: 4
+  num_workers: 2
+  train_crop_mode: random
+  val_crop_mode: center
+  train_msa_sample_mode: random
+  val_msa_sample_mode: top
+  bucket_by_length: true
+  length_bucket_size: 16
+
+model:
+  msa_depth: 192
+  extra_msa_depth: 0
+  c_m: 128
+  c_s: 192
+  c_z: 64
+  c_t: 32
+  c_e: 32
+  msa_blocks: 2
+  msa_heads: 8
+  msa_head_dim: 16
+  msa_transition_multiplier: 2
+  msa_dropout: 0.0
+  outer_product_dim: 16
+  pairformer_blocks: 8
+  pair_transition_multiplier: 2
+  pair_dropout: 0.0
+  triangle_mult_c: 64
+  triangle_heads: 4
+  triangle_head_dim: 16
+  single_attention_heads: 8
+  single_transition_multiplier: 4
+  single_dropout: 0.0
+  structure_c: 96
+  structure_layers: 4
+  structure_dropout: 0.0
+  ipa_heads: 8
+  ipa_head_dim: 12
+  ipa_query_points: 4
+  ipa_value_points: 4
+  n_cycles: 1
+  n_ensemble: 1
+  activation_checkpointing: true
+  checkpoint_preserve_rng_state: false
+  bf16: true
+
+optim:
+  name: muon
+  lr: 1.0e-3
+  muon_lr: 1.0e-2
+  muon_momentum: 0.95
+  muon_nesterov: true
+  muon_ns_steps: 5
+  muon_weight_decay: 0.0
+  aux_lr: 1.0e-3
+  aux_beta1: 0.9
+  aux_beta2: 0.999
+  aux_eps: 1.0e-6
+  aux_weight_decay: 0.0
+  weight_decay: 0.0
+  grad_clip_norm: 0.1
+  lr_decay_factor: 0.5
+
+train:
+  max_steps: 30000
+  log_every: 10
+  eval_every: 5000
+  save_every: 1000
+  grad_accum_steps: 2
+  finetune_start_step: 1000
+  finetune_ramp_steps: 4000
+  finetune_lr_scale: 1.0
+  warmup_steps: 334
+  lr_decay_step: 5000
+  amp: false
+  eval_foldscore_components: false

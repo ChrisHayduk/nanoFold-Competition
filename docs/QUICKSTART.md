@@ -95,6 +95,10 @@ To restart a run from step 0 and clear stale metrics/checkpoints for that run na
 
 On macOS with Python 3.13 or newer, nanoFold automatically uses `data.num_workers=0` for DataLoader stability. That message is informational.
 
+For submissions with many short chains, `data.bucket_by_length: true` and
+`data.length_bucket_size: 16` keep similarly sized training examples together and reduce pairwise
+padding. This changes neither the official manifests nor the fixed sample/residue budgets.
+
 Validation prints `val_lddt_ca`, `val_loss`, `val_rmsd_ca`, and `val_rmsd_atom14` directly in the terminal so you can see both competition-aligned quality and coordinate error during the run.
 
 The reference submission loads its model architecture directly from:

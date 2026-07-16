@@ -203,6 +203,8 @@ The official tracks disable templates by preprocessing with `T=0`; template-enab
 Config schema uses:
 - `data.processed_features_dir`
 - `data.processed_labels_dir`
+- `data.bucket_by_length` and `data.length_bucket_size` are optional training-loader controls. They
+  group similarly sized chains to reduce padding while preserving the fixed sample/residue budget.
 
 ## Official Policy
 

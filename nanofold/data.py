@@ -2,11 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, Iterator, List, Tuple
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
 
 from .chain_paths import chain_npz_path
 
@@ -50,6 +50,53 @@ def read_manifest(manifest_path: str | Path) -> List[str]:
     if not ids:
         raise ValueError(f"Empty manifest: {manifest_path}")
     return ids
+
+
+class LengthBucketBatchSampler(Sampler[list[int]]):
+    """Shuffle samples while keeping nearby sequence lengths in each batch."""
+
+    def __init__(
+        self,
+        lengths: List[int],
+        batch_size: int,
+        generator: torch.Generator,
+        *,
+        bucket_size: int = 16,
+        drop_last: bool = False,
+    ) -> None:
+        if not lengths:
+            raise ValueError("`lengths` must not be empty.")
+        if batch_size <= 0:
+            raise ValueError("`batch_size` must be positive.")
+        if bucket_size <= 0:
+            raise ValueError("`bucket_size` must be positive.")
+        self.lengths = tuple(int(length) for length in lengths)
+        self.batch_size = int(batch_size)
+        self.bucket_size = int(bucket_size)
+        self.generator = generator
+        self.drop_last = bool(drop_last)
+
+    def __iter__(self) -> Iterator[list[int]]:
+        bucket_width = self.batch_size * self.bucket_size
+        sorted_indices = sorted(range(len(self.lengths)), key=self.lengths.__getitem__)
+        batches: list[list[int]] = []
+        for start in range(0, len(sorted_indices), bucket_width):
+            bucket = sorted_indices[start : start + bucket_width]
+            permutation = torch.randperm(len(bucket), generator=self.generator).tolist()
+            bucket = [bucket[index] for index in permutation]
+            for batch_start in range(0, len(bucket), self.batch_size):
+                batch = bucket[batch_start : batch_start + self.batch_size]
+                if len(batch) == self.batch_size or not self.drop_last:
+                    batches.append(batch)
+
+        batch_order = torch.randperm(len(batches), generator=self.generator).tolist()
+        for index in batch_order:
+            yield batches[index]
+
+    def __len__(self) -> int:
+        if self.drop_last:
+            return len(self.lengths) // self.batch_size
+        return (len(self.lengths) + self.batch_size - 1) // self.batch_size
 
 
 class ProcessedNPZDataset(Dataset):
@@ -130,6 +177,14 @@ class ProcessedNPZDataset(Dataset):
 
     def __len__(self) -> int:
         return len(self.chain_ids)
+
+    def sequence_lengths(self) -> List[int]:
+        lengths: List[int] = []
+        for chain_id in self.chain_ids:
+            features_path = chain_npz_path(self.processed_features_dir, chain_id)
+            with np.load(features_path) as feature_data:
+                lengths.append(int(feature_data["aatype"].shape[0]))
+        return lengths
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         chain_id = self.chain_ids[idx]
