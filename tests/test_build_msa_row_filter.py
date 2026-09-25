@@ -138,6 +138,9 @@ def test_filter_cli_pins_actual_identity_and_rejects_missing_search_output(tmp_p
     search = payload["mmseqs"]["command"]
     assert search[search.index("--alignment-mode") + 1] == "3"
     previous = output.read_bytes()
+    repeated = subprocess.run(command, capture_output=True, text=True, check=False)
+    assert repeated.returncode == 0, repeated.stderr
+    assert output.read_bytes() == previous
     mmseqs.write_text("#!/bin/sh\nexit 0\n")
     failure = subprocess.run(command, capture_output=True, text=True, check=False)
     assert failure.returncode != 0
@@ -258,3 +261,160 @@ def test_source_scanning_includes_all_feature_variants_for_the_same_chain(tmp_pa
     assert set(rows.values()) == {"C" * 20, "D" * 20}
     assert stats["chains"] == 1
     assert stats["feature_variants"] == 2
+
+
+def test_inventory_sizes_exhaustive_search_without_mmseqs_and_is_not_a_filter(tmp_path: Path) -> None:
+    import json
+    import subprocess
+    import sys
+
+    features = tmp_path / "features"
+    _write_feature(features, "trn1_A", ["A" * 40, "C" * 40, "D" * 40, "C" * 40, "E" * 19])
+    train, heldout, cache, output = [tmp_path / name for name in ("train", "heldout", "cache", "inventory")]
+    train.write_text("trn1_A\n")
+    heldout.write_text("val1_A\nval2_A\n")
+    cache.write_text(json.dumps({"val1_A": {"sequence": "F" * 40}, "val2_A": {"sequence": "G" * 40}}))
+    result = subprocess.run([
+        sys.executable, str(Path(__file__).resolve().parents[1] / "scripts/build_msa_row_filter.py"),
+        "--source-manifest", str(train), "--heldout-manifest", str(heldout),
+        "--chain-data-cache", str(cache), "--source-processed-features-dir", str(features),
+        "--mmseqs-bin", "__does_not_exist__", "--output", str(output),
+        "--inventory-only", "--exhaustive", "--max-seqs", "1",
+    ], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    inventory = json.loads(output.read_text())
+    assert inventory["inventory_type"] == "msa_search_inventory"
+    assert "filter_type" not in inventory and "excluded_sequence_sha256" not in inventory
+    assert inventory["source_unique_sequence_count"] == inventory["required_exhaustive_max_seqs"] == 2
+    assert inventory["heldout_unique_sequence_count"] == 2
+    assert inventory["all_pair_comparisons"] == 4
+    assert inventory["mmseqs_search_executed"] is False
+    assert inventory["exhaustive_hit_capacity_sufficient"] is False
+    assert inventory["source_complete"] is True
+    assert inventory["source_sequence_set_sha256"]
+    assert inventory["heldout_sequence_set_sha256"]
+
+
+def test_exhaustive_filter_rejects_truncating_hit_capacity_before_search(tmp_path: Path) -> None:
+    import pytest
+
+    heldout, source, output = [tmp_path / name for name in ("heldout.fa", "source.fa", "hits.m8")]
+    heldout.write_text(f">heldout_1\n{'A' * 40}\n")
+    source.write_text(f">source_1\n{'C' * 40}\n>source_2\n{'D' * 40}\n")
+    output.write_text("previous\n")
+    with pytest.raises(ValueError, match="max-seqs >= 2"):
+        _load_filter_module()._run_mmseqs(
+            mmseqs_bin="__must_not_execute__", heldout_fasta=heldout, source_fasta=source,
+            output_m8=output, tmp_dir=tmp_path / "work", min_seq_id=0.3, coverage=0.8,
+            threads=1, max_seqs=1, exhaustive=True,
+        )
+    assert output.read_text() == "previous\n"
+
+
+def test_real_exhaustive_filter_recovers_prefilter_missed_homolog(tmp_path: Path) -> None:
+    import hashlib
+    import json
+    import os
+    import shutil
+    import subprocess
+    import sys
+
+    import pytest
+
+    binary = os.environ.get("MMSEQS_TEST_BINARY") or shutil.which("mmseqs")
+    if not binary:
+        pytest.skip("Set MMSEQS_TEST_BINARY to run the all-pair filter regression")
+    source_sequence = "SDNKAWGPALHQYCLWHIMIYVKYYMFIMLYEMNLNEHRA"
+    heldout_sequence = "SMPKAWGRWPHWYGLWFYFSYPMYYMFIMYYTTAWNIHRW"
+    features = tmp_path / "features"
+    _write_feature(features, "trn1_A", ["D" * len(source_sequence), source_sequence])
+    train, heldout, cache, output = [tmp_path / name for name in ("train", "heldout", "cache", "filter")]
+    train.write_text("trn1_A\n")
+    heldout.write_text("val1_A\n")
+    cache.write_text(json.dumps({"val1_A": {"sequence": heldout_sequence}}))
+    command = [
+        sys.executable, str(Path(__file__).resolve().parents[1] / "scripts/build_msa_row_filter.py"),
+        "--source-manifest", str(train), "--heldout-manifest", str(heldout),
+        "--chain-data-cache", str(cache), "--source-processed-features-dir", str(features),
+        "--mmseqs-bin", str(binary), "--threads", "1", "--output", str(output), "--max-seqs", "1",
+    ]
+    heuristic = subprocess.run(command, capture_output=True, text=True, timeout=120)
+    assert heuristic.returncode == 0, heuristic.stderr
+    assert json.loads(output.read_text())["excluded_sequence_count"] == 0
+    exhaustive = subprocess.run([*command, "--exhaustive"], capture_output=True, text=True, timeout=120)
+    assert exhaustive.returncode == 0, exhaustive.stderr
+    result = json.loads(output.read_text())
+    assert result["excluded_sequence_sha256"] == [hashlib.sha256(source_sequence.encode()).hexdigest()]
+    assert result["exhaustive"] is True
+    assert result["search_contract"] == "mmseqs-local-all-pairs-v1"
+    assert result["mmseqs"]["possible_pair_count"] == 1
+    assert result["mmseqs"]["search_parameters"]["max_accept"] == 1
+    assert result["input_binding"]["source_fasta_sha256"]
+    assert result["input_binding"]["heldout_fasta_sha256"]
+    assert result["input_binding"]["m8_sha256"]
+
+
+def test_inventory_resolves_cache_once_and_binds_actual_source_assets(tmp_path: Path, monkeypatch) -> None:
+    import hashlib
+    import json
+    import sys
+
+    features = tmp_path / "features"
+    _write_feature(features, "trn1_A", ["A" * 40, "C" * 40])
+    train, heldout = tmp_path / "train", tmp_path / "heldout"
+    train.write_text("trn1_A\n")
+    heldout.write_text("val1_A\n")
+    first, second, alias, output = [tmp_path / name for name in ("first.json", "second.json", "alias.json", "inventory")]
+    first.write_text(json.dumps({"val1_A": {"sequence": "D" * 40}}))
+    second.write_text(json.dumps({"val1_A": {"sequence": "E" * 40}}))
+    alias.symlink_to(first)
+    module = _load_filter_module()
+    original_load = module._load_chain_data_cache
+    def retarget_then_load(path):
+        alias.unlink()
+        alias.symlink_to(second)
+        assert path == first.resolve()
+        return original_load(path)
+    monkeypatch.setattr(module, "_load_chain_data_cache", retarget_then_load)
+    monkeypatch.setattr(sys, "argv", [
+        "build_msa_row_filter.py", "--source-manifest", str(train), "--heldout-manifest", str(heldout),
+        "--chain-data-cache", str(alias), "--source-processed-features-dir", str(features),
+        "--output", str(output), "--inventory-only", "--exhaustive",
+    ])
+    module.main()
+    result = json.loads(output.read_text())
+    assert result["chain_data_cache_sha256"] == hashlib.sha256(first.read_bytes()).hexdigest()
+    assert result["heldout_sequence_set_sha256"] == module._hash_sequence_set({module._sequence_sha256("D" * 40)})
+    feature = chain_npz_path(features, "trn1_A").resolve()
+    assert result["input_binding"]["source_assets"] == [
+        {"path": str(feature), "sha256": hashlib.sha256(feature.read_bytes()).hexdigest()},
+    ]
+
+
+def test_inventory_fails_if_source_asset_changes_during_scan(tmp_path: Path, monkeypatch) -> None:
+    import json
+    import sys
+
+    import pytest
+
+    features = tmp_path / "features"
+    _write_feature(features, "trn1_A", ["A" * 40, "C" * 40])
+    train, heldout, cache, output = [tmp_path / name for name in ("train", "heldout", "cache", "inventory")]
+    train.write_text("trn1_A\n")
+    heldout.write_text("val1_A\n")
+    cache.write_text(json.dumps({"val1_A": {"sequence": "D" * 40}}))
+    module = _load_filter_module()
+    original_load = module.load_msa_for_audit
+    def mutate_after_load(path, **kwargs):
+        result = original_load(path, **kwargs)
+        path.write_bytes(path.read_bytes() + b"changed during scan")
+        return result
+    monkeypatch.setattr(module, "load_msa_for_audit", mutate_after_load)
+    monkeypatch.setattr(sys, "argv", [
+        "build_msa_row_filter.py", "--source-manifest", str(train), "--heldout-manifest", str(heldout),
+        "--chain-data-cache", str(cache), "--source-processed-features-dir", str(features),
+        "--output", str(output), "--inventory-only",
+    ])
+    with pytest.raises(ValueError, match="input changed"):
+        module.main()
+    assert not output.exists()

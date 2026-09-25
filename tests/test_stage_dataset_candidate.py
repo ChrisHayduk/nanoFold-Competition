@@ -43,6 +43,7 @@ def _inputs(tmp_path: Path, *, related: bool = False) -> list[str]:
     salt = tmp_path / "salt.txt"
     salt.write_text("stage-fixture-secret-never-in-public-contract")
     return [
+        "--sampling-policy", "cath-v2",
         "--stage-dir", str(tmp_path / "candidate"), "--chain-data-cache", str(cache),
         "--metadata-sources-dir", str(sources), "--metadata-source-lock", str(source_lock),
         "--feature-exclusion-list", str(exclusions), "--processability-exclusion-list", str(exclusions),
@@ -88,6 +89,51 @@ def test_staging_runs_real_builders_and_verifier_without_changing_release(tmp_pa
         staging.stage_candidate(args)
 
 
+def test_full_coverage_staging_with_real_homology_graph_and_extra_train_target(tmp_path: Path) -> None:
+    from scripts import build_homology_groups as graph
+
+    args = staging.parse_args([*_inputs(tmp_path), "--sampling-policy", "cath-v3",
+                               "--mmseqs-bin", _mmseqs_binary()])
+    cache = json.loads(args.chain_data_cache.read_text())
+    template = cache["0000_A"]["seq"]
+    for index in range(1, 4):
+        sequence = list(template)
+        sequence[index] = "A" if sequence[index] != "A" else "C"
+        cache[f"{index:04d}_A"]["seq"] = "".join(sequence)
+    args.chain_data_cache.write_text(json.dumps(cache))
+    source_lock = json.loads(args.metadata_source_lock.read_text())
+    source_lock["chain_data_cache"]["sha256"] = staging._sha256(args.chain_data_cache)
+    args.metadata_source_lock.write_text(json.dumps(source_lock))
+    metadata = tmp_path / "graph-metadata.json"
+    subprocess.run([
+        sys.executable, str(staging.SCRIPT_DIR / "build_structure_metadata.py"),
+        "--chain-data-cache", str(args.chain_data_cache),
+        "--metadata-sources-dir", str(args.metadata_sources_dir),
+        "--metadata-source-lock", str(args.metadata_source_lock),
+        "--feature-exclusion-list", str(args.feature_exclusion_list),
+        "--processability-exclusion-list", str(args.processability_exclusion_list),
+        "--metadata-out", str(metadata), "--require-monomer",
+    ], check=True, capture_output=True, text=True)
+    receipt = graph.build_groups(graph.parse_args([
+        "--chain-data-cache", str(args.chain_data_cache), "--structure-metadata", str(metadata),
+        "--cluster-tsv", str(args.cluster_tsv), "--out-dir", str(tmp_path / "groups"),
+        "--mmseqs-bin", args.mmseqs_bin,
+    ]))
+    args.split_group_receipt = receipt
+    args.split_group_tsv = receipt.parent / "split-groups.tsv"
+    status = json.loads(staging.stage_candidate(args).read_text())
+    assert status["status"] == "manifests_verified"
+    assert status["target_sequences_audited"] is True
+    assert status["all_group_coverage_verified"] is True
+    assert status["group_coverage"]["complete_group_count"] == 9
+    assert status["group_coverage"]["covered_group_count"] == 9
+    assert status["group_coverage"]["split_group_counts"] == {"train": 5, "val": 2, "hidden_val": 2}
+    assert len((args.stage_dir / "public/train.txt").read_text().splitlines()) == 6
+    group_map = graph.load_map(args.split_group_tsv, set(cache), canonical=True)
+    train = (args.stage_dir / "public/train.txt").read_text().splitlines()
+    assert sum(group_map[chain] == group_map["0000_A"] for chain in train) == 2
+
+
 def test_cluster_disjoint_but_related_targets_fail_staging_and_retain_both_audits(tmp_path: Path) -> None:
     args = staging.parse_args([*_inputs(tmp_path, related=True), "--mmseqs-bin", _mmseqs_binary()])
     with pytest.raises(subprocess.CalledProcessError):
@@ -110,6 +156,52 @@ def test_precomputed_clusters_still_require_an_audit_binary_before_outputs(tmp_p
     with pytest.raises(ValueError, match="MMseqs2 is required"):
         staging.stage_candidate(args)
     assert not args.stage_dir.exists()
+
+
+def test_full_coverage_policy_requires_both_group_map_and_receipt_before_outputs(tmp_path: Path) -> None:
+    options = _inputs(tmp_path)
+    args = staging.parse_args([*options, "--sampling-policy", "cath-v3"])
+    with pytest.raises(ValueError, match="requires --split-group-tsv and --split-group-receipt"):
+        staging.stage_candidate(args)
+    assert not args.stage_dir.exists()
+    args.split_group_tsv = args.cluster_tsv
+    with pytest.raises(ValueError, match="requires --split-group-tsv and --split-group-receipt"):
+        staging.stage_candidate(args)
+    assert not args.stage_dir.exists()
+
+
+def test_cath_v2_cannot_silently_ignore_full_group_contract(tmp_path: Path) -> None:
+    args = staging.parse_args(_inputs(tmp_path))
+    args.split_group_tsv = args.cluster_tsv
+    args.split_group_receipt = args.metadata_source_lock
+    with pytest.raises(ValueError, match="only supported for cath-v3"):
+        staging.stage_candidate(args)
+    assert not args.stage_dir.exists()
+
+
+@pytest.mark.parametrize("mutation", ["omitted_group", "wrong_owner_count", "status_only", "false_coverage", "boolean_count"])
+def test_full_coverage_receipt_requires_every_locked_group(tmp_path: Path, mutation: str) -> None:
+    args = staging.parse_args(_inputs(tmp_path))
+    lock = {"split_groups": {"group_count": 9, "selection_unit_count": 12, "selection_unit_ids_sha256": "0" * 64}}
+    coverage = {
+        "required": "all_groups", "all_group_coverage_verified": True,
+        "complete_group_count": 9, "covered_group_count": 9, "selection_unit_count": 12,
+        "selection_unit_ids_sha256": "0" * 64,
+        "split_group_counts": {"train": 5, "val": 2, "hidden_val": 2},
+    }
+    staging._validate_group_coverage({"group_coverage": coverage}, lock, args)
+    if mutation == "omitted_group":
+        coverage["covered_group_count"] = 8
+    elif mutation == "wrong_owner_count":
+        coverage["split_group_counts"] = {"train": 6, "val": 2, "hidden_val": 1}
+    elif mutation == "status_only":
+        coverage = {"all_group_coverage_verified": True}
+    elif mutation == "false_coverage":
+        coverage["all_group_coverage_verified"] = 1
+    else:
+        coverage["split_group_counts"] = {"train": 5, "val": 2, "hidden_val": True}
+    with pytest.raises(ValueError, match="cover every locked group"):
+        staging._validate_group_coverage({"group_coverage": coverage}, lock, args)
 
 
 def test_inputs_changed_after_audit_cannot_receive_verified_receipt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

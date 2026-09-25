@@ -16,15 +16,19 @@ from build_hidden_manifest import (  # noqa: E402
     _assert_public_manifests,
     _componentize,
     _load_lock_args,
+    _load_split_group_map,
     _read_manifest,
     _read_optional_chain_list,
     _sample_by_allocation,
+    _validate_group_selection,
     _validate_public_sampling_contract,
     _validate_source_lock,
     _with_cluster_ids,
 )
 from build_manifests import (  # noqa: E402
+    CATH_SAMPLING_POLICIES,
     DEFAULT_STRATIFY_FIELDS,
+    GROUP_SAMPLING_POLICY,
     LEGACY_STRATIFY_FIELDS,
     SAMPLING_POLICY,
     _assert_quality_report,
@@ -35,6 +39,7 @@ from build_manifests import (  # noqa: E402
     _cluster_sequences_mmseqs,
     _load_cluster_tsv,
     _load_structure_metadata,
+    _sample_hidden_groups,
     _select_stratified,
     _sha256,
     _validate_metadata_identity,
@@ -45,8 +50,9 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Verify that maintainer-only hidden validation is disjoint from the fixed public "
-            "manifests and respects structural stratification gates. For cath-v2, replay public and "
+            "manifests and respects structural stratification gates. For CATH sampling policies, replay public and "
             "hidden selection against the locked candidate universe, sizes, seed, and private salt digest."
+            " cath-v3 additionally requires complete full-group coverage and disjoint group ownership."
         )
     )
     parser.add_argument(
@@ -66,6 +72,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--structure-metadata", type=Path, default=None)
     parser.add_argument("--cluster-tsv", type=Path, default=None)
+    parser.add_argument("--split-group-tsv", type=Path, default=None,
+                        help="Relocated cath-v3 group assignments; bytes must match the source lock.")
+    parser.add_argument("--split-group-receipt", type=Path, default=None,
+                        help="Relocated cath-v3 group-construction receipt; bytes must match the source lock.")
     parser.add_argument("--mmseqs-bin", type=str, default=None)
     parser.add_argument(
         "--private-processability-exclusion-list", type=Path, default=None,
@@ -90,7 +100,7 @@ def _validate_private_lock(
     cache_sha: str, structure_metadata_path: Path, cluster_map: dict[str, str], hidden_count: int,
 ) -> str:
     """Bind the private selection to the same inputs and public release being audited."""
-    required = sampling_policy == SAMPLING_POLICY
+    required = sampling_policy in CATH_SAMPLING_POLICIES
 
     def check(container: dict[str, Any], key: str, actual: object, *, mandatory: bool = True) -> None:
         if (mandatory or key in container) and container.get(key) != actual:
@@ -101,6 +111,10 @@ def _validate_private_lock(
     check(private_lock, "chain_data_cache_sha256", cache_sha)
     check(private_lock, "sampling_policy", sampling_policy, mandatory=required)
     check(private_lock, "source_lock_sha256", _sha256(args.lock_file), mandatory=required)
+    if sampling_policy == GROUP_SAMPLING_POLICY:
+        public_groups = json.loads(args.lock_file.read_text()).get("split_groups")
+        if not isinstance(public_groups, dict) or private_lock.get("split_groups") != public_groups:
+            raise ValueError("Private hidden manifest lock split-group provenance does not match the public source lock.")
     contract = private_lock.get("public_contract", {})
     if not isinstance(contract, dict):
         raise ValueError("Private hidden manifest lock public_contract must be an object.")
@@ -120,13 +134,15 @@ def _validate_private_lock(
     if not isinstance(stratification, dict):
         raise ValueError("Private hidden manifest lock stratification must be an object.")
     if required and stratification.get("fields") != list(DEFAULT_STRATIFY_FIELDS):
-        raise ValueError("Private hidden manifest lock stratification fields disagree with cath-v2 policy.")
+        raise ValueError("Private hidden manifest lock stratification fields disagree with CATH sampling policy.")
     reference = stratification.get("reference", "selected_chains" if not required else None)
     permitted = {"eligible_disjoint_units", "public_train_plus_public_val"} if required else {
         "selected_chains", "public_train_plus_public_val",
     }
     if reference not in permitted:
         raise ValueError("Private hidden manifest lock has an unsupported stratification reference.")
+    if sampling_policy == GROUP_SAMPLING_POLICY and reference != "eligible_disjoint_units":
+        raise ValueError("cath-v3 quality reference must be the original eligible selection units.")
     # Frozen hidden-only locks describe their allocation reference, but their
     # quality gate was evaluated against pooled selected chains.
     return str(reference) if required else "selected_chains"
@@ -175,7 +191,7 @@ def _validate_private_exclusions(
 
 def verify(args: argparse.Namespace) -> dict[str, Any]:
     lock_args = _load_lock_args(args.lock_file)
-    if lock_args.sampling_policy not in {SAMPLING_POLICY, "legacy-v1"}:
+    if lock_args.sampling_policy not in {*CATH_SAMPLING_POLICIES, "legacy-v1"}:
         raise ValueError("Unsupported sampling policy in source lock.")
     structure_metadata_path = args.structure_metadata or Path(lock_args.structure_metadata)
     cluster_tsv = str(args.cluster_tsv if args.cluster_tsv is not None else lock_args.cluster_tsv)
@@ -187,6 +203,11 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
                   args.public_val_manifest, args.public_all_manifest, args.hidden_manifest, structure_metadata_path]
         if cluster_tsv:
             inputs.append(Path(cluster_tsv))
+        if lock_args.sampling_policy == GROUP_SAMPLING_POLICY:
+            inputs.extend([
+                getattr(args, "split_group_tsv", None) or Path(lock_args.split_group_tsv),
+                getattr(args, "split_group_receipt", None) or Path(lock_args.split_group_receipt),
+            ])
         private_record = _load_private_lock(args.private_lock_file)
         filtering = private_record.get("filtering", {})
         exclusion_record = filtering.get("private_processability_exclusions", {}) if isinstance(filtering, dict) else {}
@@ -226,9 +247,9 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError(f"chain_data_cache.json must be a JSON object: {args.chain_data_cache}")
 
     structure_metadata_accepted, structure_metadata = _load_structure_metadata(
-        structure_metadata_path, require_schema_version=2 if lock_args.sampling_policy == SAMPLING_POLICY else None,
+        structure_metadata_path, require_schema_version=2 if lock_args.sampling_policy in CATH_SAMPLING_POLICIES else None,
     )
-    if lock_args.sampling_policy == SAMPLING_POLICY:
+    if lock_args.sampling_policy in CATH_SAMPLING_POLICIES:
         _validate_metadata_identity(structure_metadata_path, cache_sha256=cache_sha, args=argparse.Namespace(**vars(lock_args)))
     candidates, _reject_reasons, _structural_metadata_source = _build_candidates(
         data,
@@ -257,7 +278,7 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
             mmseqs_bin=mmseqs_bin,
             min_seq_id=lock_args.min_seq_id,
             coverage=lock_args.coverage,
-            alignment_mode=3 if lock_args.sampling_policy == SAMPLING_POLICY else None,
+            alignment_mode=3 if lock_args.sampling_policy in CATH_SAMPLING_POLICIES else None,
         )
         if cluster_map_or_none is None:
             raise RuntimeError(
@@ -267,6 +288,12 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
             )
         cluster_map = cluster_map_or_none
 
+    split_group_map = _load_split_group_map(
+        args.lock_file, lock_args, candidate_ids, override_path=getattr(args, "split_group_tsv", None),
+        receipt_override_path=getattr(args, "split_group_receipt", None),
+        chain_data_cache_path=args.chain_data_cache, structure_metadata_path=structure_metadata_path,
+        cluster_map=cluster_map,
+    )
     _validate_source_lock(
         args.lock_file, train_path=args.public_train_manifest, val_path=args.public_val_manifest,
         all_path=args.public_all_manifest, structure_metadata_path=structure_metadata_path, cluster_map=cluster_map,
@@ -305,7 +332,9 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
     )
     private_exclusions = _validate_private_exclusions(
         private_lock, override_path=getattr(args, "private_processability_exclusion_list", None),
-        required=lock_args.sampling_policy == SAMPLING_POLICY and reference_population == "public_train_plus_public_val",
+        required=lock_args.sampling_policy == GROUP_SAMPLING_POLICY or (
+            lock_args.sampling_policy == SAMPLING_POLICY and reference_population == "public_train_plus_public_val"
+        ),
     )
     _fail_if_nonempty("Public/private processability exclusion", public_ids & private_exclusions)
     components = _componentize(clustered_candidates, cluster_map, seed=lock_args.seed)
@@ -321,19 +350,26 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
         excluded_hidden_components += bool(member_ids & hidden_set) and bool(member_ids & private_exclusions)
     if shared_components:
         raise RuntimeError(f"Selected splits share {shared_components} transitive cluster/PDB/exact-sequence components.")
-    if lock_args.sampling_policy == SAMPLING_POLICY and repeated_units:
+    if lock_args.sampling_policy in CATH_SAMPLING_POLICIES and repeated_units:
         raise RuntimeError(f"Selected manifests contain multiple representatives of {repeated_units} connected components.")
     if excluded_hidden_components:
         raise RuntimeError(f"Hidden split touches {excluded_hidden_components} privately excluded connected components.")
-    _validate_public_sampling_contract(args.lock_file, lock_args, components, train_ids, val_ids)
-    if lock_args.sampling_policy == SAMPLING_POLICY:
+    group_coverage = None
+    if split_group_map is not None:
+        group_coverage = _validate_group_selection(components, split_group_map, splits, private_exclusions)
+    fixed_hidden_groups = _validate_public_sampling_contract(
+        args.lock_file, lock_args, components, train_ids, val_ids, split_group_map=split_group_map,
+    )
+    if lock_args.sampling_policy in CATH_SAMPLING_POLICIES:
         digest = private_lock.get("hidden_split_salt_sha256")
         if not isinstance(digest, str) or len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
             raise ValueError("Private hidden manifest lock hidden salt digest is missing or invalid.")
         hidden_pool = [component.representative for component in components
                        if not any(member.chain_id in public_ids or member.chain_id in private_exclusions
                                   for member in component.members)]
-        if reference_population == "eligible_disjoint_units":
+        if fixed_hidden_groups is not None:
+            replay = _sample_hidden_groups(fixed_hidden_groups, seed=lock_args.seed, hidden_split_salt_digest=digest)
+        elif reference_population == "eligible_disjoint_units":
             replay = _select_stratified(hidden_pool, size=lock_args.hidden_val_size, seed=lock_args.seed,
                                        salt=f"hidden_val:{digest}", stratify_fields=DEFAULT_STRATIFY_FIELDS)
         else:
@@ -351,7 +387,7 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
         reference_candidates = [component.representative for component in components]
     elif reference_population == "public_train_plus_public_val":
         reference_candidates = [candidate_by_id[chain_id] for chain_id in train_ids + val_ids]
-    stratify_fields = DEFAULT_STRATIFY_FIELDS if lock_args.sampling_policy == SAMPLING_POLICY else LEGACY_STRATIFY_FIELDS
+    stratify_fields = DEFAULT_STRATIFY_FIELDS if lock_args.sampling_policy in CATH_SAMPLING_POLICIES else LEGACY_STRATIFY_FIELDS
 
     selected_candidates = {
         chain_id: candidate_by_id[chain_id]
@@ -370,6 +406,7 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
     return {
         "status": "ok",
         "sampling_policy": lock_args.sampling_policy,
+        **({"group_coverage": group_coverage} if group_coverage is not None else {}),
         "counts": {
             "train": len(train_ids),
             "val": len(val_ids),

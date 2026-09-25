@@ -75,6 +75,15 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Comma-separated MSA names to scan. Defaults to --msa-name.",
     )
+    ap.add_argument(
+        "--exhaustive", action="store_true",
+        help="Compare every held-out/source row pair without masking or a heuristic prefilter. "
+        "This can require billions of local alignments; max-seqs must cover all unique source rows.",
+    )
+    ap.add_argument(
+        "--inventory-only", action="store_true",
+        help="Write a search-size inventory instead of a usable row filter; scan rows but do not run MMseqs.",
+    )
     ap.add_argument("--min-seq-id", type=float, default=0.30)
     ap.add_argument("--coverage", type=float, default=0.80)
     ap.add_argument("--mmseqs-bin", default="mmseqs")
@@ -91,11 +100,40 @@ def parse_args() -> argparse.Namespace:
 
 
 def _sha256_file(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    with path.open("rb") as handle:
+        return hashlib.file_digest(handle, "sha256").hexdigest()
 
 
 def _sequence_sha256(sequence: str) -> str:
     return hashlib.sha256(sequence.upper().encode("utf-8")).hexdigest()
+
+
+def _record_source_asset(path: Path, snapshots: dict[Path, str] | None) -> Path:
+    resolved = path.resolve(strict=True)
+    if snapshots is not None:
+        digest = _sha256_file(resolved)
+        if resolved in snapshots and snapshots[resolved] != digest:
+            raise ValueError("Source asset changed while scanning MSA rows")
+        snapshots[resolved] = digest
+    return resolved
+
+
+def _assert_inputs_unchanged(snapshots: dict[Path, str]) -> None:
+    for path, expected in snapshots.items():
+        if not path.is_file() or _sha256_file(path) != expected:
+            raise ValueError("MSA filter input changed during scanning or search; no result was written")
+
+
+def _source_asset_record(snapshots: dict[Path, str]) -> dict[str, Any]:
+    records = [{"path": str(path), "sha256": digest} for path, digest in sorted(snapshots.items())]
+    return {
+        "source_assets": records,
+        "source_asset_manifest_sha256": hashlib.sha256(json.dumps(records, sort_keys=True).encode()).hexdigest(),
+    }
+
+
+def _hash_sequence_set(sequence_hashes: set[str]) -> str:
+    return hashlib.sha256("".join(f"{digest}\n" for digest in sorted(sequence_hashes)).encode()).hexdigest()
 
 
 def _read_manifest(path: Path) -> list[str]:
@@ -169,6 +207,7 @@ def _scan_processed_msa_rows(
     *,
     manifest_paths: Sequence[Path],
     features_dirs: Sequence[Path],
+    source_asset_sha256: dict[Path, str] | None = None,
 ) -> tuple[dict[str, str], dict[str, int]]:
     sequences_by_hash: dict[str, str] = {}
     stats = {"chains": 0, "feature_variants": 0, "missing_features": 0, "rows": 0, "non_query_rows": 0}
@@ -187,6 +226,7 @@ def _scan_processed_msa_rows(
                 continue
             stats["chains"] += 1
             for feature_path in feature_paths:
+                feature_path = _record_source_asset(feature_path, source_asset_sha256)
                 msa = load_msa_for_audit(feature_path, chain_id=chain_id)
                 stats["feature_variants"] += 1
                 stats["rows"] += int(msa.shape[0])
@@ -202,6 +242,7 @@ def _scan_raw_msa_rows(
     manifest_paths: Sequence[Path],
     raw_root: Path,
     msa_names: Sequence[str],
+    source_asset_sha256: dict[Path, str] | None = None,
 ) -> tuple[dict[str, str], dict[str, int]]:
     sequences_by_hash: dict[str, str] = {}
     stats = {"chains": 0, "missing_msa_files": 0, "rows": 0, "non_query_rows": 0}
@@ -216,6 +257,7 @@ def _scan_raw_msa_rows(
                     stats["missing_msa_files"] += 1
                     continue
                 loaded = True
+                msa_path = _record_source_asset(msa_path, source_asset_sha256)
                 a3m = read_a3m(msa_path)
                 msa, deletions = a3m.to_tokens(max_seqs=None)
                 aligned_msa, _ = a3m.to_aligned_msa()
@@ -272,8 +314,16 @@ def _run_mmseqs(
     coverage: float,
     threads: int,
     max_seqs: int,
+    exhaustive: bool = False,
 ) -> list[str]:
     validate_search_parameters(min_seq_id=min_seq_id, coverage=coverage, threads=threads, max_seqs=max_seqs)
+    if exhaustive:
+        with source_fasta.open() as handle:
+            source_count = sum(line.startswith(">") for line in handle)
+        if max_seqs < source_count:
+            raise ValueError(
+                f"Exhaustive MSA filtering requires --max-seqs >= {source_count} unique source rows; got {max_seqs}."
+            )
     output_m8.unlink(missing_ok=True)
     cmd = [
         mmseqs_bin,
@@ -294,11 +344,11 @@ def _run_mmseqs(
         "0",
         "--search-type", "1",
         "--dbtype", "1",
-        "--prefilter-mode", "0",
-        "-e", "0.001",
+        "--prefilter-mode", "2" if exhaustive else "0",
+        "-e", "1e308" if exhaustive else "0.001",
         "-s", "5.7",
-        "--mask", "1",
-        "--comp-bias-corr", "1",
+        "--mask", "0" if exhaustive else "1",
+        "--comp-bias-corr", "0" if exhaustive else "1",
         "--threads",
         str(threads),
         "--max-seqs",
@@ -306,6 +356,8 @@ def _run_mmseqs(
         "--format-output",
         "query,target,pident,alnlen,qcov,tcov,evalue,bits",
     ]
+    if exhaustive:
+        cmd.extend(["--max-accept", str(max_seqs), "--max-rejected", str(max_seqs)])
     proc = subprocess.run(cmd, text=True, check=False)
     if proc.returncode != 0:
         raise RuntimeError(f"MMseqs failed with exit code {proc.returncode}: {' '.join(cmd)}")
@@ -334,19 +386,27 @@ def main() -> None:
         min_seq_id=args.min_seq_id, coverage=args.coverage, threads=args.threads, max_seqs=args.max_seqs,
     )
     mmseqs_path = shutil.which(args.mmseqs_bin)
-    if mmseqs_path is None:
+    if mmseqs_path is None and not args.inventory_only:
         raise SystemExit(f"MMseqs binary not found: {args.mmseqs_bin}")
 
-    source_manifests = [Path(path) for path in args.source_manifest]
-    heldout_manifests = [Path(path) for path in args.heldout_manifest]
+    args.chain_data_cache = args.chain_data_cache.resolve(strict=True)
+    source_manifests = [Path(path).resolve(strict=True) for path in args.source_manifest]
+    heldout_manifests = [Path(path).resolve(strict=True) for path in args.heldout_manifest]
+    input_snapshots = {
+        path: _sha256_file(path) for path in {args.chain_data_cache, *source_manifests, *heldout_manifests}
+    }
+    source_manifest_records = [_manifest_record(path) for path in source_manifests]
+    heldout_manifest_records = [_manifest_record(path) for path in heldout_manifests]
+    source_asset_sha256: dict[Path, str] = {}
     cache = _load_chain_data_cache(args.chain_data_cache)
     resolved_msa_names = _resolve_msa_names(args.msa_name, args.msa_names)
 
-    source_processed_features_dirs = tuple(args.source_processed_features_dir or ())
+    source_processed_features_dirs = tuple(path.resolve(strict=True) for path in (args.source_processed_features_dir or ()))
     if source_processed_features_dirs:
         sequences_by_hash, source_stats = _scan_processed_msa_rows(
             manifest_paths=source_manifests,
             features_dirs=source_processed_features_dirs,
+            source_asset_sha256=source_asset_sha256,
         )
         source_mode = "processed_features"
         if source_stats["missing_features"] and not args.allow_missing_source_features:
@@ -356,10 +416,12 @@ def main() -> None:
                 "(pass --allow-missing-source-features only for exploratory audits)."
             )
     else:
+        args.raw_root = args.raw_root.resolve(strict=True)
         sequences_by_hash, source_stats = _scan_raw_msa_rows(
             manifest_paths=source_manifests,
             raw_root=args.raw_root,
             msa_names=resolved_msa_names,
+            source_asset_sha256=source_asset_sha256,
         )
         source_mode = "raw_a3m"
         if source_stats["missing_msa_files"] and not args.allow_missing_source_msas:
@@ -368,8 +430,57 @@ def main() -> None:
                 f"{source_stats['missing_msa_files']} "
                 "(pass --allow-missing-source-msas only for exploratory audits)."
             )
+    source_complete = not (source_stats.get("missing_features", 0) or source_stats.get("missing_msa_files", 0))
+    heldout_hashes = {
+        _sequence_sha256(_chain_sequence(cache, chain_id))
+        for manifest in heldout_manifests for chain_id in _read_manifest(manifest)
+    }
+    if not heldout_hashes:
+        raise ValueError("Held-out manifests must contain target sequences")
+    if args.inventory_only:
+        _assert_inputs_unchanged({**input_snapshots, **source_asset_sha256})
+        payload = {
+            "schema_version": 1,
+            "inventory_type": "msa_search_inventory",
+            "search_contract": "mmseqs-local-all-pairs-v1" if args.exhaustive else "mmseqs-prefiltered-v1",
+            "source_complete": source_complete,
+            "minimum_non_query_sequence_length": 20,
+            "source_unique_sequence_count": len(sequences_by_hash),
+            "heldout_unique_sequence_count": len(heldout_hashes),
+            "all_pair_comparisons": len(sequences_by_hash) * len(heldout_hashes),
+            "required_exhaustive_max_seqs": max(1, len(sequences_by_hash)),
+            "configured_max_seqs": args.max_seqs,
+            "exhaustive_hit_capacity_sufficient": args.max_seqs >= len(sequences_by_hash),
+            "source_sequence_set_sha256": _hash_sequence_set(set(sequences_by_hash)),
+            "heldout_sequence_set_sha256": _hash_sequence_set(heldout_hashes),
+            "chain_data_cache_sha256": input_snapshots[args.chain_data_cache],
+            "source_manifests": source_manifest_records,
+            "heldout_manifests": heldout_manifest_records,
+            "input_binding": _source_asset_record(source_asset_sha256),
+            "source_stats": source_stats,
+            "source_mode": source_mode,
+            "source_inputs": {
+                "raw_root": str(args.raw_root) if source_mode == "raw_a3m" else None,
+                "processed_features_dirs": [str(path) for path in source_processed_features_dirs],
+                "msa_names": list(resolved_msa_names),
+            },
+            "threshold": {
+                "min_seq_id": args.min_seq_id, "coverage": args.coverage,
+                "cov_mode": 0, "alignment_mode": 3, "seq_id_mode": 0,
+            },
+            "mmseqs_search_executed": False,
+        }
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+        print(f"Wrote search inventory for {payload['all_pair_comparisons']} pairs to {args.output}; no search executed")
+        return
     if not sequences_by_hash:
         raise SystemExit("No source MSA rows were found for filtering.")
+    if args.exhaustive and args.max_seqs < len(sequences_by_hash):
+        raise ValueError(
+            f"Exhaustive MSA filtering requires --max-seqs >= {len(sequences_by_hash)} unique source rows; "
+            f"got {args.max_seqs}."
+        )
 
     work_parent = args.tmp_dir
     with tempfile.TemporaryDirectory(prefix="nanofold_msa_row_filter_", dir=str(work_parent) if work_parent else None) as tmp:
@@ -392,7 +503,16 @@ def main() -> None:
             coverage=float(args.coverage),
             threads=int(args.threads),
             max_seqs=int(args.max_seqs),
+            exhaustive=bool(args.exhaustive),
         )
+        input_binding = {
+            **_source_asset_record(source_asset_sha256),
+            "source_fasta_sha256": _sha256_file(source_fasta),
+            "heldout_fasta_sha256": _sha256_file(heldout_fasta),
+            "m8_sha256": _sha256_file(output_m8),
+            "source_sequence_set_sha256": _hash_sequence_set(set(sequences_by_hash)),
+            "heldout_sequence_set_sha256": _hash_sequence_set(heldout_hashes),
+        }
         excluded, hit_count = _parse_excluded_hashes(
             output_m8,
             query_ids={f"heldout_{index}" for index in range(1, heldout_unique_count + 1)},
@@ -401,16 +521,19 @@ def main() -> None:
 
     # Composition masking and unknown residues can hide even identical rows from
     # MMseqs. Exact filtering must be independent of heuristic search sensitivity.
-    heldout_hashes = {
-        _sequence_sha256(_chain_sequence(cache, chain_id))
-        for manifest in heldout_manifests for chain_id in _read_manifest(manifest)
-    }
     exact_excluded = set(sequences_by_hash) & heldout_hashes
     excluded.update(exact_excluded)
 
+    recorded_command = list(cmd)
+    recorded_command[2:6] = ["<heldout_targets.fasta>", "<source_msa_rows.fasta>", "<output.m8>", "<tmp_dir>"]
     payload = {
         "schema_version": 1,
         "filter_type": "heldout_target_homology",
+        "search_contract": "mmseqs-local-all-pairs-v1" if args.exhaustive else "mmseqs-prefiltered-v1",
+        "search_scope": "Identity and bidirectional coverage of MMseqs local alignments against collected "
+        "non-query source sequences of at least 20 residues; not every possible alignment or all evolutionary homology.",
+        "exhaustive": bool(args.exhaustive),
+        "input_binding": input_binding,
         "threshold": {
             "min_seq_id": float(args.min_seq_id),
             "coverage": float(args.coverage),
@@ -421,15 +544,24 @@ def main() -> None:
         "mmseqs": {
             "binary": args.mmseqs_bin,
             "version": _mmseqs_version(args.mmseqs_bin),
-            "command": cmd,
+            "command": recorded_command,
             "max_seqs": int(args.max_seqs),
-            "search_parameters": {"prefilter_mode": 0, "evalue": 0.001, "sensitivity": 5.7,
-                                  "mask": 1, "comp_bias_corr": 1, "search_type": 1, "dbtype": 1},
+            "search_parameters": {
+                "prefilter_mode": 2 if args.exhaustive else 0,
+                "evalue": 1e308 if args.exhaustive else 0.001,
+                "sensitivity": 5.7, "mask": 0 if args.exhaustive else 1,
+                "comp_bias_corr": 0 if args.exhaustive else 1, "search_type": 1, "dbtype": 1,
+                "max_accept": args.max_seqs if args.exhaustive else 2147483647,
+                "max_rejected": args.max_seqs if args.exhaustive else 2147483647,
+            },
+            "possible_pair_count": heldout_unique_count * len(sequences_by_hash),
             "hit_count": hit_count,
         },
         "source": {
             "mode": source_mode,
-            "manifests": [_manifest_record(path) for path in source_manifests],
+            "complete": source_complete,
+            "minimum_non_query_sequence_length": 20,
+            "manifests": source_manifest_records,
             "raw_root": str(args.raw_root) if source_mode == "raw_a3m" else None,
             "processed_features_dir": str(source_processed_features_dirs[0]) if source_processed_features_dirs else None,
             "processed_features_dirs": [str(path) for path in source_processed_features_dirs],
@@ -437,18 +569,19 @@ def main() -> None:
             "stats": source_stats,
         },
         "heldout": {
-            "manifests": [_manifest_record(path) for path in heldout_manifests],
+            "manifests": heldout_manifest_records,
             "unique_target_sequence_count": heldout_unique_count,
         },
         "chain_data_cache": {
             "path": str(args.chain_data_cache),
-            "sha256": _sha256_file(args.chain_data_cache),
+            "sha256": input_snapshots[args.chain_data_cache],
         },
         "exact_match_excluded_sequence_count": len(exact_excluded),
         "excluded_sequence_count": len(excluded),
         "excluded_sequence_sha256": sorted(excluded),
     }
 
+    _assert_inputs_unchanged({**input_snapshots, **source_asset_sha256})
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
     print(f"Wrote MSA row filter with {len(excluded)} excluded sequence hashes to {args.output}")

@@ -133,23 +133,47 @@ The split groups assigned sequence clusters and PDB entries. Cluster
 disjointness does not prove that every cross-split pair is below the clustering
 identity threshold, or that CATH homologous superfamilies are disjoint.
 
-The `cath-v2` sampler is available for staging a separately versioned dataset.
-It requires schema-2 structure metadata and an explicit
-`--sampling-policy cath-v2`:
+Candidate staging defaults to `cath-v3`, a policy for a separately versioned
+dataset. It requires schema-2 structure metadata, original cluster assignments,
+and a separate complete `--split-group-tsv` with a source-bound
+`--split-group-receipt`. Precomputed original clusters use `--cluster-tsv`;
+the two assignment files have different purposes. `--sampling-policy cath-v2`
+remains an explicit alternative.
 
 - CATH Class, Architecture, Topology, and Homologous superfamily identifiers are
   retained per domain, including multiple domains on a chain. Missing annotation
   is explicit; broad alpha/beta labels do not substitute for CATH Architecture.
-- Allocation targets the eligible disjoint-unit distribution hierarchically
+- Allocation targets the eligible original-unit distribution hierarchically
   across each chain's set of CATH Architecture IDs, then length and resolution
   bins. Measured secondary structure is reported separately when available.
 - Assigned sequence clusters, exact duplicate sequences, and shared PDB entries
-  form indivisible groups. One representative is retained per connected group.
-- Public validation and training are allocated before hidden validation, so the
-  public selection is independent of the private hidden salt.
+  form original units, each contributing one quality-ranked representative to
+  the selectable pool. Larger, homology-closed groups combine these units and
+  cannot cross split boundaries. Every eligible full group must be represented.
+- The allocator jointly selects `2,000` held-out groups while preserving enough
+  training capacity, then uses the public seed to assign `1,000` to public
+  validation and `1,000` to hidden validation. Each contributes one target.
+  Training takes one anchor from every remaining group, then adds distinct
+  original-unit representatives to reach `10,000` chains.
 - Source hashes, annotation coverage, structural distributions, and held-out
-  CATH familiarity are recorded for review. Structural balancing does not itself
-  create a family-disjoint generalization test.
+  CATH familiarity are recorded alongside distinct group counts and the maximum
+  training-group share. Review group concentration separately from chain
+  counts; structural balancing is not evidence of better model performance or
+  family-disjoint generalization.
+
+The currently audited candidate universe has `13,033` original-unit
+representatives in `8,856` full groups. This allocation uses `6,856` training
+anchors plus `3,144` additional representatives. These are candidate-universe
+counts, not a change to the published benchmark. Capacity forces the largest
+group into training with at least `2,245` targets (`22.45%`). Evaluation therefore
+covers held-out smaller groups, not the full target-frequency mixture. Training
+weights selected targets equally; inverse-group weighting is a separate ablation.
+
+The hidden salt chooses members within fixed hidden groups and orders the hidden
+manifest; public selection is independent of it. Complete coverage makes the hidden-group
+complement inferable when the full universe is known, including target membership
+for singleton groups. Hidden IDs and artifacts remain private, but this policy
+does not promise secret membership.
 
 Candidate staging requires complete cache-target sequence audits across both
 split boundaries before issuing a verified receipt, even with precomputed
@@ -158,15 +182,17 @@ cache targets exactly and records that binding in preprocessing provenance.
 Processed-tensor and residual MSA audits remain separate release gates.
 
 The published benchmark's broad structural metadata and existing results must
-not be relabeled as `cath-v2` results. See [dataset sampling](docs/DATA_SAMPLING.md)
+not be relabeled as results from a staged policy. See [dataset sampling](docs/DATA_SAMPLING.md)
 for the staging workflow, validation gates, and remaining scientific limits.
 
 Training resume preserves the sampler epoch/cursor, loader generators and per-rank RNG, and checks the actual sampling weights and dataset bytes. Checkpoint replacement is atomic, and invalid RNG or AMP state fails before changing run history. Checkpoints lacking supported sampling state require a fresh training run. See the [training sampling contract](docs/API.md#training-sampling-and-multiple-gpus).
 
 Unweighted distributed epochs drop incomplete tails instead of repeating
 chains. Resume also validates exposure counters against the step and global
-batch size. Split verification replays CATH-v2 selection from the locked inputs,
-including exact integer quota ties and private exclusions.
+batch size. Split verification replays the selected policy from locked inputs,
+including exact integer quota ties. Hidden-only cath-v3 generation must reproduce
+the fixed group plan; exclusions touching a fixed hidden group fail instead of
+reassigning its ownership.
 
 ## Data Format
 
@@ -277,9 +303,12 @@ row filters, fingerprints, and private locks in the ignored
 `.nanofold_private/` workspace. Public releases contain only the reviewed public
 manifests, public fingerprints, and public-safe provenance summaries.
 
-New `cath-v2` candidates require complete schema-2 metadata and both source locks.
-`scripts/stage_dataset_candidate.py` builds and verifies the manifests in a fresh
-private directory and records completion only after independent verification.
+`scripts/stage_dataset_candidate.py` defaults to `cath-v3` and builds complete
+schema-2 metadata, manifests, and both source locks in a fresh private directory.
+It requires the original clustering and separately audited full-group assignments,
+then replays the split plan and runs mandatory target-sequence audits before
+recording completion. Explicit `--sampling-policy cath-v2` staging remains
+available; neither policy has been adopted by the published release.
 `scripts/regenerate_official_manifests.sh` refuses automatic regeneration;
 its `--help` points to the staged workflow. The full refresh wrapper also refuses
 manifest regeneration and requires `--skip-manifest-regen` for asset maintenance.
@@ -445,7 +474,7 @@ CI enforces the same PR guardrail:
 - `scripts/setup_official_data.sh`: official participant setup
 - `scripts/setup_custom_data.sh`: public asset setup from verified staged custom manifests
 - `scripts/build_manifests.py`: maintainer manifest generation
-- `scripts/sync_official_manifest_hashes.py`: sync official manifest hashes across track/lock/docs
+- `scripts/sync_official_manifest_hashes.py`: check frozen manifest references by default; explicit `--write` repairs references only when manifests still match their existing source lock
 - `scripts/build_fingerprint.py`: split dataset fingerprint generator
 - `scripts/run_official.py`: canonical official validate/train/eval/result runner
 - `scripts/run_official_docker.sh`: no-network official container runner

@@ -82,7 +82,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--sample-limit",
         type=int,
         default=0,
-        help="Debug-only limit on eligible chains processed; cath-v2 split generation requires 0 (the full universe).",
+        help="Debug-only limit on eligible chains processed; cath-v2 and cath-v3 require 0 (the complete eligible universe).",
     )
     parser.add_argument("--fail-fast", action="store_true")
     return parser.parse_args(argv)

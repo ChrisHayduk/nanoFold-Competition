@@ -6,7 +6,8 @@ usage() {
 Usage: bash scripts/full_official_data_refresh.sh [options]
 
 Maintainer asset rebuild for frozen official manifests (requires --skip-manifest-regen).
-New cath-v2 datasets use stage_dataset_candidate.py with fresh private paths; see
+New candidates use stage_dataset_candidate.py (default cath-v3) with fresh private
+paths and both --split-group-tsv and --split-group-receipt. See
 regenerate_official_manifests.sh --help. Automatic manifest replacement is refused.
 
 Asset rebuild flow:
@@ -299,7 +300,7 @@ done
 if [[ "$SKIP_MANIFEST_REGEN" -eq 0 ]]; then
   echo "Official manifests are frozen; automatic regeneration is disabled." >&2
   echo "Use --skip-manifest-regen to rebuild/audit published assets, or run" >&2
-  echo "bash scripts/regenerate_official_manifests.sh --help for cath-v2 staging commands." >&2
+  echo "bash scripts/regenerate_official_manifests.sh --help for versioned candidate staging commands." >&2
   exit 1
 fi
 
@@ -393,15 +394,20 @@ fi
 if [[ "$SKIP_SETUP" -eq 0 && "$USER_MSA_ROW_FILTER" -eq 0 && "$SKIP_MSA_ROW_FILTER_BUILD" -eq 0 ]]; then
   CANDIDATE_OUTPUTS+=("$MSA_ROW_FILTER_OUT")
 fi
+PROTECTED_MSA_ROW_FILTER=""
+if [[ "$USER_MSA_ROW_FILTER" -eq 1 ]]; then
+  PROTECTED_MSA_ROW_FILTER="$MSA_ROW_FILTER"
+fi
 python - "$REPO_ROOT" "$PRIVATE_ROOT" "$MANIFESTS_DIR" "$HIDDEN_MANIFESTS_DIR" \
   "$LOCK_FILE" "$TRACK_FILE" "$PRIVATE_MANIFEST_LOCK" "$STRUCTURE_METADATA" \
   "$METADATA_SOURCE_LOCK" "$FEATURE_EXCLUSION_LIST" "$PROCESSABILITY_EXCLUSION_LIST" \
+  "$CHAIN_DATA_CACHE" "$PROTECTED_MSA_ROW_FILTER" \
   "${CANDIDATE_OUTPUTS[@]}" <<'PYTHON'
 import sys
 from pathlib import Path
 
 repo, private, manifests, hidden_manifests = (Path(p).resolve() for p in sys.argv[1:5])
-protected = [Path(p).resolve() for p in sys.argv[5:12]]
+protected = [Path(p).resolve() for p in sys.argv[5:14] if p]
 protected.extend(manifests / name for name in ("train.txt", "val.txt", "all.txt"))
 protected.append(hidden_manifests / "hidden_val.txt")
 protected.append(private / "msa_row_filters/official_heldout_target_homology_filter.json")
@@ -414,7 +420,7 @@ protected.extend(repo / "leaderboard" / name for name in (
 ))
 protected_roots = [repo / "leaderboard", repo / "tracks", repo / "data/manifests"]
 protected.extend(path for root in protected_roots for path in root.rglob("*") if path.is_file())
-outputs = [Path(p).resolve() for p in sys.argv[12:]]
+outputs = [Path(p).resolve() for p in sys.argv[14:]]
 
 def aliases(left, right):
     return left == right or (left.exists() and right.exists() and left.samefile(right))

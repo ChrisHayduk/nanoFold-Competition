@@ -75,6 +75,11 @@ def parse_args() -> argparse.Namespace:
         "--run-mmseqs", action="store_true",
         help="Align all held-out/source target pairs with a permissive E-value limit; separately search non-query MSA rows heuristically. Gate both with --strict.",
     )
+    ap.add_argument(
+        "--exhaustive", action="store_true",
+        help="With --run-mmseqs, also compare every held-out target/non-query MSA-row pair without "
+        "masking or a heuristic prefilter. Requires max-seqs to cover all unique source rows.",
+    )
     ap.add_argument("--mmseqs-bin", default="mmseqs")
     ap.add_argument("--min-seq-id", type=float, default=0.30)
     ap.add_argument("--coverage", type=float, default=0.80)
@@ -114,6 +119,11 @@ def _read_optional_set(path: Path | None) -> set[str]:
     if path is None:
         return set()
     return set(read_manifest(path))
+
+
+def _sha256_file(path: Path) -> str:
+    with path.open("rb") as handle:
+        return hashlib.file_digest(handle, "sha256").hexdigest()
 
 
 def _sequence_sha256(sequence: str) -> str:
@@ -704,6 +714,7 @@ def run_mmseqs_homology(
     include_identifiers: bool,
     val_features_dir: Path | None = None,
     source_targets_only: bool = False,
+    exhaustive: bool = False,
 ) -> dict[str, Any]:
     validate_search_parameters(min_seq_id=min_seq_id, coverage=coverage, threads=threads, max_seqs=max_seqs)
     if shutil.which(mmseqs_bin) is None:
@@ -723,23 +734,33 @@ def run_mmseqs_homology(
         "val_targets_with_train_target_homolog_hits" if source_targets_only
         else "val_targets_with_train_msa_homolog_hits"
     )
+    all_pairs = source_targets_only or exhaustive
+    search_contract = "mmseqs-local-all-pairs-v1" if all_pairs else "mmseqs-prefiltered-v1"
     search_parameters = {
-        "prefilter_mode": 2 if source_targets_only else 0,
-        "evalue": 1e308 if source_targets_only else 1e-3,
+        "prefilter_mode": 2 if all_pairs else 0,
+        "evalue": 1e308 if all_pairs else 1e-3,
         "sensitivity": 5.7,
-        "mask": 0 if source_targets_only else 1,
-        "comp_bias_corr": 0 if source_targets_only else 1,
+        "mask": 0 if all_pairs else 1,
+        "comp_bias_corr": 0 if all_pairs else 1,
         "search_type": 1,
         "dbtype": 1,
+        "max_seqs": max_seqs,
+        "max_accept": max_seqs if all_pairs else 2147483647,
+        "max_rejected": max_seqs if all_pairs else 2147483647,
     }
     threshold = {
         "min_seq_id": min_seq_id, "coverage": coverage, "cov_mode": 0, "alignment_mode": 3, "seq_id_mode": 0,
     }
-    if source_targets_only and max_seqs < len(source_records):
-        raise ValueError("Target-pair audit max-seqs must cover every source target")
+    if all_pairs and max_seqs < len(source_records):
+        raise ValueError(
+            f"Exhaustive audit requires --max-seqs >= {len(source_records)} unique source records; got {max_seqs}."
+        )
     if not source_records:
         return {
             "threshold": threshold,
+            "search_contract": search_contract,
+            "exhaustive": all_pairs,
+            "possible_pair_count": 0,
             "search_parameters": search_parameters,
             "target_records": len(target_records),
             source_count_key: 0,
@@ -790,6 +811,8 @@ def run_mmseqs_homology(
             "--format-output",
             "query,target,pident,alnlen,qcov,tcov,evalue,bits",
         ]
+        if all_pairs:
+            cmd.extend(["--max-accept", str(max_seqs), "--max-rejected", str(max_seqs)])
         proc = subprocess.run(cmd, text=True, check=False)
         if proc.returncode != 0:
             raise RuntimeError(f"MMseqs failed with exit code {proc.returncode}: {' '.join(cmd)}")
@@ -804,6 +827,9 @@ def run_mmseqs_homology(
         unique_target_hits.add(query)
     return {
         "threshold": threshold,
+        "search_contract": search_contract,
+        "exhaustive": all_pairs,
+        "possible_pair_count": len(target_records) * len(source_records),
         "search_parameters": search_parameters,
         "mmseqs": {"binary": mmseqs_bin, "version": _mmseqs_version(mmseqs_bin), "command": cmd},
         "target_records": len(target_records),
@@ -816,7 +842,7 @@ def run_mmseqs_homology(
             "source_records_sha256": sequence_records_sha256(source_records),
             "target_records_sha256": sequence_records_sha256(target_records),
             "query_ids": [header for header, _ in target_records],
-            "m8_sha256": hashlib.sha256(m8_out.read_bytes()).hexdigest(),
+            "m8_sha256": _sha256_file(m8_out),
         },
         "identifiers_in_m8": include_identifiers,
         "search_executed": True,
@@ -854,6 +880,8 @@ def strict_failures(summary: dict[str, Any]) -> list[str]:
 
 def main() -> None:
     args = parse_args()
+    if args.exhaustive and not args.run_mmseqs:
+        raise SystemExit("--exhaustive requires --run-mmseqs")
     validate_search_parameters(
         min_seq_id=args.min_seq_id, coverage=args.coverage, threads=args.threads, max_seqs=args.max_seqs,
     )
@@ -926,6 +954,7 @@ def main() -> None:
             include_identifiers=bool(args.include_identifiers_in_mmseqs),
             val_features_dir=args.val_features_dir,
             source_targets_only=True,
+            exhaustive=bool(args.exhaustive),
         )
         summary["mmseqs_homology"] = run_mmseqs_homology(
             train_ids=train_ids,
@@ -940,6 +969,7 @@ def main() -> None:
             tmp_dir=args.tmp_dir,
             include_identifiers=bool(args.include_identifiers_in_mmseqs),
             val_features_dir=args.val_features_dir,
+            exhaustive=bool(args.exhaustive),
         )
     failures = strict_failures(summary)
     summary["validation"] = {
@@ -949,12 +979,17 @@ def main() -> None:
         "cluster_disjointness_checked": summary["target_manifest_disjointness"]["cluster_map_complete"],
         "mmseqs_homology_checked": bool(args.run_mmseqs),
         "target_target_homology_checked": bool(args.run_mmseqs),
+        "exhaustive_msa_homology_checked": bool(args.run_mmseqs and args.exhaustive),
+        "msa_search_contract": summary.get("mmseqs_homology", {}).get("search_contract"),
         "homology_scope": "Target pairs use all-pair MMseqs local alignments without composition correction "
         "or prefilter masking, with E-value limit 1e308. Source non-query rows of at least 20 residues use "
-        "a separate heuristic search. Identity and bidirectional coverage gates apply to the returned "
-        "local alignments; zero hits do not prove absence of every possible alignment or all homology.",
+        + ("the same all-pair contract. " if args.exhaustive else "a separate heuristic search. ")
+        + "Identity and bidirectional coverage gates apply to the returned local alignments; zero hits do not "
+        "prove absence of every possible alignment or all homology.",
         "depth_identifiers_included": bool(args.include_depth_identifiers),
     }
+    if not args.run_mmseqs:
+        summary["validation"]["homology_scope"] = "MMseqs homology was not checked; --run-mmseqs was not requested."
     (args.out_dir / "msa_split_audit_summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
     print(f"Wrote MSA split audit to {args.out_dir}")
     if args.strict and failures:

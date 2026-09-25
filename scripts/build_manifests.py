@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from bisect import bisect_left
 from collections import Counter, defaultdict
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -18,6 +19,9 @@ from typing import Any, Dict, List
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
 
 from nanofold.structure_metadata import validate_author_chain_id
 
@@ -45,6 +49,9 @@ published cache metadata and requires source-bound versioned structural metadata
 
 STANDARD_AAS = set("ARNDCQEGHILKMFPSTWYV")
 SAMPLING_POLICY = "cath-v2"
+GROUP_SAMPLING_POLICY = "cath-v3"
+CATH_SAMPLING_POLICIES = (SAMPLING_POLICY, GROUP_SAMPLING_POLICY)
+GROUP_ALLOCATOR_POLICY = "joint_heldout_groups_mandatory_train_v1"
 DEFAULT_STRATIFY_FIELDS = ("cath_architecture_ids", "length_bin", "resolution_bin")
 LEGACY_STRATIFY_FIELDS = (
     "secondary_structure_class",
@@ -93,12 +100,17 @@ class SplitResult:
     structural_metadata_source: str
     group_policy: dict[str, bool]
     quality_report: dict[str, Any]
+    split_group_map: dict[str, str] | None = None
 
 
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--sampling-policy", choices=[SAMPLING_POLICY], required=True,
-                    help="Explicit opt-in to versioned CATH sampling; requires metadata schema 2 and new output paths.")
+    ap.add_argument("--sampling-policy", choices=CATH_SAMPLING_POLICIES, required=True,
+                    help="Versioned CATH sampling: cath-v3 covers every full group while preserving whole-group split ownership.")
+    ap.add_argument("--split-group-tsv", default="",
+                    help="Required for cath-v3: complete eligible-chain full-group representative/member TSV, nesting original clusters, PDBs and exact sequences.")
+    ap.add_argument("--split-group-receipt", default="",
+                    help="Required for cath-v3: validated full-universe homology graph provenance receipt.")
     ap.add_argument("--chain-data-cache", type=str, required=True, help="Path to chain_data_cache.json")
     ap.add_argument("--out-dir", type=str, required=True, help="Where to write public train.txt, val.txt, and all.txt")
     ap.add_argument(
@@ -607,7 +619,7 @@ def _build_candidates(
     secondary_source = "structure_metadata"
 
     for chain_id, meta_raw in sorted(data.items()):
-        if sampling_policy == SAMPLING_POLICY:
+        if sampling_policy in CATH_SAMPLING_POLICIES:
             validate_author_chain_id(chain_id)
         elif not re.fullmatch(r"[0-9A-Za-z]{4}_[^\s_]+", chain_id):
             reject_reasons["invalid_chain_id"] += 1
@@ -624,14 +636,14 @@ def _build_candidates(
             reject_reasons["missing_sequence"] += 1
             continue
         seq = seq.upper()
-        if sampling_policy == SAMPLING_POLICY and _unknown_aa_fraction(seq) != 0:
+        if sampling_policy in CATH_SAMPLING_POLICIES and _unknown_aa_fraction(seq) != 0:
             reject_reasons["nonstandard_amino_acids"] += 1
             continue
 
         raw_length = meta.get("seq_length", meta.get("sequence_length", len(seq)))
         raw_resolution = meta.get("resolution")
         oligomer_count = meta.get("oligomeric_count")
-        if sampling_policy == SAMPLING_POLICY:
+        if sampling_policy in CATH_SAMPLING_POLICIES:
             length_value = _to_optional_float(raw_length)
             res_value = _to_optional_float(raw_resolution)
             olig_value = _to_optional_float(oligomer_count)
@@ -654,20 +666,20 @@ def _build_candidates(
         if res != 999.0 and res > max_resolution:
             reject_reasons["resolution"] += 1
             continue
-        if (require_monomer or sampling_policy != SAMPLING_POLICY) and olig != 1:
+        if (require_monomer or sampling_policy not in CATH_SAMPLING_POLICIES) and olig != 1:
             reject_reasons["oligomeric_count"] += 1
             continue
 
         metadata_entry = structure_metadata[chain_id]
         ss_class, helix_fraction, beta_fraction, coil_fraction = _parse_secondary_payload(metadata_entry)
         domain_class, domain_source, metadata_source_count = _parse_domain_payload(metadata_entry)
-        if sampling_policy != SAMPLING_POLICY and (
+        if sampling_policy not in CATH_SAMPLING_POLICIES and (
             ss_class == "unknown" or any(value is None for value in (helix_fraction, beta_fraction, coil_fraction))
             or domain_class == "unknown"
         ):
             reject_reasons["missing_structure_metadata"] += 1
             continue
-        cath = _parse_cath_payload(metadata_entry) if sampling_policy == SAMPLING_POLICY else {}
+        cath = _parse_cath_payload(metadata_entry) if sampling_policy in CATH_SAMPLING_POLICIES else {}
 
         candidates.append(
             Candidate(
@@ -842,14 +854,16 @@ def _select_stratified(
     seed: int,
     salt: str,
     stratify_fields: tuple[str, ...],
+    reference_units: list[Candidate] | None = None,
 ) -> list[Candidate]:
     if size <= 0:
         return []
     by_stratum: defaultdict[tuple[str, ...], list[Candidate]] = defaultdict(list)
     for unit in units:
         by_stratum[_stratum(unit, stratify_fields)].append(unit)
-    allocation = _allocate_counts_by_stratum(
-        units, size=size, stratify_fields=stratify_fields, seed=seed, salt=salt,
+    allocation = _allocate_hierarchical(
+        units, units if reference_units is None else reference_units,
+        size=size, stratify_fields=stratify_fields, seed=seed, salt=salt,
     )
     selected: list[Candidate] = []
     for key, count in sorted(allocation.items()):
@@ -861,6 +875,182 @@ def _select_stratified(
     if len(selected) != size:
         raise RuntimeError(f"Internal stratified sampling error: requested {size}, selected {len(selected)}")
     return sorted(selected, key=lambda item: (_stable_random_score(seed, f"{salt}:selected", item.chain_id), item.chain_id))
+
+
+def _group_sampling_units(
+    candidates: list[Candidate], cluster_map: dict[str, str], split_group_map: dict[str, str], *, seed: int,
+) -> tuple[list[Candidate], dict[str, list[Candidate]]]:
+    """Validate full-universe nesting and retain one representative per original unit."""
+    ids = {candidate.chain_id for candidate in candidates}
+    if len(ids) != len(candidates) or set(cluster_map) != ids or set(split_group_map) != ids:
+        raise ValueError("Original clusters and full split groups must cover the complete eligible candidate universe exactly.")
+    if any(not isinstance(group, str) or not group.strip() for group in split_group_map.values()):
+        raise ValueError("Full split group identifiers must be nonempty strings.")
+    links: tuple[dict[str, str], ...] = ({}, {}, {})
+    for candidate in candidates:
+        group = split_group_map[candidate.chain_id]
+        for seen, value in zip(links, (cluster_map[candidate.chain_id], candidate.pdb_id, candidate.sequence), strict=True):
+            if value in seen and seen[value] != group:
+                raise ValueError("Full split groups must contain every original cluster, PDB entry and exact-sequence component.")
+            seen[value] = group
+    clustered = [replace(candidate, cluster_id=cluster_map[candidate.chain_id]) for candidate in candidates]
+    units = _disjoint_units(clustered, cluster_map, disallow_pdb_overlap=True, seed=seed)
+    groups: defaultdict[str, list[Candidate]] = defaultdict(list)
+    for candidate in units:
+        groups[split_group_map[candidate.chain_id]].append(candidate)
+    if set(groups) != set(split_group_map.values()):
+        raise RuntimeError("Original representative population does not cover every full split group.")
+    return units, dict(groups)
+
+
+def _select_group_anchors(
+    anchors: list[Candidate], reference: list[Candidate], costs: dict[str, int], *, size: int,
+    budget: int, seed: int,
+) -> list[Candidate]:
+    """Select stratified held-out groups without exhausting train capacity.
+
+    A held-out group contributes one target, so its remaining members consume
+    the unused-target budget. Each seeded choice reserves the exact minimum
+    completion cost of the remaining quotas.
+    """
+    salt = "heldout-group-ownership"
+    allocation = _allocate_hierarchical(
+        anchors, reference, size=size, stratify_fields=DEFAULT_STRATIFY_FIELDS, seed=seed, salt=salt,
+    )
+    strata: defaultdict[tuple[str, ...], list[Candidate]] = defaultdict(list)
+    for candidate in anchors:
+        strata[_stratum(candidate, DEFAULT_STRATIFY_FIELDS)].append(candidate)
+    minimum_cost = {
+        key: sum(sorted(costs[candidate.chain_id] for candidate in strata[key])[:quota])
+        for key, quota in allocation.items()
+    }
+    minimum_remaining = sum(minimum_cost.values())
+    if minimum_remaining > budget:
+        raise ValueError("Held-out CATH quotas exceed the available train-capacity budget; this group allocation is infeasible.")
+    selected: list[Candidate] = []
+    for key, quota in sorted(allocation.items()):
+        minimum_remaining -= minimum_cost[key]
+        remaining_costs = sorted(costs[candidate.chain_id] for candidate in strata[key])
+        ranked = sorted(strata[key], key=lambda candidate: (
+            _stable_random_score(seed, f"{salt}:{'|'.join(key)}", candidate.chain_id), candidate.chain_id,
+        ))
+        for candidate in ranked:
+            if quota == 0:
+                break
+            cost = costs[candidate.chain_id]
+            remaining_costs.pop(bisect_left(remaining_costs, cost))
+            if len(remaining_costs) < quota - 1:
+                raise RuntimeError("Held-out quota completion lost available groups.")
+            completion = sum(remaining_costs[:quota - 1]) + minimum_remaining
+            if cost + completion <= budget:
+                selected.append(candidate)
+                budget -= cost
+                quota -= 1
+        if quota:
+            raise RuntimeError("Held-out group allocation did not satisfy its exact quotas.")
+    return selected
+
+
+def _select_with_mandatory(
+    pool: list[Candidate], mandatory: list[Candidate], reference: list[Candidate], *, size: int, seed: int,
+) -> list[Candidate]:
+    """Preserve every mandatory group anchor and apportion the remaining slots."""
+    mandatory_ids = {candidate.chain_id for candidate in mandatory}
+    if (len(mandatory_ids) != len(mandatory) or not mandatory_ids <= {candidate.chain_id for candidate in pool}
+            or not len(mandatory) <= size <= len(pool)):
+        raise ValueError("Mandatory group coverage is incompatible with the requested train size or candidate pool.")
+    selected = list(mandatory)
+    extra = [candidate for candidate in pool if candidate.chain_id not in mandatory_ids]
+
+    def visit(members: list[Candidate], anchors: list[Candidate], targets: list[Candidate],
+              quota: int, prefix: tuple[str, ...]) -> None:
+        if len(prefix) == len(DEFAULT_STRATIFY_FIELDS):
+            ranked = sorted(members, key=lambda candidate: (
+                _stable_random_score(seed, f"train-mandatory:{'|'.join(prefix)}", candidate.chain_id), candidate.chain_id,
+            ))
+            selected.extend(ranked[:quota - len(anchors)])
+            return
+        field = DEFAULT_STRATIFY_FIELDS[len(prefix)]
+        groups: defaultdict[str, list[Candidate]] = defaultdict(list)
+        lower: defaultdict[str, list[Candidate]] = defaultdict(list)
+        target_groups: defaultdict[str, list[Candidate]] = defaultdict(list)
+        for candidate in members:
+            groups[_candidate_field(candidate, field)].append(candidate)
+        for candidate in anchors:
+            lower[_candidate_field(candidate, field)].append(candidate)
+        for candidate in targets:
+            target_groups[_candidate_field(candidate, field)].append(candidate)
+        keys = sorted(set(groups) | set(lower))
+        denominator = max(1, len(targets))
+        # Integer numerators of deficits relative to the full target quota;
+        # mandatory counts are lower bounds, not a new reference population.
+        deficits = {key: max(0, quota * len(target_groups[key]) - denominator * len(lower[key])) for key in keys}
+        counts = _apportion_counts(
+            {key: len(groups[key]) for key in keys}, deficits, size=quota - len(anchors), seed=seed,
+            salt=f"train-mandatory:{json.dumps(prefix)}",
+        )
+        for key in keys:
+            visit(groups[key], lower[key], target_groups[key], len(lower[key]) + counts[key], (*prefix, key))
+
+    visit(extra, mandatory, reference, size, ())
+    if len(selected) != size or len({candidate.chain_id for candidate in selected}) != size:
+        raise RuntimeError("Mandatory group sampling did not produce the exact requested train size.")
+    return sorted(selected, key=lambda candidate: (
+        _stable_random_score(seed, "train-mandatory:selected", candidate.chain_id), candidate.chain_id,
+    ))
+
+
+def _plan_group_splits(
+    units: list[Candidate], groups: dict[str, list[Candidate]], *,
+    train_size: int, val_size: int, hidden_val_size: int, seed: int,
+) -> tuple[list[Candidate], list[Candidate], list[list[Candidate]]]:
+    """Fix all group ownership using public inputs, before any hidden salt is read."""
+    sizes = (train_size, val_size, hidden_val_size)
+    if any(type(size) is not int or size <= 0 for size in sizes):
+        raise ValueError("Group sampling requires positive integer split sizes.")
+    grouped_ids = [candidate.chain_id for members in groups.values() for candidate in members]
+    if (any(not members for members in groups.values()) or len(grouped_ids) != len(set(grouped_ids))
+            or set(grouped_ids) != {candidate.chain_id for candidate in units} or len(grouped_ids) != len(units)):
+        raise ValueError("Full groups must partition the original representative population exactly.")
+    heldout_size = val_size + hidden_val_size
+    budget = len(units) - sum(sizes)
+    train_group_count = len(groups) - heldout_size
+    if budget < 0 or train_group_count <= 0 or train_group_count > train_size:
+        raise ValueError("Split sizes cannot cover every full group with one target per held-out group and mandatory train coverage.")
+    anchors = {group: _choose_representative(members, seed) for group, members in sorted(groups.items())}
+    anchor_to_group = {candidate.chain_id: group for group, candidate in anchors.items()}
+    costs = {candidate.chain_id: len(groups[group]) - 1 for group, candidate in anchors.items()}
+    eligible = [candidate for candidate in anchors.values() if costs[candidate.chain_id] <= budget]
+    if len(eligible) < heldout_size:
+        raise ValueError("Not enough full groups can enter held-out splits without exhausting train capacity.")
+    heldout = _select_group_anchors(eligible, units, costs, size=heldout_size, budget=budget, seed=seed)
+    val = _select_stratified(
+        heldout, size=val_size, seed=seed, salt="val-group-ownership", stratify_fields=DEFAULT_STRATIFY_FIELDS,
+        reference_units=units,
+    )
+    val_ids = {candidate.chain_id for candidate in val}
+    heldout_groups = {anchor_to_group[candidate.chain_id] for candidate in heldout}
+    hidden_group_ids = sorted(anchor_to_group[candidate.chain_id] for candidate in heldout if candidate.chain_id not in val_ids)
+    train_group_ids = sorted(set(groups) - heldout_groups)
+    train = _select_with_mandatory(
+        [candidate for group in train_group_ids for candidate in groups[group]],
+        [anchors[group] for group in train_group_ids], units, size=train_size, seed=seed,
+    )
+    return train, val, [groups[group] for group in hidden_group_ids]
+
+
+def _sample_hidden_groups(
+    hidden_groups: list[list[Candidate]], *, seed: int, hidden_split_salt_digest: str,
+) -> list[Candidate]:
+    if hidden_groups and not hidden_split_salt_digest:
+        raise ValueError("Hidden group member selection requires a private salt digest.")
+    salt = f"hidden-group-member:{hidden_split_salt_digest}"
+    hidden = [min(members, key=lambda candidate: (
+        _stable_random_score(seed, salt, candidate.chain_id), candidate.chain_id,
+    )) for members in hidden_groups]
+    return sorted(hidden, key=lambda candidate: (
+        _stable_random_score(seed, f"{salt}:selected", candidate.chain_id), candidate.chain_id,
+    ))
 
 
 def _split_candidates(
@@ -877,15 +1067,20 @@ def _split_candidates(
     cluster_method: str,
     cluster_command: list[str] | None,
     structural_metadata_source: str,
+    sampling_policy: str = SAMPLING_POLICY,
+    split_group_map: dict[str, str] | None = None,
 ) -> SplitResult:
     candidate_by_id = {candidate.chain_id: candidate for candidate in candidates}
     candidates_with_clusters = [replace(candidate, cluster_id=cluster_map[candidate.chain_id]) for candidate in candidates]
-    units = _disjoint_units(
-        candidates_with_clusters,
-        cluster_map,
-        disallow_pdb_overlap=disallow_pdb_overlap,
-        seed=seed,
-    )
+    if sampling_policy == GROUP_SAMPLING_POLICY:
+        if split_group_map is None or not disallow_pdb_overlap or stratify_fields != DEFAULT_STRATIFY_FIELDS:
+            raise ValueError("cath-v3 requires complete split groups, PDB disjointness and the declared CATH hierarchy.")
+        units, groups = _group_sampling_units(candidates_with_clusters, cluster_map, split_group_map, seed=seed)
+    elif sampling_policy == SAMPLING_POLICY and split_group_map is None:
+        units = _disjoint_units(candidates_with_clusters, cluster_map, disallow_pdb_overlap=disallow_pdb_overlap, seed=seed)
+        groups = {}
+    else:
+        raise ValueError("Unsupported sampling policy or unexpected full split groups.")
     required = int(train_size) + int(val_size) + int(hidden_val_size)
     if len(units) < required:
         raise ValueError(
@@ -893,22 +1088,28 @@ def _split_candidates(
             "The candidate source set is too small for the official split contract."
         )
 
-    # Public choices must not reveal holes left by privately selected hidden chains.
-    val = _select_stratified(units, size=int(val_size), seed=seed, salt="val", stratify_fields=stratify_fields)
-    val_ids = {candidate.chain_id for candidate in val}
-    train_pool = [candidate for candidate in units if candidate.chain_id not in val_ids]
-    train = _select_stratified(train_pool, size=int(train_size), seed=seed, salt="train", stratify_fields=stratify_fields)
-    public_ids = val_ids | {candidate.chain_id for candidate in train}
-    hidden_pool = [candidate for candidate in units if candidate.chain_id not in public_ids]
-    if hidden_val_size > 0:
-        if not hidden_split_salt_digest:
-            raise RuntimeError("Hidden split salt digest is required when hidden_val_size is positive.")
-        hidden = _select_stratified(
-            hidden_pool, size=int(hidden_val_size), seed=seed,
-            salt=f"hidden_val:{hidden_split_salt_digest}", stratify_fields=stratify_fields,
+    if sampling_policy == GROUP_SAMPLING_POLICY:
+        train, val, hidden_groups = _plan_group_splits(
+            units, groups, train_size=train_size, val_size=val_size, hidden_val_size=hidden_val_size, seed=seed,
         )
+        hidden = _sample_hidden_groups(hidden_groups, seed=seed, hidden_split_salt_digest=hidden_split_salt_digest)
     else:
-        hidden = []
+        # Public choices must not reveal holes left by privately selected hidden chains.
+        val = _select_stratified(units, size=int(val_size), seed=seed, salt="val", stratify_fields=stratify_fields)
+        val_ids = {candidate.chain_id for candidate in val}
+        train_pool = [candidate for candidate in units if candidate.chain_id not in val_ids]
+        train = _select_stratified(train_pool, size=int(train_size), seed=seed, salt="train", stratify_fields=stratify_fields)
+        public_ids = val_ids | {candidate.chain_id for candidate in train}
+        hidden_pool = [candidate for candidate in units if candidate.chain_id not in public_ids]
+        if hidden_val_size > 0:
+            if not hidden_split_salt_digest:
+                raise RuntimeError("Hidden split salt digest is required when hidden_val_size is positive.")
+            hidden = _select_stratified(
+                hidden_pool, size=int(hidden_val_size), seed=seed,
+                salt=f"hidden_val:{hidden_split_salt_digest}", stratify_fields=stratify_fields,
+            )
+        else:
+            hidden = []
 
     selected = {candidate.chain_id: candidate for candidate in train + val + hidden}
     quality_report = _build_quality_report(
@@ -922,6 +1123,23 @@ def _split_candidates(
         reference_candidates=units,
     )
     _assert_quality_report(quality_report)
+    group_policy = {"cluster_disjoint": True, "pdb_disjoint": disallow_pdb_overlap, "exact_sequence_disjoint": True}
+    if split_group_map is not None:
+        split_counts = {name: Counter(split_group_map[candidate.chain_id] for candidate in members)
+                        for name, members in (("train", train), ("val", val), ("hidden_val", hidden))}
+        quality_report["group_sampling"] = {
+            "allocator_policy": GROUP_ALLOCATOR_POLICY,
+            "reference_population": "original_cluster_pdb_exact_representatives",
+            "selection_unit_count": len(units), "full_group_count": len(groups),
+            "selection_unit_ids_sha256": hashlib.sha256(
+                "".join(candidate.chain_id + "\n" for candidate in sorted(units, key=lambda item: item.chain_id)).encode()
+            ).hexdigest(),
+            "split_group_counts": {name: len(counts) for name, counts in split_counts.items()},
+            "selected_counts_by_group": {name: dict(sorted(counts.items())) for name, counts in split_counts.items()},
+            "max_train_group_share": max(split_counts["train"].values(), default=0) / max(1, len(train)),
+            "hidden_membership_privacy": "Group coverage reveals the hidden group complement when the full universe is known; singleton target membership is inferable.",
+        }
+        group_policy.update(full_group_disjoint=True, all_groups_covered=True)
     return SplitResult(
         train_ids=[candidate.chain_id for candidate in train],
         val_ids=[candidate.chain_id for candidate in val],
@@ -933,8 +1151,9 @@ def _split_candidates(
         cluster_method=cluster_method,
         cluster_command=cluster_command,
         structural_metadata_source=structural_metadata_source,
-        group_policy={"cluster_disjoint": True, "pdb_disjoint": disallow_pdb_overlap, "exact_sequence_disjoint": True},
+        group_policy=group_policy,
         quality_report=quality_report,
+        split_group_map=split_group_map,
     )
 
 
@@ -967,6 +1186,16 @@ def _assert_split_disjointness(result: SplitResult) -> None:
                         f"{label} leakage across splits: {value} appears in {other_split} and {split_name}"
                     )
                 seen[value] = split_name
+    if result.split_group_map is not None:
+        ownership: dict[str, str] = {}
+        for split_name, ids in split_ids.items():
+            for chain_id in ids:
+                group = result.split_group_map[chain_id]
+                if group in ownership and ownership[group] != split_name:
+                    raise RuntimeError("Full split group appears in multiple selected splits.")
+                ownership[group] = split_name
+        if set(ownership) != set(result.split_group_map.values()):
+            raise RuntimeError("Selected splits do not cover every full eligible group.")
 
 
 def _split_distribution(result: SplitResult, ids: list[str]) -> dict[str, Any]:
@@ -1194,6 +1423,11 @@ def _write_manifest(path: Path, chain_ids: list[str]) -> None:
 def main() -> None:
     args = parse_args()
     _validate_generation_args(args)
+    if args.sampling_policy == GROUP_SAMPLING_POLICY:
+        if not args.split_group_tsv or not args.split_group_receipt:
+            raise ValueError("cath-v3 requires --split-group-tsv and --split-group-receipt.")
+    elif args.split_group_tsv or args.split_group_receipt:
+        raise ValueError("Full split-group inputs require --sampling-policy cath-v3.")
     if not args.lock_file.strip() or not args.private_lock_file.strip():
         raise ValueError("CATH sampling requires nonempty --lock-file and --private-lock-file paths.")
 
@@ -1229,6 +1463,7 @@ def main() -> None:
         structure_metadata=structure_metadata,
         structure_metadata_accepted=structure_metadata_accepted,
         require_monomer=args.require_monomer,
+        sampling_policy=args.sampling_policy,
     )
     required_count = int(args.train_size) + int(args.val_size) + int(args.hidden_val_size)
     if int(args.hidden_val_size) <= 0:
@@ -1269,6 +1504,17 @@ def main() -> None:
     else:
         raise RuntimeError("All accepted structure metadata candidates must have sequences in chain_data_cache.json.")
 
+    split_group_map = _load_cluster_tsv(args.split_group_tsv, set(candidate_ids)) if args.split_group_tsv else None
+    group_receipt: dict[str, Any] | None = None
+    if split_group_map is not None:
+        from build_homology_groups import validate_group_receipt
+
+        group_receipt = validate_group_receipt(
+            Path(args.split_group_receipt), split_group_tsv=Path(args.split_group_tsv),
+            chain_data_cache=cache_path, structure_metadata=Path(args.structure_metadata),
+            cluster_map=cluster_map, candidate_ids=set(candidate_ids),
+            min_seq_id=float(args.min_seq_id), coverage=float(args.coverage),
+        )
     stratify_fields = DEFAULT_STRATIFY_FIELDS
     result = _split_candidates(
         candidates=candidates,
@@ -1283,8 +1529,20 @@ def main() -> None:
         cluster_method=cluster_method,
         cluster_command=cluster_command,
         structural_metadata_source=structural_metadata_source,
+        sampling_policy=args.sampling_policy,
+        split_group_map=split_group_map,
     )
     _assert_split_disjointness(result)
+    if group_receipt is not None and group_receipt.get("original_unit_count") != result.unit_count:
+        raise ValueError("Full-group receipt original-unit count disagrees with the reconstructed sampling population.")
+    split_groups_record = None if split_group_map is None else {
+        "path": str(args.split_group_tsv), "sha256": _sha256(Path(args.split_group_tsv)),
+        "assignments_sha256": _cluster_assignments_sha256(split_group_map),
+        "group_count": len(set(split_group_map.values())), "coverage": "all_groups",
+        "selection_unit_count": result.unit_count, "allocator_policy": GROUP_ALLOCATOR_POLICY,
+        "selection_unit_ids_sha256": result.quality_report["group_sampling"]["selection_unit_ids_sha256"],
+        "receipt_path": str(args.split_group_receipt), "receipt_sha256": _sha256(Path(args.split_group_receipt)),
+    }
 
     out_dir = Path(args.out_dir)
     hidden_out_dir = Path(args.hidden_out_dir)
@@ -1334,11 +1592,11 @@ def main() -> None:
             stratify_fields=stratify_fields,
         )
         lock = {
-            "sampling_policy": SAMPLING_POLICY,
+            "sampling_policy": args.sampling_policy,
             "chain_data_cache_path": str(cache_path),
             "chain_data_cache_sha256": cache_sha,
             "args": {
-                "sampling_policy": SAMPLING_POLICY,
+                "sampling_policy": args.sampling_policy,
                 "train_size": int(args.train_size),
                 "val_size": int(args.val_size),
                 "hidden_val_size": int(args.hidden_val_size),
@@ -1392,6 +1650,9 @@ def main() -> None:
                 "unique_count": len(all_ids),
             },
         }
+        if split_groups_record is not None:
+            lock["split_groups"] = split_groups_record
+            lock["args"].update(split_group_tsv=str(args.split_group_tsv), split_group_receipt=str(args.split_group_receipt))
         lock_path = Path(args.lock_file)
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         _atomic_write(lock_path, json.dumps(lock, indent=2) + "\n")
@@ -1399,7 +1660,7 @@ def main() -> None:
 
     if args.private_lock_file:
         private_lock = {
-            "sampling_policy": SAMPLING_POLICY,
+            "sampling_policy": args.sampling_policy,
             "notes": "Maintainer-only hidden manifest lock. Do not commit this file.",
             "chain_data_cache_sha256": cache_sha,
             "hidden_split_salt_sha256": hidden_split_salt_digest,
@@ -1420,6 +1681,15 @@ def main() -> None:
             "stratification": {"reference": "eligible_disjoint_units", "fields": list(stratify_fields)},
             "quality_report": result.quality_report,
         }
+        if split_groups_record is not None:
+            private_lock["split_groups"] = split_groups_record
+            private_lock["filtering"] = {
+                "private_processability_exclusion_count": 0,
+                "private_processability_exclusions": {
+                    "path": None, "sha256": None,
+                    "canonical_ids_sha256": hashlib.sha256(b"").hexdigest(),
+                },
+            }
         private_lock_path = Path(args.private_lock_file)
         private_lock_path.parent.mkdir(parents=True, exist_ok=True)
         _atomic_write(private_lock_path, json.dumps(private_lock, indent=2) + "\n")

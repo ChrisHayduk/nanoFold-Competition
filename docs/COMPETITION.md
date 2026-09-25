@@ -137,23 +137,59 @@ split-separation groups. This is not a guarantee that every cross-split pair
 falls below the MMseqs identity threshold or that homologous families are absent
 across splits. `all.txt` contains train plus public validation only.
 
-New sampling work uses the explicit `--sampling-policy cath-v2` option with
-schema-2 structure metadata and fresh staging paths. The policy retains the CATH
-Class/Architecture/Topology/Homologous-superfamily identity of every annotated
-domain and represents missing annotation explicitly. It balances the eligible
-disjoint-unit population by CATH Architecture label-set signature, then length,
-then resolution. Secondary-structure measurements are separate annotations;
-synthetic fractions derived from broad domain classes are not sampling axes.
+Candidate staging defaults to `cath-v3`, with schema-2 structure metadata and
+fresh private outputs. CATH Class/Architecture/Topology/Homologous-superfamily
+identifiers are retained for every annotated domain, with missing annotation
+explicit. Hierarchical balance targets each chain's CATH Architecture label-set
+signature, then length and resolution. Measured secondary structure is a separate
+annotation; synthetic fractions inferred from domain classes are not sampling
+axes. `--sampling-policy cath-v2` remains an explicit candidate policy.
 
-Candidate groups join assigned sequence clusters, exact duplicate sequences,
-and PDB entries transitively, retaining one representative per group. Public
-validation and training are selected before salted hidden validation, making
-public selection independent of the hidden salt. Quality reports record
-annotation coverage, distributions against the eligible population, and CATH
-familiarity with training. These reports describe structural coverage; they do
-not establish family-disjoint generalization.
+`cath-v3` distinguishes original selection units from full split groups. Original
+units join assigned sequence clusters, exact duplicate sequences, and PDB entries
+transitively; each retains one quality-ranked representative. A separate complete
+homology-closed grouping combines whole original units. These full groups must
+remain within one split, and every eligible full group must contribute at least
+one selected representative. Original precomputed assignments use `--cluster-tsv`;
+cath-v3 additionally requires `--split-group-tsv`. Staging also requires the
+source-bound full-universe audit receipt through `--split-group-receipt`.
 
-The committed benchmark has not been regenerated with this policy. Existing
+For the `10,000`/`1,000`/`1,000` candidate contract, selection proceeds as follows:
+
+1. Jointly select `2,000` held-out full groups while preserving enough original
+   representatives to fill training. Public-seed allocation fixes `1,000` groups
+   for public validation and `1,000` for hidden validation, with one target each.
+2. Select one training anchor from every remaining full group, then fill the
+   remaining training slots with other original-unit representatives. No original
+   unit contributes twice.
+3. Use the private salt only to choose one representative from each fixed hidden
+   group and order the hidden manifest. Anchor-based quotas need not match the
+   chosen members' strata exactly; actual hidden distributions pass quality checks.
+   Hidden-only generation must replay this exact group plan;
+   private exclusions touching any fixed hidden group cause failure.
+
+The currently audited candidate universe contains `13,033` original-unit
+representatives across `8,856` full groups. The resulting training allocation is
+`6,856` group anchors plus `3,144` additional representatives. Quality reports
+separate chain counts from distinct full-group counts, record the maximum
+training-group share, and report annotation coverage, structural distributions,
+and CATH familiarity with training. Review group concentration alongside
+structural balance: more representatives from one group do not add independent
+groups, and balance alone proves neither model gains nor family-disjoint
+generalization. In this candidate universe, capacity forces the largest group
+into training with at least `2,245` targets (`22.45%`); evaluation covers smaller
+held-out groups rather than the full target-frequency mixture. This capacity
+bound is a candidate limitation, not a universal policy constant. Default training
+weights targets equally: a group with `m` selected targets receives `m` exposures
+in a complete traversal before batch/tail drops. Inverse-group weighting is a
+separate sampling ablation.
+
+Complete full-group coverage has a privacy limit: anyone who knows the eligible
+universe and grouping can infer hidden groups as the complement of public
+groups. Singleton hidden-group membership is then inferable. Keeping hidden IDs,
+salts, labels, and artifacts private does not guarantee membership secrecy.
+
+The committed benchmark has not adopted either candidate policy. Existing
 results retain their original dataset identity. See [dataset sampling](DATA_SAMPLING.md)
 for candidate generation, source validation, quality gates, and release review.
 
@@ -214,7 +250,12 @@ residual MMseqs hits. Cluster checks require a complete `--cluster-tsv`; absent
 cluster assignments are not interpreted as proof of separation. Target searches
 align all source/held-out pairs with prefiltering and masking disabled and a
 permissive E-value limit. Searches over non-query MSA rows of at least 20 residues
-remain heuristic. Reports record these modes separately. Neither constitutes
+remain heuristic by default. Standalone filter generation supports `--exhaustive`,
+and `audit_msa_split.py --strict --run-mmseqs --exhaustive` uses all-pair local
+alignments for MSA rows as well. Exhaustive mode requires enough `--max-seqs`
+capacity for all searched source records. The filter builder's `--inventory-only`
+reports unique sequence counts and pair workload without searching or producing
+a usable filter. Reports record these modes separately. Neither constitutes
 proof of absence under every possible alignment or of all biological homology.
 Exact held-out sequence matches are also removed independently of MMseqs,
 including low-complexity sequences that its masking can suppress.
@@ -230,12 +271,16 @@ root.
 Automatic regeneration is disabled in both official wrappers.
 `scripts/regenerate_official_manifests.sh --help` gives staging guidance; new
 candidates use `scripts/stage_dataset_candidate.py` to build complete metadata,
-generate both source locks and independently verify fresh private outputs.
-Staging also requires both cache-target sequence audits to pass before issuing
-a verified receipt. This early gate does not replace processed-tensor and MSA
-audits. The direct builders remain available with `--sampling-policy cath-v2`.
-The hidden builder requires a matching versioned public
-source lock. Follow [DATA_SAMPLING.md](DATA_SAMPLING.md) for the complete workflow.
+generate both source locks, and independently replay fresh private outputs.
+Staging defaults to `cath-v3`, requiring original clustering plus separately
+audited full-group assignments. Both cache-target sequence audits must pass
+before a verified receipt is issued, including when clusters are precomputed.
+This early gate does not replace processed-tensor and MSA audits. Direct builders
+require an explicit `--sampling-policy cath-v3` or `--sampling-policy cath-v2`.
+The hidden builder requires a matching versioned public source lock; cath-v3
+verification checks fixed group ownership and complete group coverage as well as
+the selected representatives. Follow [DATA_SAMPLING.md](DATA_SAMPLING.md) for the
+complete workflow.
 Do not sync candidate hashes into the published track configuration. Asset
 rebuilds write candidate fingerprints and raw/hidden asset locks under
 `.nanofold_private/asset_rebuild/leaderboard/` by default and reject protected

@@ -199,3 +199,49 @@ def test_source_lock_rejects_inconsistent_filtering_counts(tmp_path: Path) -> No
     _write_json(audit, payload)
     with pytest.raises(ValueError, match="counts are inconsistent"):
         module.build_source_lock(row_filter_path=row_filter, processed_filter_audit_paths=[audit])
+
+
+def test_source_lock_retains_exhaustive_contract_and_redacts_bound_private_inputs(tmp_path: Path) -> None:
+    module = _load_lock_module()
+    row_filter = tmp_path / "filter.json"
+    _write_filter(row_filter)
+    payload = json.loads(row_filter.read_text())
+    payload["search_contract"] = "mmseqs-local-all-pairs-v1"
+    payload["exhaustive"] = True
+    payload["input_binding"] = {
+        "source_fasta_sha256": "c" * 64, "heldout_fasta_sha256": "d" * 64, "m8_sha256": "e" * 64,
+        "source_sequence_set_sha256": "f" * 64, "heldout_sequence_set_sha256": "1" * 64,
+        "secret_sequence": "private_target_chain",
+    }
+    payload["mmseqs"]["search_parameters"] = {
+        "prefilter_mode": 2, "evalue": 1e308, "mask": 0, "comp_bias_corr": 0, "dbtype": 1,
+        "max_accept": 1_000_000, "max_rejected": 1_000_000, "secret_sequence": "private_target_chain",
+    }
+    payload["mmseqs"]["command"].extend([
+        "--prefilter-mode", "2", "--mask", "0", "--comp-bias-corr", "0", "-e", "1e308",
+        "--max-accept", "1000000", "--max-rejected", "1000000",
+    ])
+    _write_json(row_filter, payload)
+    public = module.build_source_lock(row_filter_path=row_filter, processed_filter_audit_paths=[])
+    summary = public["msa_row_filter"]
+    assert summary["search_contract"] == "mmseqs-local-all-pairs-v1"
+    assert summary["exhaustive"] is True
+    assert summary["mmseqs"]["search_parameters"]["prefilter_mode"] == 2
+    command = summary["mmseqs"]["command"]
+    assert command[command.index("--comp-bias-corr") + 1] == "0"
+    assert command[command.index("--max-rejected") + 1] == "1000000"
+    assert set(summary["input_binding"].values()) == {"<private>"}
+    assert "private_target_chain" not in json.dumps(public)
+    assert "d" * 64 not in json.dumps(public)
+    private = module.build_source_lock(row_filter_path=row_filter, processed_filter_audit_paths=[], include_private_paths=True)
+    assert private["msa_row_filter"]["input_binding"]["heldout_fasta_sha256"] == "d" * 64
+    assert "private_target_chain" not in json.dumps(private)
+
+
+def test_source_lock_rejects_search_inventory_as_a_completed_filter(tmp_path: Path) -> None:
+    import pytest
+
+    inventory = tmp_path / "inventory.json"
+    _write_json(inventory, {"schema_version": 1, "inventory_type": "msa_search_inventory"})
+    with pytest.raises(ValueError, match="inventory is not a row filter"):
+        _load_lock_module().build_source_lock(row_filter_path=inventory, processed_filter_audit_paths=[])

@@ -12,6 +12,7 @@ import hashlib
 import importlib
 import io
 import json
+import math
 import re
 import sys
 from collections.abc import Iterator, Mapping
@@ -643,19 +644,102 @@ def _validate_filter_summary(path: Path) -> dict[str, Any]:
         "final_filtered_chain_count", "final_msa_row_filter_sha256",
     }
 
-    def check_fields(value: Any) -> None:
+    search_parameter_fields = {
+        "prefilter_mode", "evalue", "sensitivity", "mask", "comp_bias_corr", "search_type", "dbtype",
+        "max_accept", "max_rejected", "max_seqs",
+    }
+    binding_fields = {
+        "source_fasta_sha256", "heldout_fasta_sha256", "m8_sha256", "source_sequence_set_sha256",
+        "heldout_sequence_set_sha256", "source_asset_manifest_sha256",
+    }
+    new_fields_by_location = {
+        "msa_row_filter": {"search_contract", "exhaustive", "input_binding"},
+        "msa_row_filter.mmseqs": {"search_parameters", "possible_pair_count"},
+        "msa_row_filter.mmseqs.search_parameters": search_parameter_fields,
+        "msa_row_filter.input_binding": binding_fields,
+        "msa_row_filter.source": {"complete", "minimum_non_query_sequence_length"},
+    }
+
+    def check_fields(value: Any, location: str = "") -> None:
         if isinstance(value, dict):
-            if set(value) - allowed_fields:
+            if set(value) - (allowed_fields | new_fields_by_location.get(location, set())):
                 raise ValueError("Unrecognized field in public MSA filter summary")
             if value.get("role") == "hidden" and (value.get("path") != "<private>" or value.get("sha256") != "<private>"):
                 raise ValueError("Hidden manifest provenance must be redacted in public filter summaries")
-            for child in value.values():
-                check_fields(child)
+            for key, child in value.items():
+                check_fields(child, f"{location}.{key}" if location else str(key))
         elif isinstance(value, list):
             for child in value:
-                check_fields(child)
+                check_fields(child, location)
 
     check_fields(raw)
+    row_filter = raw.get("msa_row_filter")
+    if not isinstance(row_filter, dict):
+        raise ValueError("Public MSA filter summary must contain an msa_row_filter object")
+    binding = row_filter.get("input_binding", {})
+    if not isinstance(binding, dict) or set(binding) - binding_fields or any(value != "<private>" for value in binding.values()):
+        raise ValueError("Private MSA search input bindings must be redacted in public filter summaries")
+    contract = row_filter.get("search_contract")
+    exhaustive = row_filter.get("exhaustive")
+    if contract not in (None, "mmseqs-local-all-pairs-v1", "mmseqs-prefiltered-v1"):
+        raise ValueError("Unsupported public MSA search contract")
+    if exhaustive is not None and not isinstance(exhaustive, bool):
+        raise ValueError("Public MSA exhaustive flag must be boolean or unavailable")
+    if (contract is None and exhaustive is not None) or (
+        contract is not None and exhaustive is not (contract == "mmseqs-local-all-pairs-v1")
+    ):
+        raise ValueError("Public MSA search contract and exhaustive flag disagree")
+    mmseqs = row_filter.get("mmseqs", {})
+    if not isinstance(mmseqs, dict):
+        raise ValueError("Public MSA search settings must be an object")
+    parameters = mmseqs.get("search_parameters", {})
+    if not isinstance(parameters, dict) or set(parameters) - search_parameter_fields:
+        raise ValueError("Unsupported public MSA search parameters")
+    for value in parameters.values():
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+            raise ValueError("Public MSA search parameters must be finite nonnegative numbers")
+    if contract is not None:
+        expected = {"prefilter_mode": 2 if exhaustive else 0, "evalue": 1e308 if exhaustive else 0.001,
+                    "mask": 0 if exhaustive else 1, "comp_bias_corr": 0 if exhaustive else 1,
+                    "search_type": 1, "dbtype": 1}
+        if any(parameters.get(key) != value for key, value in expected.items()):
+            raise ValueError("Public MSA search parameters disagree with the declared contract")
+    pair_count = mmseqs.get("possible_pair_count")
+    if pair_count is not None and (isinstance(pair_count, bool) or not isinstance(pair_count, int) or pair_count < 0):
+        raise ValueError("Public MSA possible-pair count must be a nonnegative integer")
+    source = row_filter.get("source", {})
+    if not isinstance(source, dict):
+        raise ValueError("Public MSA source settings must be an object")
+    if source.get("complete") is not None and not isinstance(source["complete"], bool):
+        raise ValueError("Public MSA source completeness must be boolean or unavailable")
+    minimum_length = source.get("minimum_non_query_sequence_length")
+    if minimum_length is not None and (
+        isinstance(minimum_length, bool) or not isinstance(minimum_length, int) or minimum_length < 1
+    ):
+        raise ValueError("Public MSA minimum sequence length must be a positive integer")
+    command = mmseqs.get("command", [])
+    prefix = ["mmseqs", "easy-search", "<heldout_targets.fasta>", "<source_msa_rows.fasta>", "<output.m8>", "<tmp_dir>"]
+    allowed_flags = {
+        "--min-seq-id", "-c", "--cov-mode", "--alignment-mode", "--seq-id-mode", "--threads",
+        "--max-seqs", "-e", "-s", "--prefilter-mode", "--mask", "--comp-bias-corr", "--search-type",
+        "--dbtype", "--max-accept", "--max-rejected",
+    }
+    if not isinstance(command, list) or (command and (command[:6] != prefix or (len(command) - 6) % 2)):
+        raise ValueError("Public MSA command must use the sanitized search template")
+    seen_flags: set[str] = set()
+    for index in range(6, len(command), 2):
+        flag, value = command[index:index + 2]
+        if not isinstance(flag, str) or flag not in allowed_flags or flag in seen_flags:
+            raise ValueError("Unsupported or repeated public MSA command parameter")
+        seen_flags.add(flag)
+        if not isinstance(value, str):
+            raise ValueError("Public MSA command parameters must be numeric strings")
+        try:
+            number = float(value)
+        except ValueError as exc:
+            raise ValueError("Public MSA command parameters must be numeric strings") from exc
+        if not math.isfinite(number) or number < 0:
+            raise ValueError("Public MSA command parameters must be finite nonnegative numbers")
     return raw
 
 

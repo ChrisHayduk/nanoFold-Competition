@@ -55,7 +55,7 @@ accumulation by `WORLD_SIZE` and rejects combinations that cannot preserve that
 batch exactly. Only rank zero writes checkpoints and runs public validation.
 `NANOFOLD_DDP_TIMEOUT_SECONDS`, when set, must be a positive integer.
 
-Training normally shuffles the manifest each epoch. For an explicitly labeled
+Training normally shuffles the manifest each epoch, giving equal weight to selected targets. A group containing `m` selected targets contributes `m` exposures in a complete traversal before incomplete-batch and distributed-tail drops. Inverse-group weighting is a separate sampling ablation; complete group coverage alone does not equalize group exposure. For an explicitly labeled
 weighted-sampling study, set `data.train_sample_weights` to a JSON mapping from
 chain ID to weight, or a text file with `chain_id weight` or `chain_id,weight`
 rows, and set `data.allow_train_sample_weights: true`. Every training chain must
@@ -81,6 +81,14 @@ step and effective batch size. Samples must equal `step * effective_batch_size`;
 nonpadding and cropped residue counts must lie within the corresponding sample
 and crop bounds. Conflicting counter aliases fail validation before run history
 changes.
+
+### Candidate manifest policy
+
+Candidate generation is a maintainer interface; participant data configuration and the published manifest pins remain unchanged. `scripts/stage_dataset_candidate.py` defaults to `--sampling-policy cath-v3`. Supply the original `--cluster-tsv` separately from the `--split-group-tsv` and `--split-group-receipt` produced by `scripts/build_homology_groups.py`. The original assignments define quality-ranked selectable representatives; the separate full groups define indivisible split ownership. `--sampling-policy cath-v2` explicitly selects its own one-representative-per-original-unit contract and does not accept the v3 group options.
+
+CATH v3 requires all eligible full groups to be represented, confines each group to one split, and allows one representative per original unit. Public and hidden validation each use one target per group; training covers every remaining group before filling its additional target slots. Group ownership uses the public seed. The hidden salt affects only member choice and ordering within fixed hidden groups. Full coverage allows hidden groups to be inferred from the known universe and public complement; private files and the sealed label boundary do not imply group-membership secrecy.
+
+Source locks bind the full map and provenance receipt alongside original assignments and inputs. Verification replays membership and order and checks coverage independently. Completion also requires both complete cache-target audits with matching inputs, counts, thresholds and artifact hashes. `candidate_status.json` records `target_sequences_audited: true` only after those gates; processed tensors, MSA audits, fingerprints and release adoption remain separate. See [dataset sampling](DATA_SAMPLING.md) for executable commands and group-concentration diagnostics.
 
 ## Batch Contract by Mode
 
@@ -125,7 +133,9 @@ sequence before coordinate projection. Missing or inconsistent cache records
 fail, and the cache SHA256 and selected chain/sequence mapping enter stored
 configuration and source provenance. Resume also checks processed `aatype`
 against the expected sequence; changed cache bytes or a newly enabled cache
-binding require fresh output directories. These checks add no model inputs.
+binding require fresh output directories. These checks add no model inputs. Maintainers can run `scripts/audit_target_identity.py` with complete manifests and expected counts to verify raw and/or processed target identity independently; it requires actual assets and leaves labels, geometry and homology to their separate gates.
+
+Maintainers can run `scripts/audit_label_geometry.py --chain-data-cache CACHE --split NAME MANIFEST FEATURES LABELS COUNT --out-dir PRIVATE_AUDIT`, repeating `--split` for train, public validation and hidden validation. It requires complete selected manifests, exact cache/feature/label identities, valid feature and label schemas, and atom14 masks supported by each actual residue type. Nonexistent observed atoms fail. The receipt binds source and asset hashes and reports masked CA and peptide C–N distances, skipping explicit segment breaks, nonconsecutive residue indices and missing atoms. Distance outliers are diagnostics only; they do not reject experimental structures. An optional verified `--split-group-tsv` adds group summaries. Keep all reports private.
 
 Feature archives must not contain supervision arrays. A features-only loader
 rejects such archives before passing data to submission code. Manifests must be

@@ -101,7 +101,8 @@ def test_official_wrappers_refuse_regeneration_before_any_file_writes(tmp_path: 
     ):
         proc = subprocess.run(["bash", str(REPO_ROOT / "scripts" / script), *args], capture_output=True, text=True)
         assert proc.returncode != 0
-        assert "cath-v2" in proc.stderr
+        assert "frozen" in proc.stderr
+        assert "regeneration" in proc.stderr
         assert sentinel.read_text() == "frozen\n"
         assert sorted(path.name for path in tmp_path.iterdir()) == ["source.lock.json"]
 
@@ -160,6 +161,44 @@ def test_refresh_rejects_published_fingerprint_alias_before_writes(tmp_path: Pat
     assert "frozen dataset contract" in proc.stderr
     assert "Download public split" not in proc.stdout
     assert published.read_text() == "frozen fingerprint\n"
+    assert set(tmp_path.rglob("*")) == before
+
+
+@pytest.mark.parametrize("source_option,output_option", [
+    ("--chain-data-cache", "--data-source-lock"),
+    ("--msa-row-filter", "--fingerprint-out"),
+])
+@pytest.mark.parametrize("alias", ["direct", "symlink", "hardlink"])
+def test_refresh_rejects_source_input_alias_before_writes(
+    tmp_path: Path, source_option: str, output_option: str, alias: str,
+) -> None:
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    refresh = scripts / "full_official_data_refresh.sh"
+    shutil.copyfile(REPO_ROOT / "scripts/full_official_data_refresh.sh", refresh)
+    source = tmp_path / "pinned input.json"
+    source.write_text('{"source": "preserve these bytes"}\n')
+    original = source.read_bytes()
+    output = source
+    if alias != "direct":
+        output = tmp_path / "candidate.json"
+        if alias == "symlink":
+            output.symlink_to(source)
+        else:
+            output.hardlink_to(source)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "python").symlink_to(sys.executable)
+    before = set(tmp_path.rglob("*"))
+    proc = subprocess.run(
+        ["bash", str(refresh), "--skip-manifest-regen", source_option, str(source), output_option, str(output)],
+        env=dict(os.environ, PATH=f"{fake_bin}:{os.environ['PATH']}"),
+        capture_output=True, text=True, check=False,
+    )
+    assert proc.returncode != 0
+    assert "frozen dataset contract" in proc.stderr
+    assert "[1/5]" not in proc.stdout
+    assert source.read_bytes() == original
     assert set(tmp_path.rglob("*")) == before
 
 

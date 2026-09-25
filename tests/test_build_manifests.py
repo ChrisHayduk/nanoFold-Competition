@@ -12,6 +12,147 @@ import pytest
 TEST_HIDDEN_SPLIT_SALT = "test-hidden-split-salt-with-enough-length-000000"
 
 
+def _group_fixture(sizes: list[int]):
+    from scripts.build_manifests import Candidate
+
+    candidates = []
+    groups = {}
+    for size in sizes:
+        group_id = f"{len(candidates):04d}_A"
+        for _ in range(size):
+            index = len(candidates)
+            chain_id = f"{index:04d}_A"
+            sequence = "A" * 88 + "".join("C" if index & (1 << bit) else "A" for bit in range(12))
+            candidates.append(Candidate(
+                chain_id=chain_id, sequence=sequence, length=100, resolution=2.0, release_date=None,
+                cluster_id=chain_id, pdb_id=chain_id[:4], secondary_structure_class="unknown",
+                secondary_helix_fraction=None, secondary_beta_fraction=None, secondary_coil_fraction=None,
+                domain_architecture_class="alpha", domain_architecture_source="cath", metadata_source_count=1,
+                cath_architecture_ids=("1.10",), cath_topology_ids=("1.10.1",),
+                cath_homologous_superfamily_ids=("1.10.1.1",), cath_annotation_status="annotated", cath_domain_count=1,
+            ))
+            groups[chain_id] = group_id
+    return candidates, {candidate.chain_id: candidate.chain_id for candidate in candidates}, groups
+
+
+def test_group_sampling_preserves_every_group_exact_sizes_and_public_salt_independence() -> None:
+    from dataclasses import replace
+    from functools import partial
+
+    from scripts.build_manifests import DEFAULT_STRATIFY_FIELDS, _assert_split_disjointness, _split_candidates
+
+    candidates, clusters, groups = _group_fixture([10, 3, 2, 1, 1, 1, 1, 1, 1, 1])
+    # A rare architecture belongs to a singleton group and cannot be discarded.
+    candidates[-1] = replace(candidates[-1], cath_architecture_ids=("4.10",), cath_topology_ids=("4.10.1",),
+                             cath_homologous_superfamily_ids=("4.10.1.1",))
+    split = partial(_split_candidates, cluster_map=clusters, train_size=15, val_size=2, hidden_val_size=2, seed=17,
+                    stratify_fields=DEFAULT_STRATIFY_FIELDS, disallow_pdb_overlap=True,
+                    cluster_method="fixture", cluster_command=None, structural_metadata_source="fixture",
+                    sampling_policy="cath-v3", split_group_map=groups)
+    result = split(candidates=candidates, hidden_split_salt_digest="first-private-salt")
+    changed = split(candidates=list(reversed(candidates)), hidden_split_salt_digest="other-private-salt")
+    repeated = split(candidates=list(reversed(candidates)), hidden_split_salt_digest="first-private-salt")
+    _assert_split_disjointness(result)
+    assert result == repeated
+    assert (result.train_ids, result.val_ids) == (changed.train_ids, changed.val_ids)
+    assert [len(result.train_ids), len(result.val_ids), len(result.hidden_val_ids)] == [15, 2, 2]
+    assert {groups[chain] for chain in result.selected_candidates} == set(groups.values())
+    assert candidates[-1].chain_id in result.selected_candidates
+    assert all(groups[chain] != groups[candidates[0].chain_id] for chain in result.val_ids + result.hidden_val_ids)
+    report = result.quality_report["group_sampling"]
+    assert report["split_group_counts"] == {"train": 6, "val": 2, "hidden_val": 2}
+    assert report["full_group_count"] == 10
+    assert report["selection_unit_count"] == 22
+    assert report["selection_unit_ids_sha256"] == hashlib.sha256(
+        "".join(f"{index:04d}_A\n" for index in range(22)).encode()
+    ).hexdigest()
+    assert sum(report["selected_counts_by_group"]["train"].values()) == 15
+    assert 0 < report["max_train_group_share"] <= 1
+
+
+def test_group_sampler_rejects_missing_groups_and_original_unit_links() -> None:
+    from dataclasses import replace
+
+    from scripts.build_manifests import _group_sampling_units
+
+    candidates, clusters, groups = _group_fixture([2, 2, 1])
+    with pytest.raises(ValueError, match="complete eligible"):
+        _group_sampling_units(candidates, clusters, {key: value for key, value in groups.items() if key != candidates[-1].chain_id}, seed=0)
+    for link in ("cluster", "pdb", "sequence"):
+        modified = list(candidates)
+        changed_clusters = dict(clusters)
+        if link == "cluster":
+            changed_clusters[candidates[-1].chain_id] = clusters[candidates[0].chain_id]
+        else:
+            attribute = "pdb_id" if link == "pdb" else "sequence"
+            modified[-1] = replace(modified[-1], **{attribute: getattr(candidates[0], attribute)})
+        with pytest.raises(ValueError, match="contain every original"):
+            _group_sampling_units(modified, changed_clusters, groups, seed=0)
+
+
+def test_group_sampler_retains_only_original_quality_representatives() -> None:
+    from dataclasses import replace
+
+    from scripts.build_manifests import _group_sampling_units
+
+    candidates, clusters, groups = _group_fixture([2, 2, 1])
+    extra = replace(candidates[0], chain_id="9000_A", pdb_id="9000", resolution=3.0)
+    clusters[extra.chain_id] = clusters[candidates[0].chain_id]
+    groups[extra.chain_id] = groups[candidates[0].chain_id]
+    units, full_groups = _group_sampling_units(candidates + [extra], clusters, groups, seed=0)
+    assert {candidate.chain_id for candidate in units} == {candidate.chain_id for candidate in candidates}
+    assert len(full_groups) == 3
+
+
+def test_group_capacity_guard_reserves_minimum_remaining_quota_cost(monkeypatch: pytest.MonkeyPatch) -> None:
+    from scripts import build_manifests as sampler
+
+    candidates, _, _ = _group_fixture([1, 1, 1, 1])
+    monkeypatch.setattr(sampler, "_stable_random_score", lambda seed, salt, value: int(value[:4]) if value[:4].isdigit() else 0)
+    costs = {candidate.chain_id: (2 if index < 2 else 0) for index, candidate in enumerate(candidates)}
+    # Blindly accepting the first two seeded choices costs 4; choosing 0 and 2
+    # completes the same biological quota without consuming train capacity.
+    selected = sampler._select_group_anchors(candidates, candidates, costs, size=2, budget=2, seed=0)
+    assert [candidate.chain_id for candidate in selected] == [candidates[0].chain_id, candidates[2].chain_id]
+    with pytest.raises(ValueError, match="quotas exceed"):
+        sampler._select_group_anchors(candidates[:2], candidates, costs, size=2, budget=3, seed=0)
+
+
+def test_mandatory_train_anchors_are_lower_bounds_without_reweighting_reference() -> None:
+    from dataclasses import replace
+
+    from scripts.build_manifests import _select_with_mandatory
+
+    candidates, _, _ = _group_fixture([1] * 10)
+    candidates[-1] = replace(candidates[-1], cath_architecture_ids=("4.10",))
+    selected = _select_with_mandatory(candidates, [candidates[0], candidates[-1]], candidates, size=6, seed=0)
+    assert len(selected) == len({candidate.chain_id for candidate in selected}) == 6
+    assert candidates[0] in selected and candidates[-1] in selected
+    assert sum(candidate.cath_architecture_ids == ("4.10",) for candidate in selected) == 1
+    with pytest.raises(ValueError, match="Mandatory group coverage"):
+        _select_with_mandatory(candidates, candidates[:7], candidates, size=6, seed=0)
+
+
+@pytest.mark.parametrize("sizes,train,val,hidden", [([1] * 10, 5, 2, 2), ([4, 4, 4], 8, 1, 1), ([2, 2], 2, 1, 1)])
+def test_group_plan_fails_when_coverage_or_heldout_capacity_is_impossible(sizes, train, val, hidden) -> None:
+    from scripts.build_manifests import _group_sampling_units, _plan_group_splits
+
+    candidates, clusters, assignments = _group_fixture(sizes)
+    units, groups = _group_sampling_units(candidates, clusters, assignments, seed=0)
+    with pytest.raises(ValueError, match="cover every full group|Not enough full groups"):
+        _plan_group_splits(units, groups, train_size=train, val_size=val, hidden_val_size=hidden, seed=0)
+
+
+def test_hidden_member_salt_changes_only_members_inside_assigned_groups() -> None:
+    from scripts.build_manifests import _group_sampling_units, _sample_hidden_groups
+
+    candidates, clusters, assignments = _group_fixture([10, 10])
+    _, groups = _group_sampling_units(candidates, clusters, assignments, seed=0)
+    outcomes = [_sample_hidden_groups(list(groups.values()), seed=0, hidden_split_salt_digest=f"salt-{i}") for i in range(5)]
+    assert all(len(outcome) == 2 and {assignments[c.chain_id] for c in outcome} == set(groups) for outcome in outcomes)
+    assert len({tuple(c.chain_id for c in outcome) for outcome in outcomes}) > 1
+
+
 def test_real_mmseqs_clusters_ac_only_sequences_as_proteins() -> None:
     import shutil
 

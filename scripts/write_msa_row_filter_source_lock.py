@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -43,7 +44,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def _sha256_file(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    with path.open("rb") as handle:
+        return hashlib.file_digest(handle, "sha256").hexdigest()
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -121,7 +123,8 @@ def _normalize_mmseqs_command(command: Any) -> list[str]:
     safe.extend(replacements)
     numeric_flags = {
         "--min-seq-id", "-c", "--cov-mode", "--alignment-mode", "--seq-id-mode",
-        "--threads", "--max-seqs", "-e", "-s",
+        "--threads", "--max-seqs", "-e", "-s", "--prefilter-mode", "--mask",
+        "--comp-bias-corr", "--search-type", "--dbtype", "--max-accept", "--max-rejected",
     }
     for index in range(search_index + 5, len(normalized) - 1):
         flag = normalized[index]
@@ -134,8 +137,48 @@ def _normalize_mmseqs_command(command: Any) -> list[str]:
     return safe
 
 
+def _safe_search_parameters(value: Any) -> dict[str, int | float]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError("MMseqs search parameters must be an object")
+    fields = ("prefilter_mode", "evalue", "sensitivity", "mask", "comp_bias_corr", "search_type", "dbtype",
+              "max_accept", "max_rejected", "max_seqs")
+    result = {}
+    for field in fields:
+        if field not in value:
+            continue
+        number = value[field]
+        if isinstance(number, bool) or not isinstance(number, (int, float)) or not math.isfinite(number):
+            raise ValueError(f"MMseqs search parameter {field} must be finite numeric data")
+        result[field] = number
+    return result
+
+
+def _safe_input_binding(value: Any, *, include_private_paths: bool) -> dict[str, str]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError("Row-filter input binding must be an object")
+    result = {}
+    for field in ("source_fasta_sha256", "heldout_fasta_sha256", "m8_sha256",
+                  "source_sequence_set_sha256", "heldout_sequence_set_sha256", "source_asset_manifest_sha256"):
+        if field not in value:
+            continue
+        digest = value[field]
+        if not isinstance(digest, str) or len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+            raise ValueError(f"Row-filter input binding {field} must be a SHA256 digest")
+        result[field] = digest if include_private_paths else "<private>"
+    return result
+
+
 def _summarize_row_filter(filter_path: Path, *, include_private_paths: bool) -> dict[str, Any]:
     payload = _load_json(filter_path)
+    if payload.get("inventory_type") is not None:
+        raise ValueError("Search inventory is not a row filter; run the search before writing a filter source lock")
+    search_contract = payload.get("search_contract")
+    if search_contract not in (None, "mmseqs-local-all-pairs-v1", "mmseqs-prefiltered-v1"):
+        raise ValueError("Unsupported row-filter search contract")
     source = payload.get("source", {})
     heldout = payload.get("heldout", {})
     mmseqs = payload.get("mmseqs", {})
@@ -155,6 +198,9 @@ def _summarize_row_filter(filter_path: Path, *, include_private_paths: bool) -> 
         "path": _safe_path(str(filter_path), include_private_paths=include_private_paths),
         "sha256": _sha256_file(filter_path),
         "filter_type": payload.get("filter_type"),
+        "search_contract": search_contract,
+        "exhaustive": payload.get("exhaustive") if isinstance(payload.get("exhaustive"), bool) else None,
+        "input_binding": _safe_input_binding(payload.get("input_binding"), include_private_paths=include_private_paths),
         "threshold": payload.get("threshold"),
         "excluded_sequence_count": payload.get("excluded_sequence_count"),
         "excluded_sequence_sha256_included": False,
@@ -163,10 +209,14 @@ def _summarize_row_filter(filter_path: Path, *, include_private_paths: bool) -> 
             "version": mmseqs.get("version"),
             "command": _normalize_mmseqs_command(mmseqs.get("command")),
             "max_seqs": mmseqs.get("max_seqs"),
+            "search_parameters": _safe_search_parameters(mmseqs.get("search_parameters")),
+            "possible_pair_count": mmseqs.get("possible_pair_count"),
             "hit_count": mmseqs.get("hit_count"),
         },
         "source": {
             "mode": source.get("mode"),
+            "complete": source.get("complete") if isinstance(source.get("complete"), bool) else None,
+            "minimum_non_query_sequence_length": source.get("minimum_non_query_sequence_length"),
             "manifests": _safe_manifests(source.get("manifests"), include_private_paths=include_private_paths),
             "raw_root": _safe_path(source.get("raw_root"), include_private_paths=include_private_paths),
             "processed_features_dirs": [
@@ -253,7 +303,8 @@ def build_source_lock(
             "final_audit_filter_hash_checked": bool(audit_summaries),
             "residual_homology_audited": False,
             "scope": "Filtering counts and source provenance only; use audit_msa_split.py --strict "
-            "--run-mmseqs on the final features to check residual held-out target homology.",
+            "--run-mmseqs --exhaustive on the final features for all-pair local-alignment checks of "
+            "residual held-out target homology.",
         },
         "safety": {
             "raw_sequences_included": False,

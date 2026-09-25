@@ -23,6 +23,30 @@ AUDIT_ARTIFACTS = frozenset({
 })
 
 
+def _validate_group_coverage(report: dict[str, Any], lock: dict[str, Any], args: argparse.Namespace) -> None:
+    coverage = report.get("group_coverage")
+    groups = lock.get("split_groups")
+    if not isinstance(coverage, dict) or not isinstance(groups, dict):
+        raise ValueError("cath-v3 verification must prove complete group coverage.")
+    count, unit_count = groups.get("group_count"), groups.get("selection_unit_count")
+    unit_digest = groups.get("selection_unit_ids_sha256")
+    if (type(count) is not int or count <= args.val_size + args.hidden_val_size
+            or type(unit_count) is not int or unit_count < args.train_size + args.val_size + args.hidden_val_size
+            or not isinstance(unit_digest, str) or re.fullmatch(r"[0-9a-f]{64}", unit_digest) is None):
+        raise ValueError("cath-v3 source lock has invalid group or representative counts.")
+    expected = {
+        "required": "all_groups", "all_group_coverage_verified": True,
+        "complete_group_count": count, "covered_group_count": count, "selection_unit_count": unit_count,
+        "selection_unit_ids_sha256": unit_digest,
+        "split_group_counts": {"train": count - args.val_size - args.hidden_val_size,
+                               "val": args.val_size, "hidden_val": args.hidden_val_size},
+    }
+    if (set(coverage) != set(expected)
+            or any(type(coverage[key]) is not type(value) or coverage[key] != value for key, value in expected.items())
+            or any(type(value) is not int for value in coverage["split_group_counts"].values())):
+        raise ValueError("cath-v3 verification did not cover every locked group with the required split ownership.")
+
+
 def _read_audit_json(path: Path) -> dict[str, Any]:
     def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
         result: dict[str, Any] = {}
@@ -127,7 +151,7 @@ def _validate_target_audit_receipt(
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Build complete schema-2 metadata, generate cath-v2 public/hidden manifests and both source locks, "
+            "Build complete schema-2 metadata, generate versioned CATH public/hidden manifests and both source locks, "
             "then independently verify them and audit both target-sequence split boundaries in a fresh private directory. "
             "Requires pinned annotation sources and MMseqs2, including when using precomputed clusters. "
             "Failures retain private logs and never receive a verified completion receipt. "
@@ -137,6 +161,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--stage-dir", type=Path, required=True,
                         help="Fresh private output directory; in-repository paths must be under .nanofold_private/.")
+    parser.add_argument("--sampling-policy", choices=("cath-v2", "cath-v3"), default="cath-v3",
+                        help="cath-v3 covers every full group and keeps whole groups in one split.")
+    parser.add_argument("--split-group-tsv", type=Path,
+                        help="Required for cath-v3: complete homology-closed groups for the eligible universe.")
+    parser.add_argument("--split-group-receipt", type=Path,
+                        help="Required for cath-v3: source-bound complete homology-group audit receipt.")
     parser.add_argument("--chain-data-cache", type=Path, required=True)
     parser.add_argument("--metadata-sources-dir", type=Path, required=True)
     parser.add_argument("--metadata-source-lock", type=Path, required=True)
@@ -171,14 +201,21 @@ def stage_candidate(args: argparse.Namespace) -> Path:
     if stage.is_relative_to(repo) and not stage.is_relative_to(private_root):
         raise ValueError("In-repository --stage-dir must be under .nanofold_private to keep hidden artifacts untracked.")
     # Validate local prerequisites before creating outputs or starting expensive clustering.
+    source_hashes: dict[Path, str] = {}
     for name in ("chain_data_cache", "metadata_source_lock", "feature_exclusion_list",
-                 "processability_exclusion_list", "cluster_tsv", "hidden_split_salt_file"):
+                 "processability_exclusion_list", "cluster_tsv", "split_group_tsv", "split_group_receipt",
+                 "hidden_split_salt_file"):
         value = getattr(args, name)
         if value is not None:
             path = value.resolve()
             if not path.is_file():
                 raise ValueError(f"Missing input for --{name.replace('_', '-')}: {path}")
             setattr(args, name, path)
+            source_hashes[path] = _sha256(path)
+    if args.sampling_policy == "cath-v3" and (args.split_group_tsv is None or args.split_group_receipt is None):
+        raise ValueError("cath-v3 requires --split-group-tsv and --split-group-receipt for the complete eligible universe.")
+    if args.sampling_policy != "cath-v3" and (args.split_group_tsv is not None or args.split_group_receipt is not None):
+        raise ValueError("--split-group-tsv and --split-group-receipt are only supported for cath-v3.")
     args.metadata_sources_dir = args.metadata_sources_dir.resolve()
     if not args.metadata_sources_dir.is_dir():
         raise ValueError("--metadata-sources-dir must be a directory containing pinned annotation sources.")
@@ -195,7 +232,7 @@ def stage_candidate(args: argparse.Namespace) -> Path:
     stage.mkdir(mode=0o700, parents=True, exist_ok=False)
     status_path = stage / "candidate_status.json"
     status: dict[str, object] = {
-        "schema_version": 1, "sampling_policy": "cath-v2", "status": "running",
+        "schema_version": 1, "sampling_policy": args.sampling_policy, "status": "running",
         "processed_assets_audited": False,
         "target_sequences_audited": False,
     }
@@ -210,6 +247,8 @@ def stage_candidate(args: argparse.Namespace) -> Path:
         with (stage / f"{step}.log").open("w") as log:
             subprocess.run([sys.executable, str(SCRIPT_DIR / script), *options], cwd=REPO_ROOT,
                            stdout=log, stderr=subprocess.STDOUT, check=True)
+        if any(_sha256(path) != digest for path, digest in source_hashes.items()):
+            raise ValueError("Candidate inputs changed between staging steps; use immutable sources and a fresh directory.")
 
     policy_options = ["--min-len", str(args.min_len), "--max-len", str(args.max_len),
                       "--max-resolution", str(args.max_resolution)]
@@ -230,16 +269,18 @@ def stage_candidate(args: argparse.Namespace) -> Path:
             *policy_options,
         ])
         cluster_options = ["--cluster-tsv", str(args.cluster_tsv)] if args.cluster_tsv else []
+        group_options = (["--split-group-tsv", str(args.split_group_tsv),
+                          "--split-group-receipt", str(args.split_group_receipt)] if args.split_group_tsv else [])
         salt_options = (["--hidden-split-salt-file", str(args.hidden_split_salt_file)]
                         if args.hidden_split_salt_file else [])
         run_step("manifests", "build_manifests.py", [
-            "--sampling-policy", "cath-v2", "--chain-data-cache", str(args.chain_data_cache),
+            "--sampling-policy", args.sampling_policy, "--chain-data-cache", str(args.chain_data_cache),
             "--structure-metadata", str(metadata), "--out-dir", str(stage / "public"),
             "--hidden-out-dir", str(stage / "hidden"), "--lock-file", str(public_lock),
             "--private-lock-file", str(private_lock), "--train-size", str(args.train_size),
             "--val-size", str(args.val_size), "--hidden-val-size", str(args.hidden_val_size),
             "--seed", str(args.seed), "--min-seq-id", str(args.min_seq_id), "--coverage", str(args.coverage),
-            "--mmseqs-bin", args.mmseqs_bin, *policy_options, *cluster_options, *salt_options,
+            "--mmseqs-bin", args.mmseqs_bin, *policy_options, *cluster_options, *group_options, *salt_options,
         ])
         artifacts = [metadata, public_lock, private_lock,
                      stage / "public/train.txt", stage / "public/val.txt", stage / "public/all.txt",
@@ -253,8 +294,13 @@ def stage_candidate(args: argparse.Namespace) -> Path:
             "--hidden-manifest", str(stage / "hidden/hidden_val.txt"),
             "--json-out", str(verification), "--mmseqs-bin", args.mmseqs_bin,
         ])
-        if json.loads(verification.read_text()).get("status") != "ok":
+        verified_report = _read_audit_json(verification)
+        if verified_report.get("status") != "ok" or verified_report.get("sampling_policy") != args.sampling_policy:
             raise ValueError("Manifest verification did not produce a successful report.")
+        if args.sampling_policy == "cath-v3":
+            _validate_group_coverage(verified_report, _read_audit_json(public_lock), args)
+            status["all_group_coverage_verified"] = True
+            status["group_coverage"] = verified_report["group_coverage"]
         verified_inputs[verification] = _sha256(verification)
         target_audit = stage / "target_audit"
         audit_inputs = {

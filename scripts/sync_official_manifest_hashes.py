@@ -25,7 +25,9 @@ class ManifestHashes:
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(
         description=(
-            "Synchronize official manifest SHA256 values across track policy, lock metadata, and docs."
+            "Check references to an existing locked manifest set. Use --write to repair "
+            "references only when the manifest bytes and counts already match the source lock; "
+            "new selections require a fresh candidate and a separate release adoption workflow."
         )
     )
     ap.add_argument("--manifests-dir", type=str, default="data/manifests")
@@ -53,11 +55,20 @@ def parse_args() -> argparse.Namespace:
     )
     ap.add_argument("--readme", type=str, default="README.md")
     ap.add_argument("--competition-doc", type=str, default="docs/COMPETITION.md")
-    ap.add_argument(
+    mode = ap.add_mutually_exclusive_group()
+    mode.add_argument(
         "--check",
+        dest="check",
         action="store_true",
-        help="Check-only mode. Exit non-zero if any file is out of sync.",
+        help="Check-only mode (default). Exit non-zero if any file is out of sync.",
     )
+    mode.add_argument(
+        "--write",
+        dest="check",
+        action="store_false",
+        help="Repair references to the already locked manifest set; cannot adopt a different selection.",
+    )
+    ap.set_defaults(check=True)
     ap.add_argument(
         "--include-hidden",
         action="store_true",
@@ -214,12 +225,42 @@ def _update_lock_json(
     *,
     include_hidden: bool,
 ) -> str:
-    if path.exists():
-        raw = json.loads(path.read_text())
-    else:
-        raw = {}
+    if not path.is_file():
+        raise ValueError(
+            f"An existing manifest source lock is required: {path}. "
+            "Build a fresh candidate with its own provenance; this tool cannot create or adopt a dataset."
+        )
+    raw = json.loads(path.read_text())
     if not isinstance(raw, dict):
         raise ValueError(f"Lock file must be a JSON object: {path}")
+
+    outputs = raw.get("outputs")
+    expected_bindings = {
+        "train_manifest_sha256": hashes.train,
+        "val_manifest_sha256": hashes.val,
+        "all_manifest_sha256": hashes.all,
+        "train_count": hashes.train_count,
+        "val_count": hashes.val_count,
+        "unique_count": hashes.unique_count,
+    }
+    if include_hidden:
+        if hashes.hidden_val is None or hashes.hidden_val_count is None:
+            raise ValueError("--include-hidden requires the existing locked hidden manifest file.")
+        expected_bindings.update({
+            "hidden_val_manifest_sha256": hashes.hidden_val,
+            "hidden_val_count": hashes.hidden_val_count,
+        })
+    mismatches = [
+        key for key, value in expected_bindings.items()
+        if not isinstance(outputs, dict) or type(outputs.get(key)) is not type(value) or outputs.get(key) != value
+    ]
+    if mismatches:
+        raise ValueError(
+            "Manifest bytes/counts do not match the existing source lock: " + ", ".join(mismatches) + ". "
+            "Refusing to rebind manifests while retaining old provenance. Build a fresh candidate "
+            "and use a separate release adoption workflow; --write cannot bypass this check."
+        )
+    assert isinstance(outputs, dict)
 
     if isinstance(raw.get("chain_data_cache_path"), str):
         cache_path = Path(str(raw["chain_data_cache_path"]))
@@ -239,11 +280,6 @@ def _update_lock_json(
             value = args.get(key)
             if isinstance(value, str) and value and Path(value).is_absolute():
                 args[key] = _display_path(Path(value), lock_file=path)
-
-    outputs = raw.get("outputs")
-    if not isinstance(outputs, dict):
-        outputs = {}
-        raw["outputs"] = outputs
 
     train_path = manifests_dir / "train.txt"
     val_path = manifests_dir / "val.txt"
@@ -370,7 +406,7 @@ def main() -> None:
             print("Out-of-sync official hash references:")
             for item in rel:
                 print(f"- {item}")
-            print("\nRun:\n  python scripts/sync_official_manifest_hashes.py")
+            print("\nReview these changes, then rerun with --write to repair references to the locked manifests.")
             raise SystemExit(1)
         print("Updated files:")
         for item in rel:

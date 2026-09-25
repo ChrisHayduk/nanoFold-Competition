@@ -324,3 +324,78 @@ def test_real_mmseqs_treats_ac_only_target_sequences_as_proteins(tmp_path: Path)
         )
         assert result["val_targets_with_train_target_homolog_hits"] == expected_hits
         assert result["search_parameters"]["dbtype"] == 1
+
+
+def test_exhaustive_audit_requires_search_and_reports_declared_contract(tmp_path: Path) -> None:
+    import json
+    import subprocess
+    import sys
+
+    script = str(Path(__file__).resolve().parents[1] / "scripts/audit_msa_split.py")
+    invalid = subprocess.run([sys.executable, script, "--out-dir", str(tmp_path), "--exhaustive"],
+                             capture_output=True, text=True)
+    assert invalid.returncode != 0
+    assert "requires --run-mmseqs" in invalid.stderr
+    features = tmp_path / "features"
+    _write_feature(features, "trn1_A", ["A" * 40, "C" * 40])
+    _write_feature(features, "val1_A", ["D" * 40])
+    train, heldout = tmp_path / "train", tmp_path / "heldout"
+    train.write_text("trn1_A\n")
+    heldout.write_text("val1_A\n")
+    mmseqs = tmp_path / "mmseqs"
+    mmseqs.write_text('#!/bin/sh\nif [ "$1" = version ]; then echo test; else : > "$4"; fi\n')
+    mmseqs.chmod(0o755)
+    out = tmp_path / "report"
+    proc = subprocess.run([
+        sys.executable, script, "--train-manifest", str(train), "--val-manifest", str(heldout),
+        "--features-dir", str(features), "--out-dir", str(out), "--skip-plot", "--strict",
+        "--run-mmseqs", "--exhaustive", "--max-seqs", "1", "--mmseqs-bin", str(mmseqs),
+    ], capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
+    report = json.loads((out / "msa_split_audit_summary.json").read_text())
+    assert report["validation"]["exhaustive_msa_homology_checked"] is True
+    assert report["validation"]["msa_search_contract"] == "mmseqs-local-all-pairs-v1"
+    assert "separate heuristic search" not in report["validation"]["homology_scope"]
+    assert report["mmseqs_homology"]["search_parameters"]["prefilter_mode"] == 2
+    assert report["mmseqs_homology"]["possible_pair_count"] == 1
+    assert report["mmseqs_homology"]["input_binding"]["m8_sha256"]
+
+
+def test_exhaustive_msa_audit_rejects_source_hit_cap(tmp_path: Path) -> None:
+    import pytest
+
+    features = tmp_path / "features"
+    _write_feature(features, "trn1_A", ["A" * 40, "C" * 40, "D" * 40])
+    _write_feature(features, "val1_A", ["E" * 40])
+    mmseqs = tmp_path / "mmseqs"
+    mmseqs.write_text("#!/bin/sh\nexit 99\n")
+    mmseqs.chmod(0o755)
+    with pytest.raises(ValueError, match="max-seqs >= 2"):
+        _load_audit_module().run_mmseqs_homology(
+            train_ids=["trn1_A"], val_ids=["val1_A"], features_dir=features, out_dir=tmp_path,
+            mmseqs_bin=str(mmseqs), min_seq_id=0.3, coverage=0.8, threads=1, max_seqs=1,
+            tmp_dir=None, include_identifiers=False, exhaustive=True,
+        )
+
+
+def test_real_exhaustive_msa_audit_recovers_prefilter_missed_pair(tmp_path: Path) -> None:
+    import os
+    import shutil
+
+    import pytest
+
+    binary = os.environ.get("MMSEQS_TEST_BINARY") or shutil.which("mmseqs")
+    if not binary:
+        pytest.skip("Set MMSEQS_TEST_BINARY to run the all-pair MSA audit regression")
+    features = tmp_path / "features"
+    _write_feature(features, "trn1_A", ["D" * 40, "SDNKAWGPALHQYCLWHIMIYVKYYMFIMLYEMNLNEHRA"])
+    _write_feature(features, "val1_A", ["SMPKAWGRWPHWYGLWFYFSYPMYYMFIMYYTTAWNIHRW"])
+    module = _load_audit_module()
+    for exhaustive, expected_hits in ((False, 0), (True, 1)):
+        result = module.run_mmseqs_homology(
+            train_ids=["trn1_A"], val_ids=["val1_A"], features_dir=features, out_dir=tmp_path,
+            mmseqs_bin=str(binary), min_seq_id=0.3, coverage=0.8, threads=1, max_seqs=1,
+            tmp_dir=None, include_identifiers=False, exhaustive=exhaustive,
+        )
+        assert result["val_targets_with_train_msa_homolog_hits"] == expected_hits
+        assert result["exhaustive"] == exhaustive

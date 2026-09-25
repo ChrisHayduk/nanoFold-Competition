@@ -407,13 +407,36 @@ def test_main_revalidates_before_any_network_write(public_inputs: Namespace, mon
     assert hub.api.calls == []
 
 
-def _attach_public_filter_summary(args: Namespace, tmp_path: Path) -> Path:
+def _attach_public_filter_summary(args: Namespace, tmp_path: Path, *, exhaustive: bool | None = None) -> Path:
     raw_filter = tmp_path / "row_filter.json"
-    raw_filter.write_text(json.dumps({
+    payload: dict[str, Any] = {
         "source": {"manifests": [], "stats": {}}, "heldout": {"manifests": []}, "mmseqs": {},
         "chain_data_cache": {}, "threshold": {"min_seq_id": 0.3, "coverage": 0.8, "cov_mode": 0},
         "excluded_sequence_count": 2,
-    }))
+    }
+    if exhaustive is not None:
+        parameters = {
+            "prefilter_mode": 2 if exhaustive else 0, "evalue": 1e308 if exhaustive else 0.001,
+            "sensitivity": 5.7, "mask": 0 if exhaustive else 1, "comp_bias_corr": 0 if exhaustive else 1,
+            "search_type": 1, "dbtype": 1, "max_accept": 100, "max_rejected": 100,
+        }
+        command = ["mmseqs", "easy-search", "/tmp/heldout", "/tmp/source", "/tmp/result", "/tmp/work"]
+        for field, flag in {
+            "prefilter_mode": "--prefilter-mode", "evalue": "-e", "sensitivity": "-s", "mask": "--mask",
+            "comp_bias_corr": "--comp-bias-corr", "search_type": "--search-type", "dbtype": "--dbtype",
+            "max_accept": "--max-accept", "max_rejected": "--max-rejected",
+        }.items():
+            command.extend([flag, str(parameters[field])])
+        payload.update({
+            "search_contract": "mmseqs-local-all-pairs-v1" if exhaustive else "mmseqs-prefiltered-v1",
+            "exhaustive": exhaustive,
+            "input_binding": {"source_fasta_sha256": "a" * 64, "heldout_fasta_sha256": "b" * 64,
+                              "source_asset_manifest_sha256": "c" * 64},
+            "mmseqs": {"search_parameters": parameters, "command": command, "possible_pair_count": 400,
+                       "max_seqs": 100},
+        })
+        payload["source"].update(complete=True, minimum_non_query_sequence_length=20)
+    raw_filter.write_text(json.dumps(payload))
     digest = sha256_file(raw_filter)
     for chain in exporter.read_manifest(args.all_manifest):
         _edit_npz(chain_npz_path(args.processed_features_dir, chain), msa_row_filter_sha256=np.asarray(digest))
@@ -469,3 +492,51 @@ def test_full_validated_export_reaches_only_fake_hf(public_inputs: Namespace, mo
     assert fake.last_dataset is not None and fake.last_dataset.pushed
     assert len(fake.last_dataset["train"]) == len(fake.last_dataset["validation"]) == 2
     assert len(hub.api.calls) == 7
+
+
+@pytest.mark.parametrize("exhaustive", [False, True])
+def test_safe_search_contract_summary_is_bound_to_exported_features(
+    public_inputs: Namespace, tmp_path: Path, exhaustive: bool,
+) -> None:
+    path = _attach_public_filter_summary(public_inputs, tmp_path, exhaustive=exhaustive)
+    validated = exporter._validate_public_inputs(public_inputs)
+    assert validated.auxiliary_files["metadata/msa_row_filter_source_lock_public_safe.json"] == path.read_bytes()
+    summary = json.loads(path.read_text())["msa_row_filter"]
+    assert summary["exhaustive"] is exhaustive
+    assert set(summary["input_binding"].values()) == {"<private>"}
+    assert summary["mmseqs"]["search_parameters"]["prefilter_mode"] == (2 if exhaustive else 0)
+
+
+@pytest.mark.parametrize("corruption", [
+    "private_digest", "asset_records", "parameter_text", "nonfinite_parameter", "unknown_command_flag",
+    "mismatched_contract", "mismatched_parameters", "misplaced_field", "invalid_completeness",
+])
+def test_new_filter_fields_cannot_expand_public_disclosure(
+    public_inputs: Namespace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, corruption: str,
+) -> None:
+    path = _attach_public_filter_summary(public_inputs, tmp_path, exhaustive=True)
+    summary = json.loads(path.read_text())
+    row_filter = summary["msa_row_filter"]
+    if corruption == "private_digest":
+        row_filter["input_binding"]["heldout_fasta_sha256"] = "d" * 64
+    elif corruption == "asset_records":
+        row_filter["input_binding"]["source_assets"] = [{"path": "data/features.npz", "sha256": "f" * 64}]
+    elif corruption == "parameter_text":
+        row_filter["mmseqs"]["search_parameters"]["mask"] = "arbitrary string"
+    elif corruption == "nonfinite_parameter":
+        row_filter["mmseqs"]["search_parameters"]["evalue"] = float("nan")
+    elif corruption == "unknown_command_flag":
+        row_filter["mmseqs"]["command"].extend(["--unreviewed", "123"])
+    elif corruption == "mismatched_contract":
+        row_filter["exhaustive"] = False
+    elif corruption == "mismatched_parameters":
+        row_filter["mmseqs"]["search_parameters"]["mask"] = 1
+    elif corruption == "misplaced_field":
+        summary["validation"]["search_contract"] = row_filter["search_contract"]
+    else:
+        row_filter["source"]["complete"] = "yes"
+    path.write_text(json.dumps(summary))
+    monkeypatch.setattr(exporter, "parse_args", lambda: public_inputs)
+    monkeypatch.setattr(exporter, "_require_hf_modules", lambda: pytest.fail("Unsafe metadata reached HF"))
+    with pytest.raises(ValueError):
+        exporter.main()
