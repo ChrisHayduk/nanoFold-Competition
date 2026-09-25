@@ -41,6 +41,36 @@ def test_invalid_search_parameters_are_rejected(identity: float, coverage: float
         validate_search_parameters(min_seq_id=identity, coverage=coverage, threads=threads, max_seqs=max_seqs)
 
 
+def test_native_count_limit_is_accepted() -> None:
+    validate_search_parameters(min_seq_id=0.3, coverage=0.8, threads=2_147_483_647, max_seqs=2_147_483_647)
+
+
+@pytest.mark.parametrize("value", [2_147_483_648, 4_294_967_297])
+@pytest.mark.parametrize("argument", ["threads", "max_seqs"])
+def test_native_count_overflow_is_rejected(argument: str, value: int) -> None:
+    counts = {"threads": 1, "max_seqs": 100}
+    counts[argument] = value
+    with pytest.raises(ValueError, match=r"\[1, 2147483647\]"):
+        validate_search_parameters(min_seq_id=0.3, coverage=0.8, **counts)
+
+
+def test_exhaustive_search_rejects_overflow_before_launch_or_output_removal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from scripts.build_msa_row_filter import _run_mmseqs
+
+    source = tmp_path / "source.fasta"
+    source.write_text(">source\nAAAA\n")
+    output = tmp_path / "alignments.m8"
+    output.write_text("previous audit evidence\n")
+    monkeypatch.setattr("scripts.build_msa_row_filter.subprocess.run", lambda *args, **kwargs: pytest.fail("MMseqs was launched"))
+    with pytest.raises(ValueError, match=r"\[1, 2147483647\]"):
+        _run_mmseqs(
+            mmseqs_bin="mmseqs", heldout_fasta=tmp_path / "heldout.fasta", source_fasta=source,
+            output_m8=output, tmp_dir=tmp_path / "work", min_seq_id=0.3, coverage=0.8,
+            threads=1, max_seqs=4_294_967_297, exhaustive=True,
+        )
+    assert output.read_text() == "previous audit evidence\n"
+
+
 @pytest.mark.parametrize("corruption", ["missing_query", "masked_query", "masked_hit", "gapped_query", "float_hit", "wrong_chain", "negative_deletions"])
 def test_audit_rejects_semantically_invalid_processed_sequences(tmp_path: Path, corruption: str) -> None:
     import numpy as np

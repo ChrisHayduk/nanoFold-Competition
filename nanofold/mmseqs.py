@@ -63,8 +63,10 @@ def sequence_records_sha256(records: Sequence[tuple[str, str]]) -> str:
 def validate_search_parameters(*, min_seq_id: float, coverage: float, threads: int, max_seqs: int) -> None:
     if not 0 < min_seq_id <= 1 or not 0 < coverage <= 1:
         raise ValueError("MMseqs identity and coverage thresholds must be in (0, 1]")
-    if threads < 1 or max_seqs < 1:
-        raise ValueError("MMseqs threads and max-seqs must be positive")
+    # MMseqs parses these CLI counts with atoi, including size_t max-seqs.
+    # Exhaustive searches also reuse max-seqs for max-accept/max-rejected.
+    if not 1 <= threads <= 2_147_483_647 or not 1 <= max_seqs <= 2_147_483_647:
+        raise ValueError("MMseqs threads and max-seqs must be in [1, 2147483647]")
 
 
 def iter_mmseqs_hits(
