@@ -27,9 +27,9 @@ Options:
   --download-workers <int>    Concurrent per-chain and mmCIF downloads (default: 32)
   --disable-templates         Skip template-hit download and template preprocessing (default)
   --skip-preprocess           Do not run preprocess.py
-  --resume-preprocess         Reuse readable feature+label NPZs and preprocess only missing or invalid chains
+  --resume-preprocess         Reuse pairs only when schema-3 source/config provenance matches
   --force                     Allow overwriting manifest files when copying to --manifests-dir
-  --dry-run                   Print commands without executing
+  --dry-run                   Validate inputs and print commands without writes
   -h, --help                  Show this message
 EOF
 }
@@ -152,10 +152,6 @@ run_cmd() {
 }
 
 verify_manifest_hashes() {
-  if [[ "$DRY_RUN" -eq 1 ]]; then
-    echo "+ verify official manifest SHA256 digests for track limited"
-    return
-  fi
   python - "$REPO_ROOT" "$1" "$2" "$3" <<'PY'
 from __future__ import annotations
 
@@ -207,7 +203,7 @@ if [[ "$DRY_RUN" -eq 0 ]] && ! command -v unzip >/dev/null 2>&1; then
   exit 1
 fi
 
-if [[ "$DRY_RUN" -eq 0 ]] && ! command -v python >/dev/null 2>&1; then
+if ! command -v python >/dev/null 2>&1; then
   echo "python not found. Activate your environment first."
   exit 1
 fi
@@ -233,41 +229,58 @@ SOURCE_MANIFESTS_DIR="$REPO_ROOT/data/manifests"
 SOURCE_TRAIN="$SOURCE_MANIFESTS_DIR/train.txt"
 SOURCE_VAL="$SOURCE_MANIFESTS_DIR/val.txt"
 SOURCE_ALL="$SOURCE_MANIFESTS_DIR/all.txt"
-SOURCE_MANIFESTS_DIR_ABS="$(python -c 'import pathlib; print(pathlib.Path("'"$SOURCE_MANIFESTS_DIR"'").resolve())')"
-MANIFESTS_DIR_ABS="$(python -c 'import pathlib; print(pathlib.Path("'"$MANIFESTS_DIR"'").resolve())')"
+SOURCE_MANIFESTS_DIR_ABS="$(python -c 'import pathlib, sys; print(pathlib.Path(sys.argv[1]).resolve())' "$SOURCE_MANIFESTS_DIR")"
+MANIFESTS_DIR_ABS="$(python -c 'import pathlib, sys; print(pathlib.Path(sys.argv[1]).resolve())' "$MANIFESTS_DIR")"
 
-if [[ ! -f "$SOURCE_TRAIN" || ! -f "$SOURCE_VAL" ]]; then
+if [[ ! -f "$SOURCE_TRAIN" || ! -f "$SOURCE_VAL" || ! -f "$SOURCE_ALL" ]]; then
   echo "Missing committed official manifests under $SOURCE_MANIFESTS_DIR."
   exit 1
 fi
 
-mkdir -p "$DATA_ROOT" "$PDB_DIR" "$DATA_CACHES_DIR" "$MANIFESTS_DIR" "$PROCESSED_FEATURES_DIR" "$PROCESSED_LABELS_DIR"
+verify_manifest_hashes "$SOURCE_TRAIN" "$SOURCE_VAL" "$SOURCE_ALL"
+python - "$REPO_ROOT" "$MANIFESTS_DIR" "$DATA_ROOT" "$PROCESSED_FEATURES_DIR" "$PROCESSED_LABELS_DIR" <<'PYTHON'
+import sys
+from pathlib import Path
+
+repo, manifests, *outputs = [Path(value).resolve() for value in sys.argv[1:]]
+protected = [repo / name for name in ("leaderboard", "tracks", "data/manifests")]
+
+def overlaps(left, right):
+    return left.is_relative_to(right) or right.is_relative_to(left)
+
+for index, output in enumerate(outputs):
+    if any(overlaps(output, path.resolve()) for path in [manifests, *protected, *outputs[:index]]):
+        raise SystemExit("Asset output directories must be separate from manifests, published contracts and each other.")
+    if output.exists() and not output.is_dir():
+        raise SystemExit("Asset outputs must be directories.")
+if manifests != (repo / "data/manifests").resolve() and any(
+    overlaps(manifests, path.resolve()) for path in protected
+):
+    raise SystemExit("Manifest copies must not overlap published dataset contracts.")
+PYTHON
 
 TARGET_TRAIN="$MANIFESTS_DIR/train.txt"
 TARGET_VAL="$MANIFESTS_DIR/val.txt"
 TARGET_ALL="$MANIFESTS_DIR/all.txt"
 
 if [[ "$MANIFESTS_DIR_ABS" != "$SOURCE_MANIFESTS_DIR_ABS" ]]; then
-  if [[ "$FORCE" -ne 1 && ( -e "$TARGET_TRAIN" || -e "$TARGET_VAL" ) ]]; then
+  if [[ "$FORCE" -ne 1 && ( -e "$TARGET_TRAIN" || -e "$TARGET_VAL" || -e "$TARGET_ALL" ) ]]; then
     echo "Refusing to overwrite existing manifests in $MANIFESTS_DIR (pass --force to override)."
     exit 1
   fi
+fi
+
+run_cmd mkdir -p "$DATA_ROOT" "$PDB_DIR" "$DATA_CACHES_DIR" "$MANIFESTS_DIR" "$PROCESSED_FEATURES_DIR" "$PROCESSED_LABELS_DIR"
+
+if [[ "$MANIFESTS_DIR_ABS" != "$SOURCE_MANIFESTS_DIR_ABS" ]]; then
   run_cmd cp "$SOURCE_TRAIN" "$TARGET_TRAIN"
   run_cmd cp "$SOURCE_VAL" "$TARGET_VAL"
-  if [[ -f "$SOURCE_ALL" ]]; then
-    run_cmd cp "$SOURCE_ALL" "$TARGET_ALL"
-  fi
+  run_cmd cp "$SOURCE_ALL" "$TARGET_ALL"
 fi
 
-if [[ ! -f "$TARGET_ALL" ]]; then
-  if [[ "$DRY_RUN" -eq 0 ]]; then
-    cat "$TARGET_TRAIN" "$TARGET_VAL" | awk 'NF {print $0}' | sort -u > "$TARGET_ALL"
-  else
-    echo "+ cat $TARGET_TRAIN $TARGET_VAL | awk 'NF {print \$0}' | sort -u > $TARGET_ALL"
-  fi
+if [[ "$DRY_RUN" -eq 0 ]]; then
+  verify_manifest_hashes "$TARGET_TRAIN" "$TARGET_VAL" "$TARGET_ALL"
 fi
-
-verify_manifest_hashes "$TARGET_TRAIN" "$TARGET_VAL" "$TARGET_ALL"
 
 echo "[1/5] Downloading OpenFold cache metadata from RODA..."
 run_cmd aws s3 cp s3://openfold/data_caches/ "$DATA_CACHES_DIR/" --recursive --only-show-errors --no-sign-request

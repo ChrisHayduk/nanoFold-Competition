@@ -417,6 +417,41 @@ def test_custom_scheduler_may_restore_empty_or_dynamic_state(saved) -> None:
     assert scheduler.updates == saved.get("updates", 0) + 1
 
 
+def _exposure_checkpoint():
+    return {
+        "step": 3,
+        "cumulative_samples_seen": 12,
+        "cumulative_cropped_residues_seen": 70,
+        "cumulative_nonpad_residues_seen": 65,
+        "cumulative_residues_seen": 65,
+    }
+
+
+@pytest.mark.parametrize("field,value", [
+    ("step", -1), ("cumulative_samples_seen", -999), ("cumulative_samples_seen", True),
+    ("cumulative_samples_seen", 11), ("cumulative_cropped_residues_seen", "70"),
+    ("cumulative_cropped_residues_seen", 73), ("cumulative_nonpad_residues_seen", 71),
+    ("cumulative_nonpad_residues_seen", 11), ("cumulative_residues_seen", 64),
+    ("cumulative_residues_seen", None),
+])
+def test_resume_rejects_corrupt_or_impossible_exposure_counters(field, value) -> None:
+    checkpoint = {**_exposure_checkpoint(), field: value}
+    with pytest.raises(ValueError, match="exposure"):
+        train._resume_exposure_counters(checkpoint, effective_batch_size=4, crop_size=6)
+
+
+def test_resume_requires_explicit_exposure_counters_and_preserves_actual_residue_counts() -> None:
+    checkpoint = _exposure_checkpoint()
+    assert train._resume_exposure_counters(checkpoint, effective_batch_size=4, crop_size=6) == (12, 70, 65)
+    for field in checkpoint:
+        incomplete = {key: value for key, value in checkpoint.items() if key != field}
+        with pytest.raises(ValueError, match="exposure"):
+            train._resume_exposure_counters(incomplete, effective_batch_size=4, crop_size=6)
+    assert train._resume_exposure_counters(
+        dict.fromkeys(checkpoint, 0), effective_batch_size=4, crop_size=6,
+    ) == (0, 0, 0)
+
+
 def test_stateless_custom_scheduler_still_requires_explicit_checkpoint_state() -> None:
     class StatelessScheduler:
         def state_dict(self):

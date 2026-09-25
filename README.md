@@ -157,6 +157,11 @@ for the staging workflow, validation gates, and remaining scientific limits.
 
 Training resume preserves the sampler epoch/cursor, loader generators and per-rank RNG, and checks the actual sampling weights and dataset bytes. Checkpoint replacement is atomic, and invalid RNG or AMP state fails before changing run history. Checkpoints lacking supported sampling state require a fresh training run. See the [training sampling contract](docs/API.md#training-sampling-and-multiple-gpus).
 
+Unweighted distributed epochs drop incomplete tails instead of repeating
+chains. Resume also validates exposure counters against the step and global
+batch size. Split verification replays CATH-v2 selection from the locked inputs,
+including exact integer quota ties and private exclusions.
+
 ## Data Format
 
 Official preprocessing writes split artifacts per chain:
@@ -191,6 +196,14 @@ new metadata. See [data preprocessing](docs/DATA.md) for the full contract.
 
 Official scoring requires atom14 labels, and submissions must return `pred_atom14` shaped `(B, L, 14, 3)`. The runtime derives the Cα view from atom14 slot 1 for diagnostics.
 
+Preprocessing maps observed coordinates through the deposited polymer sequence
+and residue indices, preserving unresolved positions in repeated sequences.
+Feature archives containing supervision are rejected, and feature/label output
+directories must be separate. Collated batches include `msa_mask` to distinguish
+real MSA gaps from padding; maintained submissions use it for MSA statistics.
+Scoring rejects truncated or nonfinite predictions and binds official scoring
+inputs to the maintainer's evaluation contract.
+
 Maintainer preprocessing uses a private held-out-target MSA row filter built
 from the train/public-validation/hidden-validation source MSAs against both
 held-out target sets. It removes detected non-query homolog rows before the MSA
@@ -212,8 +225,10 @@ The fixed-manifest asset workflow uses
 `scripts/full_official_data_refresh.sh --skip-manifest-regen` and runs strict
 public/hidden MSA audits before fingerprinting. Preprocessing failures stop the
 workflow without changing exclusion lists or resampling targets. A processed
-feature filter can support local audits when raw A3Ms are unavailable, but cannot
-recover rows lost at the original depth cap. The compact summary from
+feature filter can support local audits of unbound research assets when raw
+A3Ms are unavailable. Schema-3 assets require preprocessing again from raw
+inputs; postprocessing cannot preserve their paired provenance or recover rows
+lost at the original depth cap. The compact summary from
 `scripts/write_msa_row_filter_source_lock.py` checks the final filter digest and
 filtering counts; it is not a residual-homology audit. Detailed commands and
 source-lock handling are in [docs/DATA.md](docs/DATA.md).
@@ -306,7 +321,19 @@ bash scripts/run_official_docker.sh \
   --update-leaderboard
 ```
 
-The Docker image build context intentionally excludes generated datasets, private hidden assets, local Python environments, checkpoints, and run outputs. Hidden data is mounted read-only during the prediction and scoring stages.
+Invoke the wrapper from a trusted checkout; `NANOFOLD_TRUSTED_ROOT` selects its
+source explicitly when needed. It builds only selected tracked source files,
+pins the resulting image ID, and uses separate containers for public training,
+hidden prediction and scoring. Hidden features are unavailable during training;
+hidden labels are mounted only for scoring. Scoring reads immutable predictions
+and writes separate fresh result files. The host repository is never mounted.
+Use `NANOFOLD_PUBLIC_FEATURES_DIR`, `NANOFOLD_PUBLIC_LABELS_DIR` and
+`NANOFOLD_RUNS_ROOT` to relocate host assets and outputs. Config data paths remain
+`data/processed_features` and `data/processed_labels` inside the container.
+Processed directories may contain only the selected manifest's NPZs and the
+documented preprocessing sidecars; extra files, directories and links fail
+preflight. The packaged vendor tree contains code and required configuration,
+excluding example structures and other research artifacts.
 
 Maintainers can run the same two-stage hidden evaluation on Modal when the checkpoint already lives in the `nanofold-runs` Modal volume:
 

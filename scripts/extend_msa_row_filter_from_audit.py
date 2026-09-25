@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any, Sequence
@@ -25,6 +26,7 @@ if str(REPO_ROOT) not in sys.path:
 from nanofold.a3m import GAP_ID, MASK_ID, RESTYPES
 from nanofold.chain_paths import chain_npz_path
 from nanofold.data import read_manifest
+from nanofold.mmseqs import iter_mmseqs_hits, load_msa_for_audit, sequence_records_sha256
 
 MSA_TOKEN_TO_AA = {idx: aa for idx, aa in enumerate(RESTYPES)}
 MSA_TOKEN_TO_AA[20] = "X"
@@ -42,6 +44,8 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--features-dir", type=Path, required=True)
     ap.add_argument("--m8", type=Path, required=True, help="MMseqs m8 file from audit_msa_split.py.")
     ap.add_argument("--source-prefix", default="trainmsa_")
+    ap.add_argument("--audit-summary", type=Path, required=True,
+                    help="Original msa_split_audit_summary.json binding the m8 and ordered source sequences.")
     ap.add_argument("--output", type=Path, required=True)
     return ap.parse_args()
 
@@ -73,16 +77,15 @@ def _msa_row_to_ungapped_sequence(row: np.ndarray) -> str:
     return "".join(chars)
 
 
-def _source_record_hashes(*, manifest_paths: Sequence[Path], features_dir: Path) -> list[str]:
-    source_hashes: list[str] = []
+def _source_records(*, manifest_paths: Sequence[Path], features_dir: Path) -> list[tuple[str, str]]:
+    source_records: list[tuple[str, str]] = []
     seen: set[str] = set()
     for manifest_path in manifest_paths:
         for chain_id in read_manifest(manifest_path):
             feature_path = chain_npz_path(features_dir, chain_id)
             if not feature_path.exists():
                 raise FileNotFoundError(f"Missing processed feature NPZ for {chain_id}: {feature_path}")
-            with np.load(feature_path) as data:
-                msa = np.asarray(data["msa"])
+            msa = load_msa_for_audit(feature_path, chain_id=chain_id)
             for row in msa[1:]:
                 sequence = _msa_row_to_ungapped_sequence(row)
                 if len(sequence) < 20:
@@ -91,31 +94,8 @@ def _source_record_hashes(*, manifest_paths: Sequence[Path], features_dir: Path)
                 if digest in seen:
                     continue
                 seen.add(digest)
-                source_hashes.append(digest)
-    return source_hashes
-
-
-def _parse_residual_source_indices(m8_path: Path, *, source_prefix: str) -> tuple[set[int], int]:
-    indices: set[int] = set()
-    hit_count = 0
-    for line in m8_path.read_text().splitlines():
-        if not line.strip():
-            continue
-        hit_count += 1
-        parts = line.split("\t")
-        if len(parts) < 2:
-            raise ValueError(f"Malformed MMseqs row in {m8_path}: {line!r}")
-        source_header = parts[1].split("|", 1)[0]
-        if not source_header.startswith(source_prefix):
-            raise ValueError(
-                f"MMseqs target header does not start with {source_prefix!r}: {source_header!r}"
-            )
-        raw_index = source_header.removeprefix(source_prefix)
-        try:
-            indices.add(int(raw_index))
-        except ValueError as exc:
-            raise ValueError(f"Bad MMseqs source index in {source_header!r}") from exc
-    return indices, hit_count
+                source_records.append((f"trainmsa_{len(source_records)}", sequence))
+    return source_records
 
 
 def extend_filter_from_audit(
@@ -126,6 +106,7 @@ def extend_filter_from_audit(
     m8_path: Path,
     source_prefix: str,
     output_path: Path,
+    audit_summary_path: Path,
 ) -> dict[str, Any]:
     payload = json.loads(base_filter_path.read_text())
     if not isinstance(payload, dict):
@@ -134,20 +115,38 @@ def extend_filter_from_audit(
     if not isinstance(raw_excluded, list):
         raise ValueError(f"Base filter missing `excluded_sequence_sha256`: {base_filter_path}")
 
+    bad_hashes = [value for value in raw_excluded if not isinstance(value, str) or re.fullmatch(r"[0-9a-fA-F]{64}", value) is None]
     base_excluded = {str(value).lower() for value in raw_excluded}
-    bad_hashes = [value for value in base_excluded if len(value) != 64]
     if bad_hashes:
         raise ValueError(f"Base filter contains malformed SHA256 values: {bad_hashes[:3]}")
 
-    source_hashes = _source_record_hashes(manifest_paths=source_manifest_paths, features_dir=features_dir)
-    residual_indices, hit_count = _parse_residual_source_indices(m8_path, source_prefix=source_prefix)
-    out_of_range = [index for index in residual_indices if index < 0 or index >= len(source_hashes)]
-    if out_of_range:
-        raise ValueError(
-            f"Residual MMseqs source indices exceed reconstructed source records: {out_of_range[:8]}"
-        )
-
-    residual_hashes = {source_hashes[index] for index in residual_indices}
+    if source_prefix != "trainmsa_":
+        raise ValueError("Residual closure requires anonymous trainmsa_ source records")
+    summary = json.loads(audit_summary_path.read_text())
+    report = summary.get("mmseqs_homology", {}) if isinstance(summary, dict) else {}
+    binding = report.get("input_binding", {})
+    if not isinstance(binding, dict) or binding.get("schema_version") != 1 or report.get("identifiers_in_m8") is not False:
+        raise ValueError("Audit summary must bind an anonymous MSA homology search")
+    source_records = _source_records(manifest_paths=source_manifest_paths, features_dir=features_dir)
+    if binding.get("source_records_sha256") != sequence_records_sha256(source_records):
+        raise ValueError("Source MSA sequences or ordering changed since the audit")
+    if binding.get("m8_sha256") != _sha256_file(m8_path):
+        raise ValueError("MMseqs output does not match the bound audit")
+    query_ids = binding.get("query_ids")
+    if not isinstance(query_ids, list) or not query_ids or any(not isinstance(value, str) for value in query_ids):
+        raise ValueError("Audit summary is missing its query identifiers")
+    threshold = report.get("threshold", {})
+    if any(threshold.get(key) != value for key, value in (("alignment_mode", 3), ("seq_id_mode", 0), ("cov_mode", 0))):
+        raise ValueError("Audit uses an unsupported alignment contract")
+    source_hashes = {header: _sequence_sha256(sequence) for header, sequence in source_records}
+    residual_hashes: set[str] = set()
+    hit_count = 0
+    for _query, target in iter_mmseqs_hits(
+        m8_path, query_ids=set(query_ids), target_ids=set(source_hashes),
+        min_seq_id=float(threshold["min_seq_id"]), coverage=float(threshold["coverage"]),
+    ):
+        residual_hashes.add(source_hashes[target])
+        hit_count += 1
     merged = base_excluded | residual_hashes
     supplemental_record = {
         "type": "mmseqs_audit_residual_closure",
@@ -160,7 +159,9 @@ def extend_filter_from_audit(
         "source_prefix": source_prefix,
         "source_record_count": len(source_hashes),
         "m8_hit_count": hit_count,
-        "residual_source_record_count": len(residual_indices),
+        "residual_source_record_count": len(residual_hashes),
+        "audit_summary_sha256": _sha256_file(audit_summary_path),
+        "source_records_sha256": binding["source_records_sha256"],
         "new_excluded_sequence_count": len(residual_hashes - base_excluded),
         "already_excluded_sequence_count": len(residual_hashes & base_excluded),
     }
@@ -188,6 +189,7 @@ def main() -> None:
         m8_path=args.m8,
         source_prefix=str(args.source_prefix),
         output_path=args.output,
+        audit_summary_path=args.audit_summary,
     )
     latest = payload["supplemental_filters"][-1]
     print(

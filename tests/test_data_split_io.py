@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
 
 from nanofold.chain_paths import chain_npz_path
-from nanofold.data import ProcessedNPZDataset
+from nanofold.data import LABEL_ONLY_KEYS, ProcessedNPZDataset
 
 
 def _write_feature_npz(path: Path) -> None:
@@ -92,3 +93,15 @@ def test_features_only_eval_has_no_supervision_keys(tmp_path: Path) -> None:
     assert "ca_mask" not in item
     assert item["residue_index"].shape == (8,)
     assert item["between_segment_residues"].shape == (8,)
+
+
+@pytest.mark.parametrize("key", LABEL_ONLY_KEYS)
+def test_features_only_dataset_rejects_label_members_without_fingerprint(tmp_path: Path, key: str) -> None:
+    features = tmp_path / "features"
+    features.mkdir()
+    manifest = tmp_path / "val.txt"
+    manifest.write_text("1abc_A\n")
+    contents: dict[str, Any] = {key: np.zeros(1)}
+    np.savez_compressed(chain_npz_path(features, "1abc_A"), **contents)
+    with pytest.raises(ValueError, match="label-only fields"):
+        ProcessedNPZDataset(features, manifest, include_labels=False)

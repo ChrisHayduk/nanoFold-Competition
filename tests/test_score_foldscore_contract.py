@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+from pathlib import Path
+
+import numpy as np
 import pytest
 import torch
 
-from score import _labels_to_device, _resolve_score_device, _score_chain
+from nanofold.chain_paths import chain_npz_path
+from score import _labels_to_device, _load_feature_crop, _resolve_score_device, _score_chain
 
 
 def _atom14_chain(length: int = 4) -> torch.Tensor:
@@ -66,3 +70,34 @@ def test_score_device_helpers_default_and_move_labels() -> None:
     }
     moved = _labels_to_device(labels, device=device)
     assert all(value.device.type == "cpu" for value in moved.values())
+
+
+@pytest.mark.parametrize("length", [0, 1, 3, 5])
+def test_score_rejects_partial_or_padded_predictions(length: int) -> None:
+    reference = _atom14_chain()
+    with pytest.raises(ValueError, match="same nonzero residue length"):
+        _score_chain(
+            pred_atom14=_atom14_chain(length),
+            labels={"atom14_positions": reference, "atom14_mask": torch.ones((4, 14), dtype=torch.bool)},
+            features={"aatype": torch.zeros(4, dtype=torch.long)},
+        )
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_score_rejects_nonfinite_predictions(value: float) -> None:
+    reference = _atom14_chain()
+    predicted = reference.clone()
+    predicted[2, 1, 0] = value
+    with pytest.raises(ValueError, match="finite"):
+        _score_chain(
+            pred_atom14=predicted,
+            labels={"atom14_positions": reference, "atom14_mask": torch.ones((4, 14), dtype=torch.bool)},
+            features={"aatype": torch.zeros(4, dtype=torch.long)},
+        )
+
+
+@pytest.mark.parametrize("tokens", [np.array([0.5, 1.0]), np.array([0, 21]), np.array([0, -1])])
+def test_score_rejects_malformed_feature_tokens(tmp_path: Path, tokens: np.ndarray) -> None:
+    np.savez(chain_npz_path(tmp_path, "1abc_A"), aatype=tokens)
+    with pytest.raises(ValueError, match="integer residue tokens"):
+        _load_feature_crop(features_dir=tmp_path, chain_id="1abc_A", crop_size=8, crop_mode="center")

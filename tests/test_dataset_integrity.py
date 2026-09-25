@@ -518,3 +518,87 @@ def test_frozen_schema_optional_chain_ids_are_checked_when_present(tmp_path: Pat
     _replace_npz_array(path, "chain_id", np.asarray("1abc_B"))
     with pytest.raises(ValueError, match="chain_id.*requested chain 1abc_A"):
         build_split_fingerprint(**args)
+
+
+@pytest.mark.parametrize("label_key", ["ca_coords", "ca_mask", "atom14_positions", "atom14_mask", "resolution"])
+def test_fingerprint_rejects_supervision_in_features_only_archive(tmp_path: Path, label_key: str) -> None:
+    features = tmp_path / "features"
+    features.mkdir()
+    manifest = tmp_path / "hidden.txt"
+    manifest.write_text("1abc_A\n")
+    feature_path = chain_npz_path(features, "1abc_A")
+    _write_feature_npz(feature_path)
+    label_path = tmp_path / "labels.npz"
+    _write_label_npz(label_path)
+    with np.load(label_path) as data:
+        label_value = data[label_key] if label_key in data.files else np.asarray(2.0, dtype=np.float32)
+    _replace_npz_array(feature_path, label_key, label_value)
+
+    with pytest.raises(ValueError, match=f"supervision key `{label_key}`"):
+        build_split_fingerprint(
+            processed_features_dir=features,
+            manifest_paths={"hidden": manifest},
+            require_no_missing=True,
+            require_labels=False,
+        )
+
+
+@pytest.mark.parametrize("require_no_missing", [False, True])
+@pytest.mark.parametrize("validate_schema", [False, True])
+def test_fingerprint_cannot_claim_label_coverage_without_a_label_directory(
+    tmp_path: Path, require_no_missing: bool, validate_schema: bool,
+) -> None:
+    features = tmp_path / "features"
+    features.mkdir()
+    manifest = tmp_path / "train.txt"
+    manifest.write_text("1abc_A\n")
+    _write_feature_npz(chain_npz_path(features, "1abc_A"))
+
+    with pytest.raises(ValueError, match="requires `processed_labels_dir`"):
+        build_split_fingerprint(
+            processed_features_dir=features,
+            manifest_paths={"train": manifest},
+            require_no_missing=require_no_missing,
+            require_labels=True,
+            validate_schema=validate_schema,
+        )
+
+
+@pytest.mark.parametrize("split_names", [("train", "val"), ("public", "hidden")])
+def test_fingerprint_rejects_chain_overlap_between_splits(
+    tmp_path: Path, split_names: tuple[str, str],
+) -> None:
+    train = tmp_path / "train.txt"
+    heldout = tmp_path / "heldout.txt"
+    train.write_text("1abc_A\n2def_B\n")
+    heldout.write_text("2def_B\n3ghi_C\n")
+    with pytest.raises(ValueError, match="chain-disjoint.*share 1 chain IDs") as caught:
+        build_split_fingerprint(
+            processed_features_dir=tmp_path / "features",
+            manifest_paths={split_names[0]: train, split_names[1]: heldout},
+            require_no_missing=False,
+            require_labels=False,
+        )
+    assert "2def_B" not in str(caught.value)
+
+
+def test_fingerprint_rejects_duplicate_manifest_records(tmp_path: Path) -> None:
+    manifest = tmp_path / "train.txt"
+    manifest.write_text("1abc_A\n1abc_A\n")
+    with pytest.raises(ValueError, match="[Dd]uplicate"):
+        build_split_fingerprint(
+            processed_features_dir=tmp_path / "features",
+            manifest_paths={"train": manifest},
+            require_no_missing=False,
+            require_labels=False,
+        )
+
+
+def test_fingerprint_rejects_colliding_normalized_split_names(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="Duplicate normalized manifest split name"):
+        build_split_fingerprint(
+            processed_features_dir=tmp_path / "features",
+            manifest_paths={"train": tmp_path / "first.txt", " train ": tmp_path / "second.txt"},
+            require_no_missing=False,
+            require_labels=False,
+        )

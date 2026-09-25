@@ -3,21 +3,26 @@ from __future__ import annotations
 import argparse
 import json
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Dict, List
 
 import numpy as np
 import torch
+import yaml
 from tqdm import tqdm
 
 from nanofold.chain_paths import chain_npz_path
+from nanofold.competition_policy import TrackSpec, apply_track_policy, load_track_spec
+from nanofold.data import read_manifest
+from nanofold.dataset_integrity import verify_split_against_fingerprint
 from nanofold.metrics import (
     FOLDSCORE_COMPONENT_NAMES,
     FOLDSCORE_CURVE_COMPONENT_NAMES,
     foldscore_auc,
     foldscore_components,
 )
-from nanofold.utils import default_torch_device, get_env_metadata, utc_now_iso
+from nanofold.utils import default_torch_device, get_env_metadata, sha256_file, utc_now_iso
 
 HIDDEN_SPLITS = {"hidden_val", "test_hidden"}
 
@@ -29,6 +34,13 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--labels-dir", type=str, required=True, help="Directory with label NPZ files.")
     ap.add_argument("--manifest", type=str, default="", help="Optional manifest override.")
     ap.add_argument("--crop-size", type=int, default=-1, help="Optional crop-size override.")
+    ap.add_argument("--official", action="store_true", help="Require trusted track, manifest, split, prediction directory, and checkpoint schedule.")
+    ap.add_argument("--track", default="", help="Trusted track ID for official scoring.")
+    ap.add_argument("--config", default="", help="Trusted config supplying unfixed crop and budget values for research tracks.")
+    ap.add_argument("--fingerprint", default="", help="Trusted scoring feature-and-label fingerprint (defaults to the track fingerprint).")
+    ap.add_argument("--split", default="", help="Trusted split for official scoring.")
+    ap.add_argument("--pred-out-dir", default="", help="Trusted prediction directory for official scoring.")
+    ap.add_argument("--checkpoint-steps", default="", help="Trusted comma-separated checkpoint schedule for official scoring (supports last).")
     ap.add_argument(
         "--crop-mode",
         type=str,
@@ -143,7 +155,10 @@ def _load_feature_crop(
     with np.load(feature_path) as data:
         if "aatype" not in data:
             raise ValueError(f"Feature file {feature_path} is missing required key: aatype")
-        features = {"aatype": torch.from_numpy(np.asarray(data["aatype"], dtype=np.int64))}
+        raw_aatype = np.asarray(data["aatype"])
+        if raw_aatype.dtype.kind not in "iu" or np.any(raw_aatype < 0) or np.any(raw_aatype > 20):
+            raise ValueError("Feature aatype must contain integer residue tokens in [0, 20].")
+        features = {"aatype": torch.from_numpy(raw_aatype.astype(np.int64))}
     aatype = features["aatype"]
     if aatype.ndim != 1:
         raise ValueError(f"Invalid aatype shape in {feature_path}: {tuple(aatype.shape)}")
@@ -185,7 +200,100 @@ def _prediction_subdir(pred_root: Path, ckpt_path: str, n_ckpts: int) -> Path:
     return pred_root / Path(ckpt_path).stem
 
 
-def _validate_hidden_axis(checkpoint_rows: List[Dict[str, Any]], sample_budget: int) -> List[Dict[str, Any]]:
+def _resolve_scoring_track(track: TrackSpec, config_path: str) -> TrackSpec:
+    if all(value is not None for value in (track.max_steps, track.crop_size, track.val_crop_mode, track.effective_batch_size)):
+        return track
+    if not config_path:
+        raise ValueError("Research scoring requires a trusted config for unfixed budget and crop values.")
+    cfg = apply_track_policy(yaml.safe_load(Path(config_path).read_text()), track_spec=track)
+    data_cfg, train_cfg = cfg["data"], cfg["train"]
+    for value in (train_cfg.get("max_steps"), data_cfg.get("crop_size"), data_cfg.get("batch_size"), train_cfg.get("grad_accum_steps", 1)):
+        if type(value) is not int or value <= 0:
+            raise ValueError("Research scoring config requires positive integer budget and crop values.")
+    crop_mode = data_cfg.get("val_crop_mode", "center")
+    if crop_mode != "center":
+        raise ValueError("Scoring requires deterministic center cropping.")
+    return replace(track, max_steps=train_cfg["max_steps"], crop_size=data_cfg["crop_size"], val_crop_mode=crop_mode,
+                   effective_batch_size=data_cfg["batch_size"] * train_cfg.get("grad_accum_steps", 1))
+
+
+def _validate_official_summary(
+    summary: Dict[str, Any], *, track: TrackSpec, split: str,
+    manifest_path: Path, pred_root: Path, checkpoint_steps: str,
+) -> None:
+    """Bind untrusted prediction metadata to the maintainer's scoring contract."""
+    if split not in {"val", *HIDDEN_SPLITS}:
+        raise ValueError("Official scoring requires an explicit validation split.")
+    if track.max_steps is None or track.effective_batch_size is None or track.crop_size is None:
+        raise ValueError("Official scoring requires a complete track budget and crop policy.")
+    expected = {
+        "mode": "predict", "official_mode": True, "track": track.track_id, "split": split,
+        "crop_size": track.crop_size, "crop_mode": track.val_crop_mode,
+        "effective_batch_size": track.effective_batch_size,
+        "sample_budget": track.sample_budget, "residue_budget": track.residue_budget,
+    }
+    for key, value in expected.items():
+        if summary.get(key) != value or type(summary.get(key)) is not type(value):
+            raise ValueError(f"Official prediction summary disagrees with trusted {key}.")
+    if Path(str(summary.get("manifest_path", ""))).resolve() != manifest_path.resolve():
+        raise ValueError("Official prediction summary manifest does not match the trusted manifest.")
+    if split == "val" and track.val_manifest_sha256 and sha256_file(manifest_path) != track.val_manifest_sha256:
+        raise ValueError("Official scoring manifest hash does not match the track.")
+    if Path(str(summary.get("pred_out_dir", ""))).resolve() != pred_root.resolve():
+        raise ValueError("Official prediction summary directory does not match the trusted prediction directory.")
+    chain_ids = read_manifest(manifest_path)
+    if len(set(chain_ids)) != len(chain_ids):
+        raise ValueError("Official scoring manifest contains duplicate chains.")
+    count = track.hidden_chain_count if split in HIDDEN_SPLITS else track.val_chain_count
+    if count is not None and len(chain_ids) != count:
+        raise ValueError("Official scoring manifest count does not match the track.")
+    tokens = [token.strip().lower() for token in checkpoint_steps.split(",") if token.strip()]
+    if not tokens:
+        raise ValueError("Official scoring requires a trusted checkpoint schedule.")
+    expected_steps = []
+    for token in tokens:
+        if token != "last" and not token.isdigit():
+            raise ValueError("Invalid official checkpoint schedule.")
+        step = track.max_steps if token == "last" else int(token)
+        if step < 0 or step > track.max_steps or step in expected_steps:
+            raise ValueError("Official checkpoint schedule contains duplicate or out-of-budget steps.")
+        expected_steps.append(step)
+    if expected_steps != sorted(expected_steps):
+        raise ValueError("Official checkpoint schedule must increase.")
+    if track.official and split in HIDDEN_SPLITS:
+        if tuple(expected_steps) != track.hidden_checkpoint_steps:
+            raise ValueError("Official hidden scoring requires the fixed competition checkpoint milestones.")
+    checkpoints = summary.get("checkpoints")
+    if not isinstance(checkpoints, list) or len(checkpoints) != len(expected_steps):
+        raise ValueError("Official prediction checkpoints do not match the trusted schedule.")
+    for row, step, token in zip(checkpoints, expected_steps, tokens, strict=True):
+        if not isinstance(row, dict):
+            raise ValueError("Invalid official checkpoint metadata.")
+        fields = {
+            "step": step, "num_chains": len(chain_ids),
+            "cumulative_samples_seen": step * track.effective_batch_size,
+        }
+        for key, value in fields.items():
+            if type(row.get(key)) is not int or row.get(key) != value:
+                raise ValueError(f"Official checkpoint disagrees with trusted {key}.")
+        basename = "ckpt_last.pt" if token == "last" else f"ckpt_step_{step}.pt"
+        if Path(str(row.get("ckpt", ""))).name != basename:
+            raise ValueError("Official checkpoint filename does not match the trusted schedule.")
+        expected_dir = _prediction_subdir(pred_root, basename, len(checkpoints)).resolve()
+        if Path(str(row.get("prediction_dir", ""))).resolve() != expected_dir:
+            raise ValueError("Official checkpoint prediction directory does not match the trusted directory.")
+        nonpad = row.get("cumulative_nonpad_residues_seen")
+        cropped = row.get("cumulative_cropped_residues_seen")
+        samples = fields["cumulative_samples_seen"]
+        if type(nonpad) is not int or type(cropped) is not int or not samples <= nonpad <= cropped <= samples * track.crop_size:
+            raise ValueError("Invalid official cropped or nonpadding residue counter.")
+    if split in HIDDEN_SPLITS:
+        _validate_hidden_axis(checkpoints, int(track.sample_budget or 0), require_step_zero=not (
+            track.rank_metric == "final_hidden_foldscore" and len(checkpoints) == 1
+        ))
+
+
+def _validate_hidden_axis(checkpoint_rows: List[Dict[str, Any]], sample_budget: int, *, require_step_zero: bool = True) -> List[Dict[str, Any]]:
     if not checkpoint_rows:
         raise ValueError("Hidden scoring requires checkpoint metadata.")
     previous_samples: int | None = None
@@ -199,7 +307,7 @@ def _validate_hidden_axis(checkpoint_rows: List[Dict[str, Any]], sample_budget: 
                 f"got {current_samples} after {previous_samples}."
             )
         previous_samples = current_samples
-    if int(checkpoint_rows[0]["cumulative_samples_seen"]) != 0:
+    if require_step_zero and int(checkpoint_rows[0]["cumulative_samples_seen"]) != 0:
         raise ValueError("Hidden scoring requires a step-0 checkpoint with cumulative_samples_seen=0.")
     if int(checkpoint_rows[-1]["cumulative_samples_seen"]) != int(sample_budget):
         raise ValueError(
@@ -209,8 +317,8 @@ def _validate_hidden_axis(checkpoint_rows: List[Dict[str, Any]], sample_budget: 
     return checkpoint_rows
 
 
-def _hidden_curve_metrics(checkpoint_rows: List[Dict[str, Any]], *, sample_budget: int) -> Dict[str, Any]:
-    rows = _validate_hidden_axis(checkpoint_rows, sample_budget=sample_budget)
+def _hidden_curve_metrics(checkpoint_rows: List[Dict[str, Any]], *, sample_budget: int, compute_auc: bool = True) -> Dict[str, Any]:
+    rows = _validate_hidden_axis(checkpoint_rows, sample_budget=sample_budget, require_step_zero=compute_auc)
     final_hidden = float(rows[-1]["mean_foldscore"])
     auc_hidden = foldscore_auc(
         (
@@ -222,7 +330,7 @@ def _hidden_curve_metrics(checkpoint_rows: List[Dict[str, Any]], *, sample_budge
             for row in rows
         ),
         sample_budget=sample_budget,
-    )
+    ) if compute_auc else float("nan")
     out = {
         "final_hidden_foldscore": final_hidden,
         "foldscore_auc_hidden": auc_hidden,
@@ -245,7 +353,7 @@ def _hidden_curve_metrics(checkpoint_rows: List[Dict[str, Any]], *, sample_budge
                 for row in rows
             ),
             sample_budget=sample_budget,
-        )
+        ) if compute_auc else float("nan")
         out[f"{name}_at_steps"] = {
             str(int(row["step"])): float(row.get(key, row["mean_foldscore"])) for row in rows
         }
@@ -271,13 +379,9 @@ def main() -> None:
         raise ValueError(f"Prediction summary missing checkpoints: {prediction_summary_path}")
 
     manifest_path = Path(args.manifest).resolve() if args.manifest else Path(str(prediction_summary["manifest_path"])).resolve()
-    chain_ids = [
-        line.strip()
-        for line in manifest_path.read_text().splitlines()
-        if line.strip() and not line.startswith("#")
-    ]
-    if not chain_ids:
-        raise ValueError(f"Empty manifest for scoring: {manifest_path}")
+    chain_ids = read_manifest(manifest_path)
+    if len(set(chain_ids)) != len(chain_ids):
+        raise ValueError("Scoring manifest contains duplicate chains.")
 
     features_dir = Path(args.features_dir).resolve()
     labels_dir = Path(args.labels_dir).resolve()
@@ -285,6 +389,35 @@ def main() -> None:
     crop_size = int(args.crop_size) if args.crop_size > 0 else int(prediction_summary["crop_size"])
     crop_mode = args.crop_mode.strip() or str(prediction_summary.get("crop_mode", "center"))
     split = str(prediction_summary["split"])
+    if args.official:
+        if not all((args.manifest, args.track, args.split, args.pred_out_dir, args.checkpoint_steps)):
+            raise ValueError("Official scoring requires trusted manifest, track, split, prediction directory, and checkpoint schedule.")
+        track = _resolve_scoring_track(load_track_spec(args.track), args.config)
+        pred_root = Path(args.pred_out_dir).resolve()
+        _validate_official_summary(
+            prediction_summary, track=track, split=args.split,
+            manifest_path=manifest_path, pred_root=pred_root, checkpoint_steps=args.checkpoint_steps,
+        )
+        if args.crop_size > 0 and args.crop_size != track.crop_size:
+            raise ValueError("Official crop override does not match the track.")
+        if args.crop_mode and args.crop_mode != track.val_crop_mode:
+            raise ValueError("Official crop-mode override does not match the track.")
+        crop_size = int(track.crop_size or 0)
+        crop_mode = str(track.val_crop_mode)
+        split = args.split
+        fingerprint = args.fingerprint or (track.hidden_fingerprint_path if split in HIDDEN_SPLITS else track.fingerprint_path)
+        if not fingerprint:
+            raise ValueError("Official scoring requires a trusted feature-and-label fingerprint.")
+        manifests = {split: manifest_path} if split in HIDDEN_SPLITS else {
+            "train": Path(track.train_manifest), "val": manifest_path,
+        }
+        verify_split_against_fingerprint(
+            processed_features_dir=features_dir, processed_labels_dir=labels_dir,
+            manifest_paths=manifests, expected_fingerprint_path=fingerprint,
+            require_no_missing=True, require_labels=True, track_id=track.track_id,
+        )
+    if crop_size <= 0 or crop_mode != "center":
+        raise ValueError("Scoring requires a positive crop size and deterministic center cropping.")
     n_ckpts = len(checkpoints)
     device = _resolve_score_device(str(args.device))
     per_chain_rows: List[Dict[str, Any]] = []
@@ -315,6 +448,8 @@ def main() -> None:
             pred_path = chain_npz_path(pred_dir, chain_id)
             if not pred_path.exists():
                 raise FileNotFoundError(f"Missing prediction file for scoring: {pred_path}")
+            if not pred_path.resolve().is_relative_to(pred_root):
+                raise ValueError("Prediction file resolves outside the trusted prediction directory.")
             with np.load(pred_path) as pred_npz:
                 if "pred_atom14" not in pred_npz:
                     raise ValueError(f"Prediction file is missing required `pred_atom14`: {pred_path}")
@@ -342,8 +477,9 @@ def main() -> None:
                 features=features,
             )
             for name, value in metrics.items():
-                if not np.isnan(value):
-                    chain_metrics[name].append(float(value))
+                if not np.isfinite(value):
+                    raise ValueError(f"Nonfinite {name} for a scored chain; refusing an incomplete mean.")
+                chain_metrics[name].append(float(value))
             per_chain_rows.append(
                 {
                     "split": split,
@@ -410,6 +546,7 @@ def main() -> None:
             _hidden_curve_metrics(
                 scored_checkpoints,
                 sample_budget=int(prediction_summary.get("sample_budget", 0)),
+                compute_auc=not (args.official and track.rank_metric == "final_hidden_foldscore" and len(scored_checkpoints) == 1),
             )
         )
 

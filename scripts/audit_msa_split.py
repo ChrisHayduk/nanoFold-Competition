@@ -29,7 +29,12 @@ if str(REPO_ROOT) not in sys.path:
 
 from nanofold.a3m import GAP_ID, MASK_ID, RESTYPES
 from nanofold.chain_paths import chain_data_dir, chain_npz_path
-from nanofold.mmseqs import iter_mmseqs_hits, validate_search_parameters
+from nanofold.mmseqs import (
+    iter_mmseqs_hits,
+    load_msa_for_audit,
+    sequence_records_sha256,
+    validate_search_parameters,
+)
 
 MSA_TOKEN_TO_AA = {idx: aa for idx, aa in enumerate(RESTYPES)}
 MSA_TOKEN_TO_AA[20] = "X"
@@ -68,7 +73,7 @@ def parse_args() -> argparse.Namespace:
     )
     ap.add_argument(
         "--run-mmseqs", action="store_true",
-        help="Search held-out targets against both source targets and non-query MSA rows; gate both with --strict.",
+        help="Align all held-out/source target pairs with a permissive E-value limit; separately search non-query MSA rows heuristically. Gate both with --strict.",
     )
     ap.add_argument("--mmseqs-bin", default="mmseqs")
     ap.add_argument("--min-seq-id", type=float, default=0.30)
@@ -106,7 +111,7 @@ def read_manifest(path: Path) -> list[str]:
 
 
 def _read_optional_set(path: Path | None) -> set[str]:
-    if path is None or not path.exists():
+    if path is None:
         return set()
     return set(read_manifest(path))
 
@@ -224,29 +229,8 @@ def _load_feature_msa(features_dir: Path, chain_id: str) -> tuple[np.ndarray, in
     path = chain_npz_path(features_dir, chain_id)
     if not path.exists():
         return None
-    with np.load(path, allow_pickle=False) as data:
-        if "msa" not in data.files:
-            return None
-        raw_msa = np.asarray(data["msa"])
-        if not np.issubdtype(raw_msa.dtype, np.integer):
-            raise ValueError("Processed MSA tokens must be integers")
-        if np.any(raw_msa < 0) or np.any(raw_msa > MASK_ID):
-            raise ValueError("Processed MSA contains invalid residue tokens")
-        msa = raw_msa.astype(np.int32)
-        if msa.ndim != 2 or msa.shape[0] == 0 or msa.shape[1] == 0:
-            raise ValueError("Processed MSA must be a nonempty two-dimensional array")
-        if "aatype" in data.files:
-            aatype = np.asarray(data["aatype"])
-            if aatype.ndim != 1 or not np.issubdtype(aatype.dtype, np.integer):
-                raise ValueError("Processed query must be a one-dimensional integer array")
-            length = int(aatype.shape[0])
-            if not np.array_equal(msa[0], aatype):
-                raise ValueError("Processed MSA query row does not match aatype")
-        else:
-            length = int(msa.shape[1])
-        if length != msa.shape[1]:
-            raise ValueError("Processed MSA width does not match query length")
-    return msa, length
+    msa = load_msa_for_audit(path, chain_id=chain_id)
+    return msa, int(msa.shape[1])
 
 
 def summarize_split_features(
@@ -739,12 +723,23 @@ def run_mmseqs_homology(
         "val_targets_with_train_target_homolog_hits" if source_targets_only
         else "val_targets_with_train_msa_homolog_hits"
     )
+    search_parameters = {
+        "prefilter_mode": 2 if source_targets_only else 0,
+        "evalue": 1e308 if source_targets_only else 1e-3,
+        "sensitivity": 5.7,
+        "mask": 0 if source_targets_only else 1,
+        "comp_bias_corr": 0 if source_targets_only else 1,
+        "search_type": 1,
+    }
     threshold = {
         "min_seq_id": min_seq_id, "coverage": coverage, "cov_mode": 0, "alignment_mode": 3, "seq_id_mode": 0,
     }
+    if source_targets_only and max_seqs < len(source_records):
+        raise ValueError("Target-pair audit max-seqs must cover every source target")
     if not source_records:
         return {
             "threshold": threshold,
+            "search_parameters": search_parameters,
             "target_records": len(target_records),
             source_count_key: 0,
             "hit_count": 0,
@@ -780,6 +775,12 @@ def run_mmseqs_homology(
             "3",
             "--seq-id-mode",
             "0",
+            "--search-type", "1",
+            "--prefilter-mode", str(search_parameters["prefilter_mode"]),
+            "-e", str(search_parameters["evalue"]),
+            "-s", str(search_parameters["sensitivity"]),
+            "--mask", str(search_parameters["mask"]),
+            "--comp-bias-corr", str(search_parameters["comp_bias_corr"]),
             "--threads",
             str(threads),
             "--max-seqs",
@@ -801,12 +802,20 @@ def run_mmseqs_homology(
         unique_target_hits.add(query)
     return {
         "threshold": threshold,
+        "search_parameters": search_parameters,
         "mmseqs": {"binary": mmseqs_bin, "version": _mmseqs_version(mmseqs_bin), "command": cmd},
         "target_records": len(target_records),
         source_count_key: len(source_records),
         "hit_count": hit_count,
         hit_count_key: len(unique_target_hits),
         "m8_path": str(m8_out),
+        "input_binding": {
+            "schema_version": 1,
+            "source_records_sha256": sequence_records_sha256(source_records),
+            "target_records_sha256": sequence_records_sha256(target_records),
+            "query_ids": [header for header, _ in target_records],
+            "m8_sha256": hashlib.sha256(m8_out.read_bytes()).hexdigest(),
+        },
         "identifiers_in_m8": include_identifiers,
         "search_executed": True,
     }
@@ -938,9 +947,10 @@ def main() -> None:
         "cluster_disjointness_checked": summary["target_manifest_disjointness"]["cluster_map_complete"],
         "mmseqs_homology_checked": bool(args.run_mmseqs),
         "target_target_homology_checked": bool(args.run_mmseqs),
-        "homology_scope": "Separate held-out query searches versus source targets and source non-query "
-        "rows of at least 20 residues, "
-        "using the configured heuristic MMseqs search; zero hits do not prove absence of all homology.",
+        "homology_scope": "Target pairs use all-pair MMseqs local alignments without composition correction "
+        "or prefilter masking, with E-value limit 1e308. Source non-query rows of at least 20 residues use "
+        "a separate heuristic search. Identity and bidirectional coverage gates apply to the returned "
+        "local alignments; zero hits do not prove absence of every possible alignment or all homology.",
         "depth_identifiers_included": bool(args.include_depth_identifiers),
     }
     (args.out_dir / "msa_split_audit_summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")

@@ -129,3 +129,73 @@ def test_filter_processed_features_searches_multiple_source_roots_and_skips_exis
         assert data["msa"].shape == (1, 20)
     with np.load(chain_npz_path(out_features, "second_A")) as data:
         assert data["msa"].shape == (2, 20)
+
+
+def test_skip_existing_rebuilds_changed_source_and_modified_output(tmp_path: Path) -> None:
+    module = _load_filter_processed_module()
+    manifest = tmp_path / "train.txt"
+    manifest.write_text("toy_A\n")
+    source, output = tmp_path / "source", tmp_path / "output"
+    _write_feature(source, "toy_A", ["A" * 20, "C" * 20])
+    filter_path = tmp_path / "filter.json"
+    _write_filter(filter_path, ["C" * 20])
+    kwargs = dict(manifest_paths=[manifest], source_features_dirs=[source], out_features_dir=output,
+                  row_filter=module._load_msa_row_filter(filter_path), skip_existing=True)
+    module.filter_processed_features(**kwargs)
+    _write_feature(source, "toy_A", ["A" * 20, "C" * 20, "D" * 20])
+    rebuilt = module.filter_processed_features(**kwargs)
+    assert rebuilt["per_chain"][0]["status"] == "written"
+    output_path = chain_npz_path(output, "toy_A")
+    with np.load(output_path) as data:
+        assert data["msa"].shape[0] == 2
+        arrays = dict(data)
+    arrays["residue_index"][0] = 99
+    np.savez(output_path, **arrays)
+    repaired = module.filter_processed_features(**kwargs)
+    assert repaired["per_chain"][0]["status"] == "written"
+    with np.load(output_path) as data:
+        assert data["residue_index"][0] == 0
+
+
+def test_filter_rejects_in_place_and_false_provenance(tmp_path: Path) -> None:
+    import pytest
+
+    module = _load_filter_processed_module()
+    manifest = tmp_path / "train.txt"
+    manifest.write_text("toy_A\n")
+    source = tmp_path / "source"
+    _write_feature(source, "toy_A", ["A" * 20, "C" * 20])
+    filter_path = tmp_path / "filter.json"
+    _write_filter(filter_path, ["C" * 20])
+    row_filter = module._load_msa_row_filter(filter_path)
+    path = chain_npz_path(source, "toy_A")
+    original = path.read_bytes()
+    with pytest.raises(ValueError, match="separate output"):
+        module.filter_processed_features(manifest_paths=[manifest], source_features_dirs=[source],
+                                         out_features_dir=source, row_filter=row_filter)
+    assert path.read_bytes() == original
+    with np.load(path) as data:
+        arrays = dict(data)
+    arrays["preprocess_config_sha256"] = np.asarray("a" * 64)
+    np.savez(path, **arrays)
+    with pytest.raises(ValueError, match="re-running preprocess"):
+        module.filter_processed_features(manifest_paths=[manifest], source_features_dirs=[source],
+                                         out_features_dir=tmp_path / "out", row_filter=row_filter)
+    assert not chain_npz_path(tmp_path / "out", "toy_A").exists()
+
+
+def test_processed_filter_refuses_to_choose_between_conflicting_variants(tmp_path: Path) -> None:
+    import pytest
+
+    module = _load_filter_processed_module()
+    manifest = tmp_path / "train.txt"
+    manifest.write_text("toy_A\n")
+    first, second, output = tmp_path / "first", tmp_path / "second", tmp_path / "out"
+    _write_feature(first, "toy_A", ["A" * 20, "C" * 20])
+    _write_feature(second, "toy_A", ["A" * 20, "D" * 20])
+    filter_path = tmp_path / "filter.json"
+    _write_filter(filter_path, ["C" * 20])
+    with pytest.raises(ValueError, match="different source feature variants"):
+        module.filter_processed_features(manifest_paths=[manifest], source_features_dirs=[first, second],
+                                         out_features_dir=output, row_filter=module._load_msa_row_filter(filter_path))
+    assert not chain_npz_path(output, "toy_A").exists()

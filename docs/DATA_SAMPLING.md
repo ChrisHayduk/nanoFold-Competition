@@ -21,6 +21,12 @@ Schema 2 preserves `cath_domains` with domain ID and all four identifiers. Repea
 
 Chain IDs follow OpenFold's author-chain namespace. Matching is case sensitive and does not truncate multi-character names. CATH's legacy chain `0` is ambiguous without an explicit crosswalk; unknown mappings remain unknown. mmCIF structural annotations use author/label crosswalks and polymer residue positions.
 
+PDB accession prefixes must be lowercase; author-chain case remains significant.
+The optional RCSB annotation path resolves author IDs through verified
+polymer-entity/label-asym crosswalks. Entry-level metadata alone does not count as
+chain annotation coverage. SCOPe small-protein and coiled-coil classes remain
+distinct audit labels, not inferred coil fractions.
+
 ## Eligible population and sampling unit
 
 The default candidate is a single chain with standard amino acids, a consistent sequence length of 40–256, and resolution at most 3 Å when known. Missing/nonpositive resolution is unknown rather than exceptional coordinate quality. Feature and processability exclusions must exist and are hashed. Metadata records the full eligible universe and any debugging sample limit; `cath-v2` refuses truncated metadata or permissive unknown-amino-acid filters. These gates describe the available source population, not a representative sample of all proteins.
@@ -35,6 +41,9 @@ Live MMseqs clustering requests actual alignment identity with `--alignment-mode
 
 The primary strata are complete unique CATH Architecture-label sets (including unknown), then length bin, then resolution bin. Hierarchical proportional apportionment avoids rounding every sparse Cartesian cell independently. Remainder ties use seeded hashes; equal quotas do not systematically favor lexically early labels. Capacity-aware allocation redistributes unavailable quotas proportionally and fails if total capacity is insufficient.
 
+Quota floors, remainders and saturation comparisons use integer arithmetic, so
+mathematically equal fractions remain tied regardless of floating-point rounding.
+
 The joint generator selects public validation, then train, before selecting hidden validation from the remainder. Public membership and order are independent of the hidden salt. The hidden-only generator takes an already fixed `cath-v2` public contract, excludes every connected component touching it, and matches the public distribution subject to remaining capacity. Both refuse existing sampling outputs. Per-file atomic writes and locks make completion auditable, but do not constitute a transaction across several directories.
 
 Reports include:
@@ -47,6 +56,13 @@ Reports include:
 Current safeguards limit JS divergence to 0.35 for each split with at least 100 examples, and unknown CATH fraction to 0.75. These are failure limits, not evidence that smaller discrepancies are scientifically harmless. Inspect rare-label depletion and coverage changes before adopting a release. The public lock describes public distributions; the complete reference/hidden quality report remains private.
 
 Generation requires both public and private source locks. The verifier checks all public manifest hashes/counts, cache and metadata identity, cluster assignments, policy and private input bindings. It reconstructs complete connected components, including unselected members that could bridge splits, and enforces one selected chain per component for `cath-v2`. Private processability exclusions are checked against locked bytes, canonical IDs and counts; every component touching an exclusion is unavailable to hidden selection. Use `--private-processability-exclusion-list` to relocate the same locked input. The verifier can audit a frozen source lock under that lock's recorded policy; it does not relabel that selection as `cath-v2`.
+
+For CATH-v2, verification also requires complete typed generation arguments and
+replays public and hidden selections, including representatives and ordering.
+Repinning hashes cannot make an inconsistent seed, size or selection pass this
+replay. An omitted private exclusion file is recorded explicitly as absent; a
+supplied path must exist. Verification reports cannot overwrite any audited
+input, including through symlink or hardlink aliases.
 
 ## Stage a new candidate
 
@@ -100,11 +116,23 @@ strict homology audits and candidate fingerprints remain required separately.
 
 A correct static split can still be sampled incorrectly during training. Checkpoints therefore bind the actual chain/weight population and preserve the epoch, consumed-batch cursor, loader generator and each rank's RNG. Resume replays the current epoch prefix before restoring model random state, preventing repeated exposure to epoch-zero examples after interruptions. Worker seeds are rank-specific; the distributed sampling plan stays shared. Unsupported checkpoints and changed sampling contracts fail explicitly. See [the API contract](API.md#training-sampling-and-multiple-gpus) for supported replay and its I/O cost.
 
+Unweighted distributed sampling drops incomplete shuffled tails instead of
+duplicating chains to fill ranks. Exposure counters are checked against steps,
+effective batch and crop bounds. MSA masks distinguish biological gaps from
+batch padding so differences in companion-chain depth do not alter MSA profiles
+or deletion averages.
+
 ## Before adopting a dataset
 
 A release needs complete raw-asset availability and successful preprocessing, with rejected cases analyzed across annotation, length and structural categories. Do not automatically resample after a hidden preprocessing failure or add hidden IDs to public exclusions. Preserve the failed attempt privately and create a deliberate new candidate version if eligibility must change.
 
-Run strict MSA audits for train→public validation and public-all→hidden, using separate held-out feature roots where needed. `--strict --run-mmseqs` searches held-out targets against both source targets and non-query MSA rows of at least 20 residues, and fails on either kind of hit. Both searches request actual alignment identity and validate numeric fields, known IDs, coverage and expected output; missing output cannot count as zero hits. A zero-hit result is limited to those heuristic searches. A filter digest proves filter identity, not absence of residual homology. Audit after filtering and before fingerprinting. Keep identifier-bearing reports private.
+Run strict MSA audits for train→public validation and public-all→hidden, using separate held-out feature roots where needed. `--strict --run-mmseqs` searches held-out targets against both source targets and non-query MSA rows of at least 20 residues, and fails on either kind of hit. Both searches request actual alignment identity and validate numeric fields, known IDs, coverage and expected output; missing output cannot count as zero hits. Target pairs use all-pair local alignment with prefiltering, masking and composition correction disabled and E-value limit `1e308`. Large MSA-row searches retain explicitly recorded heuristic settings. A zero-hit result is limited to those alignment/search contracts. A filter digest proves filter identity, not absence of residual homology. Audit after filtering and before fingerprinting. Keep identifier-bearing reports private.
+
+The row filter also removes canonical exact matches independently of MMseqs, so
+low-complexity masking cannot retain an identical held-out target. All supplied
+processed roots contribute their source variants. Audit-based filter extension
+requires the matching summary, ordered source-record digest and alignment-output
+hash; changed source content or ordering requires a fresh audit.
 
 Preprocessing changes also require a new asset/fingerprint version. Schema-3 files bind configuration, implementation and raw input bytes; changed provenance cannot be resumed into existing outputs. Their run metadata is mandatory during fingerprint creation, including when someone removes or downgrades it. Validation masks identity-mismatched labels, checks atom/token consistency and detects mixed feature/label pairs. Strict alignment mode still enforces the valid-CA minimum. Optional research templates require auditable polymer residue indices and sequence identity, so missing coordinates cannot shift template positions.
 

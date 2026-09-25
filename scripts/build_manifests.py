@@ -8,11 +8,18 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 from collections import Counter, defaultdict
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Dict, List
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from nanofold.structure_metadata import validate_author_chain_id
 
 """Create train/val/hidden manifests from an OpenFold/OpenProteinSet chain_data_cache.
 
@@ -598,7 +605,9 @@ def _build_candidates(
     secondary_source = "structure_metadata"
 
     for chain_id, meta_raw in sorted(data.items()):
-        if not re.fullmatch(r"[0-9A-Za-z]{4}_[^\s_]+", chain_id):
+        if sampling_policy == SAMPLING_POLICY:
+            validate_author_chain_id(chain_id)
+        elif not re.fullmatch(r"[0-9A-Za-z]{4}_[^\s_]+", chain_id):
             reject_reasons["invalid_chain_id"] += 1
             continue
         if chain_id not in structure_metadata_accepted:
@@ -761,19 +770,20 @@ def _apportion_counts(
         if not sum(active_weights.values()):
             active_weights = dict(available)
         total_weight = sum(active_weights.values())
-        exact = {key: remaining * active_weights[key] / total_weight for key in available}
-        saturated = [key for key in available if exact[key] >= available[key]]
+        numerators = {key: remaining * active_weights[key] for key in available}
+        saturated = [key for key in available if numerators[key] >= available[key] * total_weight]
         if saturated:
             for key in saturated:
                 allocation[key] += available[key]
                 remaining -= available.pop(key)
             continue
-        floors = {key: int(value) for key, value in exact.items()}
+        quotas = {key: divmod(value, total_weight) for key, value in numerators.items()}
+        floors = {key: quota[0] for key, quota in quotas.items()}
         for key, count in floors.items():
             allocation[key] += count
             remaining -= count
         ranked = sorted(available, key=lambda key: (
-            -(exact[key] - floors[key]), _stable_random_score(seed, salt, key), key,
+            -quotas[key][1], _stable_random_score(seed, salt, key), key,
         ))
         for key in ranked[:remaining]:
             allocation[key] += 1

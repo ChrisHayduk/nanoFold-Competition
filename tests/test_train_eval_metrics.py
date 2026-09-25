@@ -10,11 +10,14 @@ from eval import _load_feature_crop, _load_label_crop
 from nanofold.chain_paths import chain_npz_path
 from train import (
     WeightedDistributedSampler,
+    _append_scalar_output_metrics,
     _cfg_with_runtime,
     _epoch_aware_sampler,
     _scalar_output_metrics,
     _summarize_eval_metrics,
     _validate_train_sample_weights_opt_in,
+    batch_lddt_ca,
+    batch_rmsd_ca,
     masked_kabsch_rmsd,
 )
 
@@ -48,6 +51,46 @@ def test_summarize_eval_metrics_includes_rmsd_when_available() -> None:
         "val_rmsd_ca": 3.0,
         "val_rmsd_atom14": 7.0,
     }
+
+
+def test_public_eval_metrics_weight_each_valid_target_equally_across_unequal_batches() -> None:
+    true = torch.tensor([
+        [[0., 0., 0.], [1., 0., 0.], [0., 2., 0.], [0., 0., 3.]],
+    ]).repeat(3, 1, 1)
+    predicted = true.clone()
+    predicted[1] *= 3
+    predicted[2] *= 2
+    mask = torch.ones((3, 4), dtype=torch.bool)
+    mask[1, 2:] = False  # This target has no defined Kabsch RMSD.
+    residue_mask = torch.ones_like(mask)
+
+    def aggregate(slices):
+        scores, rmsds = [], []
+        for indices in slices:
+            args = (predicted[indices], true[indices], mask[indices], residue_mask[indices])
+            scores.append(batch_lddt_ca(*args))
+            rmsds.append(batch_rmsd_ca(*args))
+        return _summarize_eval_metrics(scores, [], rmsds)
+
+    individual = aggregate([slice(i, i + 1) for i in range(3)])
+    assert individual["val_rmsd_ca"] > 0
+    assert aggregate([slice(0, 2), slice(2, 3)]) == pytest.approx(individual)
+    assert aggregate([slice(0, 1), slice(1, 3)]) == pytest.approx(individual)
+
+
+def test_public_eval_scalar_outputs_weight_batch_means_by_target_count_and_keep_valid_items() -> None:
+    scalar_metrics = {}
+    _append_scalar_output_metrics(scalar_metrics, {
+        "loss_component": torch.tensor(2.0),
+        "per_target": torch.tensor([1.0, float("nan")]),
+    }, batch_size=2)
+    _append_scalar_output_metrics(scalar_metrics, {
+        "loss_component": torch.tensor(5.0), "per_target": torch.tensor([3.0]),
+    }, batch_size=1)
+    metrics = _summarize_eval_metrics([], [torch.tensor([2., 2.]), torch.tensor([5.])], scalar_metrics=scalar_metrics)
+    assert metrics["val_loss"] == pytest.approx(3.0)
+    assert metrics["val_loss_component"] == pytest.approx(3.0)
+    assert metrics["val_per_target"] == pytest.approx(2.0)
 
 
 def test_summarize_eval_metrics_includes_loss_components_and_foldscore_components() -> None:

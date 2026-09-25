@@ -23,6 +23,7 @@ from nanofold.structure_metadata import (
     domain_architecture_from_cath_class,
     domain_architecture_from_scop_sccs,
     secondary_fractions_from_mmcif_annotations,
+    validate_author_chain_id,
 )
 
 STANDARD_AAS = set("ARNDCQEGHILKMFPSTWYV")
@@ -142,9 +143,7 @@ def _candidate_rows(
     candidates: list[dict[str, Any]] = []
     reject_counts: Counter[str] = Counter()
     for chain_id, raw_meta in sorted(data.items()):
-        if not re.fullmatch(r"[0-9A-Za-z]{4}_[^\s_]+", chain_id):
-            reject_counts["invalid_chain_id"] += 1
-            continue
+        validate_author_chain_id(chain_id)
         if not isinstance(raw_meta, dict):
             reject_counts["bad_metadata"] += 1
             continue
@@ -292,17 +291,29 @@ def _load_rcsb_annotations(path: Path) -> tuple[dict[str, set[str]], dict[str, d
         if not isinstance(row, dict) or not isinstance(row.get("chain_id"), str):
             raise ValueError(f"Malformed RCSB record at {path.name}:{line_number}")
         chain_id = row["chain_id"]
+        validate_author_chain_id(chain_id)
         if chain_id in metadata:
             raise ValueError(f"Duplicate RCSB chain record: {chain_id}")
         entry = row.get("entry") if isinstance(row.get("entry"), dict) else {}
         entity = row.get("entity") if isinstance(row.get("entity"), dict) else {}
+        instance = row.get("instance")
+        identifiers = instance.get("rcsb_polymer_entity_instance_container_identifiers") if isinstance(instance, dict) else None
+        verified_chain = (
+            isinstance(identifiers, dict)
+            and identifiers.get("auth_asym_id") == _chain_name(chain_id)
+            and str(identifiers.get("entry_id", "")).lower() == _pdb_id(chain_id)
+            and bool(entity)
+            and not row.get("errors")
+        )
+        chain_entity = entity if verified_chain else {}
         metadata[chain_id] = {
             "experimental_method": _first_nested_value(entry, ("exptl", "method")),
-            "taxonomy_id": _first_nested_value(entity, ("rcsb_entity_source_organism", "ncbi_taxonomy_id")),
-            "source_organism": _first_nested_value(entity, ("rcsb_entity_source_organism", "scientific_name")),
+            "taxonomy_id": _first_nested_value(chain_entity, ("rcsb_entity_source_organism", "ncbi_taxonomy_id")),
+            "source_organism": _first_nested_value(chain_entity, ("rcsb_entity_source_organism", "scientific_name")),
             "errors": row.get("errors", []),
+            "chain_mapping_status": "verified_author_chain" if verified_chain else "unresolved",
         }
-        if entry or entity:
+        if verified_chain:
             _add_source_value(annotations, chain_id, "annotated")
     return annotations, metadata
 
@@ -436,6 +447,7 @@ def _load_feature_exclusions(path: Path) -> set[str]:
         line = raw_line.split("#", 1)[0].strip()
         if not line:
             continue
+        validate_author_chain_id(line)
         out.add(line)
     return out
 

@@ -53,6 +53,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from nanofold.a3m import GAP_ID, MASK_ID, RESTYPES, read_a3m, sequence_to_ids, ungap_query_columns
 from nanofold.chain_paths import chain_data_dir, chain_error_path, chain_id_from_stem, chain_npz_path
+from nanofold.data import read_manifest
 from nanofold.dataset_integrity import (
     preprocess_config_sha256,
     validate_feature_label_pair,
@@ -115,7 +116,10 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument(
         "--strict",
         action="store_true",
-        help="Require exact coordinate-sequence and MSA-query equality instead of masked projection.",
+        help=(
+            "Require exact coordinate-sequence and MSA-query equality. Projection uses deposited "
+            "polymer residue indices when available; ambiguous sequence alignments always fail."
+        ),
     )
     ap.add_argument("--min-projection-seq-identity", type=float, default=0.90)
     ap.add_argument("--min-projection-coverage", type=float, default=0.70)
@@ -314,10 +318,12 @@ def _global_alignment_pairs(query_seq: str, template_seq: str) -> List[Tuple[int
     if not query_seq or not template_seq:
         return []
 
-    try:
-        aln = _GLOBAL_ALIGNER.align(query_seq, template_seq)[0]
-    except Exception:
+    alignments = iter(_GLOBAL_ALIGNER.align(query_seq, template_seq))
+    aln = next(alignments, None)
+    if aln is None:
         return []
+    if next(alignments, None) is not None:
+        raise ValueError("Ambiguous sequence alignment: coordinate-to-query correspondence is not unique")
 
     q_segments, t_segments = aln.aligned
     pairs: List[Tuple[int, int]] = []
@@ -524,8 +530,11 @@ def _project_atom14_to_query(
     structure_seq: str,
     structure_atom14_positions: np.ndarray,
     structure_atom14_mask: np.ndarray,
+    *,
+    polymer_sequence: str | None = None,
+    polymer_residue_index: np.ndarray | None = None,
 ) -> Tuple[np.ndarray, np.ndarray, Dict[str, float]]:
-    """Map structure atom14 coordinates onto query positions via global sequence alignment.
+    """Map observed coordinates through deposited polymer positions onto the query.
 
     Projects labels only at identical residues. Mismatches remain fully masked
     because atom14 slots and side-chain geometry depend on residue identity. Returns
@@ -533,7 +542,28 @@ def _project_atom14_to_query(
     the Cα slot for projection identity, coverage, aligned fraction, and
     valid-Cα count diagnostics.
     """
-    pairs = _global_alignment_pairs(query_seq=query_seq, template_seq=structure_seq)
+    if polymer_sequence is not None:
+        if polymer_residue_index is None or polymer_residue_index.shape != (len(structure_seq),):
+            raise ValueError("Deposited polymer sequence requires one label_seq_id per observed residue")
+        indices = [int(index) for index in polymer_residue_index]
+        if any(index < 0 or index >= len(polymer_sequence) for index in indices):
+            raise ValueError("Observed label_seq_id lies outside the deposited polymer sequence")
+        if len(set(indices)) != len(indices):
+            raise ValueError("Ambiguous observed residues: duplicate polymer label_seq_id")
+        for index, letter in zip(indices, structure_seq, strict=True):
+            deposited_letter = polymer_sequence[index].upper()
+            if letter.upper() != deposited_letter and "X" not in (letter.upper(), deposited_letter):
+                raise ValueError("Observed residue identity disagrees with its deposited polymer position")
+        observed_by_polymer = {polymer: observed for observed, polymer in enumerate(indices)}
+        polymer_pairs = _global_alignment_pairs(query_seq=query_seq, template_seq=polymer_sequence)
+        pairs = [
+            (query, observed_by_polymer[polymer])
+            for query, polymer in polymer_pairs if polymer in observed_by_polymer
+        ]
+    else:
+        # Without a deposited sequence, unresolved repeats cannot be positioned
+        # from observed residues alone. Only an unambiguous alignment is usable.
+        pairs = _global_alignment_pairs(query_seq=query_seq, template_seq=structure_seq)
     if not pairs:
         raise ValueError("Could not align structure sequence to query sequence")
 
@@ -942,14 +972,18 @@ def main() -> None:
     mmcif_root = Path(args.mmcif_root)
     processed_features_dir = Path(args.processed_features_dir)
     processed_labels_dir = Path(args.processed_labels_dir)
+    feature_root, label_root = processed_features_dir.resolve(), processed_labels_dir.resolve()
+    if feature_root == label_root or feature_root in label_root.parents or label_root in feature_root.parents:
+        raise ValueError("Feature and label output directories must be separate and must not contain each other")
+    manifest = Path(args.manifest)
+    chain_ids = read_manifest(manifest)
+    if any(re.fullmatch(r"[A-Za-z0-9]{4}_[^\s/\\]+", cid) is None for cid in chain_ids):
+        raise ValueError("Preprocessing manifest requires PDB_chain IDs with a four-character PDB ID and nonempty chain")
     processed_features_dir.mkdir(parents=True, exist_ok=True)
     processed_labels_dir.mkdir(parents=True, exist_ok=True)
     msa_row_filter = _load_msa_row_filter(args.msa_row_filter)
 
     config_sha256 = _write_preprocess_meta(args, processed_features_dir, msa_row_filter)
-
-    manifest = Path(args.manifest)
-    chain_ids = [ln.strip() for ln in manifest.read_text().splitlines() if ln.strip() and not ln.startswith("#")]
 
     n_ok = 0
     n_fail = 0
@@ -1012,32 +1046,18 @@ def main() -> None:
                 require_full_match=args.strict,
             )
 
-            if args.strict:
-                if len(chain_struct.sequence) != msa.shape[1]:
-                    raise ValueError(
-                        f"Length mismatch for {cid}: msa L={msa.shape[1]} vs structure L={len(chain_struct.sequence)}"
-                    )
-                target_seq = chain_struct.sequence
-                target_atom14_positions = chain_struct.atom14_positions.astype(np.float32, copy=False)
-                target_atom14_mask = chain_struct.atom14_mask > 0.5
-                target_ca_coords = target_atom14_positions[:, CA_ATOM14_SLOT, :]
-                target_ca_mask = target_atom14_mask[:, CA_ATOM14_SLOT]
-                projection_stats = {
-                    "projection_seq_identity": 1.0,
-                    "projection_alignment_coverage": 1.0,
-                    "projection_aligned_fraction": 1.0,
-                    "projection_valid_ca_count": float(int(target_ca_mask.sum())),
-                }
-            else:
-                target_seq = query_sequence
-                target_atom14_positions, target_atom14_mask, projection_stats = _project_atom14_to_query(
-                    query_seq=query_sequence,
-                    structure_seq=chain_struct.sequence,
-                    structure_atom14_positions=chain_struct.atom14_positions,
-                    structure_atom14_mask=chain_struct.atom14_mask,
-                )
-                target_ca_coords = target_atom14_positions[:, CA_ATOM14_SLOT, :]
-                target_ca_mask = target_atom14_mask[:, CA_ATOM14_SLOT]
+            target_seq = query_sequence
+            target_atom14_positions, target_atom14_mask, projection_stats = _project_atom14_to_query(
+                query_seq=query_sequence,
+                structure_seq=chain_struct.sequence,
+                structure_atom14_positions=chain_struct.atom14_positions,
+                structure_atom14_mask=chain_struct.atom14_mask,
+                polymer_sequence=chain_struct.polymer_sequence,
+                polymer_residue_index=chain_struct.polymer_residue_index,
+            )
+            target_ca_coords = target_atom14_positions[:, CA_ATOM14_SLOT, :]
+            target_ca_mask = target_atom14_mask[:, CA_ATOM14_SLOT]
+            if not args.strict:
                 if projection_stats["projection_seq_identity"] < float(args.min_projection_seq_identity):
                     raise ValueError(f"Projection seq identity below threshold for {cid}: {projection_stats}")
                 if projection_stats["projection_alignment_coverage"] < float(args.min_projection_coverage):

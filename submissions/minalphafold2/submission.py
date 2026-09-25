@@ -318,6 +318,13 @@ def _build_minalphafold_inputs(
     msa = batch["msa"].detach().cpu().long()
     deletions = batch["deletions"].detach().cpu().long()
     residue_mask = batch["residue_mask"].detach().cpu().float()
+    msa_mask = batch.get("msa_mask")
+    if msa_mask is None:
+        msa_mask = residue_mask[:, None, :].bool().expand_as(msa)
+    else:
+        msa_mask = msa_mask.detach().cpu()
+        if msa_mask.dtype != torch.bool or msa_mask.shape != msa.shape:
+            raise ValueError("msa_mask must be a boolean tensor with the same shape as msa.")
     between_segment_residues = batch.get("between_segment_residues")
     if between_segment_residues is not None:
         between_segment_residues = between_segment_residues.detach().cpu().long()
@@ -342,16 +349,26 @@ def _build_minalphafold_inputs(
     else:
         residue_index = residue_index.detach().cpu().long()
 
-    msa_features = [
-        _build_single_msa_features(
-            msa=msa[i],
-            deletions=deletions[i],
+    msa_features = []
+    for i in range(batch_size):
+        real_length = int(residue_mask[i].sum().item())
+        real_columns = torch.arange(length) < real_length
+        real_rows = msa_mask[i].any(dim=-1)
+        if (
+            real_length == 0 or not bool(real_rows[0])
+            or not torch.equal(residue_mask[i].bool(), real_columns)
+            or not torch.equal(msa_mask[i], real_rows[:, None] & real_columns[None, :])
+        ):
+            raise ValueError("MSA padding must contain complete biological rows and a nonempty residue prefix.")
+        # Feature construction computes profiles and samples rows. Strip batch
+        # padding first so companions cannot change a protein's biological MSA.
+        msa_features.append(_build_single_msa_features(
+            msa=msa[i, real_rows, :real_length],
+            deletions=deletions[i, real_rows, :real_length],
             msa_depth=msa_depth,
             extra_msa_depth=extra_msa_depth,
             training=training,
-        )
-        for i in range(batch_size)
-    ]
+        ))
     max_cluster = max(item["msa_feat"].shape[0] for item in msa_features)
     max_extra = max(item["extra_msa_feat"].shape[0] for item in msa_features)
 

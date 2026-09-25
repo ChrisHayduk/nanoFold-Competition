@@ -8,7 +8,9 @@ from .a3m import GAP_ID, MSA_ALPHABET_SIZE, SEQ_ALPHABET_SIZE, UNK_ID
 from .metrics import lddt_ca
 
 
-def msa_profile(msa_tokens: torch.Tensor, residue_mask: torch.Tensor) -> torch.Tensor:
+def msa_profile(
+    msa_tokens: torch.Tensor, residue_mask: torch.Tensor, msa_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
     """Compute a simple MSA profile: per-position AA frequencies.
 
     msa_tokens: (B, N, L) int
@@ -21,6 +23,8 @@ def msa_profile(msa_tokens: torch.Tensor, residue_mask: torch.Tensor) -> torch.T
 
     # Ignore padding positions (residue_mask False) by setting everything to GAP.
     tokens = torch.where(residue_mask[:, None, :], tokens, torch.full_like(tokens, GAP_ID))
+    if msa_mask is not None:
+        tokens = torch.where(msa_mask, tokens, torch.full_like(tokens, GAP_ID))
 
     # Mask gaps
     is_gap = tokens == GAP_ID
@@ -79,6 +83,7 @@ class NanoFoldBaseline(nn.Module):
         msa: torch.Tensor,
         deletions: torch.Tensor,
         residue_mask: torch.Tensor,
+        msa_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # aatype: (B,L), msa/deletions: (B,N,L)
         B, L = aatype.shape
@@ -88,10 +93,12 @@ class NanoFoldBaseline(nn.Module):
         pos_idx = torch.arange(L, device=aatype.device, dtype=torch.long)[None, :].expand(B, L)
         x = self.aa_embed(aatype.clamp(min=0, max=SEQ_ALPHABET_SIZE - 1)) + self.pos_embed(pos_idx)  # (B,L,d)
 
-        prof = msa_profile(msa, residue_mask=residue_mask)  # (B,L,21)
+        prof = msa_profile(msa, residue_mask=residue_mask, msa_mask=msa_mask)  # (B,L,21)
         x = x + self.prof_proj(prof)
 
-        del_feat = torch.log1p(deletions.float()).mean(dim=1)  # (B,L)
+        valid_msa = residue_mask[:, None, :].expand_as(msa) if msa_mask is None else msa_mask
+        del_values = torch.where(valid_msa, torch.log1p(deletions.float()), 0.0)
+        del_feat = del_values.sum(dim=1) / valid_msa.sum(dim=1).clamp(min=1)  # (B,L)
         del_feat = torch.where(residue_mask, del_feat, torch.zeros_like(del_feat))
         x = x + self.del_proj(del_feat.unsqueeze(-1))
 

@@ -71,6 +71,8 @@ class ChainAtoms:
     # Zero-based positions in the deposited polymer sequence, not the compact
     # observed-coordinate sequence. -1 means mmCIF did not supply label_seq_id.
     polymer_residue_index: np.ndarray
+    # Complete deposited entity sequence, including residues without coordinates.
+    polymer_sequence: str | None
     resolution: float
     resolved_author_chain_id: str
     chain_mapping_method: str
@@ -222,6 +224,21 @@ def extract_chain_atoms(
     atom14_positions_list: List[np.ndarray] = []
     atom14_mask_list: List[np.ndarray] = []
     polymer_residue_indices: List[int] = []
+    selected_subchains = {
+        res.subchain for res in chain
+        if res.entity_type == gemmi.EntityType.Polymer
+        and (label_chain_id is None or res.subchain == label_chain_id)
+    }
+    if len(selected_subchains) > 1:
+        raise ValueError(f"Author chain '{chain.name}' contains multiple polymer label chains")
+    entity = (
+        st.get_entity_of(chain.get_subchain(next(iter(selected_subchains))))
+        if selected_subchains else None
+    )
+    polymer_sequence = (
+        "".join(one_letter_from_resname(name) for name in entity.full_sequence)
+        if entity is not None and entity.full_sequence else None
+    )
 
     for res in chain:
         # Keep only polymer residues. Filtering on het_flag would also drop
@@ -234,6 +251,8 @@ def extract_chain_atoms(
         residue_name_3 = res.name.upper()
         one_letter = one_letter_from_resname(residue_name_3)
         sequence_letters.append(one_letter)
+        if res.label_seq is not None and res.label_seq < 1:
+            raise ValueError("Polymer label_seq_id must be positive")
         polymer_residue_indices.append(res.label_seq - 1 if res.label_seq is not None else -1)
 
         positions, mask = _collect_atom14(res, residue_name_3)
@@ -242,6 +261,9 @@ def extract_chain_atoms(
 
     if not atom14_positions_list:
         raise ValueError(f"No polymer residues found for {pdb_id}_{chain_id} in {mmcif_path}")
+    known_polymer_indices = [index for index in polymer_residue_indices if index >= 0]
+    if len(set(known_polymer_indices)) != len(known_polymer_indices):
+        raise ValueError("Ambiguous observed residues: duplicate polymer label_seq_id")
 
     sequence = "".join(sequence_letters)
 
@@ -274,6 +296,7 @@ def extract_chain_atoms(
         atom14_positions=atom14_positions,
         atom14_mask=atom14_mask,
         polymer_residue_index=np.asarray(polymer_residue_indices, dtype=np.int32),
+        polymer_sequence=polymer_sequence,
         resolution=resolution,
         resolved_author_chain_id=chain.name,
         chain_mapping_method=chain_mapping_method,

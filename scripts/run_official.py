@@ -85,6 +85,10 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--hidden-fingerprint", type=str, default="", help="Hidden fingerprint JSON path override.")
     ap.add_argument("--skip-train", action="store_true", help="Skip train.py stage and reuse existing checkpoints.")
     ap.add_argument(
+        "--predict-hidden-only", action="store_true",
+        help="Reuse completed public training/evaluation and only write hidden predictions in a separate features-only runtime.",
+    )
+    ap.add_argument(
         "--skip-hidden-scoring",
         action="store_true",
         help="Run hidden prediction only; do not score or finalize the result artifact.",
@@ -144,6 +148,7 @@ def _build_predict_command(
     fingerprint: Path | None = None,
     hidden_manifest: Path | None = None,
     forbid_labels_dir: Path | None = None,
+    submission_root: Path | None = None,
 ) -> List[str]:
     cmd = [
         python,
@@ -167,6 +172,8 @@ def _build_predict_command(
         cmd.extend(["--hidden-manifest", str(hidden_manifest)])
     if forbid_labels_dir is not None:
         cmd.extend(["--forbid-labels-dir", str(forbid_labels_dir)])
+    if submission_root is not None:
+        cmd.extend(["--submission-root", str(submission_root)])
     if ckpt is not None:
         cmd.extend(["--ckpt", str(ckpt)])
     if ckpt_dir is not None:
@@ -184,8 +191,15 @@ def _build_score_command(
     labels_dir: Path,
     per_chain_out: Path,
     save_path: Path,
+    track_id: str = "",
+    split: str = "",
+    manifest: Path | None = None,
+    pred_out_dir: Path | None = None,
+    checkpoint_steps: str = "",
+    config_path: Path | None = None,
+    fingerprint: Path | None = None,
 ) -> List[str]:
-    return [
+    cmd = [
         python,
         "score.py",
         "--prediction-summary",
@@ -199,6 +213,19 @@ def _build_score_command(
         "--save",
         str(save_path),
     ]
+    if track_id:
+        if manifest is None or pred_out_dir is None or not split or not checkpoint_steps:
+            raise ValueError("Official scoring requires the complete trusted scoring contract.")
+        cmd.extend([
+            "--official", "--track", track_id, "--split", split,
+            "--manifest", str(manifest), "--pred-out-dir", str(pred_out_dir),
+            "--checkpoint-steps", checkpoint_steps,
+        ])
+        if config_path is not None:
+            cmd.extend(["--config", str(config_path)])
+        if fingerprint is not None:
+            cmd.extend(["--fingerprint", str(fingerprint)])
+    return cmd
 
 
 def _resolve_commit(explicit: str) -> str:
@@ -309,6 +336,15 @@ def _validate_hidden_lock(
     raw = _read_json(lock_path)
     if not isinstance(raw, dict):
         raise ValueError(f"Hidden lock file must contain a JSON object: {lock_path}")
+    chain_ids = read_manifest(hidden_manifest)
+    if len(chain_ids) != len(set(chain_ids)):
+        raise ValueError("Hidden manifest contains duplicate chains.")
+    if raw.get("track") != track_spec.track_id:
+        raise ValueError("Hidden lock track does not match the requested track.")
+    if type(raw.get("hidden_chain_count")) is not int or raw["hidden_chain_count"] != len(chain_ids):
+        raise ValueError("Hidden lock count does not match the hidden manifest.")
+    if track_spec.hidden_chain_count is not None and len(chain_ids) != track_spec.hidden_chain_count:
+        raise ValueError("Hidden manifest count does not match the requested track.")
 
     expected = {
         "hidden_manifest_sha256": raw.get("hidden_manifest_sha256"),
@@ -447,20 +483,17 @@ def _score_hidden_predictions(
                 crop_size=crop_size,
             )
 
-            L = min(pred_atom14.shape[0], true_atom14.shape[0], atom14_mask.shape[0])
-            if L <= 0:
-                metrics = {name: float("nan") for name in FOLDSCORE_COMPONENT_NAMES}
-            else:
-                comps = foldscore_components(
-                    pred_atom14=torch.from_numpy(pred_atom14[:L]),
-                    true_atom14=torch.from_numpy(true_atom14[:L]),
-                    atom14_mask=torch.from_numpy(atom14_mask[:L]),
-                    aatype=torch.from_numpy(aatype[:L]),
-                )
-                metrics = {name: float(value.detach().cpu()) for name, value in comps.items()}
+            comps = foldscore_components(
+                pred_atom14=torch.from_numpy(pred_atom14),
+                true_atom14=torch.from_numpy(true_atom14),
+                atom14_mask=torch.from_numpy(atom14_mask),
+                aatype=torch.from_numpy(aatype),
+            )
+            metrics = {name: float(value.detach().cpu()) for name, value in comps.items()}
             for name, value in metrics.items():
-                if not np.isnan(value):
-                    score_lists[name].append(float(value))
+                if not np.isfinite(value):
+                    raise ValueError(f"Nonfinite hidden {name}; refusing an incomplete mean.")
+                score_lists[name].append(float(value))
             per_chain_rows.append(
                 {
                     "split": "hidden_val",
@@ -594,6 +627,8 @@ def main() -> None:
     args = parse_args()
     if args.skip_hidden_scoring and args.score_hidden_only:
         raise ValueError("`--skip-hidden-scoring` and `--score-hidden-only` are mutually exclusive.")
+    if args.predict_hidden_only and (args.score_hidden_only or args.disable_hidden or not args.skip_hidden_scoring):
+        raise ValueError("`--predict-hidden-only` requires `--skip-hidden-scoring` and cannot score or disable hidden evaluation.")
     _require_sealed_hidden_runtime(disable_hidden=bool(args.disable_hidden))
     submission_dir = Path(args.submission).resolve()
     if not submission_dir.exists():
@@ -609,15 +644,24 @@ def main() -> None:
     run_name = str(cfg.get("run_name", "")).strip()
     if not run_name:
         raise ValueError("Config must define a non-empty `run_name`.")
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", run_name) is None:
+        raise ValueError("Official run_name must be a single safe directory name.")
 
     track_spec = load_track_spec(args.track)
+    if track_spec.official and not args.disable_hidden:
+        checkpoint_tokens = _parse_checkpoint_steps(args.checkpoint_steps)
+        requested_steps = tuple(track_spec.max_steps if token == "last" else int(token) for token in checkpoint_tokens)
+        if requested_steps != track_spec.hidden_checkpoint_steps:
+            raise ValueError("Official hidden runs require the fixed competition checkpoint milestones.")
     commit = _resolve_commit(args.commit)
     data_cfg = cfg.get("data", {}) if isinstance(cfg.get("data"), dict) else {}
-    train_manifest_path = Path(str(data_cfg.get("train_manifest", track_spec.train_manifest))).resolve()
-    val_manifest_path = Path(str(data_cfg.get("val_manifest", track_spec.val_manifest))).resolve()
+    train_manifest_path = Path(track_spec.train_manifest).resolve()
+    val_manifest_path = Path(track_spec.val_manifest).resolve()
     all_manifest_path = Path(str(track_spec.all_manifest)).resolve() if track_spec.all_manifest else None
 
     run_dir = Path("runs") / run_name
+    if not run_dir.resolve().is_relative_to(Path("runs").resolve()) or run_dir.is_symlink():
+        raise ValueError("Official run directory must not escape runs through a symlink.")
     run_dir.mkdir(parents=True, exist_ok=True)
     public_predict_summary_path = run_dir / "predict_val.json"
     eval_public_summary_path = run_dir / "eval_val.json"
@@ -628,12 +672,12 @@ def main() -> None:
     ckpt_last_path = ckpt_dir / "ckpt_last.pt"
     hidden_predict_summary_path = run_dir / "predict_hidden.json"
     hidden_eval_summary_path = run_dir / "eval_hidden.json"
-    hidden_eval_cfg_path = (config_path.parent / f".{run_name}_hidden_predict_config.yaml").resolve()
+    hidden_eval_cfg_path = (run_dir / "hidden_predict_config.yaml").resolve()
     hidden_pred_dir = run_dir / "hidden_predictions"
     forbid_labels_dir = run_dir / "_forbidden_eval_labels_mount"
     forbid_labels_dir.mkdir(parents=True, exist_ok=True)
 
-    if not args.score_hidden_only:
+    if not args.score_hidden_only and not args.predict_hidden_only:
         _run(
             [
                 args.python,
@@ -664,17 +708,6 @@ def main() -> None:
         if not ckpt_last_path.exists():
             raise FileNotFoundError(f"Missing checkpoint after training: {ckpt_last_path}")
 
-        score_labels_dir = str(data_cfg.get("processed_labels_dir", "")).strip()
-        score_features_dir = str(data_cfg.get("processed_features_dir", "")).strip()
-        if not score_features_dir:
-            raise ValueError(
-                "Config data.processed_features_dir is required for public validation scoring in the official runner."
-            )
-        if not score_labels_dir:
-            raise ValueError(
-                "Config data.processed_labels_dir is required for public validation scoring in the official runner."
-            )
-
         _run(
             _build_predict_command(
                 python=args.python,
@@ -689,6 +722,12 @@ def main() -> None:
             ),
             env=_scrub_hidden_env(stage="predict"),
         )
+
+    if not args.predict_hidden_only:
+        score_labels_dir = str(data_cfg.get("processed_labels_dir", "")).strip()
+        score_features_dir = str(data_cfg.get("processed_features_dir", "")).strip()
+        if not score_features_dir or not score_labels_dir:
+            raise ValueError("Official public scoring requires feature and label directories in the trusted config.")
         _run(
             _build_score_command(
                 python=args.python,
@@ -697,6 +736,12 @@ def main() -> None:
                 labels_dir=Path(score_labels_dir).resolve(),
                 per_chain_out=per_chain_public_path,
                 save_path=eval_public_summary_path,
+                track_id=track_spec.track_id,
+                split="val",
+                manifest=val_manifest_path,
+                pred_out_dir=public_pred_dir,
+                checkpoint_steps="last",
+                config_path=config_path,
             ),
             env=_scrub_hidden_env(stage="score"),
         )
@@ -776,6 +821,7 @@ def main() -> None:
                     fingerprint=hidden_fingerprint,
                     hidden_manifest=hidden_manifest,
                     forbid_labels_dir=forbid_labels_dir,
+                    submission_root=submission_dir,
                 ),
                 env=_scrub_hidden_env(stage="predict"),
             )
@@ -817,6 +863,13 @@ def main() -> None:
                 labels_dir=hidden_labels_dir,
                 per_chain_out=hidden_per_chain_path,
                 save_path=hidden_eval_summary_path,
+                track_id=track_spec.track_id,
+                split="hidden_val",
+                manifest=hidden_manifest,
+                pred_out_dir=hidden_pred_dir,
+                checkpoint_steps=args.checkpoint_steps,
+                config_path=config_path,
+                fingerprint=hidden_fingerprint,
             ),
             env=_scrub_hidden_env(stage="score"),
         )

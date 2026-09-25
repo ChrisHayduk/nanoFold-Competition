@@ -26,7 +26,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from nanofold.a3m import GAP_ID, MASK_ID, RESTYPES, read_a3m, ungap_query_columns
 from nanofold.chain_paths import chain_data_dir, chain_npz_path
-from nanofold.mmseqs import iter_mmseqs_hits, validate_search_parameters
+from nanofold.mmseqs import canonical_target_sequence, iter_mmseqs_hits, load_msa_for_audit, validate_search_parameters
 
 MSA_TOKEN_TO_AA = {idx: aa for idx, aa in enumerate(RESTYPES)}
 MSA_TOKEN_TO_AA[20] = "X"
@@ -55,7 +55,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Optional processed feature directory to scan instead of raw A3M files. "
-            "Repeat when public and hidden features live in separate roots. "
+            "Repeat to scan the union of all matching source feature variants across roots. "
             "Use raw A3Ms for official regeneration; processed features are useful for audits."
         ),
     )
@@ -99,7 +99,7 @@ def _sequence_sha256(sequence: str) -> str:
 
 
 def _read_manifest(path: Path) -> list[str]:
-    return [line.strip() for line in path.read_text().splitlines() if line.strip() and not line.startswith("#")]
+    return [line.strip() for line in path.read_text().splitlines() if line.strip() and not line.lstrip().startswith("#")]
 
 
 def _manifest_record(path: Path) -> dict[str, Any]:
@@ -124,7 +124,7 @@ def _chain_sequence(cache: dict[str, Any], chain_id: str) -> str:
     for key in ("sequence", "seq", "seqres", "aatype_sequence"):
         value = raw.get(key)
         if isinstance(value, str) and value.strip():
-            return value.strip().upper()
+            return canonical_target_sequence(value)
     raise KeyError(f"Missing sequence in chain_data_cache for {chain_id}")
 
 
@@ -171,27 +171,28 @@ def _scan_processed_msa_rows(
     features_dirs: Sequence[Path],
 ) -> tuple[dict[str, str], dict[str, int]]:
     sequences_by_hash: dict[str, str] = {}
-    stats = {"chains": 0, "missing_features": 0, "rows": 0, "non_query_rows": 0}
+    stats = {"chains": 0, "feature_variants": 0, "missing_features": 0, "rows": 0, "non_query_rows": 0}
+    seen_chains: set[str] = set()
     for manifest_path in manifest_paths:
         for chain_id in _read_manifest(manifest_path):
-            feature_path = next(
-                (
-                    chain_npz_path(features_dir, chain_id)
-                    for features_dir in features_dirs
-                    if chain_npz_path(features_dir, chain_id).exists()
-                ),
-                None,
-            )
-            if feature_path is None:
+            if chain_id in seen_chains:
+                continue
+            seen_chains.add(chain_id)
+            feature_paths = list(dict.fromkeys(
+                chain_npz_path(features_dir, chain_id).resolve()
+                for features_dir in features_dirs if chain_npz_path(features_dir, chain_id).exists()
+            ))
+            if not feature_paths:
                 stats["missing_features"] += 1
                 continue
-            with np.load(feature_path) as data:
-                msa = np.asarray(data["msa"])
             stats["chains"] += 1
-            stats["rows"] += int(msa.shape[0])
-            for row in msa[1:]:
-                stats["non_query_rows"] += 1
-                _add_sequence(sequences_by_hash, _msa_row_to_ungapped_sequence(row))
+            for feature_path in feature_paths:
+                msa = load_msa_for_audit(feature_path, chain_id=chain_id)
+                stats["feature_variants"] += 1
+                stats["rows"] += int(msa.shape[0])
+                for row in msa[1:]:
+                    stats["non_query_rows"] += 1
+                    _add_sequence(sequences_by_hash, _msa_row_to_ungapped_sequence(row))
     stats["unique_non_query_rows"] = len(sequences_by_hash)
     return sequences_by_hash, stats
 
@@ -212,6 +213,7 @@ def _scan_raw_msa_rows(
             for msa_name in msa_names:
                 msa_path = _find_msa_path(chain_dir, msa_name)
                 if msa_path is None:
+                    stats["missing_msa_files"] += 1
                     continue
                 loaded = True
                 a3m = read_a3m(msa_path)
@@ -228,8 +230,6 @@ def _scan_raw_msa_rows(
                     _add_sequence(sequences_by_hash, _msa_row_to_ungapped_sequence(row))
             if loaded:
                 stats["chains"] += 1
-            else:
-                stats["missing_msa_files"] += 1
     stats["unique_non_query_rows"] = len(sequences_by_hash)
     return sequences_by_hash, stats
 
@@ -292,6 +292,12 @@ def _run_mmseqs(
         "3",
         "--seq-id-mode",
         "0",
+        "--search-type", "1",
+        "--prefilter-mode", "0",
+        "-e", "0.001",
+        "-s", "5.7",
+        "--mask", "1",
+        "--comp-bias-corr", "1",
         "--threads",
         str(threads),
         "--max-seqs",
@@ -392,6 +398,15 @@ def main() -> None:
             source_hashes=set(sequences_by_hash), min_seq_id=args.min_seq_id, coverage=args.coverage,
         )
 
+    # Composition masking and unknown residues can hide even identical rows from
+    # MMseqs. Exact filtering must be independent of heuristic search sensitivity.
+    heldout_hashes = {
+        _sequence_sha256(_chain_sequence(cache, chain_id))
+        for manifest in heldout_manifests for chain_id in _read_manifest(manifest)
+    }
+    exact_excluded = set(sequences_by_hash) & heldout_hashes
+    excluded.update(exact_excluded)
+
     payload = {
         "schema_version": 1,
         "filter_type": "heldout_target_homology",
@@ -407,6 +422,8 @@ def main() -> None:
             "version": _mmseqs_version(args.mmseqs_bin),
             "command": cmd,
             "max_seqs": int(args.max_seqs),
+            "search_parameters": {"prefilter_mode": 0, "evalue": 0.001, "sensitivity": 5.7,
+                                  "mask": 1, "comp_bias_corr": 1, "search_type": 1},
             "hit_count": hit_count,
         },
         "source": {
@@ -426,6 +443,7 @@ def main() -> None:
             "path": str(args.chain_data_cache),
             "sha256": _sha256_file(args.chain_data_cache),
         },
+        "exact_match_excluded_sequence_count": len(exact_excluded),
         "excluded_sequence_count": len(excluded),
         "excluded_sequence_sha256": sorted(excluded),
     }

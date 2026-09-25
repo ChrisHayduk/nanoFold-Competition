@@ -206,9 +206,13 @@ training versus public validation and on all public targets versus hidden
 validation before fingerprinting. Strict mode rejects missing features,
 duplicate targets, chain/PDB overlap, exact target-sequence leakage, and detected
 residual MMseqs hits. Cluster checks require a complete `--cluster-tsv`; absent
-cluster assignments are not interpreted as proof of separation. MMseqs searches
-are heuristic and cover both source targets and non-query rows of at least 20 residues. A zero-hit
-audit does not prove absence of all sequence homology or all pairwise leakage.
+cluster assignments are not interpreted as proof of separation. Target searches
+align all source/held-out pairs with prefiltering and masking disabled and a
+permissive E-value limit. Searches over non-query MSA rows of at least 20 residues
+remain heuristic. Reports record these modes separately. Neither constitutes
+proof of absence under every possible alignment or of all biological homology.
+Exact held-out sequence matches are also removed independently of MMseqs,
+including low-complexity sequences that its masking can suppress.
 
 Standalone audits remain descriptive unless `--strict` is supplied. They also
 report MSA-depth distributions, exact background-row overlap, and optional raw
@@ -255,8 +259,9 @@ output root must retain matching run provenance. Resume cannot overwrite that
 provenance to describe outputs made under another configuration.
 
 Filtering existing processed MSAs with `scripts/filter_processed_msa_features.py`
-produces distinct preprocessing metadata and fingerprints. It cannot recover
-rows discarded by an earlier depth cap. For newly prepared data, filter raw MSA
+is limited to research assets without paired schema-3 provenance, writes a new
+root, and binds reuse to source bytes. Schema-3 pairs require fresh preprocessing.
+Filtering cannot recover rows discarded by an earlier depth cap. Filter raw MSA
 rows during preprocessing and audit the final features. If a residual MMseqs
 search finds hits, the extension/filtering tools can remove those rows before a
 new audit; the resulting zero-hit claim remains specific to that search.
@@ -288,6 +293,13 @@ explicitly enabled training study and must be identified as such; it still
 uses only the fixed training manifest and the same sample budget. See the
 [training API](API.md#training-sampling-and-multiple-gpus) for configuration.
 
+Unweighted distributed epochs drop shuffled tails that cannot fill ranks and
+local batches, instead of repeating chains. The checkpoint contract records the
+omitted population. MSA row/residue padding has an explicit `msa_mask`; models
+must respect it when calculating profiles or deletion statistics. Public
+validation diagnostics weight targets equally across unequal batches, with
+undefined RMSDs excluded individually.
+
 Track budget constants:
 
 | Track | Seed | Crop size | MSA depth | Effective batch | Max steps | Sample budget | Residue budget | Parameter cap |
@@ -305,6 +317,8 @@ Runtime reproducibility:
 - Resume replays the consumed loader prefix before restoring model RNG, preserving sampling across interruptions under the same loader configuration.
 - Changed data bytes, sampling weights, worker/batch settings, world size or device type fail resume checks. Older checkpoints missing sampling state require a fresh training run and remain usable for prediction/scoring.
 - Atomic checkpoint replacement preserves the previous checkpoint on write failure. Every rank receives save failures; resume validates all rank RNG states and required AMP scaler/scheduler state before changing history.
+- Exposure counters must be exact nonnegative integers consistent with the step,
+  effective batch, crop bounds and counter aliases before resume changes history.
 
 See the [training sampling contract](API.md#training-sampling-and-multiple-gpus) for replay costs and limits. These checks do not establish bitwise CUDA reproducibility across environments.
 
@@ -339,6 +353,13 @@ Secondary metrics:
 - `gdt_ts_ca`, `lddt_ca`, and `lddt_backbone_atom14` diagnostics
 - public val score is retained for diagnostics only
 
+Official scoring requires exact prediction lengths and finite coordinates and
+metrics; malformed targets fail the run rather than disappearing from an
+average. The maintainer fixes the manifest, split, prediction root, crop,
+milestones and exposure counts independently of submission-writable prediction
+metadata. Official AUC tracks use the documented checkpoint schedule; choosing
+different checkpoints changes the evaluation and is rejected.
+
 Canonical result artifact:
 - `runs/<run_name>/result.json`
 
@@ -368,6 +389,21 @@ Hidden manifests, hidden NPZ directories, hidden fingerprints, hidden source loc
 Hidden official runs are split into:
 - prediction stage: hidden features mounted, labels absent
 - scoring stage: saved predictions + hidden labels, no submission hooks
+
+The Docker wrapper builds a selected set of tracked source files from a trusted
+checkout and pins the image ID across three separate containers: public training
+and validation, hidden prediction, and fresh scoring. It never mounts the host
+repository. Scoring receives read-only run inputs with separate output-file
+mounts; only that stage can update the leaderboard. Submission configs stay
+inside the submission directory. Host asset relocation uses the wrapper's
+documented environment variables; stage, Python and scoring-path overrides are
+rejected. Direct local Python execution assumes trusted maintainer code and is
+not an isolation boundary.
+
+Mounted processed roots are limited to manifest-selected NPZs and known feature
+sidecars (`preprocess_meta.json`, `msa_row_filter_audit.json`). Extra files,
+subdirectories and links fail before execution. The image includes its required
+public source lock and excludes vendor example structures and research assets.
 
 Official orchestration entrypoints:
 - `predict.py` for prediction only

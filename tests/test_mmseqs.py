@@ -39,3 +39,44 @@ def test_missing_search_output_is_not_an_empty_result(tmp_path: Path) -> None:
 def test_invalid_search_parameters_are_rejected(identity: float, coverage: float, threads: int, max_seqs: int) -> None:
     with pytest.raises(ValueError):
         validate_search_parameters(min_seq_id=identity, coverage=coverage, threads=threads, max_seqs=max_seqs)
+
+
+@pytest.mark.parametrize("corruption", ["missing_query", "masked_query", "masked_hit", "gapped_query", "float_hit", "wrong_chain", "negative_deletions"])
+def test_audit_rejects_semantically_invalid_processed_sequences(tmp_path: Path, corruption: str) -> None:
+    import numpy as np
+
+    from nanofold.mmseqs import load_msa_for_audit
+
+    arrays = {
+        "aatype": np.array([0, 1, 2], dtype=np.int32),
+        "msa": np.array([[0, 1, 2], [3, 4, 5]], dtype=np.int32),
+        "deletions": np.zeros((2, 3), dtype=np.int32),
+        "chain_id": np.asarray("toy_A"),
+    }
+    if corruption == "missing_query":
+        del arrays["aatype"]
+    elif corruption == "masked_query":
+        arrays["aatype"][0] = arrays["msa"][0, 0] = 22
+    elif corruption == "masked_hit":
+        arrays["msa"][1, 0] = 22
+    elif corruption == "gapped_query":
+        arrays["aatype"][0] = arrays["msa"][0, 0] = 21
+    elif corruption == "float_hit":
+        arrays["msa"] = arrays["msa"].astype(float) + 0.1
+    elif corruption == "wrong_chain":
+        arrays["chain_id"] = np.asarray("other_A")
+    else:
+        arrays["deletions"][1, 1] = -1
+    path = tmp_path / "features.npz"
+    np.savez(path, **arrays)
+    with pytest.raises(ValueError):
+        load_msa_for_audit(path, chain_id="toy_A")
+
+
+def test_heldout_normalization_matches_feature_unknown_residues() -> None:
+    from nanofold.mmseqs import canonical_target_sequence
+
+    assert canonical_target_sequence("ABZJUOX") == "AXXXXXX"
+    for invalid in ("AC D", "AC-D", "AC\n>injected", "", "AC*D"):
+        with pytest.raises(ValueError, match="amino-acid"):
+            canonical_target_sequence(invalid)

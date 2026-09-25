@@ -51,6 +51,7 @@ SEALED_RUNTIME_ENV = "NANOFOLD_OFFICIAL_SEALED_RUNTIME"
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Prediction-only evaluation entrypoint.")
     ap.add_argument("--config", type=str, required=True)
+    ap.add_argument("--submission-root", default="", help="Trusted submission code root when a generated prediction config is stored elsewhere.")
     ap.add_argument("--ckpt", type=str, default="", help="Single checkpoint path to evaluate.")
     ap.add_argument(
         "--ckpt-list",
@@ -324,7 +325,8 @@ def main() -> None:
         print(f"Feature fingerprint verification succeeded: {Path(fingerprint_path).resolve()}")
 
     checkpoints = _resolve_checkpoints(args)
-    hooks = load_submission_hooks(predict_cfg, config_path, allowed_root=config_path.parent)
+    submission_root = Path(args.submission_root).resolve() if args.submission_root else config_path.parent
+    hooks = load_submission_hooks(predict_cfg, config_path, allowed_root=submission_root)
     device = default_torch_device()
     print(f"Using device: {device}")
     use_amp = bool(predict_cfg.get("train", {}).get("amp", False)) and device.type == "cuda"

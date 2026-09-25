@@ -15,11 +15,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from zipfile import BadZipFile
 
 import numpy as np
 
@@ -30,12 +32,18 @@ if str(REPO_ROOT) not in sys.path:
 
 from nanofold.chain_paths import chain_id_from_stem, chain_npz_path
 from nanofold.data import read_manifest
+from nanofold.dataset_integrity import (
+    validate_feature_label_pair,
+    validate_feature_npz_schema,
+    validate_label_npz_schema,
+)
 from nanofold.structure_metadata import secondary_fractions_from_atom14
 
 DEFAULT_MIN_LENGTH = 40
 DEFAULT_MAX_LENGTH = 256
 DEFAULT_MAX_RESOLUTION_ANGSTROMS = 3.0
 DEFAULT_MAX_SINGLE_AA_FRACTION = 0.8
+DEFAULT_MIN_VALID_CA = 32
 
 
 def max_single_aa_fraction(aatype: np.ndarray) -> float:
@@ -52,11 +60,15 @@ def load_cluster_tsv(path: str | Path) -> dict[str, tuple[str, int]]:
     members: dict[str, str] = {}
     cluster_sizes: Counter[str] = Counter()
     with cluster_path.open() as handle:
-        for line in handle:
-            parts = line.strip().split("\t")
-            if len(parts) < 2:
+        for line_number, line in enumerate(handle, start=1):
+            if not line.strip():
                 continue
+            parts = line.rstrip("\r\n").split("\t")
+            if len(parts) != 2 or any(not part or any(char.isspace() for char in part) for part in parts):
+                raise ValueError(f"Malformed MMseqs2 cluster row at line {line_number}")
             representative, member = parts[0], parts[1]
+            if member in members:
+                raise ValueError(f"Duplicate or conflicting MMseqs2 cluster assignment at line {line_number}")
             members[member] = representative
             cluster_sizes[representative] += 1
     return {
@@ -98,6 +110,7 @@ def evaluate_chain(
     max_resolution: float,
     max_single_aa_fraction_threshold: float,
     cluster_info: dict[str, tuple[str, int]] | None = None,
+    min_valid_ca: int = DEFAULT_MIN_VALID_CA,
 ) -> dict[str, Any]:
     """Evaluate one chain and return a JSON-serializable manifest entry."""
     feature_path = chain_npz_path(processed_features_dir, chain_id)
@@ -112,25 +125,26 @@ def evaluate_chain(
     if reject_reasons:
         return entry
 
-    with np.load(feature_path) as features, np.load(label_path) as labels:
-        missing_feature_keys = [key for key in ("aatype",) if key not in features]
-        missing_label_keys = [
-            key
-            for key in ("ca_coords", "ca_mask", "atom14_positions", "atom14_mask", "resolution")
-            if key not in labels
-        ]
-        if missing_feature_keys:
-            reject_reasons.append("missing_feature_key")
-        if missing_label_keys:
-            reject_reasons.append("missing_label_key")
-        if reject_reasons:
-            entry["missing_feature_keys"] = missing_feature_keys
-            entry["missing_label_keys"] = missing_label_keys
-            return entry
+    try:
+        feature_errors = validate_feature_npz_schema(feature_path)
+        label_errors = validate_label_npz_schema(label_path)
+        pair_errors = [] if feature_errors or label_errors else validate_feature_label_pair(
+            feature_path, label_path, expected_chain_id=chain_id,
+        )
+    except (OSError, ValueError, KeyError, EOFError, BadZipFile) as exc:
+        entry["reject_reasons"] = ["unreadable_npz"]
+        entry["schema_errors"] = [str(exc)]
+        return entry
+    if feature_errors or label_errors or pair_errors:
+        entry["reject_reasons"] = ["invalid_feature_label_schema"]
+        entry["schema_errors"] = feature_errors + label_errors + pair_errors
+        return entry
 
+    with np.load(feature_path) as features, np.load(label_path) as labels:
         aatype = np.asarray(features["aatype"])
         length = int(aatype.shape[0])
         resolution = float(np.asarray(labels["resolution"]).reshape(()).item())
+        valid_ca_count = int(np.count_nonzero(labels["ca_mask"]))
         single_aa_fraction = max_single_aa_fraction(aatype)
         secondary_class, helix_fraction, beta_fraction, coil_fraction = secondary_fractions_from_atom14(
             np.asarray(labels["atom14_positions"]),
@@ -143,6 +157,8 @@ def evaluate_chain(
         reject_reasons.append("max_length")
     if np.isfinite(resolution) and resolution > max_resolution:
         reject_reasons.append("resolution")
+    if valid_ca_count < min_valid_ca:
+        reject_reasons.append("insufficient_valid_ca")
     if single_aa_fraction > max_single_aa_fraction_threshold:
         reject_reasons.append("single_aa")
 
@@ -150,6 +166,8 @@ def evaluate_chain(
         {
             "length": length,
             "resolution": resolution,
+            "resolution_status": "measured" if resolution > 0 else "unknown",
+            "valid_ca_count": valid_ca_count,
             "max_single_aa_fraction": round(single_aa_fraction, 4),
             "secondary_structure_class": secondary_class,
             "secondary_helix_fraction": round(float(helix_fraction), 4) if helix_fraction is not None else None,
@@ -177,12 +195,29 @@ def build_manifest(
     max_single_aa_fraction_threshold: float,
     mmseqs_cluster_tsv: str | Path | None = None,
     sample_limit: int | None = None,
+    min_valid_ca: int = DEFAULT_MIN_VALID_CA,
 ) -> dict[str, Any]:
+    if min_length <= 0 or (max_length is not None and max_length < min_length):
+        raise ValueError("Invalid sequence length bounds")
+    if not math.isfinite(max_resolution) or max_resolution <= 0:
+        raise ValueError("max_resolution must be positive and finite")
+    if not math.isfinite(max_single_aa_fraction_threshold) or not 0 <= max_single_aa_fraction_threshold <= 1:
+        raise ValueError("max_single_aa_fraction_threshold must be in [0, 1]")
+    if isinstance(min_valid_ca, bool) or not isinstance(min_valid_ca, int) or min_valid_ca <= 0:
+        raise ValueError("min_valid_ca must be a positive integer")
+    if sample_limit is not None and (
+        isinstance(sample_limit, bool) or not isinstance(sample_limit, int) or sample_limit <= 0
+    ):
+        raise ValueError("sample_limit must be a positive integer when specified")
     chain_ids = discover_chain_ids(processed_features_dir, manifest_path=manifest_path)
+    if len(chain_ids) != len(set(chain_ids)):
+        raise ValueError("Duplicate chains in filter input")
     if sample_limit is not None:
         chain_ids = chain_ids[:sample_limit]
 
     cluster_info = load_cluster_tsv(mmseqs_cluster_tsv) if mmseqs_cluster_tsv else {}
+    if mmseqs_cluster_tsv and set(chain_ids) - set(cluster_info):
+        raise ValueError("MMseqs2 cluster assignments must cover every evaluated chain")
     entries = [
         evaluate_chain(
             chain_id,
@@ -193,6 +228,7 @@ def build_manifest(
             max_resolution=max_resolution,
             max_single_aa_fraction_threshold=max_single_aa_fraction_threshold,
             cluster_info=cluster_info,
+            min_valid_ca=min_valid_ca,
         )
         for chain_id in chain_ids
     ]
@@ -213,6 +249,7 @@ def build_manifest(
             "max_length": max_length,
             "max_resolution_angstroms": max_resolution,
             "max_single_aa_fraction": max_single_aa_fraction_threshold,
+            "min_valid_ca": min_valid_ca,
             "mmseqs_cluster_tsv": str(mmseqs_cluster_tsv) if mmseqs_cluster_tsv else None,
         },
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -238,6 +275,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-length", type=int, default=DEFAULT_MAX_LENGTH)
     parser.add_argument("--max-resolution-angstroms", type=float, default=DEFAULT_MAX_RESOLUTION_ANGSTROMS)
     parser.add_argument("--max-single-aa-fraction", type=float, default=DEFAULT_MAX_SINGLE_AA_FRACTION)
+    parser.add_argument(
+        "--min-valid-ca", type=int, default=DEFAULT_MIN_VALID_CA,
+        help="Minimum number of observed CA labels after full feature/label schema and identity validation.",
+    )
     parser.add_argument("--mmseqs-cluster-tsv", type=Path, default=None)
     parser.add_argument("--sample-limit", type=int, default=None)
     return parser.parse_args(argv)
@@ -256,6 +297,7 @@ def main(argv: list[str] | None = None) -> None:
         max_single_aa_fraction_threshold=float(args.max_single_aa_fraction),
         mmseqs_cluster_tsv=args.mmseqs_cluster_tsv,
         sample_limit=args.sample_limit,
+        min_valid_ca=args.min_valid_ca,
     )
 
     args.manifest_out.parent.mkdir(parents=True, exist_ok=True)

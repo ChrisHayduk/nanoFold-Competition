@@ -84,6 +84,14 @@ Run `--dry-run --readme-out hf_dataset_export/README.md` first to validate the
 public inputs and inspect the generated dataset card without contacting Hugging
 Face.
 
+Publication requires the reviewed public manifest/source-lock bytes, correct
+counts and union, and a matching fingerprint of the actual tensors. Auxiliary
+publication metadata must come from the reviewed public paths. Staged private
+candidates cannot be uploaded through this command before deliberate release
+promotion. Export caches bind content digests, and inputs are checked again
+before publication. `--max-examples-per-split` is restricted to local inspection;
+a truncated debug export cannot be published as the full benchmark.
+
 Hugging Face benchmark aggregation is still a beta feature. The root
 `eval.yaml` declares NanoFold's intended `nanofold` evaluation framework and
 the `nanofold` task. If the Hub requires allow-listing for the dataset to
@@ -104,9 +112,19 @@ Maintainer-only hidden outputs:
 .nanofold_private/leaderboard/official_data_source.lock.json
 ```
 
+`scripts/pin_hidden_assets.py --track-id <track>` validates the actual manifest,
+chain count, fingerprint and feature/label bytes before atomically writing a
+lock. A caller-supplied count cannot override the manifest. Strict raw-source
+locks require nonempty, disjoint public splits with an exact union, complete
+source evidence and real nonempty assets.
+
 ## 2. How Data Is Downloaded
 
 Participants should use the public setup script:
+
+Setup dry runs validate inputs and print commands without creating outputs.
+Downloads stage each attempt separately, so a failed transfer cannot become a
+completed source on retry. Public, hidden and raw output roots must not overlap.
 
 ```bash
 python -m venv .venv
@@ -234,11 +252,19 @@ For each chain ID, preprocessing:
 6. Caps raw MSA depth with `--max-msa-seqs` before writing NPZ files.
 7. Loads the matching mmCIF file.
 8. Extracts chain atom coordinates into the canonical atom14 layout.
-9. Aligns the mmCIF structure sequence to the MSA query sequence.
+9. Aligns the full deposited polymer sequence to the MSA query, then places observed coordinates using `label_seq_id`. Missing coordinates retain their polymer positions, including within repeated sequences. Without polymer context, sequence-only projection must be unambiguous.
 10. Projects atom14 coordinates onto query positions, masking every label at a sequence mismatch.
 11. Rejects chains that fail projection quality thresholds, including the valid-CA minimum in strict alignment mode.
 12. Validates and writes one feature NPZ and one label NPZ per chain, with matching configuration and source-content hashes.
 13. Records schema-3 run provenance in `preprocess_meta.json`. This run metadata is required for fingerprinting provenance-bearing pairs; removing or downgrading it is an error. Resume verifies raw inputs and existing files before skipping work. Chain resolution prefers author IDs, then explicit polymer label IDs, then a unique sequence match; ambiguous matches fail. Alternate atom locations are selected by occupancy; invalid nonfinite coordinates fail.
+
+Preprocessing validates nonempty, unique, well-formed manifest IDs before
+creating outputs. Feature and label roots must be separate and cannot contain
+one another. This also keeps label files out of a features-only directory mount.
+`scripts/filter_openproteinset.py` validates complete feature/label pairs before
+admitting processed candidates; `--min-valid-ca` defaults to 32 observed CA
+positions. Unknown resolution is recorded explicitly. Cluster TSVs must have
+unambiguous assignments and cover every evaluated chain.
 
 The MSA row filter is meant to sanitize evolutionary input features against
 held-out target homologs. The recommended split-aligned threshold is `30%`
@@ -266,23 +292,22 @@ de-identified filter for current features, but official camera-ready
 regeneration should prefer raw A3Ms when all source alignments are available so
 filtering still occurs before depth capping.
 
-If raw alignments are incomplete but current processed NPZs are available,
-`scripts/filter_processed_msa_features.py` can apply the same filter to existing
-features and write a new feature root plus
-`processed_msa_row_filter_audit.json`. This preserves all feature arrays except
-`msa` and `deletions`, always keeps the query row, records
-`msa_row_filter_sha256`, and writes a `preprocess_meta.json` that makes the
-processed-feature-filtered state fingerprintable. This path is useful for
-private audits and sanitized-MSA reruns, but it cannot recover deeper raw MSA
-rows that were already removed by the original depth cap.
+For research assets without paired schema-3 provenance,
+`scripts/filter_processed_msa_features.py` can apply a filter to existing
+features in a separate output root. It preserves query rows, binds reuse to
+source bytes and filter identity, and atomically replaces each output archive.
+It rejects in-place transformations and provenance-bound schema-3 inputs;
+those require preprocessing from raw data into fresh feature and label roots.
+Postprocessing cannot recover rows discarded by the original depth cap.
 
 Because large MMseqs searches can expose additional residual hits on a
 verification pass, use `scripts/extend_msa_row_filter_from_audit.py` as a
 closure step when `scripts/audit_msa_split.py --run-mmseqs` reports
-post-filter source rows. The closure helper maps the anonymous `trainmsa_N`
-audit headers back to stable sequence hashes, extends the de-identified filter,
-and should be followed by another filtering/audit cycle until the MMseqs hit
-count is zero.
+post-filter source rows. Supply `--audit-summary` from that same audit. The
+closure helper checks the ordered source-record digest and MMseqs output hash
+before mapping anonymous `trainmsa_N` headers to sequence hashes. Changed or
+reordered source inputs require a fresh audit. Follow extension with another
+filtering/audit cycle; zero hits describes that configured search only.
 
 Use `scripts/write_msa_row_filter_source_lock.py` after filtering to create a
 compact audit/source-lock summary. By default it redacts private paths and
@@ -331,13 +356,20 @@ Label NPZ keys:
 
 Integrity checks enforce amino-acid token ranges, nonnegative deletion counts, query/MSA consistency, finite coordinates, CA/atom14 consistency, and feature/label length, index, identity and provenance agreement. Schema-3 files must contain a scalar `chain_id` matching the requested manifest chain; a matching pair under the wrong filename is rejected. An interrupted pair replacement is detected on validation; the two files are not a single filesystem transaction.
 
+Feature archives containing supervision keys are rejected. Requiring labels
+also requires a label directory; a fingerprint cannot declare complete labeled
+coverage without one. Each manifest must contain unique chains, and splits in
+one fingerprint must be disjoint. Fingerprint `all.txt` separately from its
+constituent train and validation manifests.
+
 The data loader then:
 
 - loads per-chain NPZ files with `nanofold.data.ProcessedNPZDataset`
 - crops sequences longer than `data.crop_size`
 - samples MSA rows to at most `data.msa_depth`
 - pads variable-length examples inside each batch
-- emits `residue_mask` so models can ignore padded positions
+- emits `residue_mask` for residue padding and `msa_mask` for MSA row/residue
+  padding; real biological gaps remain valid MSA cells
 - strips all supervision tensors during inference through `nanofold.submission_runtime`
 
 ## 5. Example Model Input Sample
@@ -374,6 +406,7 @@ batch = {
         ],
         dtype=torch.int64,
     ),  # shape (1, 3, 4)
+    "msa_mask": torch.ones((1, 3, 4), dtype=torch.bool),  # no batch padding here
     "deletions": tensor(
         [
             [
@@ -501,6 +534,11 @@ For multi-checkpoint hidden evaluation, each checkpoint gets its own prediction 
 
 ```bash
 python score.py \
+  --official --track limited --split hidden_val \
+  --manifest .nanofold_private/manifests/hidden_val.txt \
+  --pred-out-dir runs/<run_name>/hidden_predictions \
+  --checkpoint-steps 0,1000,2000,5000,last \
+  --fingerprint .nanofold_private/leaderboard/official_hidden_fingerprint.json \
   --prediction-summary runs/<run_name>/predict_hidden.json \
   --features-dir .nanofold_private/hidden_processed_features \
   --labels-dir .nanofold_private/hidden_processed_labels \

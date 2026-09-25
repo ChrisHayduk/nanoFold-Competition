@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -221,7 +222,7 @@ def test_hidden_lock_missing_or_incomplete_fails(tmp_path: Path) -> None:
     track = type(
         "Track",
         (),
-        {"hidden_manifest_sha256": None, "hidden_fingerprint_sha256": None},
+        {"hidden_manifest_sha256": None, "hidden_fingerprint_sha256": None, "track_id": "limited", "hidden_chain_count": 1},
     )()
 
     with pytest.raises(FileNotFoundError):
@@ -321,6 +322,8 @@ def test_hidden_lock_validates_without_public_track_pins(tmp_path: Path) -> None
     lock.write_text(
         json.dumps(
             {
+                "track": "limited",
+                "hidden_chain_count": 1,
                 "hidden_manifest_sha256": module._sha256(hidden_manifest),  # noqa: SLF001
                 "hidden_features_fingerprint_sha256": module._tree_sha256(hidden_features),  # noqa: SLF001
                 "hidden_labels_fingerprint_sha256": module._tree_sha256(hidden_labels),  # noqa: SLF001
@@ -328,7 +331,7 @@ def test_hidden_lock_validates_without_public_track_pins(tmp_path: Path) -> None
             }
         )
     )
-    track = type("Track", (), {"hidden_manifest_sha256": None, "hidden_fingerprint_sha256": None})()
+    track = type("Track", (), {"hidden_manifest_sha256": None, "hidden_fingerprint_sha256": None, "track_id": "limited", "hidden_chain_count": 1})()
 
     meta = validate_lock(
         lock_path=lock,
@@ -373,3 +376,11 @@ def test_official_runner_builds_predict_and_score_commands() -> None:
     assert "--hidden-manifest" in predict_cmd
     assert score_cmd[1] == "score.py"
     assert "--features-dir" in score_cmd
+
+
+@pytest.mark.parametrize("flags", [[], ["--skip-hidden-scoring", "--disable-hidden"], ["--score-hidden-only"]])
+def test_hidden_prediction_only_cannot_mount_labels_or_disable_hidden(flags, monkeypatch) -> None:
+    module = _load_run_official_module()
+    monkeypatch.setattr(sys, "argv", ["run_official.py", "--submission", "unused", "--predict-hidden-only", *flags])
+    with pytest.raises(ValueError, match="predict-hidden-only"):
+        module.main()

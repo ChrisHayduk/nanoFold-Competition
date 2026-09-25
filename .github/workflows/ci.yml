@@ -133,31 +133,35 @@ jobs:
 
           from nanofold.chain_paths import chain_npz_path
 
-          cid = "1abc_A"
-          Path(".ci_smoke/manifests/train.txt").write_text(f"{cid}\n")
-          Path(".ci_smoke/manifests/val.txt").write_text(f"{cid}\n")
+          Path(".ci_smoke/manifests/train.txt").write_text("1abc_A\n")
+          Path(".ci_smoke/manifests/val.txt").write_text("2def_A\n")
 
-          L, N, T = 128, 8, 1
-          np.savez_compressed(
-              chain_npz_path(".ci_smoke/processed_features", cid),
-              aatype=np.zeros((L,), dtype=np.int32),
-              msa=np.zeros((N, L), dtype=np.int32),
-              deletions=np.zeros((N, L), dtype=np.int32),
-              residue_index=np.arange(L, dtype=np.int32),
-              between_segment_residues=np.zeros((L,), dtype=np.int32),
-              template_aatype=np.zeros((T, L), dtype=np.int32),
-              template_ca_coords=np.zeros((T, L, 3), dtype=np.float32),
-              template_ca_mask=np.ones((T, L), dtype=bool),
-          )
-          np.savez_compressed(
-              chain_npz_path(".ci_smoke/processed_labels", cid),
-              ca_coords=np.zeros((L, 3), dtype=np.float32),
-              ca_mask=np.ones((L,), dtype=bool),
-              atom14_positions=np.zeros((L, 14, 3), dtype=np.float32),
-              atom14_mask=np.ones((L, 14), dtype=bool),
-              residue_index=np.arange(L, dtype=np.int32),
-              resolution=np.asarray(2.0, dtype=np.float32),
-          )
+          L, N, T = 128, 8, 0
+          for cid, residue_type, atom_count in (("1abc_A", 0, 5), ("2def_A", 7, 4)):
+              atom_mask = np.zeros((L, 14), dtype=bool)
+              atom_mask[:, :atom_count] = True
+              np.savez_compressed(
+                  chain_npz_path(".ci_smoke/processed_features", cid),
+                  chain_id=np.asarray(cid),
+                  aatype=np.full((L,), residue_type, dtype=np.int32),
+                  msa=np.full((N, L), residue_type, dtype=np.int32),
+                  deletions=np.zeros((N, L), dtype=np.int32),
+                  residue_index=np.arange(L, dtype=np.int32),
+                  between_segment_residues=np.zeros((L,), dtype=np.int32),
+                  template_aatype=np.zeros((T, L), dtype=np.int32),
+                  template_ca_coords=np.zeros((T, L, 3), dtype=np.float32),
+                  template_ca_mask=np.zeros((T, L), dtype=bool),
+              )
+              np.savez_compressed(
+                  chain_npz_path(".ci_smoke/processed_labels", cid),
+                  chain_id=np.asarray(cid),
+                  ca_coords=np.zeros((L, 3), dtype=np.float32),
+                  ca_mask=np.ones((L,), dtype=bool),
+                  atom14_positions=np.zeros((L, 14, 3), dtype=np.float32),
+                  atom14_mask=atom_mask,
+                  residue_index=np.arange(L, dtype=np.int32),
+                  resolution=np.asarray(2.0, dtype=np.float32),
+              )
 
           cfg = {
               "run_name": "ci_smoke_official",
@@ -285,6 +289,11 @@ jobs:
       - name: Score smoke multi-checkpoint
         run: |
           python score.py \
+            --official --track smoke --split val \
+            --manifest .ci_smoke/manifests/val.txt \
+            --pred-out-dir .ci_smoke/preds \
+            --checkpoint-steps 0,10,20 \
+            --fingerprint .ci_smoke/fingerprint.json \
             --prediction-summary .ci_smoke/predict_multi.json \
             --features-dir .ci_smoke/processed_features \
             --labels-dir .ci_smoke/processed_labels \

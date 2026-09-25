@@ -64,11 +64,23 @@ with replacement; zero-weight chains are not drawn. The same seed and epoch
 produce the same global weighted draw before partitioning it across ranks.
 Weights do not add data or change the configured sample budget.
 
+Unweighted distributed sampling never pads an epoch with duplicate chains. It
+drops the shuffled remainder that cannot be partitioned across ranks; the
+loader also drops incomplete local batches. The sampling contract records this
+policy, the population size, and the number of samples available per epoch.
+Chains omitted at an epoch boundary can reappear in later shuffled epochs.
+
 Training checkpoints include a versioned `sampling_state`: the manifest-aligned sampling-weight digest, loader/sampler configuration, epoch and consumed-batch cursor, epoch-start generator state, and RNG state for every rank. Resume reconstructs the ordered loader, replays consumed batches, then restores that rank's model RNG. Worker seeds differ across ranks while the distributed sampling plan uses a shared seed. Replaying the current epoch prefix adds startup I/O but does not count as new training exposure.
 
 Resume requires the same effective sampling population and weights, dataset contents, world size, device type, worker count, batch/accumulation settings and crop/MSA configuration. Changing weights or feature/label bytes at the same file path is detected. Verified runs bind their checked fingerprint; other runs stream-hash train and validation files once at startup. Checkpoints without supported sampling state cannot resume training safely and produce an explicit error; they remain usable for prediction/scoring. `--allow-resume-mismatch` does not bypass sampling-state checks. Deterministic sample/augmentation replay does not promise bitwise numerical agreement across different hardware or library versions.
 
 Checkpoint writes use staged, flushed files followed by atomic replacement. A failed write preserves the previous checkpoint, and rank-zero save failures propagate to every rank. Resume validates RNG states for all ranks and requires valid AMP scaler state when AMP is enabled, plus the configured scheduler's saved state, before changing run history.
+
+Exposure counters must be nonnegative integers consistent with the checkpoint
+step and effective batch size. Samples must equal `step * effective_batch_size`;
+nonpadding and cropped residue counts must lie within the corresponding sample
+and crop bounds. Conflicting counter aliases fail validation before run history
+changes.
 
 ## Batch Contract by Mode
 
@@ -80,6 +92,8 @@ Guaranteed keys:
 - `chain_id: list[str]`
 - `aatype: (B, L) int`
 - `msa: (B, N, L) int`
+- `msa_mask: (B, N, L) bool` — true for biological MSA cells, including gaps;
+  false for batch padding in either the row or residue dimension
 - `deletions: (B, N, L) int`
 - `template_aatype: (B, T, L) int`
 - `template_ca_coords: (B, T, L, 3) float`
@@ -92,6 +106,7 @@ Guaranteed keys:
 
 Optional metadata keys:
 - `residue_index: (B, L) int` — contiguous 0..L-1 per chain (AF2 supplement 1.2.9)
+- `between_segment_residues: (B, L) int` — zero for these single-chain targets
 - `resolution: (B,) float` — Å, 0.0 if unknown
 
 Typical use:
@@ -103,15 +118,22 @@ backbone_valid = batch["atom14_mask"][..., :4].all(dim=-1)
 
 Processed NPZ validation checks token ranges, nonnegative deletions, query/MSA agreement, finite coordinates, and matching feature/label lengths and residue indices. CA coordinates and masks must agree with atom14 slot 1. Query/structure sequence mismatches have all atom labels masked. Schema-3 preprocessing adds matching `preprocess_config_sha256` and `source_inputs_sha256` provenance to each pair; these are storage/audit metadata, not model inputs. Fingerprinting rejects mixed configurations and stored chain IDs that disagree with the manifest. Schema 3 requires the chain ID in both files.
 
+Feature archives must not contain supervision arrays. A features-only loader
+rejects such archives before passing data to submission code. Manifests must be
+nonempty and contain unique chain IDs; fingerprinted splits must be disjoint.
+Requiring labels also requires an explicit label directory. Models must use
+`msa_mask` when aggregating MSA profiles or deletion features so another chain's
+MSA depth cannot change the current chain's features.
+
 ### Inference mode (`training=False`)
 
 Guaranteed keys:
 - all non-supervision keys above
-- runtime forwards only the inference allowlist: `chain_id`, `aatype`, `msa`, `deletions`, `template_*`, `residue_mask`
+- runtime forwards only the inference allowlist: `chain_id`, `aatype`, `msa`, `msa_mask`, `deletions`, `template_*`, `residue_index`, `between_segment_residues`, `residue_mask`
 
 Not present:
 - `ca_coords`, `ca_mask`
-- `atom14_positions`, `atom14_mask`, `residue_index`, `resolution`
+- `atom14_positions`, `atom14_mask`, `resolution`
 
 Runtime strips supervision keys internally in inference mode even if caller accidentally passes them.
 
@@ -162,7 +184,16 @@ official budget.
 
 Official ranking uses equal chain weighting and a CASP15-inspired raw score
 over the CASP metrics that can be computed reproducibly from `pred_atom14` and
-the official residue identities:
+the official residue identities.
+
+Each prediction must have the exact expected residue count and finite atom14
+coordinates. Scoring rejects truncated or extra residues, invalid residue
+identities, malformed labels, and nonfinite metrics; it does not silently score
+a shared prefix or omit failed targets. Official scoring binds the manifest,
+split, crop, prediction root, checkpoint schedule, and exposure counts to
+maintainer-supplied inputs rather than trusting a prediction summary.
+
+The composite is:
 
 ```text
 FoldScore =

@@ -31,7 +31,7 @@ Options:
   --hidden-features-dir <path>        Hidden feature NPZ output dir (default: <private-root>/hidden_processed_features)
   --hidden-labels-dir <path>          Hidden label NPZ output dir (default: <private-root>/hidden_processed_labels)
   --chain-data-cache <path>           chain_data_cache.json path
-                                      (default: data/openproteinset/pdb_data/data_caches/chain_data_cache.json)
+                                      (default: <data-root>/pdb_data/data_caches/chain_data_cache.json)
   --structure-metadata <path>         Required structure metadata JSON for split generation
                                       (default: data/manifests/structure_metadata.json)
   --metadata-sources-dir <path>       Downloaded structure metadata source directory
@@ -94,7 +94,7 @@ PROCESSED_FEATURES_DIR="data/processed_features"
 PROCESSED_LABELS_DIR="data/processed_labels"
 HIDDEN_FEATURES_DIR=""
 HIDDEN_LABELS_DIR=""
-CHAIN_DATA_CACHE="data/openproteinset/pdb_data/data_caches/chain_data_cache.json"
+CHAIN_DATA_CACHE=""
 STRUCTURE_METADATA="data/manifests/structure_metadata.json"
 METADATA_SOURCES_DIR="data/metadata_sources"
 METADATA_SOURCE_LOCK="data/metadata_sources/structure_metadata_sources.lock.json"
@@ -306,6 +306,9 @@ fi
 if [[ -z "$HIDDEN_MANIFESTS_DIR" ]]; then
   HIDDEN_MANIFESTS_DIR="$PRIVATE_ROOT/manifests"
 fi
+if [[ -z "$CHAIN_DATA_CACHE" ]]; then
+  CHAIN_DATA_CACHE="$DATA_ROOT/pdb_data/data_caches/chain_data_cache.json"
+fi
 if [[ -z "$HIDDEN_FEATURES_DIR" ]]; then
   HIDDEN_FEATURES_DIR="$PRIVATE_ROOT/hidden_processed_features"
 fi
@@ -347,6 +350,30 @@ if ! command -v python >/dev/null 2>&1; then
 fi
 
 cd "$REPO_ROOT"
+
+ASSET_DIRS=("$DATA_ROOT" "$PROCESSED_FEATURES_DIR" "$PROCESSED_LABELS_DIR")
+if [[ "$SKIP_HIDDEN" -eq 0 ]]; then
+  ASSET_DIRS+=("$HIDDEN_FEATURES_DIR" "$HIDDEN_LABELS_DIR")
+fi
+python - "$REPO_ROOT" "$MANIFESTS_DIR" "$HIDDEN_MANIFESTS_DIR" "${ASSET_DIRS[@]}" <<'PYTHON'
+import sys
+from pathlib import Path
+
+repo, manifests, hidden_manifests, *assets = [Path(value).resolve() for value in sys.argv[1:]]
+protected = [manifests, hidden_manifests, *(repo / name for name in ("leaderboard", "tracks", "data/manifests"))]
+
+def overlaps(left, right):
+    return left.is_relative_to(right) or right.is_relative_to(left)
+
+for index, asset in enumerate(assets):
+    if any(overlaps(asset, other.resolve()) for other in [*protected, *assets[:index]]):
+        raise SystemExit("Raw, public and hidden asset directories must be separate from manifests, contracts and each other.")
+    if asset.exists() and not asset.is_dir():
+        raise SystemExit("Asset output paths must be directories.")
+for hidden in assets[3:]:
+    if hidden.is_relative_to(repo) and not hidden.is_relative_to(repo / ".nanofold_private"):
+        raise SystemExit("In-repository hidden assets must stay under .nanofold_private.")
+PYTHON
 
 # Resolve aliases before any download or output write. Hash consistency checks
 # alone cannot detect replacing the published fingerprint with new asset bytes.

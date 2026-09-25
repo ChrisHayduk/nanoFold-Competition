@@ -2,6 +2,11 @@ FROM python:3.11-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
+ENV PYTHONSAFEPATH=1
+ENV PYTHONNOUSERSITE=1
+ENV PYTHONPATH=/workspace
+ENV HOME=/tmp/nanofold-home
+ENV XDG_CACHE_HOME=/tmp/nanofold-cache
 
 WORKDIR /workspace
 
@@ -9,6 +14,17 @@ COPY requirements.txt requirements-dev.txt ./
 RUN pip install --no-cache-dir -r requirements.txt -r requirements-dev.txt
 RUN mkdir -p /nanofold_hidden
 
-COPY . .
+# Keep the image independent of submission code, outputs and arbitrary private
+# directories even when built directly. The wrapper also limits the build context.
+COPY nanofold ./nanofold
+COPY scripts ./scripts
+COPY tracks ./tracks
+COPY train.py eval.py predict.py score.py ./
+COPY data/manifests/train.txt data/manifests/val.txt data/manifests/all.txt ./data/manifests/
+COPY leaderboard/official_dataset_fingerprint.json leaderboard/research_large_dataset_fingerprint.json leaderboard/unlimited_dataset_fingerprint.json ./leaderboard/
+COPY leaderboard/official_manifest_source.lock.json ./leaderboard/
+COPY third_party/minAlphaFold2/minalphafold ./third_party/minAlphaFold2/minalphafold
+COPY third_party/minAlphaFold2/configs ./third_party/minAlphaFold2/configs
+COPY third_party/minAlphaFold2/LICENSE ./third_party/minAlphaFold2/LICENSE
 
 ENTRYPOINT ["python", "scripts/run_official.py"]

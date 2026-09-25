@@ -274,3 +274,28 @@ def test_conflicting_cluster_membership_and_invalid_msa_are_rejected(tmp_path: P
     np.savez_compressed(path, aatype=np.array([1]), msa=np.array([[2]]))
     with pytest.raises(ValueError, match="query row does not match"):
         module._load_feature_msa(tmp_path, "trn1_A")
+
+
+def test_real_mmseqs_target_audit_finds_prefilter_missed_pair(tmp_path: Path) -> None:
+    import os
+    import shutil
+
+    import pytest
+
+    binary = os.environ.get("MMSEQS_TEST_BINARY") or shutil.which("mmseqs")
+    if not binary:
+        pytest.skip("Set MMSEQS_TEST_BINARY to run the real target alignment regression")
+    module = _load_audit_module()
+    features = tmp_path / "features"
+    _write_feature(features, "trn1_A", ["SDNKAWGPALHQYCLWHIMIYVKYYMFIMLYEMNLNEHRA"])
+    _write_feature(features, "val1_A", ["SMPKAWGRWPHWYGLWFYFSYPMYYMFIMYYTTAWNIHRW"])
+    result = module.run_mmseqs_homology(
+        train_ids=["trn1_A"], val_ids=["val1_A"], features_dir=features, out_dir=tmp_path,
+        mmseqs_bin=str(binary), min_seq_id=0.3, coverage=0.8, threads=1, max_seqs=100,
+        tmp_dir=None, include_identifiers=False, source_targets_only=True,
+    )
+    assert result["val_targets_with_train_target_homolog_hits"] == 1
+    assert result["search_parameters"]["prefilter_mode"] == 2
+    assert result["search_parameters"]["evalue"] == 1e308
+    assert result["search_parameters"]["mask"] == 0
+    assert result["input_binding"]["m8_sha256"]

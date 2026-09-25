@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from nanofold.a3m import ungap_query_columns
 from nanofold.residue_constants import ATOM14_NUM_SLOTS, CA_ATOM14_SLOT
@@ -189,3 +190,111 @@ def test_projection_masks_mismatched_residue_including_sidechain_slots() -> None
     np.testing.assert_array_equal(projected[:3], positions[:3])
     assert stats["projection_seq_identity"] == 0.75
     assert stats["projection_valid_ca_count"] == 3
+
+
+def test_projection_uses_polymer_positions_for_unresolved_repeated_residues() -> None:
+    module = _load_preprocess_module()
+    positions = np.zeros((9, 14, 3), dtype=np.float32)
+    observed_indices = np.array([0, 1, 2, 3, 5, 6, 7, 8, 9], dtype=np.int32)
+    positions[:, CA_ATOM14_SLOT, 0] = observed_indices
+    mask = np.zeros((9, 14), dtype=bool)
+    mask[:, CA_ATOM14_SLOT] = True
+
+    projected, projected_mask, stats = module._project_atom14_to_query(
+        "M" + "A" * 10, "A" * 9, positions, mask,
+        polymer_sequence="A" * 10, polymer_residue_index=observed_indices,
+    )
+    # The query's leading M is absent from the deposited polymer. The missing
+    # internal alanine remains missing instead of shifting a repeated segment.
+    assert np.flatnonzero(~projected_mask[:, CA_ATOM14_SLOT]).tolist() == [0, 5]
+    np.testing.assert_array_equal(projected[observed_indices + 1, CA_ATOM14_SLOT, 0], observed_indices)
+    assert stats["projection_valid_ca_count"] == 9
+
+
+def test_projection_rejects_ambiguous_observed_sequence_without_polymer_context() -> None:
+    module = _load_preprocess_module()
+    with pytest.raises(ValueError, match="Ambiguous sequence alignment"):
+        module._project_atom14_to_query(
+            "AAAAAAAAAA", "AAAAAAAAA", np.zeros((9, 14, 3)), np.ones((9, 14), dtype=bool),
+        )
+
+
+def test_projection_rejects_ambiguous_query_mapping_even_with_polymer_context() -> None:
+    module = _load_preprocess_module()
+    with pytest.raises(ValueError, match="Ambiguous sequence alignment"):
+        module._project_atom14_to_query(
+            "AAAAAAAAA", "AAAAAAAAA", np.zeros((9, 14, 3)), np.ones((9, 14), dtype=bool),
+            polymer_sequence="AAAAAAAAAA", polymer_residue_index=np.arange(9),
+        )
+
+
+def test_projection_rejects_residue_identity_at_wrong_polymer_position() -> None:
+    module = _load_preprocess_module()
+    with pytest.raises(ValueError, match="identity disagrees"):
+        module._project_atom14_to_query(
+            "ACD", "CAD", np.zeros((3, 14, 3)), np.ones((3, 14), dtype=bool),
+            polymer_sequence="ACD", polymer_residue_index=np.arange(3),
+        )
+
+
+@pytest.mark.parametrize("indices", [[0, 0, 2], [0, -1, 2], [0, 1, 3]])
+def test_projection_rejects_invalid_deposited_coordinate_mapping(indices: list[int]) -> None:
+    module = _load_preprocess_module()
+    with pytest.raises(ValueError, match="label_seq_id"):
+        module._project_atom14_to_query(
+            "AAA", "AAA", np.zeros((3, 14, 3)), np.ones((3, 14), dtype=bool),
+            polymer_sequence="AAA", polymer_residue_index=np.asarray(indices),
+        )
+
+
+def test_preprocess_preserves_unresolved_polymer_position_with_author_insertion_codes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import gemmi
+
+    from nanofold.chain_paths import chain_data_dir, chain_npz_path
+
+    module = _load_preprocess_module()
+    structure = gemmi.Structure()
+    model = gemmi.Model(1)
+    chain = gemmi.Chain("A")
+    for index in range(10):
+        if index == 4:
+            continue
+        residue = gemmi.Residue()
+        residue.name = "ALA"
+        residue.seqid = gemmi.SeqId(100 + index // 2, "A" if index % 2 else " ")
+        residue.label_seq = index + 1
+        residue.entity_type = gemmi.EntityType.Polymer
+        atom = gemmi.Atom()
+        atom.name = "CA"
+        atom.element = gemmi.Element("C")
+        atom.pos = gemmi.Position(index * 3.8, 0, 0)
+        atom.occ = 1
+        residue.add_atom(atom)
+        chain.add_residue(residue)
+    model.add_chain(chain)
+    structure.add_model(model)
+    structure.setup_entities()
+    structure.get_entity_of(structure[0][0].get_polymer()).full_sequence = ["ALA"] * 10
+    mmcif_root = tmp_path / "mmcif"
+    mmcif_root.mkdir()
+    structure.make_mmcif_document().write_file(str(mmcif_root / "1abc.cif"))
+    alignments = tmp_path / "alignments"
+    chain_dir = chain_data_dir(alignments, "1abc_A")
+    chain_dir.mkdir(parents=True)
+    (chain_dir / "uniref90_hits.a3m").write_text(">query\nAAAAAAAAAA\n")
+    manifest = tmp_path / "manifest.txt"
+    manifest.write_text("1abc_A\n")
+    features, labels = tmp_path / "features", tmp_path / "labels"
+    monkeypatch.setattr(sys, "argv", [
+        "preprocess.py", "--manifest", str(manifest), "--alignments-root", str(alignments),
+        "--mmcif-root", str(mmcif_root), "--processed-features-dir", str(features),
+        "--processed-labels-dir", str(labels), "--disable-templates", "--fail-fast",
+        "--min-projection-valid-ca", "3",
+    ])
+    module.main()
+    with np.load(chain_npz_path(labels, "1abc_A")) as data:
+        assert np.flatnonzero(~data["ca_mask"]).tolist() == [4]
+        observed = np.array([0, 1, 2, 3, 5, 6, 7, 8, 9])
+        np.testing.assert_allclose(data["ca_coords"][observed, 0], observed * 3.8)

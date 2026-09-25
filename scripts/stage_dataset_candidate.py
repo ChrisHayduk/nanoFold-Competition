@@ -56,7 +56,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def stage_candidate(args: argparse.Namespace) -> Path:
     stage = args.stage_dir.resolve()
     repo = REPO_ROOT.resolve()
-    private_root = (repo / ".nanofold_private").resolve()
+    private_root = repo / ".nanofold_private"
     if stage.is_relative_to(repo) and not stage.is_relative_to(private_root):
         raise ValueError("In-repository --stage-dir must be under .nanofold_private to keep hidden artifacts untracked.")
     # Validate local prerequisites before creating outputs or starting expensive clustering.

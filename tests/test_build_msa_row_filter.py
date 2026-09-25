@@ -26,7 +26,7 @@ def _write_feature(features_dir: Path, chain_id: str, rows: list[str]) -> None:
         msa[row_index, : len(row)] = sequence_to_ids(row)
     path = chain_npz_path(features_dir, chain_id)
     path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(path, msa=msa)
+    np.savez_compressed(path, msa=msa, aatype=msa[0])
 
 
 def test_parse_excluded_hashes_from_mmseqs_targets(tmp_path: Path) -> None:
@@ -155,3 +155,86 @@ def test_filter_rejects_unknown_sequence_in_search_output(tmp_path: Path) -> Non
         module._parse_excluded_hashes(
             m8, query_ids={"heldout_1"}, source_hashes={"a" * 64}, min_seq_id=0.3, coverage=0.8,
         )
+
+
+def test_exact_filter_does_not_depend_on_mmseqs_masking(tmp_path: Path) -> None:
+    import hashlib
+    import json
+    import subprocess
+    import sys
+
+    features = tmp_path / "features"
+    _write_feature(features, "trn1_A", ["D" * 20, "A" * 20, "X" * 20])
+    train, heldout, cache, output = [tmp_path / name for name in ("train", "heldout", "cache", "filter")]
+    train.write_text("trn1_A\n")
+    heldout.write_text("val1_A\nval2_A\n")
+    cache.write_text(json.dumps({"val1_A": {"sequence": "A" * 20}, "val2_A": {"sequence": "B" * 20}}))
+    mmseqs = tmp_path / "mmseqs"
+    mmseqs.write_text('#!/bin/sh\nif [ "$1" = version ]; then echo test; else : > "$4"; fi\n')
+    mmseqs.chmod(0o755)
+    proc = subprocess.run([
+        sys.executable, str(Path(__file__).resolve().parents[1] / "scripts/build_msa_row_filter.py"),
+        "--source-manifest", str(train), "--heldout-manifest", str(heldout),
+        "--chain-data-cache", str(cache), "--source-processed-features-dir", str(features),
+        "--mmseqs-bin", str(mmseqs), "--output", str(output),
+    ], capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
+    result = json.loads(output.read_text())
+    assert set(result["excluded_sequence_sha256"]) == {
+        hashlib.sha256((residue * 20).encode()).hexdigest() for residue in ("A", "X")
+    }
+    assert result["exact_match_excluded_sequence_count"] == 2
+    assert result["mmseqs"]["hit_count"] == 0
+
+
+def test_filter_with_real_mmseqs_identity_coverage_and_masked_exact_rows(tmp_path: Path) -> None:
+    import hashlib
+    import json
+    import os
+    import random
+    import shutil
+    import subprocess
+    import sys
+
+    import pytest
+
+    binary = os.environ.get("MMSEQS_TEST_BINARY") or shutil.which("mmseqs")
+    if not binary:
+        pytest.skip("Set MMSEQS_TEST_BINARY to run the real MMseqs integration regression")
+    rng = random.Random(43)
+    alphabet = "ARNDCQEGHILKMFPSTWYV"
+    target = "".join(rng.choices(alphabet, k=100))
+    homolog = "".join(aa if i % 2 == 0 else rng.choice(alphabet.replace(aa, "")) for i, aa in enumerate(target))
+    fragment = target[:70]
+    features = tmp_path / "features"
+    _write_feature(features, "trn1_A", ["D" * 100, homolog, fragment, "A" * 100, "X" * 100])
+    train, heldout, cache, output = [tmp_path / name for name in ("train", "heldout", "cache", "filter")]
+    train.write_text("trn1_A\n")
+    heldout.write_text("val1_A\nval2_A\nval3_A\n")
+    cache.write_text(json.dumps({"val1_A": {"sequence": target}, "val2_A": {"sequence": "A" * 100},
+                                "val3_A": {"sequence": "B" * 100}}))
+    proc = subprocess.run([
+        sys.executable, str(Path(__file__).resolve().parents[1] / "scripts/build_msa_row_filter.py"),
+        "--source-manifest", str(train), "--heldout-manifest", str(heldout),
+        "--chain-data-cache", str(cache), "--source-processed-features-dir", str(features),
+        "--mmseqs-bin", str(binary), "--threads", "1", "--output", str(output),
+    ], capture_output=True, text=True, timeout=120)
+    assert proc.returncode == 0, proc.stderr + proc.stdout[-2000:]
+    result = json.loads(output.read_text())
+    expected = {hashlib.sha256(sequence.encode()).hexdigest() for sequence in (homolog, "A" * 100, "X" * 100)}
+    assert set(result["excluded_sequence_sha256"]) == expected
+    assert hashlib.sha256(fragment.encode()).hexdigest() not in expected
+    assert result["mmseqs"]["version"]
+
+
+def test_source_scanning_includes_all_feature_variants_for_the_same_chain(tmp_path: Path) -> None:
+    module = _load_filter_module()
+    manifest = tmp_path / "train.txt"
+    manifest.write_text("trn1_A\n")
+    first, second = tmp_path / "first", tmp_path / "second"
+    _write_feature(first, "trn1_A", ["A" * 20, "C" * 20])
+    _write_feature(second, "trn1_A", ["A" * 20, "D" * 20])
+    rows, stats = module._scan_processed_msa_rows(manifest_paths=[manifest], features_dirs=[first, second])
+    assert set(rows.values()) == {"C" * 20, "D" * 20}
+    assert stats["chains"] == 1
+    assert stats["feature_variants"] == 2

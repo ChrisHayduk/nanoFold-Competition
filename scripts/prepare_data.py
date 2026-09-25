@@ -191,8 +191,9 @@ def run(
 def _has_file(root: Path, filename: str) -> bool:
     if not root.exists():
         return False
-    for _ in root.rglob(filename):
-        return True
+    for path in root.rglob(filename):
+        if path.is_file() and path.stat().st_size > 0:
+            return True
     return False
 
 
@@ -273,6 +274,7 @@ def _download_url(
     destination.parent.mkdir(parents=True, exist_ok=True)
     attempt = 0
     while True:
+        tmp_path = None
         try:
             if timeout_seconds <= 0:
                 response_cm = urlopen(url)
@@ -284,8 +286,10 @@ def _download_url(
                     prefix=f".{destination.name}.",
                     delete=False,
                 ) as tmp:
-                    tmp.write(response.read())
                     tmp_path = Path(tmp.name)
+                    tmp.write(response.read())
+                if tmp_path.stat().st_size == 0:
+                    raise OSError("Downloaded response is empty")
                 tmp_path.replace(destination)
             return True
         except (HTTPError, URLError, OSError) as exc:
@@ -299,6 +303,9 @@ def _download_url(
                 print(f"WARNING: download failed and will be skipped ({exc})")
                 return False
             raise
+        finally:
+            if tmp_path is not None:
+                tmp_path.unlink(missing_ok=True)
 
 
 def _download_mmcif_subset(
@@ -325,7 +332,7 @@ def _download_mmcif_subset(
 
     def download_one(pdb_id: str) -> tuple[str, bool]:
         url, destination = _structure_url_and_destination(f"{pdb_id}_A", data_root)
-        if destination.exists():
+        if destination.is_file() and destination.stat().st_size > 0:
             return pdb_id, True
         ok = _download_url(
             url,
@@ -366,7 +373,7 @@ def _download_mmcif_subset(
     if not dry_run:
         for pdb_id in pdb_ids:
             _, destination = _structure_url_and_destination(f"{pdb_id}_A", data_root)
-            if not destination.exists() and pdb_id not in missing:
+            if (not destination.is_file() or destination.stat().st_size == 0) and pdb_id not in missing:
                 missing.append(pdb_id)
     if missing and strict:
         sample = ", ".join(missing[:12])
@@ -387,56 +394,39 @@ def _download_chain(
     retry_delay_seconds: float,
     verbose: bool = False,
 ) -> bool:
-    s3_path = f"{bucket}/pdb/{cid}"
-    if full_chain_dir:
-        return run(
-            [
-                "aws",
-                "s3",
-                "cp",
-                s3_path,
-                str(out_dir),
-                "--recursive",
-                "--only-show-errors",
-                "--no-sign-request",
-            ],
-            dry_run,
-            retries=retries,
-            retry_delay_seconds=retry_delay_seconds,
-            allow_fail=True,
-            verbose=verbose,
-        )
+    def download(destination: Path) -> bool:
+        cmd = ["aws", "s3", "cp", f"{bucket}/pdb/{cid}", str(destination),
+               "--recursive", "--only-show-errors"]
+        if not full_chain_dir:
+            cmd.extend(["--exclude", "*"])
+            for name in msa_names:
+                cmd.extend(["--include", name, "--include", f"*/{name}"])
+            if not no_template_hits:
+                cmd.extend(["--include", template_hits_name, "--include", f"*/{template_hits_name}"])
+        cmd.append("--no-sign-request")
+        return run(cmd, dry_run, retries=0, retry_delay_seconds=retry_delay_seconds,
+                   allow_fail=True, verbose=verbose)
 
-    cmd = [
-        "aws",
-        "s3",
-        "cp",
-        s3_path,
-        str(out_dir),
-        "--recursive",
-        "--only-show-errors",
-        "--exclude",
-        "*",
-        *[item for name in msa_names for item in ("--include", name, "--include", f"*/{name}")],
-    ]
-    if not no_template_hits:
-        cmd.extend(
-            [
-                "--include",
-                template_hits_name,
-                "--include",
-                f"*/{template_hits_name}",
-            ]
-        )
-    cmd.append("--no-sign-request")
-    return run(
-        cmd,
-        dry_run,
-        retries=retries,
-        retry_delay_seconds=retry_delay_seconds,
-        allow_fail=True,
-        verbose=verbose,
-    )
+    if dry_run:
+        return download(out_dir)
+    out_dir.parent.mkdir(parents=True, exist_ok=True)
+    # An interrupted AWS transfer must never look like a completed cache entry
+    # on this or a subsequent invocation. Publish only successful downloads.
+    for attempt in range(max(0, retries) + 1):
+        with tempfile.TemporaryDirectory(dir=out_dir.parent, prefix=".download-") as temporary:
+            staging = Path(temporary)
+            if download(staging):
+                for source in staging.rglob("*"):
+                    if source.is_file():
+                        destination = out_dir / source.relative_to(staging)
+                        destination.parent.mkdir(parents=True, exist_ok=True)
+                        source.replace(destination)
+                return True
+        if attempt < retries:
+            wait_seconds = max(0.0, retry_delay_seconds) * (attempt + 1)
+            print(f"WARNING: retrying chain download {attempt + 1}/{retries} after {wait_seconds:.1f}s")
+            time.sleep(wait_seconds)
+    return False
 
 
 def _replace_with_symlink(target: Path, source: Path) -> None:
@@ -471,7 +461,8 @@ def _process_chain(
     verbose: bool = False,
 ) -> List[str]:
     out_dir = chain_data_dir(roda_root, cid)
-    out_dir.parent.mkdir(parents=True, exist_ok=True)
+    if not dry_run:
+        out_dir.parent.mkdir(parents=True, exist_ok=True)
 
     need_tpl = not no_template_hits
     has_msa, has_tpl = _has_required_files(out_dir, msa_names, template_hits_name, need_tpl)
@@ -484,24 +475,21 @@ def _process_chain(
     candidates = _dedupe_keep_order(candidates)
 
     chosen_source = None
-    chosen_has_tpl = False
     fallback_source = None
-    fallback_has_tpl = False
 
     for source_cid in candidates:
         source_dir = chain_data_dir(roda_root, source_cid)
-        source_dir.parent.mkdir(parents=True, exist_ok=True)
+        if not dry_run:
+            source_dir.parent.mkdir(parents=True, exist_ok=True)
         src_msa, src_tpl = _has_required_files(source_dir, msa_names, template_hits_name, need_tpl)
         if src_msa and fallback_source is None:
             fallback_source = source_cid
-            fallback_has_tpl = src_tpl
 
         if src_msa and src_tpl:
             chosen_source = source_cid
-            chosen_has_tpl = src_tpl
             break
 
-    if chosen_source is None and fallback_source is None:
+    if chosen_source is None:
         for source_cid in candidates:
             source_dir = chain_data_dir(roda_root, source_cid)
             _download_chain(
@@ -517,21 +505,20 @@ def _process_chain(
                 retry_delay_seconds=retry_delay_seconds,
                 verbose=verbose,
             )
+            if dry_run:
+                return []
             src_msa, src_tpl = _has_required_files(source_dir, msa_names, template_hits_name, need_tpl)
             if not src_msa:
                 continue
 
             if fallback_source is None:
                 fallback_source = source_cid
-                fallback_has_tpl = src_tpl
             if src_tpl:
                 chosen_source = source_cid
-                chosen_has_tpl = src_tpl
                 break
 
     if chosen_source is None and fallback_source is not None:
         chosen_source = fallback_source
-        chosen_has_tpl = fallback_has_tpl
 
     missing_required: List[str] = []
     if chosen_source is None:
@@ -546,7 +533,7 @@ def _process_chain(
         _replace_with_symlink(out_dir, chain_data_dir(roda_root, chosen_source))
 
     has_msa = all(_has_file(out_dir, name) for name in msa_names)
-    has_tpl = chosen_has_tpl if need_tpl else True
+    has_tpl = _has_file(out_dir, template_hits_name) if need_tpl else True
     if not has_msa:
         missing_names = [name for name in msa_names if not _has_file(out_dir, name)]
         print(f"WARNING: {cid} missing required MSA file(s) after download: {','.join(missing_names)}")
@@ -632,12 +619,12 @@ def _download_manifest_chains(
 def main() -> None:
     args = parse_args()
     data_root = Path(args.data_root)
-    data_root.mkdir(parents=True, exist_ok=True)
     roda_root = data_root / "roda_pdb"
-    roda_root.mkdir(parents=True, exist_ok=True)
 
     manifest = Path(args.manifest)
-    chain_ids = [ln.strip() for ln in manifest.read_text().splitlines() if ln.strip() and not ln.startswith("#")]
+    chain_ids = [ln.strip() for ln in manifest.read_text().splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
+    if not chain_ids or len(chain_ids) != len(set(chain_ids)):
+        raise ValueError("Manifest must contain a nonempty set of unique chain IDs.")
     duplicate_map = _load_duplicate_map(args.duplicate_chains_file)
     msa_names = _normalize_msa_names(args.msa_name, args.msa_names)
 

@@ -124,6 +124,59 @@ def test_loader_uses_sampling_only_for_training(monkeypatch, tmp_path, split, we
     assert (train._epoch_aware_sampler(loader.sampler) is not None) is (split == "train" and world_size == 2)
 
 
+@pytest.mark.parametrize("field,value", [("crop_size", True), ("crop_size", 1.5), ("msa_depth", 0), ("msa_depth", 1.5)])
+def test_loader_rejects_invalid_sampling_sizes_before_coercion(field, value) -> None:
+    config = {"data": {"crop_size": 2, "msa_depth": 1, field: value}}
+    with pytest.raises(ValueError, match="positive integer"):
+        train.make_loader(
+            config, "train", device=torch.device("cpu"), include_labels=True,
+            fail_if_labels_present=False, allow_missing=False, generator_seed=73,
+        )
+
+
+@pytest.mark.parametrize("population,batch_size", [(5, 1), (7, 2), (9, 2), (6, 2)])
+def test_unweighted_distributed_epochs_omit_incomplete_global_batches_without_repeating_targets(
+    monkeypatch, population, batch_size,
+) -> None:
+    class StubDataset(Dataset):
+        chain_ids = [f"chain_{index}" for index in range(population)]
+
+        def __init__(self, **kwargs):
+            pass
+
+        def __len__(self):
+            return len(self.chain_ids)
+
+        def __getitem__(self, index):
+            return self.chain_ids[index]
+
+    monkeypatch.setattr(train, "ProcessedNPZDataset", StubDataset)
+    config = {"data": {
+        "processed_features_dir": "features", "train_manifest": "train", "val_manifest": "val",
+        "crop_size": 2, "msa_depth": 1, "batch_size": batch_size,
+    }}
+    loaders = [train.make_loader(
+        config, "train", device=torch.device("cpu"), include_labels=True, fail_if_labels_present=False,
+        allow_missing=False, generator_seed=73, distributed_rank=rank, distributed_world_size=2,
+    ) for rank in range(2)]
+    expected_count = population // (2 * batch_size) * (2 * batch_size)
+    for epoch in (0, 1, 5):
+        consumed = []
+        for loader in loaders:
+            assert isinstance(loader.sampler, DistributedSampler)
+            loader.sampler.set_epoch(epoch)
+            consumed.extend(list(loader.sampler)[:len(loader) * batch_size])
+        assert len(consumed) == len(set(consumed)) == expected_count
+    contracts = [train._training_sampling_contract(
+        loader, world_size=2, local_grad_accum_steps=1,
+    ) for loader in loaders]
+    assert contracts[0] == contracts[1]
+    assert contracts[0]["schema_version"] == 2
+    assert contracts[0]["sampler_drop_last"] is True
+    assert contracts[0]["epoch_sample_count"] == expected_count
+    assert contracts[0]["epoch_omitted_population_count"] == population - expected_count
+
+
 @pytest.mark.parametrize("value", [False, True])
 def test_single_device_metrics_do_not_allocate_float64_on_mps(monkeypatch, value) -> None:
     def unexpected_collective(*args, **kwargs):

@@ -177,3 +177,36 @@ def test_refresh_rejects_colliding_candidate_fingerprints_before_writes(tmp_path
     assert proc.returncode != 0
     assert "Candidate output paths must be distinct" in proc.stderr
     assert not list(tmp_path.iterdir())
+
+
+def test_custom_raw_root_propagates_to_default_chain_cache(tmp_path: Path) -> None:
+    raw = tmp_path / "custom-raw"
+    result = subprocess.run(["bash", "scripts/full_official_data_refresh.sh", "--dry-run",
+                             "--skip-manifest-regen", "--data-root", str(raw)],
+                            cwd=REPO_ROOT, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    cache = raw / "pdb_data/data_caches/chain_data_cache.json"
+    commands = [line for line in result.stdout.splitlines() if "--chain-data-cache" in line]
+    assert len(commands) == 2
+    assert all(f"--chain-data-cache {cache}" in command for command in commands)
+    assert not raw.exists()
+
+
+@pytest.mark.parametrize("overlap", ["public_hidden_features", "hidden_features_labels", "features_under_raw"])
+def test_refresh_rejects_overlapping_asset_roots_before_work(tmp_path: Path, overlap: str) -> None:
+    root = tmp_path / "assets"
+    args = ["--data-root", str(root / "raw"), "--processed-features-dir", str(root / "public_features"),
+            "--processed-labels-dir", str(root / "public_labels"),
+            "--hidden-features-dir", str(root / "hidden_features"), "--hidden-labels-dir", str(root / "hidden_labels")]
+    if overlap == "public_hidden_features":
+        args.extend(["--hidden-features-dir", str(root / "public_features")])
+    elif overlap == "hidden_features_labels":
+        args.extend(["--hidden-labels-dir", str(root / "hidden_features")])
+    else:
+        args.extend(["--processed-features-dir", str(root / "raw/features")])
+    result = subprocess.run(["bash", "scripts/full_official_data_refresh.sh", "--dry-run",
+                             "--skip-manifest-regen", *args], cwd=REPO_ROOT, capture_output=True, text=True)
+    assert result.returncode != 0
+    assert "must be separate" in result.stderr
+    assert "[1/5]" not in result.stdout
+    assert not root.exists()

@@ -94,6 +94,32 @@ def test_resume_preserves_metadata_and_skips_only_unchanged_inputs(preprocessing
         assert ground_truth["ca_coords"][0, 0] == 4
 
 
+@pytest.mark.parametrize("manifest_text", ["", "# no targets\n", "1abc_A\n1abc_A\n", "bad-id\n", "../../bad_A\n"])
+def test_invalid_manifest_fails_before_creating_outputs(preprocessing, tmp_path: Path, manifest_text: str) -> None:
+    _, run, features, labels, _, _ = preprocessing
+    manifest = tmp_path / "invalid.txt"
+    manifest.write_text(manifest_text)
+    with pytest.raises(ValueError):
+        run("--manifest", str(manifest))
+    assert not features.exists()
+    assert not labels.exists()
+
+
+@pytest.mark.parametrize("relationship", ["same", "labels_inside_features", "features_inside_labels"])
+def test_feature_and_label_roots_must_be_disjoint(preprocessing, relationship: str) -> None:
+    _, run, features, labels, _, _ = preprocessing
+    if relationship == "same":
+        labels = features
+    elif relationship == "labels_inside_features":
+        labels = features / "labels"
+    else:
+        features = labels / "features"
+    with pytest.raises(ValueError, match="must not contain each other"):
+        run("--processed-features-dir", str(features), "--processed-labels-dir", str(labels))
+    assert not features.exists()
+    assert not labels.exists()
+
+
 def test_resume_rejects_changed_config_without_relabeling_existing_output(preprocessing) -> None:
     _, run, features, _, _, _ = preprocessing
     run()

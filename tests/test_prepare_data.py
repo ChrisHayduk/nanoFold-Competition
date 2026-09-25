@@ -153,3 +153,120 @@ def test_download_mmcif_subset_strict_fails_on_missing_download(tmp_path: Path, 
         assert "Missing required mmCIF downloads" in str(exc)
     else:
         raise AssertionError("strict mmCIF subset download should fail on missing files")
+
+
+def test_prepare_dry_run_creates_no_directories(tmp_path: Path, monkeypatch) -> None:
+    module = _load_prepare_data_module()
+    manifest = tmp_path / "chains.txt"
+    manifest.write_text("1abc_A\n")
+    root = tmp_path / "not-created"
+    monkeypatch.setattr(sys, "argv", ["prepare_data.py", "--manifest", str(manifest), "--data-root", str(root),
+                                    "--dry-run", "--strict-downloads", "--download-mmcif-subset", "--no-template-hits"])
+    module.main()
+    assert not root.exists()
+
+
+@pytest.mark.parametrize("invalid", ["directory", "empty"])
+def test_required_alignment_assets_must_be_nonempty_regular_files(tmp_path: Path, invalid: str) -> None:
+    module = _load_prepare_data_module()
+    asset = tmp_path / "uniref90_hits.a3m"
+    if invalid == "directory":
+        asset.mkdir()
+    else:
+        asset.touch()
+    assert module._has_required_files(tmp_path, [asset.name], "hits.hhr", False) == (False, True)
+
+
+def test_failed_aws_download_does_not_publish_partial_assets(tmp_path: Path, monkeypatch) -> None:
+    module = _load_prepare_data_module()
+    out = tmp_path / "chain"
+    out.mkdir()
+    existing = out / "uniref90_hits.a3m"
+    existing.write_text(">query\nCOMPLETE\n")
+
+    def failed_transfer(command, *args, **kwargs):
+        destination = Path(command[4])
+        (destination / "uniref90_hits.a3m").write_text(">query\nPART")
+        return False
+
+    monkeypatch.setattr(module, "run", failed_transfer)
+    assert not module._download_chain("1abc_A", out, bucket="s3://openfold", msa_names=[existing.name],
+                                      template_hits_name="hits.hhr", no_template_hits=True,
+                                      full_chain_dir=False, dry_run=False, retries=0, retry_delay_seconds=0)
+    assert existing.read_text() == ">query\nCOMPLETE\n"
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["chain"]
+
+
+def test_partial_existing_chain_still_downloads_missing_templates(tmp_path: Path, monkeypatch) -> None:
+    module = _load_prepare_data_module()
+    root = tmp_path / "roda"
+    chain = module.chain_data_dir(root, "1abc_A")
+    chain.mkdir(parents=True)
+    (chain / "uniref90_hits.a3m").write_text(">query\nAAAA\n")
+    calls = []
+
+    def transfer(cid, destination, **kwargs):
+        calls.append(cid)
+        (destination / "hits.hhr").write_text("template hits")
+        return True
+
+    monkeypatch.setattr(module, "_download_chain", transfer)
+    missing = module._process_chain("1abc_A", roda_root=root, duplicate_map={}, bucket="s3://openfold",
+                                    msa_names=["uniref90_hits.a3m"], template_hits_name="hits.hhr",
+                                    no_template_hits=False, full_chain_dir=False, dry_run=False,
+                                    retries=0, retry_delay_seconds=0)
+    assert missing == []
+    assert calls == ["1abc_A"]
+
+
+def test_fallback_does_not_report_unlinked_template_as_present(tmp_path: Path) -> None:
+    module = _load_prepare_data_module()
+    root = tmp_path / "roda"
+    target = module.chain_data_dir(root, "1abc_A")
+    representative = module.chain_data_dir(root, "2abc_A")
+    for chain in (target, representative):
+        chain.mkdir(parents=True)
+        (chain / "uniref90_hits.a3m").write_text(">query\nAAAA\n")
+    (representative / "hits.hhr").write_text("template hits")
+    missing = module._process_chain("1abc_A", roda_root=root, duplicate_map={"1abc_A": ["2abc_A"]},
+                                    bucket="s3://openfold", msa_names=["uniref90_hits.a3m"],
+                                    template_hits_name="hits.hhr", no_template_hits=False,
+                                    full_chain_dir=False, dry_run=False, retries=0, retry_delay_seconds=0)
+    assert missing == ["1abc_A:hits.hhr"]
+
+
+def test_failed_response_body_leaves_no_partial_download(tmp_path: Path, monkeypatch) -> None:
+    module = _load_prepare_data_module()
+
+    class Interrupted(io.BytesIO):
+        def read(self, *args, **kwargs):
+            raise OSError("response interrupted")
+
+    monkeypatch.setattr(module, "urlopen", lambda *args, **kwargs: Interrupted())
+    assert not module._download_url("https://example.invalid/file", tmp_path / "file.cif", dry_run=False,
+                                    retries=0, retry_delay_seconds=0, allow_fail=True)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_successful_retry_cannot_publish_previous_failed_attempt_bytes(tmp_path: Path, monkeypatch) -> None:
+    module = _load_prepare_data_module()
+    attempts = []
+
+    def transfer(command):
+        destination = Path(command[4])
+        attempts.append(destination)
+        if len(attempts) == 1:
+            (destination / "uniref90_hits.a3m").write_text(">query\nPART")
+            raise module.subprocess.CalledProcessError(1, command)
+        # An empty recursive listing is a successful AWS command, but has no assets.
+
+    monkeypatch.setattr(module.subprocess, "check_call", transfer)
+    monkeypatch.setattr(module.time, "sleep", lambda seconds: None)
+    out = tmp_path / "chain"
+    module._download_chain("1abc_A", out, bucket="s3://openfold", msa_names=["uniref90_hits.a3m"],
+                           template_hits_name="hits.hhr", no_template_hits=True,
+                           full_chain_dir=False, dry_run=False, retries=1, retry_delay_seconds=0)
+    assert len(attempts) == 2
+    assert attempts[0] != attempts[1]
+    assert not module._has_file(out, "uniref90_hits.a3m")
+    assert list(tmp_path.iterdir()) == []

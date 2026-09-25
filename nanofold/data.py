@@ -23,6 +23,7 @@ FEATURE_KEYS = (
 
 # Required keys every label NPZ must carry.
 LABEL_KEYS = ("ca_coords", "ca_mask", "atom14_positions", "atom14_mask")
+LABEL_ONLY_KEYS = (*LABEL_KEYS, "resolution")
 
 # Extra keys produced by the current preprocessing pipeline.
 OPTIONAL_LABEL_KEYS = (
@@ -42,10 +43,14 @@ class ExamplePaths:
 def read_manifest(manifest_path: str | Path) -> List[str]:
     manifest_path = Path(manifest_path)
     ids: List[str] = []
-    for line in manifest_path.read_text().splitlines():
+    seen: set[str] = set()
+    for line_number, line in enumerate(manifest_path.read_text().splitlines(), start=1):
         line = line.strip()
         if not line or line.startswith("#"):
             continue
+        if line in seen:
+            raise ValueError(f"Duplicate chain ID at line {line_number} in manifest: {manifest_path}")
+        seen.add(line)
         ids.append(line)
     if not ids:
         raise ValueError(f"Empty manifest: {manifest_path}")
@@ -91,6 +96,9 @@ class ProcessedNPZDataset(Dataset):
                 continue
 
             if has_feature:
+                with np.load(feature_path, allow_pickle=False) as feature_data:
+                    if set(feature_data.files).intersection(LABEL_ONLY_KEYS):
+                        raise ValueError("Features-only input archive contains label-only fields.")
                 if self.fail_if_labels_present and has_label:
                     label_conflict_chain_ids.append(chain_id)
                 else:
@@ -210,6 +218,10 @@ class ProcessedNPZDataset(Dataset):
 
 
 def _crop_single_example(example: Dict[str, torch.Tensor], crop_size: int, crop_mode: str) -> Dict[str, torch.Tensor]:
+    if type(crop_size) is not int or crop_size <= 0:
+        raise ValueError("crop_size must be a positive integer.")
+    if crop_mode not in {"random", "center"}:
+        raise ValueError(f"Unsupported crop_mode={crop_mode!r}; expected 'random' or 'center'.")
     aatype = example["aatype"]
     L = int(aatype.shape[0])
     if L <= crop_size:
@@ -217,10 +229,8 @@ def _crop_single_example(example: Dict[str, torch.Tensor], crop_size: int, crop_
 
     if crop_mode == "random":
         start = int(torch.randint(low=0, high=L - crop_size + 1, size=(1,)).item())
-    elif crop_mode == "center":
-        start = (L - crop_size) // 2
     else:
-        raise ValueError(f"Unsupported crop_mode={crop_mode!r}; expected 'random' or 'center'.")
+        start = (L - crop_size) // 2
     end = start + crop_size
 
     cropped = dict(example)
@@ -253,6 +263,12 @@ def sample_msa(
     sample_mode: str = "random",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Subsample MSA rows to a fixed depth, always keeping row 0 (query)."""
+    if type(msa_depth) is not int or msa_depth <= 0:
+        raise ValueError("msa_depth must be a positive integer.")
+    if sample_mode not in {"random", "top"}:
+        raise ValueError(f"Unsupported msa sample_mode={sample_mode!r}; expected 'random' or 'top'.")
+    if msa.ndim != 2 or msa.shape != deletions.shape or min(msa.shape) <= 0:
+        raise ValueError("msa and deletions must have matching nonempty (N, L) shapes.")
     N = msa.shape[0]
     if N <= msa_depth:
         return msa, deletions
@@ -260,8 +276,6 @@ def sample_msa(
     if sample_mode == "top":
         keep = torch.arange(msa_depth, dtype=torch.long)
         return msa[keep], deletions[keep]
-    if sample_mode != "random":
-        raise ValueError(f"Unsupported msa sample_mode={sample_mode!r}; expected 'random' or 'top'.")
 
     # Keep query at index 0; sample the rest.
     perm = torch.randperm(N - 1) + 1
@@ -277,6 +291,8 @@ def collate_batch(
     crop_mode: str = "random",
     msa_sample_mode: str = "random",
 ) -> Dict[str, torch.Tensor]:
+    if not examples:
+        raise ValueError("Cannot collate an empty batch.")
     # This baseline uses batch_size=1 in the config by default.
     # Still implement stacking for convenience.
     batch: List[Dict[str, torch.Tensor]] = []
@@ -386,11 +402,17 @@ def collate_batch(
         [pad_1d(torch.ones_like(item["aatype"], dtype=torch.bool), pad_value=0) for item in batch],
         dim=0,
     )
+    # Biological gaps remain valid observations. Only batch padding is masked.
+    msa_mask = torch.stack(
+        [pad_2d(torch.ones_like(item["msa"], dtype=torch.bool), pad_value=0) for item in batch],
+        dim=0,
+    )
 
     out: Dict[str, Any] = {
         "chain_id": chain_ids,
         "aatype": aatype,
         "msa": msa,
+        "msa_mask": msa_mask,
         "deletions": deletions,
         "template_aatype": template_aatype,
         "template_ca_coords": template_ca_coords,

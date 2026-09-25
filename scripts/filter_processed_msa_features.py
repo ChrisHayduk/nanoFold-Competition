@@ -3,7 +3,7 @@
 This is a maintainer/rebuttal utility for existing processed features. The
 preferred official data-refresh path is still ``scripts/preprocess.py
 --msa-row-filter`` because that filters raw A3M rows before depth capping and
-can backfill with deeper non-filtered rows. This script preserves every feature
+can backfill with deeper non-filtered rows. This script accepts features without raw preprocessing provenance and preserves every feature
 array except ``msa`` and ``deletions`` and is useful when raw alignments are
 incomplete locally or when a fast sanitized-feature root is needed for audits or
 experimental reruns.
@@ -14,7 +14,10 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
+import re
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
@@ -28,6 +31,7 @@ if str(REPO_ROOT) not in sys.path:
 from nanofold.a3m import GAP_ID, MASK_ID, RESTYPES
 from nanofold.chain_paths import chain_npz_path
 from nanofold.data import read_manifest
+from nanofold.mmseqs import validate_msa_arrays
 
 MSA_TOKEN_TO_AA = {idx: aa for idx, aa in enumerate(RESTYPES)}
 MSA_TOKEN_TO_AA[20] = "X"
@@ -53,7 +57,7 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         action="append",
         required=True,
-        help="Processed feature root to read from. Repeat to search public/private roots in order.",
+        help="Processed feature root to read from. Repeat for disjoint roots; conflicting chain variants are rejected.",
     )
     ap.add_argument("--out-features-dir", type=Path, required=True)
     ap.add_argument("--msa-row-filter", type=Path, required=True)
@@ -65,7 +69,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument(
         "--skip-existing",
         action="store_true",
-        help="Skip output NPZs that already carry the same msa_row_filter_sha256.",
+        help="Reuse validated output NPZs only when both source bytes and filter digest match.",
     )
     ap.add_argument(
         "--no-preprocess-meta",
@@ -106,7 +110,7 @@ def _load_msa_row_filter(path: Path) -> MSARowFilter:
         raise ValueError(f"MSA row filter missing `excluded_sequence_sha256` list: {path}")
     excluded: set[str] = set()
     for value in excluded_raw:
-        if not isinstance(value, str) or len(value) != 64:
+        if not isinstance(value, str) or re.fullmatch(r"[0-9a-fA-F]{64}", value) is None:
             raise ValueError(f"Bad sequence SHA256 in MSA row filter {path}: {value!r}")
         excluded.add(value.lower())
     return MSARowFilter(path=path, sha256=_sha256_file(path), excluded_sequence_sha256=frozenset(excluded))
@@ -123,20 +127,13 @@ def _msa_row_to_ungapped_sequence(row: np.ndarray) -> str:
 
 
 def _find_feature_path(source_features_dirs: Sequence[Path], chain_id: str) -> Path | None:
-    for features_dir in source_features_dirs:
-        candidate = chain_npz_path(features_dir, chain_id)
-        if candidate.exists():
-            return candidate
-    return None
-
-
-def _existing_filter_sha256(path: Path) -> str | None:
-    if not path.exists():
-        return None
-    with np.load(path) as data:
-        if "msa_row_filter_sha256" not in data.files:
-            return None
-        return str(np.asarray(data["msa_row_filter_sha256"]).item())
+    candidates = list(dict.fromkeys(
+        chain_npz_path(root, chain_id).resolve()
+        for root in source_features_dirs if chain_npz_path(root, chain_id).exists()
+    ))
+    if len(candidates) > 1 and len({_sha256_file(path) for path in candidates}) != 1:
+        raise ValueError("Multiple different source feature variants require separate output roots")
+    return candidates[0] if candidates else None
 
 
 def _filter_arrays(
@@ -147,14 +144,10 @@ def _filter_arrays(
         missing = [key for key in ("msa", "deletions") if key not in arrays]
         raise KeyError(f"Feature NPZ is missing required MSA keys: {', '.join(missing)}")
 
-    msa = np.asarray(arrays["msa"])
+    if any(key in arrays for key in ("preprocess_config_sha256", "source_inputs_sha256")):
+        raise ValueError("Provenance-bound features must be filtered by re-running preprocess.py from raw inputs")
+    msa = validate_msa_arrays(arrays)
     deletions = np.asarray(arrays["deletions"])
-    if msa.ndim != 2:
-        raise ValueError(f"`msa` must have rank 2, got {msa.shape}")
-    if deletions.shape != msa.shape:
-        raise ValueError(f"`deletions` must match `msa`, got {deletions.shape} vs {msa.shape}")
-    if msa.shape[0] < 1:
-        raise ValueError("`msa` must contain at least the query row")
 
     keep_indices = [0]
     for row_index, row in enumerate(msa[1:], start=1):
@@ -178,7 +171,7 @@ def _filter_arrays(
 
 
 def _load_feature_arrays(path: Path) -> dict[str, np.ndarray]:
-    with np.load(path) as data:
+    with np.load(path, allow_pickle=False) as data:
         return {key: np.array(data[key]) for key in data.files}
 
 
@@ -195,31 +188,38 @@ def _filter_one_chain(
         raise FileNotFoundError(f"Missing processed feature NPZ for {chain_id}")
 
     out_path = chain_npz_path(out_features_dir, chain_id)
-    if skip_existing and _existing_filter_sha256(out_path) == row_filter.sha256:
-        arrays = _load_feature_arrays(out_path)
-        input_rows = int(np.asarray(arrays["msa_rows_before_filter"]).item())
-        removed_rows = int(np.asarray(arrays["msa_rows_removed_by_filter"]).item())
-        output_rows = int(np.asarray(arrays["msa"]).shape[0])
-        return {
-            "chain_id": chain_id,
-            "source_path": str(source_path),
-            "output_path": str(out_path),
-            "input_rows": input_rows,
-            "removed_rows": removed_rows,
-            "output_rows": output_rows,
-            "status": "skipped_existing",
-        }
-
+    if out_path.resolve() == source_path.resolve():
+        raise ValueError("Processed MSA filtering requires a separate output feature root")
     arrays = _load_feature_arrays(source_path)
     filtered, stats = _filter_arrays(arrays, row_filter)
+    source_sha256 = _sha256_file(source_path)
+    filtered["msa_row_filter_source_sha256"] = np.asarray(source_sha256)
+    if skip_existing and out_path.exists():
+        existing = _load_feature_arrays(out_path)
+        validate_msa_arrays(existing)
+        # Compare the complete expected transformation, including original non-MSA
+        # arrays, so a modified output cannot pass on self-declared metadata alone.
+        if existing.keys() == filtered.keys() and all(
+            np.array_equal(existing[key], value) for key, value in filtered.items()
+        ):
+            return {
+                "chain_id": chain_id, "source_path": str(source_path), "output_path": str(out_path),
+                **stats, "status": "skipped_existing",
+            }
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(out_path, **filtered)  # type: ignore[arg-type]
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{out_path.name}.", suffix=".tmp", dir=out_path.parent)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            np.savez_compressed(handle, **filtered)  # type: ignore[arg-type]
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, out_path)
+    finally:
+        Path(tmp_name).unlink(missing_ok=True)
     return {
-        "chain_id": chain_id,
-        "source_path": str(source_path),
-        "output_path": str(out_path),
-        **stats,
-        "status": "written",
+        "chain_id": chain_id, "source_path": str(source_path), "output_path": str(out_path),
+        **stats, "status": "written",
     }
 
 
@@ -258,6 +258,10 @@ def filter_processed_features(
     write_preprocess_meta: bool = True,
     audit_name: str = "processed_msa_row_filter_audit.json",
 ) -> dict[str, Any]:
+    if any(out_features_dir.resolve() == source.resolve() for source in source_features_dirs):
+        raise ValueError("Processed MSA filtering requires a separate output feature root")
+    if Path(audit_name).name != audit_name or audit_name in {"", ".", "..", "preprocess_meta.json"}:
+        raise ValueError("Audit name must be a distinct filename inside the output feature root")
     out_features_dir.mkdir(parents=True, exist_ok=True)
     per_chain: list[dict[str, Any]] = []
     missing_chain_ids: list[str] = []

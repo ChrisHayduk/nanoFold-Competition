@@ -74,7 +74,9 @@ def run_batch(
     cfg: Dict[str, Any],
     training: bool,
 ) -> Dict[str, torch.Tensor]:
-    pred_ca = model(batch["aatype"], batch["msa"], batch["deletions"], batch["residue_mask"])
+    pred_ca = model(
+        batch["aatype"], batch["msa"], batch["deletions"], batch["residue_mask"], batch.get("msa_mask"),
+    )
     pred_atom14 = _atom14_from_ca(pred_ca)
     if not training:
         return {"pred_atom14": pred_atom14}

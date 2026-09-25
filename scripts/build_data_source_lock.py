@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -74,6 +75,22 @@ def _sha256(path: Path) -> str | None:
     return hasher.hexdigest()
 
 
+def _nonempty_file(path: Path) -> bool:
+    return path.is_file() and path.stat().st_size > 0
+
+
+def _atomic_write(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, prefix=f".{path.name}.", delete=False) as handle:
+        temporary = Path(handle.name)
+        try:
+            handle.write(content)
+            handle.flush()
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
 def _display_path(path: Path, *, repo_root: Path) -> str:
     try:
         return str(path.resolve().relative_to(repo_root.resolve())).replace("\\", "/")
@@ -102,9 +119,9 @@ def _tree_sha256(files: list[Path], *, root: Path) -> str | None:
 
 
 def _read_manifest(path: Path) -> list[str]:
-    if not path.exists():
+    if not path.is_file():
         return []
-    return [line.strip() for line in path.read_text().splitlines() if line.strip() and not line.startswith("#")]
+    return [line.strip() for line in path.read_text().splitlines() if line.strip() and not line.lstrip().startswith("#")]
 
 
 def _manifest_paths(
@@ -146,7 +163,7 @@ def _normalize_msa_names(msa_name: str, msa_names: str) -> list[str]:
 
 
 def _structure_metadata_source(path: Path) -> dict[str, Any]:
-    if not path.exists():
+    if not path.is_file():
         return {}
     try:
         raw = json.loads(path.read_text())
@@ -161,8 +178,9 @@ def _structure_metadata_source(path: Path) -> dict[str, Any]:
 def _has_file(root: Path, filename: str) -> bool:
     if not root.exists():
         return False
-    for _ in root.rglob(filename):
-        return True
+    for path in root.rglob(filename):
+        if _nonempty_file(path):
+            return True
     return False
 
 
@@ -194,14 +212,12 @@ def _missing_alignment_assets(
 
 
 def _annotate_manifest_lock(manifest_lock: Path, source_lock: Path) -> None:
-    if not manifest_lock.exists():
-        return
     raw = json.loads(manifest_lock.read_text())
     if not isinstance(raw, dict):
         raise ValueError(f"Manifest lock must be a JSON object: {manifest_lock}")
     raw["data_source_lock"] = _display_path(source_lock, repo_root=Path.cwd())
     raw["data_source_lock_sha256"] = _sha256(source_lock)
-    manifest_lock.write_text(json.dumps(raw, indent=2) + "\n")
+    _atomic_write(manifest_lock, json.dumps(raw, indent=2) + "\n")
 
 
 def build_lock(args: argparse.Namespace) -> dict[str, Any]:
@@ -214,10 +230,17 @@ def build_lock(args: argparse.Namespace) -> dict[str, Any]:
     chain_ids: list[str] = []
     manifest_meta: dict[str, Any] = {}
     missing_manifests: list[str] = []
+    manifest_errors: list[str] = []
+    split_ids: dict[str, set[str]] = {}
     for split_name, manifest_path in manifests.items():
-        if not manifest_path.exists():
+        if not manifest_path.is_file():
             missing_manifests.append(split_name)
         ids = _read_manifest(manifest_path)
+        if not ids:
+            manifest_errors.append(f"{split_name}: empty or missing manifest")
+        if len(ids) != len(set(ids)):
+            manifest_errors.append(f"{split_name}: duplicate chain IDs")
+        split_ids[split_name] = set(ids)
         chain_ids.extend(ids)
         manifest_meta[split_name] = {
             "path": _display_path(manifest_path, repo_root=repo_root),
@@ -226,11 +249,19 @@ def build_lock(args: argparse.Namespace) -> dict[str, Any]:
             "chain_count": len(ids),
         }
     unique_chain_ids = sorted(set(chain_ids))
+    if split_ids["train"] & split_ids["val"]:
+        manifest_errors.append("public train and validation overlap")
+    if split_ids["all"] != split_ids["train"] | split_ids["val"]:
+        manifest_errors.append("all manifest is not the exact public train/validation union")
+    if args.include_hidden and split_ids["hidden_val"] & split_ids["all"]:
+        manifest_errors.append("public and hidden manifests overlap")
+    missing_sources = [name for name in ("chain_data_cache", "structure_metadata", "metadata_source_lock")
+                       if not _nonempty_file(getattr(args, name))]
     duplicate_file = args.data_root / "pdb_data" / "duplicate_pdb_chains.txt"
     mmcif_files = _required_mmcif_files(args.data_root, unique_chain_ids)
     alignment_files = _raw_alignment_files(args.data_root, unique_chain_ids)
     msa_names = _normalize_msa_names(str(args.msa_name), str(args.msa_names))
-    missing_mmcifs = [_display_path(path, repo_root=repo_root) for path in mmcif_files if not path.exists()]
+    missing_mmcifs = [_display_path(path, repo_root=repo_root) for path in mmcif_files if not _nonempty_file(path)]
     missing_alignment_dirs, missing_alignment_files = _missing_alignment_assets(
         args.data_root,
         unique_chain_ids,
@@ -261,6 +292,8 @@ def build_lock(args: argparse.Namespace) -> dict[str, Any]:
         "raw_assets": {
             "missing_manifest_count": len(missing_manifests),
             "missing_manifests": missing_manifests,
+            "manifest_errors": manifest_errors,
+            "missing_sources": missing_sources,
             "unique_chain_count": len(unique_chain_ids),
             "mmcif_file_count": len(mmcif_files) - len(missing_mmcifs),
             "missing_mmcif_count": len(missing_mmcifs),
@@ -281,6 +314,21 @@ def build_lock(args: argparse.Namespace) -> dict[str, Any]:
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
+    inputs = [args.chain_data_cache, args.structure_metadata, args.metadata_source_lock, args.manifest_lock,
+              *_manifest_paths(args.manifests_dir, include_hidden=args.include_hidden,
+                               hidden_manifest=args.hidden_manifest).values()]
+    output = args.output.resolve()
+    if any(output == path.resolve() or (output.exists() and path.exists() and output.samefile(path))
+           for path in inputs) or output.is_relative_to(args.data_root.resolve()):
+        raise ValueError("Source lock output must not alias or overwrite source inputs or raw assets.")
+    protected = [REPO_ROOT / path for path in ("leaderboard", "tracks", "data/manifests")]
+    writes = [output, args.manifest_lock.resolve()] if args.annotate_manifest_lock else [output]
+    if any(path.is_relative_to(root.resolve()) for path in writes for root in protected):
+        raise ValueError("Source locks may not rewrite published dataset contracts; use private candidate paths.")
+    if args.annotate_manifest_lock:
+        existing = json.loads(args.manifest_lock.read_text())
+        if not isinstance(existing, dict):
+            raise ValueError("Manifest lock must be a JSON object.")
     lock = build_lock(args)
     raw_assets = lock["raw_assets"]
     if args.require_complete and (
@@ -288,16 +336,19 @@ def main(argv: list[str] | None = None) -> None:
         or raw_assets["missing_mmcif_count"] > 0
         or raw_assets["missing_alignment_dir_count"] > 0
         or raw_assets["missing_alignment_file_count"] > 0
+        or raw_assets["manifest_errors"]
+        or raw_assets["missing_sources"]
     ):
         raise SystemExit(
             "Official raw-source lock is incomplete: "
             f"missing_manifest_count={raw_assets['missing_manifest_count']} "
             f"missing_mmcif_count={raw_assets['missing_mmcif_count']} "
             f"missing_alignment_dir_count={raw_assets['missing_alignment_dir_count']} "
-            f"missing_alignment_file_count={raw_assets['missing_alignment_file_count']}"
+            f"missing_alignment_file_count={raw_assets['missing_alignment_file_count']} "
+            f"manifest_errors={raw_assets['manifest_errors']} "
+            f"missing_sources={raw_assets['missing_sources']}"
         )
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(lock, indent=2, sort_keys=True) + "\n")
+    _atomic_write(args.output, json.dumps(lock, indent=2, sort_keys=True) + "\n")
     if args.annotate_manifest_lock:
         _annotate_manifest_lock(args.manifest_lock, args.output)
     print(f"Wrote official data source lock: {args.output}")

@@ -377,3 +377,38 @@ HELX_P A A 1 5
 def test_missing_exclusion_list_fails_closed(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="Missing required exclusion list"):
         metadata._load_feature_exclusions(tmp_path / "absent.txt")
+
+
+def test_noncanonical_pdb_aliases_cannot_hide_annotation_or_bypass_exclusions(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="lowercase"):
+        _build(tmp_path, {"1OKY_A": {"seq": "AAAA"}, "1oky_A": {"seq": "AAAA"}})
+    exclusions = tmp_path / "upper.txt"
+    exclusions.write_text("1OKY_A\n")
+    with pytest.raises(ValueError, match="lowercase"):
+        metadata._load_feature_exclusions(exclusions)
+
+
+def test_rcsb_entry_only_metadata_does_not_claim_chain_coverage(tmp_path: Path) -> None:
+    path = tmp_path / "rcsb.jsonl"
+    path.write_text(json.dumps({
+        "chain_id": "2or1_L", "entry": {"exptl": [{"method": "X-RAY DIFFRACTION"}]},
+        "entity": {}, "instance": {}, "errors": ["instance unavailable"],
+    }) + "\n")
+    annotations, details = metadata._load_rcsb_annotations(path)
+    assert annotations == {}
+    assert details["2or1_L"]["experimental_method"] == "X-RAY DIFFRACTION"
+    assert details["2or1_L"]["chain_mapping_status"] == "unresolved"
+
+
+def test_scope_small_protein_and_coiled_coil_do_not_become_unstructured_coil(tmp_path: Path) -> None:
+    path = tmp_path / "scope.txt"
+    path.write_text(
+        "d1abca_ 1abc A:1-60 g.1.1.1 1 cl=1\n"
+        "d2abcb_ 2abc B:1-60 h.1.1.1 2 cl=2\n"
+    )
+    assert metadata._load_scope_annotations(path) == {
+        "1abc_A": {"small_protein"}, "2abc_B": {"coiled_coil"},
+    }
+    from nanofold.structure_metadata import normalize_domain_architecture_class
+
+    assert normalize_domain_architecture_class("small protein") == "small_protein"

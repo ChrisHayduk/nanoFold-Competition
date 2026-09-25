@@ -19,6 +19,7 @@ INFERENCE_BATCH_KEYS = frozenset(
         "chain_id",
         "aatype",
         "msa",
+        "msa_mask",
         "deletions",
         "template_aatype",
         "template_ca_coords",

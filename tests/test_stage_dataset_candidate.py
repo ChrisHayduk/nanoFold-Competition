@@ -102,3 +102,18 @@ def test_unignored_repository_stage_is_rejected_before_creating_outputs(
     with pytest.raises(ValueError, match="hidden artifacts untracked"):
         staging.stage_candidate(args)
     assert not args.stage_dir.exists()
+
+
+def test_private_root_symlink_cannot_redirect_hidden_outputs_into_tracked_tree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args = staging.parse_args(_inputs(tmp_path))
+    checkout = tmp_path / "repo"
+    tracked = checkout / "data"
+    tracked.mkdir(parents=True)
+    (checkout / ".nanofold_private").symlink_to(tracked, target_is_directory=True)
+    args.stage_dir = checkout / ".nanofold_private/candidate"
+    monkeypatch.setattr(staging, "REPO_ROOT", checkout)
+    with pytest.raises(ValueError, match="hidden artifacts untracked"):
+        staging.stage_candidate(args)
+    assert not (tracked / "candidate").exists()

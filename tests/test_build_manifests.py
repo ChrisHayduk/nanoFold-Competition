@@ -374,6 +374,14 @@ def test_build_manifests_writes_hidden_split_and_stratifies_secondary_classes(tm
 
 
 def test_build_hidden_manifest_preserves_public_manifests_and_excludes_public_components(tmp_path: Path) -> None:
+    from scripts.build_manifests import (
+        DEFAULT_STRATIFY_FIELDS,
+        _build_candidates,
+        _load_cluster_tsv,
+        _load_structure_metadata,
+        _split_candidates,
+    )
+
     payload = {
         "1aaa_A": {"seq_length": 100, "resolution": 2.0, "oligomeric_count": 1, "sequence": "A" * 100},
         "1aaa_B": {"seq_length": 101, "resolution": 2.0, "oligomeric_count": 1, "sequence": "C" * 101},
@@ -416,9 +424,19 @@ def test_build_hidden_manifest_preserves_public_manifests_and_excludes_public_co
     train = public_dir / "train.txt"
     val = public_dir / "val.txt"
     all_manifest = public_dir / "all.txt"
-    train.write_text("1aaa_A\n2bbb_A\n3ccc_A\n")
-    val.write_text("4ddd_A\n5eee_A\n")
-    all_manifest.write_text("1aaa_A\n2bbb_A\n3ccc_A\n4ddd_A\n5eee_A\n")
+    accepted, metadata = _load_structure_metadata(structure_metadata, require_schema_version=2)
+    candidates, _, _ = _build_candidates(payload, min_len=40, max_len=256, max_resolution=3,
+                                         structure_metadata=metadata, structure_metadata_accepted=accepted)
+    split = _split_candidates(
+        candidates=candidates, cluster_map=_load_cluster_tsv(str(cluster_tsv), set(chain_ids)),
+        train_size=3, val_size=2, hidden_val_size=2, seed=11,
+        hidden_split_salt_digest=hashlib.sha256(TEST_HIDDEN_SPLIT_SALT.encode()).hexdigest(),
+        stratify_fields=DEFAULT_STRATIFY_FIELDS, disallow_pdb_overlap=True,
+        cluster_method="precomputed_tsv", cluster_command=None, structural_metadata_source="test",
+    )
+    train.write_text("\n".join(split.train_ids) + "\n")
+    val.write_text("\n".join(split.val_ids) + "\n")
+    all_manifest.write_text("\n".join(sorted(split.train_ids + split.val_ids)) + "\n")
     public_before = {
         train: train.read_text(),
         val: val.read_text(),
@@ -430,6 +448,10 @@ def test_build_hidden_manifest_preserves_public_manifests_and_excludes_public_co
         json.dumps(
             {
                 "sampling_policy": "cath-v2",
+                "filtering": {"candidate_count": len(chain_ids), "disjoint_unit_count": 8,
+                              "target_policy": "single_chain",
+                              "representative_policy": "best_resolution_then_longest_then_release_date_seeded_tie"},
+                "grouping": {"cluster_disjoint": True, "pdb_disjoint": True, "exact_sequence_disjoint": True},
                 "chain_data_cache_sha256": expected_sha,
                 "structure_metadata": {"sha256": _cache_sha(structure_metadata)},
                 "clustering": {"cluster_assignments_sha256": hashlib.sha256("".join(f"{chain}\t{'1aaa_A' if chain in {'1aaa_A', '1aaa_B'} else chain}\n" for chain in sorted(chain_ids)).encode()).hexdigest()},
@@ -439,6 +461,8 @@ def test_build_hidden_manifest_preserves_public_manifests_and_excludes_public_co
                     "all_manifest_sha256": _cache_sha(all_manifest), "unique_count": 5,
                 },
                 "args": {
+                    "sampling_policy": "cath-v2", "train_size": 3, "val_size": 2, "require_monomer": False,
+                    "stratify_fields": list(DEFAULT_STRATIFY_FIELDS),
                     "hidden_val_size": 2,
                     "min_len": 40,
                     "max_len": 256,
@@ -491,7 +515,8 @@ def test_build_hidden_manifest_preserves_public_manifests_and_excludes_public_co
     hidden_ids = set((hidden_out / "hidden_val.txt").read_text().splitlines())
     assert len(hidden_ids) == 2
     assert not hidden_ids & set(all_manifest.read_text().splitlines())
-    assert "1aaa_B" not in hidden_ids
+    public_ids = set(all_manifest.read_text().splitlines())
+    assert not {chain.split("_")[0] for chain in hidden_ids} & {chain.split("_")[0] for chain in public_ids}
 
     lock = json.loads(private_lock.read_text())
     assert lock["hidden_val_count"] == 2
@@ -532,7 +557,7 @@ def test_build_hidden_manifest_preserves_public_manifests_and_excludes_public_co
     assert "Hidden JS divergence by field" in verify_proc.stdout
 
     bad_hidden = tmp_path / "bad_hidden.txt"
-    bad_hidden.write_text("1aaa_B\n" + sorted(hidden_ids)[0] + "\n")
+    bad_hidden.write_text(sorted(public_ids)[0] + "\n" + sorted(hidden_ids)[0] + "\n")
     bad_verify_proc = subprocess.run(
         [
             sys.executable,
@@ -557,10 +582,11 @@ def test_build_hidden_manifest_preserves_public_manifests_and_excludes_public_co
         check=False,
     )
     assert bad_verify_proc.returncode != 0
-    assert "MMseqs2 cluster" in (bad_verify_proc.stderr + bad_verify_proc.stdout)
+    assert "Public/hidden chain" in (bad_verify_proc.stderr + bad_verify_proc.stdout)
 
     private_exclusions = tmp_path / "hidden_processability_exclusions.txt"
-    private_exclusions.write_text("6fff_A\n")
+    excluded_chain = sorted(hidden_ids)[0]
+    private_exclusions.write_text(excluded_chain + "\n")
     excluded_hidden_out = tmp_path / "private_manifests_excluded"
     excluded_private_lock = tmp_path / "private_hidden_manifest_source_excluded.lock.json"
     excluded_proc = subprocess.run(
@@ -595,7 +621,7 @@ def test_build_hidden_manifest_preserves_public_manifests_and_excludes_public_co
     assert excluded_proc.returncode == 0, excluded_proc.stderr + excluded_proc.stdout
     excluded_hidden_ids = set((excluded_hidden_out / "hidden_val.txt").read_text().splitlines())
     assert len(excluded_hidden_ids) == 2
-    assert "6fff_A" not in excluded_hidden_ids
+    assert excluded_chain not in excluded_hidden_ids
     excluded_lock = json.loads(excluded_private_lock.read_text())
     assert excluded_lock["filtering"]["private_processability_exclusion_count"] == 1
     assert excluded_lock["filtering"]["private_processability_exclusions"]["sha256"] == _cache_sha(private_exclusions)

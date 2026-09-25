@@ -8,6 +8,7 @@ import torch
 import yaml
 
 from nanofold.competition_policy import load_track_spec
+from nanofold.data import collate_batch
 from nanofold.utils import count_parameters
 from submissions.minalphafold2 import submission
 
@@ -182,6 +183,36 @@ def test_minalphafold2_inputs_include_af2_supervision_and_masked_msa_targets() -
     assert expected_keys <= set(features)
     assert features["true_atom_positions"].shape == (1, 8, 14, 3)
     assert features["masked_msa_target"].shape[:2] == features["msa_feat"].shape[:2]
+
+
+@pytest.mark.parametrize("training", [False, True])
+def test_minalphafold2_msa_features_ignore_companion_padding(training: bool) -> None:
+    def example(length: int, depth: int) -> dict[str, Any]:
+        msa = torch.zeros((depth, length), dtype=torch.long)
+        msa[-1] = 21  # Biological gaps must survive padding removal.
+        return {
+            "chain_id": "TEST_A",
+            "aatype": torch.zeros(length, dtype=torch.long),
+            "msa": msa,
+            "deletions": torch.ones_like(msa),
+            "template_aatype": torch.zeros((0, length), dtype=torch.long),
+            "template_ca_coords": torch.zeros((0, length, 3)),
+            "template_ca_mask": torch.zeros((0, length), dtype=torch.bool),
+        }
+
+    cfg = {"model": {"msa_depth": 2, "extra_msa_depth": 4}}
+    short = example(3, 2)
+    alone = collate_batch([short], 5, 5)
+    together = collate_batch([short, example(5, 5)], 5, 5)
+    torch.manual_seed(41)
+    expected = submission._build_minalphafold_inputs(alone, cfg, training=training)
+    torch.manual_seed(41)
+    actual = submission._build_minalphafold_inputs(together, cfg, training=training)
+    for key in ("msa_feat", "msa_mask", "masked_msa_target", "masked_msa_mask"):
+        torch.testing.assert_close(actual[key][0, :2, :3], expected[key][0])
+        assert torch.count_nonzero(actual[key][0, :, 3:]) == 0
+    assert bool(actual["msa_mask"][0, :2, :3].all())
+    assert torch.count_nonzero(actual["extra_msa_mask"][0]) == 0
 
 
 def test_minalphafold2_run_batch_returns_af2_loss() -> None:

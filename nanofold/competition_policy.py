@@ -53,6 +53,12 @@ class TrackSpec:
     max_params: int | None
 
     @property
+    def hidden_checkpoint_steps(self) -> tuple[int, ...]:
+        if self.max_steps is None:
+            raise ValueError("Hidden checkpoint milestones require a fixed maximum step count.")
+        return tuple(sorted({step for step in (0, 1000, 2000, 5000, self.max_steps) if step <= self.max_steps}))
+
+    @property
     def sample_budget(self) -> int | None:
         if self.max_steps is None or self.effective_batch_size is None:
             return None

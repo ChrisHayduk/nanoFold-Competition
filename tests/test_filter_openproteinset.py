@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from nanofold.chain_paths import chain_npz_path
 
@@ -25,7 +26,7 @@ def _write_npzs(feature_dir: Path, label_dir: Path, chain_id: str, *, aatype: li
     np.savez_compressed(
         chain_npz_path(feature_dir, chain_id),
         aatype=np.asarray(aatype, dtype=np.int32),
-        msa=np.zeros((1, len(aatype)), dtype=np.int32),
+        msa=np.asarray([aatype], dtype=np.int32),
         deletions=np.zeros((1, len(aatype)), dtype=np.int32),
         template_aatype=np.zeros((0, len(aatype)), dtype=np.int32),
         template_ca_coords=np.zeros((0, len(aatype), 3), dtype=np.float32),
@@ -69,7 +70,7 @@ def test_build_manifest_filters_length_resolution_and_single_aa(tmp_path: Path) 
     assert entries["1oky_A"]["accepted"] is True
     assert "secondary_structure_class" in entries["1oky_A"]
     assert "secondary_helix_fraction" in entries["1oky_A"]
-    assert entries["1tiny_A"]["reject_reasons"] == ["min_length"]
+    assert entries["1tiny_A"]["reject_reasons"] == ["min_length", "insufficient_valid_ca"]
     assert entries["1loq_A"]["reject_reasons"] == ["resolution"]
     assert entries["1poly_A"]["reject_reasons"] == ["single_aa"]
     assert manifest["summary"]["accepted"] == 1
@@ -151,5 +152,74 @@ def test_ca_only_labels_are_rejected(tmp_path: Path) -> None:
 
     entry = manifest["chains"][0]
     assert entry["accepted"] is False
-    assert entry["reject_reasons"] == ["missing_label_key"]
-    assert "atom14_positions" in entry["missing_label_keys"]
+    assert entry["reject_reasons"] == ["invalid_feature_label_schema"]
+    assert any("atom14_positions" in error for error in entry["schema_errors"])
+
+
+@pytest.mark.parametrize("mutation", ["missing_msa", "query_mismatch", "nonfinite", "wrong_chain", "wrong_length", "no_ca", "corrupt"])
+def test_filter_cannot_accept_invalid_or_unsupervised_training_pairs(tmp_path: Path, mutation: str) -> None:
+    module = _load_filter_module()
+    features, labels = tmp_path / "features", tmp_path / "labels"
+    features.mkdir()
+    labels.mkdir()
+    _write_npzs(features, labels, "1abc_A", aatype=list(range(20)) * 3, resolution=2.0)
+    feature_path, label_path = chain_npz_path(features, "1abc_A"), chain_npz_path(labels, "1abc_A")
+    with np.load(feature_path) as data:
+        feature_data = dict(data)
+    with np.load(label_path) as data:
+        label_data = dict(data)
+    if mutation == "missing_msa":
+        del feature_data["msa"]
+    elif mutation == "query_mismatch":
+        feature_data["msa"][0, 0] = 1
+    elif mutation == "nonfinite":
+        label_data["ca_coords"][:] = np.nan
+        label_data["atom14_positions"][:] = np.nan
+        label_data["resolution"] = np.asarray(np.nan)
+    elif mutation == "wrong_chain":
+        feature_data["chain_id"] = np.asarray("2abc_A")
+        label_data["chain_id"] = np.asarray("2abc_A")
+    elif mutation == "wrong_length":
+        for key in ("ca_coords", "ca_mask", "atom14_positions", "atom14_mask"):
+            label_data[key] = label_data[key][:-1]
+    elif mutation == "no_ca":
+        label_data["ca_mask"][:] = False
+        label_data["atom14_mask"][:] = False
+    np.savez(feature_path, **feature_data)
+    np.savez(label_path, **label_data)
+    if mutation == "corrupt":
+        label_path.write_bytes(b"not a numpy archive")
+    result = module.evaluate_chain(
+        "1abc_A", processed_features_dir=features, processed_labels_dir=labels,
+        min_length=40, max_length=256, max_resolution=3.0, max_single_aa_fraction_threshold=0.8,
+    )
+    assert result["accepted"] is False
+    assert result["reject_reasons"]
+
+
+@pytest.mark.parametrize("rows", ["rep\tchain\nrep\tchain\n", "rep1\tchain\nrep2\tchain\n", "broken\n", "rep\t\n"])
+def test_filter_cluster_audit_rejects_ambiguous_assignments(tmp_path: Path, rows: str) -> None:
+    module = _load_filter_module()
+    path = tmp_path / "clusters.tsv"
+    path.write_text(rows)
+    with pytest.raises(ValueError, match="cluster"):
+        module.load_cluster_tsv(path)
+
+
+def test_filter_requires_cluster_coverage_and_reports_unknown_resolution(tmp_path: Path) -> None:
+    module = _load_filter_module()
+    features, labels = tmp_path / "features", tmp_path / "labels"
+    features.mkdir()
+    labels.mkdir()
+    _write_npzs(features, labels, "1abc_A", aatype=list(range(20)) * 3, resolution=0.0)
+    kwargs = dict(
+        processed_features_dir=features, processed_labels_dir=labels, manifest_path=None,
+        min_length=40, max_length=256, max_resolution=3.0, max_single_aa_fraction_threshold=0.8,
+    )
+    entry = module.build_manifest(**kwargs)["chains"][0]
+    assert entry["accepted"] is True
+    assert entry["resolution_status"] == "unknown"
+    path = tmp_path / "clusters.tsv"
+    path.write_text("rep\t2abc_A\n")
+    with pytest.raises(ValueError, match="cover every"):
+        module.build_manifest(**kwargs, mmseqs_cluster_tsv=path)

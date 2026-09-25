@@ -55,9 +55,14 @@ def _fixture(tmp_path: Path, *, duplicate_sequence: bool = False) -> argparse.Na
     _write_json(lock, {
         "sampling_policy": "cath-v2", "chain_data_cache_sha256": _sha(cache),
         "structure_metadata": {"sha256": _sha(metadata)}, "clustering": clustering,
-        "args": {"hidden_val_size": 1, "min_len": 40, "max_len": 256, "max_resolution": 3.0,
-                 "seed": 0, "min_seq_id": .3, "coverage": .8, "mmseqs_bin": "unused",
+        "args": {"sampling_policy": "cath-v2", "train_size": 1, "val_size": 1,
+                 "require_monomer": False, "stratify_fields": ["cath_architecture_ids", "length_bin", "resolution_bin"],
+                 "hidden_val_size": 1, "min_len": 40, "max_len": 256, "max_resolution": 3.0,
+                 "seed": 37, "min_seq_id": .3, "coverage": .8, "mmseqs_bin": "unused",
                  "cluster_tsv": str(clusters), "structure_metadata": str(metadata)},
+        "filtering": {"candidate_count": 4, "disjoint_unit_count": 4, "target_policy": "single_chain",
+                      "representative_policy": "best_resolution_then_longest_then_release_date_seeded_tie"},
+        "grouping": {"cluster_disjoint": True, "pdb_disjoint": True, "exact_sequence_disjoint": True},
         "outputs": {"train_manifest_sha256": _sha(paths["train"]), "train_count": 1,
                     "val_manifest_sha256": _sha(paths["val"]), "val_count": 1,
                     "all_manifest_sha256": _sha(paths["all"]), "unique_count": 2},
@@ -67,11 +72,13 @@ def _fixture(tmp_path: Path, *, duplicate_sequence: bool = False) -> argparse.Na
     exclusions.write_text("")
     _write_json(private_lock, {
         "sampling_policy": "cath-v2", "source_lock_sha256": _sha(lock),
+        "hidden_split_salt_sha256": hashlib.sha256(b"test-private-salt").hexdigest(),
         "chain_data_cache_sha256": _sha(cache), "hidden_val_manifest_sha256": _sha(paths["hidden"]),
         "hidden_val_count": 1, "structure_metadata": {"sha256": _sha(metadata)}, "clustering": clustering,
         "public_contract": {**{f"{name}_manifest_sha256": _sha(paths[name]) for name in ("train", "val", "all")},
                             "train_count": 1, "val_count": 1, "all_count": 2},
-        "stratification": {"reference": "public_train_plus_public_val"},
+        "stratification": {"reference": "public_train_plus_public_val",
+                           "fields": ["cath_architecture_ids", "length_bin", "resolution_bin"]},
         "filtering": {"private_processability_exclusion_count": 0,
                       "private_processability_exclusions": {"path": str(exclusions), "sha256": _sha(exclusions),
                                                            "canonical_ids_sha256": _sha(exclusions)}},
@@ -139,6 +146,7 @@ def test_frozen_policy_keeps_its_historical_quality_reference(tmp_path: Path, de
                      secondary_beta_fraction=0.1, secondary_coil_fraction=0.2)
     _write_json(metadata_path, metadata)
     public["sampling_policy"] = "legacy-v1"
+    public["args"]["sampling_policy"] = "legacy-v1"
     public["structure_metadata"]["sha256"] = _sha(metadata_path)
     _write_json(args.lock_file, public)
     private = json.loads(args.private_lock_file.read_text())
@@ -307,4 +315,169 @@ def test_precomputed_cluster_bytes_remain_bound_when_assignments_are_unchanged(t
     assert verify(args)["status"] == "ok"
     clusters.write_text(clusters.read_text() + "\n")
     with pytest.raises(ValueError, match="TSV.*SHA256"):
+        verify(args)
+
+
+def _repin_public_lock(args: argparse.Namespace, public: dict) -> None:
+    _write_json(args.lock_file, public)
+    private = json.loads(args.private_lock_file.read_text())
+    private["source_lock_sha256"] = _sha(args.lock_file)
+    _write_json(args.private_lock_file, private)
+
+
+@pytest.mark.parametrize("field", ["train_size", "val_size", "sampling_policy", "require_monomer", "stratify_fields"])
+def test_cath_source_contract_cannot_drop_sampling_configuration(tmp_path: Path, field: str) -> None:
+    args = _fixture(tmp_path)
+    public = json.loads(args.lock_file.read_text())
+    del public["args"][field]
+    _repin_public_lock(args, public)
+    with pytest.raises(ValueError, match=f"missing args.{field}"):
+        verify(args)
+
+
+@pytest.mark.parametrize("field,value", [("train_size", 999), ("val_size", 2), ("seed", 7),
+                                         ("stratify_fields", ["length_bin"])])
+def test_sampling_contract_edits_cannot_relabel_existing_public_splits(
+    tmp_path: Path, field: str, value: object,
+) -> None:
+    args = _fixture(tmp_path)
+    public = json.loads(args.lock_file.read_text())
+    public["args"][field] = value
+    _repin_public_lock(args, public)
+    with pytest.raises(ValueError, match="locked sampling sizes|do not reproduce|stratify_fields"):
+        verify(args)
+
+
+def test_wrong_component_representative_cannot_pass_verification(tmp_path: Path) -> None:
+    from scripts.build_manifests import _cluster_assignments_sha256
+
+    args = _fixture(tmp_path)
+    cache = json.loads(args.chain_data_cache.read_text())
+    cache["4ddd_A"]["resolution"] = 1.0
+    _write_json(args.chain_data_cache, cache)
+    public = json.loads(args.lock_file.read_text())
+    metadata_path = Path(public["args"]["structure_metadata"])
+    metadata = json.loads(metadata_path.read_text())
+    metadata["source"]["chain_data_cache_sha256"] = _sha(args.chain_data_cache)
+    _write_json(metadata_path, metadata)
+    clusters = {"1aaa_A": "1aaa_A", "2bbb_A": "2bbb_A", "3ccc_A": "3ccc_A", "4ddd_A": "1aaa_A"}
+    Path(public["args"]["cluster_tsv"]).write_text("".join(f"{cluster}\t{chain}\n" for chain, cluster in clusters.items()))
+    public["chain_data_cache_sha256"] = _sha(args.chain_data_cache)
+    public["structure_metadata"]["sha256"] = _sha(metadata_path)
+    public["clustering"]["cluster_assignments_sha256"] = _cluster_assignments_sha256(clusters)
+    public["filtering"]["disjoint_unit_count"] = 3
+    _repin_public_lock(args, public)
+    private = json.loads(args.private_lock_file.read_text())
+    private.update(chain_data_cache_sha256=_sha(args.chain_data_cache), structure_metadata=public["structure_metadata"],
+                   clustering=public["clustering"])
+    _write_json(args.private_lock_file, private)
+    with pytest.raises(ValueError, match="representative, and sampling policy"):
+        verify(args)
+
+
+@pytest.mark.parametrize("digest", [None, "", "invalid"])
+def test_hidden_selection_requires_and_replays_its_salt_digest(tmp_path: Path, digest: str | None) -> None:
+    args = _fixture(tmp_path)
+    private = json.loads(args.private_lock_file.read_text())
+    private["hidden_split_salt_sha256"] = digest
+    _write_json(args.private_lock_file, private)
+    with pytest.raises(ValueError, match="salt"):
+        verify(args)
+
+
+def test_repinning_hidden_manifest_hash_does_not_bypass_selection_replay(tmp_path: Path) -> None:
+    args = _fixture(tmp_path)
+    args.hidden_manifest.write_text("4ddd_A\n")
+    private = json.loads(args.private_lock_file.read_text())
+    private["hidden_val_manifest_sha256"] = _sha(args.hidden_manifest)
+    _write_json(args.private_lock_file, private)
+    with pytest.raises(ValueError, match="does not reproduce the locked salt"):
+        verify(args)
+
+
+@pytest.mark.parametrize("field", ["chain_data_cache", "lock_file", "private_lock_file", "hidden_manifest",
+                                   "public_train_manifest", "public_val_manifest", "public_all_manifest"])
+def test_verification_report_cannot_replace_audited_inputs(tmp_path: Path, field: str) -> None:
+    args = _fixture(tmp_path)
+    path = getattr(args, field)
+    before = path.read_bytes()
+    args.json_out = path
+    with pytest.raises(ValueError, match="must not alias"):
+        verify(args)
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("link_type", ["symlink", "hardlink"])
+def test_verification_report_rejects_link_aliases(tmp_path: Path, link_type: str) -> None:
+    args = _fixture(tmp_path)
+    args.json_out = tmp_path / "report.json"
+    if link_type == "symlink":
+        args.json_out.symlink_to(args.hidden_manifest)
+    else:
+        args.json_out.hardlink_to(args.hidden_manifest)
+    with pytest.raises(ValueError, match="must not alias"):
+        verify(args)
+
+
+def test_supplied_missing_private_exclusions_fail_before_hidden_generation(tmp_path: Path) -> None:
+    from scripts.build_hidden_manifest import _build_hidden_manifest
+
+    args = _fixture(tmp_path)
+    args.hidden_val_size = None
+    args.seed = None
+    args.private_processability_exclusion_list = tmp_path / "typo-exclusions.txt"
+    args.hidden_out_dir = tmp_path / "new-hidden"
+    args.private_lock_file = tmp_path / "new-private.lock.json"
+    with pytest.raises(ValueError, match="existing file"):
+        _build_hidden_manifest(args)
+    assert not args.hidden_out_dir.exists()
+    assert not args.private_lock_file.exists()
+
+
+@pytest.mark.parametrize("chain_id", ["1AAA_A", "1aaa_A_B", " 1aaa_A", "bad"])
+def test_noncanonical_candidate_names_cannot_create_disjoint_aliases(tmp_path: Path, chain_id: str) -> None:
+    from scripts.build_manifests import _build_candidates
+
+    with pytest.raises(ValueError, match="Chain IDs"):
+        _build_candidates({chain_id: {}}, min_len=40, max_len=256, max_resolution=3,
+                          structure_metadata={}, structure_metadata_accepted=set())
+
+
+def test_private_exclusion_chain_names_are_not_silently_ignored(tmp_path: Path) -> None:
+    from scripts.build_hidden_manifest import _read_optional_chain_list
+
+    path = tmp_path / "exclusions.txt"
+    path.write_text("1AAA_A\n")
+    with pytest.raises(ValueError, match="Chain IDs"):
+        _read_optional_chain_list(path)
+
+
+@pytest.mark.parametrize("field,value", [("seed", 7), ("train_size", 999)])
+def test_hidden_builder_cannot_repin_a_different_public_sampling_contract(
+    tmp_path: Path, field: str, value: int,
+) -> None:
+    from scripts.build_hidden_manifest import _build_hidden_manifest
+
+    args = _fixture(tmp_path)
+    public = json.loads(args.lock_file.read_text())
+    public["args"][field] = value
+    _write_json(args.lock_file, public)
+    args.hidden_val_size = None
+    args.seed = None
+    args.private_processability_exclusion_list = None
+    args.hidden_out_dir = tmp_path / "new-hidden"
+    args.private_lock_file = tmp_path / "new-private.lock.json"
+    with pytest.raises(ValueError, match="locked sampling sizes|do not reproduce"):
+        _build_hidden_manifest(args)
+    assert not args.hidden_out_dir.exists()
+    assert not args.private_lock_file.exists()
+
+
+@pytest.mark.parametrize("digest", [None, "", "INVALID"])
+def test_public_cache_digest_is_required_for_cath_v2(tmp_path: Path, digest: str | None) -> None:
+    args = _fixture(tmp_path)
+    public = json.loads(args.lock_file.read_text())
+    public["chain_data_cache_sha256"] = digest
+    _repin_public_lock(args, public)
+    with pytest.raises(ValueError, match="chain_data_cache_sha256 is missing or invalid"):
         verify(args)

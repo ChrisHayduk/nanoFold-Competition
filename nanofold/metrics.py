@@ -745,10 +745,19 @@ def foldscore_components(
     if atom14_mask.ndim != 2 or atom14_mask.shape[1] != ATOM14_NUM_SLOTS:
         raise ValueError(f"`atom14_mask` must have shape (L, 14), got {tuple(atom14_mask.shape)}")
 
-    L = min(int(pred_atom14.shape[0]), int(true_atom14.shape[0]), int(atom14_mask.shape[0]))
-    if L <= 0:
-        zero = torch.zeros((), device=pred_atom14.device)
-        return {name: zero for name in FOLDSCORE_COMPONENT_NAMES}
+    L = int(true_atom14.shape[0])
+    if L <= 0 or pred_atom14.shape[0] != L or atom14_mask.shape[0] != L:
+        raise ValueError("Prediction, labels, and atom14 mask must have the same nonzero residue length.")
+    if aatype.ndim != 1 or aatype.shape[0] != L:
+        raise ValueError("aatype must match the complete scored residue length.")
+    if not torch.is_floating_point(pred_atom14) or not torch.isfinite(pred_atom14).all():
+        raise ValueError("Prediction coordinates must be finite floating point values.")
+    if not torch.is_floating_point(true_atom14) or not torch.isfinite(true_atom14).all():
+        raise ValueError("Label coordinates must be finite floating point values.")
+    if atom14_mask.dtype != torch.bool:
+        raise ValueError("atom14_mask must have boolean dtype.")
+    if aatype.dtype not in (torch.int32, torch.int64) or ((aatype < 0) | (aatype >= len(RESTYPE_INDEX_TO_3))).any():
+        raise ValueError("aatype must contain valid integer residue types.")
 
     pred = pred_atom14[:L]
     true = true_atom14[:L].to(device=pred.device, dtype=pred.dtype)

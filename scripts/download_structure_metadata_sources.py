@@ -175,6 +175,65 @@ def _read_json_url(url: str, *, retries: int, retry_delay_seconds: float) -> tup
             return None, str(exc)
 
 
+def _rcsb_entry_chain_map(
+    pdb_id: str, *, retries: int, retry_delay_seconds: float,
+) -> tuple[dict[str, Any], dict[str, list[dict[str, Any]]], list[str]]:
+    """Resolve author chains through all polymer entities and label-asym instances."""
+    entry, error = _read_json_url(
+        f"https://data.rcsb.org/rest/v1/core/entry/{pdb_id}", retries=retries, retry_delay_seconds=retry_delay_seconds,
+    )
+    if error or entry is None:
+        return {}, {}, [error or "Missing RCSB entry"]
+    identifiers = entry.get("rcsb_entry_container_identifiers", {})
+    entity_ids = identifiers.get("polymer_entity_ids") if isinstance(identifiers, dict) else None
+    if not isinstance(entity_ids, list) or not entity_ids or any(not isinstance(item, str) for item in entity_ids):
+        return entry, {}, ["Missing RCSB polymer entity identifiers"]
+    if len(entity_ids) != len(set(entity_ids)):
+        return entry, {}, ["Duplicate RCSB polymer entity identifiers"]
+    mapped: dict[str, list[dict[str, Any]]] = {}
+    errors: list[str] = []
+    seen_asym_ids: set[str] = set()
+    for entity_id in entity_ids:
+        entity, error = _read_json_url(
+            f"https://data.rcsb.org/rest/v1/core/polymer_entity/{pdb_id}/{entity_id}", retries=retries, retry_delay_seconds=retry_delay_seconds,
+        )
+        if error or entity is None:
+            errors.append(error or "Missing RCSB polymer entity")
+            continue
+        entity_identifiers = entity.get("rcsb_polymer_entity_container_identifiers", {})
+        asym_ids = entity_identifiers.get("asym_ids") if isinstance(entity_identifiers, dict) else None
+        if not isinstance(asym_ids, list) or not asym_ids or any(not isinstance(item, str) for item in asym_ids):
+            errors.append("Missing RCSB polymer instance identifiers")
+            continue
+        for asym_id in asym_ids:
+            if asym_id in seen_asym_ids:
+                errors.append("Duplicate RCSB polymer instance identifiers")
+                continue
+            seen_asym_ids.add(asym_id)
+            instance_url = f"https://data.rcsb.org/rest/v1/core/polymer_entity_instance/{pdb_id}/{asym_id}"
+            instance, error = _read_json_url(instance_url, retries=retries, retry_delay_seconds=retry_delay_seconds)
+            if error or instance is None:
+                errors.append(error or "Missing RCSB polymer instance")
+                continue
+            instance_identifiers = instance.get("rcsb_polymer_entity_instance_container_identifiers", {})
+            if not isinstance(instance_identifiers, dict):
+                errors.append("Missing RCSB instance chain mapping")
+                continue
+            author_chain = instance_identifiers.get("auth_asym_id")
+            if (
+                not isinstance(author_chain, str) or not author_chain
+                or instance_identifiers.get("asym_id") != asym_id
+                or instance_identifiers.get("entity_id") != entity_id
+                or str(instance_identifiers.get("entry_id", "")).lower() != pdb_id
+            ):
+                errors.append("Unverified author-chain mapping in RCSB instance")
+                continue
+            mapped.setdefault(author_chain, []).append({
+                "instance_url": instance_url, "instance": instance, "entity": entity,
+            })
+    return entry, mapped, errors
+
+
 def _download_rcsb_jsonl(
     chain_ids: list[str],
     destination: Path,
@@ -190,62 +249,35 @@ def _download_rcsb_jsonl(
         raise ValueError(f"Refusing to reuse unverified RCSB metadata: {destination}")
     destination.parent.mkdir(parents=True, exist_ok=True)
     errors = 0
-    entry_cache: dict[str, tuple[dict[str, Any] | None, str | None]] = {}
+    entry_cache: dict[str, tuple[dict[str, Any], dict[str, list[dict[str, Any]]], list[str]]] = {}
     tmp = destination.with_suffix(destination.suffix + ".tmp")
     with tmp.open("w") as handle:
         for idx, chain_id in enumerate(chain_ids, start=1):
             if idx == 1 or idx % 1000 == 0:
                 print(f"  RCSB metadata {idx}/{len(chain_ids)}", flush=True)
             pdb_id = _pdb_id(chain_id)
-            chain_name = _chain_name(chain_id)
-            entry_url = f"https://data.rcsb.org/rest/v1/core/entry/{pdb_id}"
-            instance_url = f"https://data.rcsb.org/rest/v1/core/polymer_entity_instance/{pdb_id}/{chain_name}"
             if pdb_id not in entry_cache:
-                entry, error = _read_json_url(entry_url, retries=retries, retry_delay_seconds=retry_delay_seconds)
-                entry_cache[pdb_id] = (entry, error)
-                if error:
-                    errors += 1
-            entry, entry_error = entry_cache[pdb_id]
-            instance, instance_error = _read_json_url(
-                instance_url,
-                retries=retries,
-                retry_delay_seconds=retry_delay_seconds,
-            )
-            entity = None
-            entity_error = None
-            entity_id = None
-            if isinstance(instance, dict):
-                identifiers = instance.get("rcsb_polymer_entity_instance_container_identifiers")
-                author_chain = identifiers.get("auth_asym_id") if isinstance(identifiers, dict) else None
-                # The REST endpoint uses label asym IDs; our candidate IDs use author asym IDs.
-                if author_chain != chain_name:
-                    instance_error = (
-                        f"Unverified author-chain mapping for {chain_id}: RCSB instance auth_asym_id={author_chain!r}"
-                    )
-                    instance = None
-                elif isinstance(identifiers, dict):
-                    entity_id = identifiers.get("entity_id")
-            if entity_id is not None:
-                entity_url = f"https://data.rcsb.org/rest/v1/core/polymer_entity/{pdb_id}/{entity_id}"
-                entity, entity_error = _read_json_url(
-                    entity_url,
-                    retries=retries,
-                    retry_delay_seconds=retry_delay_seconds,
+                entry_cache[pdb_id] = _rcsb_entry_chain_map(
+                    pdb_id, retries=retries, retry_delay_seconds=retry_delay_seconds,
                 )
-            if instance_error:
+                errors += len(entry_cache[pdb_id][2])
+            entry, mapped, entry_errors = entry_cache[pdb_id]
+            matches = mapped.get(_chain_name(chain_id), [])
+            row_errors = list(entry_errors)
+            if not row_errors and len(matches) != 1:
+                row_errors.append("No unique RCSB author-chain mapping")
                 errors += 1
-            if entity_error:
-                errors += 1
+            selected = matches[0] if not row_errors and len(matches) == 1 else {}
             handle.write(
                 json.dumps(
                     {
                         "chain_id": chain_id,
-                        "entry_url": entry_url,
-                        "instance_url": instance_url,
-                        "entry": entry or {},
-                        "instance": instance or {},
-                        "entity": entity or {},
-                        "errors": [err for err in (entry_error, instance_error, entity_error) if err],
+                        "entry_url": f"https://data.rcsb.org/rest/v1/core/entry/{pdb_id}",
+                        "instance_url": selected.get("instance_url"),
+                        "entry": entry,
+                        "instance": selected.get("instance", {}),
+                        "entity": selected.get("entity", {}),
+                        "errors": row_errors,
                     },
                     sort_keys=True,
                 )

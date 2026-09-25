@@ -176,6 +176,10 @@ Then score those predictions:
 
 ```bash
 python score.py \
+  --official --track limited --split val \
+  --manifest data/manifests/val.txt \
+  --pred-out-dir runs/minalphafold2_reference/public_predictions \
+  --checkpoint-steps last \
   --prediction-summary runs/minalphafold2_reference/predict_val.json \
   --features-dir data/processed_features \
   --labels-dir data/processed_labels \

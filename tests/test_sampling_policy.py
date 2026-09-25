@@ -13,6 +13,7 @@ from scripts.build_manifests import (
     DEFAULT_STRATIFY_FIELDS,
     Candidate,
     _allocate_counts_by_stratum,
+    _apportion_counts,
     _assert_quality_report,
     _assert_split_disjointness,
     _atomic_write,
@@ -76,6 +77,26 @@ def test_equal_sparse_strata_receive_seeded_rather_than_lexical_priority() -> No
     supported = {key[0] for allocation in allocations for key, count in allocation.items() if count}
     assert len(supported) == 20
     assert len({tuple(sorted(key for key, count in allocation.items() if count)) for allocation in allocations}) > 30
+
+
+@pytest.mark.parametrize("seed,rare,middle", [(0, 1, 3), (1, 0, 4)])
+@pytest.mark.parametrize("saturated", [False, True])
+def test_exact_fractional_quota_ties_use_seed_even_for_unequal_strata(
+    seed: int, rare: int, middle: int, saturated: bool,
+) -> None:
+    # Quotas 3/7 and 24/7 have exactly the same remainder. Subtracting
+    # float floors makes them unequal and always gives the extra slot to rare.
+    capacities = {"rare": 1, "middle": 8, "large": 61}
+    weights = dict(capacities)
+    expected = {"rare": rare, "middle": middle, "large": 26}
+    if saturated:
+        capacities["capped"] = 1
+        weights["capped"] = 100
+        expected["capped"] = 1
+    allocation = _apportion_counts(capacities, weights, size=30 + saturated, seed=seed, salt="audit")
+    assert allocation == expected
+    assert _apportion_counts(dict(reversed(list(capacities.items()))), weights,
+                             size=30 + saturated, seed=seed, salt="audit") == expected
 
 
 def test_fixed_public_capacity_shortfall_redistributes_proportionally() -> None:
@@ -258,7 +279,9 @@ def test_cath_v2_rejects_incomplete_or_permissive_metadata(
 def test_source_lock_rejects_coercible_or_invalid_sampling_arguments(tmp_path: Path, field: str, value: object) -> None:
     args = {"hidden_val_size": 1, "min_len": 40, "max_len": 256, "max_resolution": 3.0,
             "seed": 0, "min_seq_id": 0.3, "coverage": 0.8, "mmseqs_bin": "mmseqs",
-            "structure_metadata": "metadata.json", "require_monomer": False}
+            "structure_metadata": "metadata.json", "require_monomer": False,
+            "sampling_policy": "cath-v2", "train_size": 1, "val_size": 1,
+            "stratify_fields": list(DEFAULT_STRATIFY_FIELDS)}
     path = tmp_path / "source.lock.json"
     path.write_text(json.dumps({"sampling_policy": "cath-v2", "args": {**args, field: value}}))
     with pytest.raises(ValueError):

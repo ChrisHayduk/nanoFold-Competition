@@ -9,7 +9,7 @@ import numpy as np
 
 from .a3m import GAP_ID, UNK_ID
 from .chain_paths import chain_npz_path
-from .data import read_manifest
+from .data import LABEL_ONLY_KEYS, read_manifest
 from .residue_constants import CA_ATOM14_SLOT
 from .utils import sha256_file
 
@@ -68,6 +68,9 @@ def validate_feature_npz_schema(npz_path: str | Path) -> List[str]:
 
     with np.load(npz_path) as data:
         keys = set(data.keys())
+        for key in LABEL_ONLY_KEYS:
+            if key in keys:
+                errors.append(f"Feature archives must not contain supervision key `{key}`")
         for key in REQUIRED_FEATURE_KEYS:
             if key not in keys:
                 errors.append(f"Missing key `{key}`")
@@ -385,6 +388,8 @@ def _normalize_manifest_map(manifest_paths: Mapping[str, str | Path]) -> Dict[st
         key = str(split_name).strip()
         if key == "":
             raise ValueError("Manifest split names must be non-empty.")
+        if key in normalized:
+            raise ValueError(f"Duplicate normalized manifest split name: {key!r}")
         normalized[key] = Path(manifest_path).resolve()
     if not normalized:
         raise ValueError("At least one manifest path is required to build a fingerprint.")
@@ -456,6 +461,8 @@ def build_split_fingerprint(
     track_id: str | None = None,
     source_lock_path: str | Path | None = None,
 ) -> Dict[str, Any]:
+    if require_labels and not processed_labels_dir:
+        raise ValueError("Label fingerprinting requires `processed_labels_dir`.")
     processed_features_dir = Path(processed_features_dir).resolve()
     processed_labels_dir_path = Path(processed_labels_dir).resolve() if processed_labels_dir else None
     manifest_map = _normalize_manifest_map(manifest_paths)
@@ -468,9 +475,19 @@ def build_split_fingerprint(
             expected_preprocess_config_hash = preprocess_config_hash
 
     manifest_meta: Dict[str, Dict[str, Any]] = {}
+    manifest_chain_ids: Dict[str, set[str]] = {}
     all_chain_ids_unsorted: List[str] = []
     for split_name, manifest_path in manifest_map.items():
         chain_ids = read_manifest(manifest_path)
+        current_chain_ids = set(chain_ids)
+        for previous_split, previous_chain_ids in manifest_chain_ids.items():
+            overlap_count = len(current_chain_ids & previous_chain_ids)
+            if overlap_count:
+                raise ValueError(
+                    "Manifest splits must be chain-disjoint: "
+                    f"{previous_split!r} and {split_name!r} share {overlap_count} chain IDs."
+                )
+        manifest_chain_ids[split_name] = current_chain_ids
         manifest_meta[split_name] = {
             "chain_count": len(chain_ids),
             "sha256": sha256_file(manifest_path),

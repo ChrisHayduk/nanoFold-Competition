@@ -202,10 +202,17 @@ def _training_sampling_contract(
     ).hexdigest()
     if len(train_loader) < 1:
         raise ValueError("Training needs at least one complete batch per rank.")
+    epoch_sample_count = len(train_loader) * int(train_loader.batch_size or 1) * world_size
     return {
+        "schema_version": 2,
         "population_sha256": population_sha256,
+        "population_count": len(chain_ids),
         "data_sha256": data_sha256,
         "sampler": type(sampler).__name__,
+        "sampling_policy": "weighted_replacement" if weights is not None else "shuffle_without_replacement",
+        "sampler_drop_last": getattr(sampler, "drop_last", None),
+        "epoch_sample_count": epoch_sample_count,
+        "epoch_omitted_population_count": None if weights is not None else len(chain_ids) - epoch_sample_count,
         "seed": getattr(sampler, "seed", _loader_generator(train_loader).initial_seed()),
         "world_size": world_size,
         "local_grad_accum_steps": local_grad_accum_steps,
@@ -385,6 +392,29 @@ def _restore_training_iterator(
     return iterator
 
 
+def _resume_exposure_counters(
+    checkpoint: Mapping[str, Any], *, effective_batch_size: int, crop_size: int,
+) -> tuple[int, int, int]:
+    fields = (
+        "step", "cumulative_samples_seen", "cumulative_cropped_residues_seen",
+        "cumulative_nonpad_residues_seen", "cumulative_residues_seen",
+    )
+    for field in fields:
+        value = checkpoint.get(field)
+        if type(value) is not int or value < 0:
+            raise ValueError(f"Checkpoint has invalid exposure counter `{field}`.")
+    samples = checkpoint["cumulative_samples_seen"]
+    cropped = checkpoint["cumulative_cropped_residues_seen"]
+    nonpad = checkpoint["cumulative_nonpad_residues_seen"]
+    if samples != checkpoint["step"] * effective_batch_size:
+        raise ValueError("Checkpoint sample exposure does not match its optimizer step and effective batch size.")
+    if not samples <= nonpad <= cropped <= samples * crop_size:
+        raise ValueError("Checkpoint residue exposure counters are inconsistent with sample exposure and crop size.")
+    if checkpoint["cumulative_residues_seen"] != nonpad:
+        raise ValueError("Checkpoint residue exposure aliases disagree.")
+    return samples, cropped, nonpad
+
+
 def _atomic_torch_save(payload: Dict[str, Any], path: Path) -> None:
     temporary_path: Path | None = None
     try:
@@ -456,7 +486,8 @@ def parse_args() -> argparse.Namespace:
         ),
         epilog=(
             "Weighted-sampling ablations may set data.train_sample_weights and must explicitly set "
-            "data.allow_train_sample_weights: true. Standard training shuffles the manifest each epoch."
+            "data.allow_train_sample_weights: true. Standard training shuffles without replacement each epoch "
+            "and omits the incomplete global batch tail; the sampling contract records omitted counts."
         ),
     )
     ap.add_argument("--config", type=str, required=True)
@@ -489,7 +520,10 @@ def parse_args() -> argparse.Namespace:
         "--resume",
         type=str,
         default="",
-        help="Resume a checkpoint with sampling state; processed data bytes, training weights, world size and loader settings must match.",
+        help=(
+            "Resume a checkpoint with valid sampling and exposure state; processed data bytes, training weights, "
+            "world size and loader settings must match."
+        ),
     )
     ap.add_argument(
         "--reset-run",
@@ -550,14 +584,12 @@ def normalize_num_workers(n: int) -> int:
 
 
 def _mean_tensors(values: Iterable[torch.Tensor]) -> float:
-    finite_values = [
-        value.float().reshape(())
-        for value in values
-        if torch.isfinite(value.float().reshape(()))
-    ]
-    if not finite_values:
+    flattened = [value.float().reshape(-1) for value in values]
+    if not flattened:
         return float("nan")
-    return float(torch.stack(finite_values).mean())
+    combined = torch.cat(flattened)
+    finite = combined[torch.isfinite(combined)]
+    return float(finite.mean()) if finite.numel() else float("nan")
 
 
 def _scalar_output_metrics(out: Dict[str, Any]) -> Dict[str, torch.Tensor]:
@@ -573,9 +605,19 @@ def _scalar_output_metrics(out: Dict[str, Any]) -> Dict[str, torch.Tensor]:
     return metrics
 
 
-def _append_scalar_output_metrics(target: Dict[str, list[torch.Tensor]], out: Dict[str, Any]) -> None:
-    for key, value in _scalar_output_metrics(out).items():
-        target.setdefault(key, []).append(value)
+def _append_scalar_output_metrics(
+    target: Dict[str, list[torch.Tensor]], out: Dict[str, Any], *, batch_size: int,
+) -> None:
+    for key, value in out.items():
+        if key in {"loss", "pred_atom14", "pred_ca"} or not torch.is_tensor(value) or value.numel() == 0:
+            continue
+        value = value.detach().float().cpu()
+        if value.ndim > 0 and value.shape[0] == batch_size:
+            per_target = value.reshape(batch_size, -1).mean(dim=1)
+        else:
+            per_target = value.mean().expand(batch_size)
+        if torch.isfinite(per_target).any():
+            target.setdefault(str(key), []).append(per_target)
 
 
 def _summarize_eval_metrics(
@@ -669,6 +711,10 @@ def make_loader(
     distributed_world_size: int = 1,
 ) -> DataLoader:
     data_cfg = cfg["data"]
+    for field in ("crop_size", "msa_depth"):
+        value = data_cfg[field]
+        if type(value) is not int or value <= 0:
+            raise ValueError(f"`data.{field}` must be a positive integer.")
     processed_features_dir = data_cfg["processed_features_dir"]
     processed_labels_dir = data_cfg.get("processed_labels_dir")
     manifest_path = data_cfg["train_manifest"] if split == "train" else data_cfg["val_manifest"]
@@ -734,7 +780,9 @@ def make_loader(
             rank=int(distributed_rank),
             shuffle=True,
             seed=int(generator_seed),
-            drop_last=False,
+            # Omit the shuffled global tail instead of padding with repeated
+            # targets. DataLoader also omits incomplete per-rank batches.
+            drop_last=True,
         )
 
     return DataLoader(
@@ -762,7 +810,7 @@ def batch_lddt_ca(
     B = pred_ca.shape[0]
     for b in range(B):
         scores.append(lddt_ca(pred_ca[b], true_ca[b], ca_mask[b] & residue_mask[b]))
-    return torch.stack(scores).mean()
+    return torch.stack(scores)
 
 
 @torch.no_grad()
@@ -817,7 +865,7 @@ def batch_rmsd_ca(
         )
         for b in range(pred_ca.shape[0])
     ]
-    return torch.nanmean(torch.stack(rmsds))
+    return torch.stack(rmsds)
 
 
 @torch.no_grad()
@@ -837,7 +885,7 @@ def batch_rmsd_atom14(
                 mask.reshape(-1),
             )
         )
-    return torch.nanmean(torch.stack(rmsds))
+    return torch.stack(rmsds)
 
 
 def optimizer_zero_grad(optimizer: Any) -> None:
@@ -1398,21 +1446,14 @@ def main() -> None:
                 f"{joined}"
             )
         rank_sampling_state = _resume_rank_sampling_state(ckpt, sampling_contract, rank=rank, device=device)
+        cumulative_samples_seen, cumulative_cropped_residues_seen, cumulative_nonpad_residues_seen = (
+            _resume_exposure_counters(ckpt, effective_batch_size=effective_batch_size, crop_size=crop_size)
+        )
         _restore_scaler_state(scaler, ckpt, enabled=use_amp)
         _restore_scheduler_state(scheduler, ckpt)
         model.load_state_dict(ckpt["model"], strict=True)
         opt.load_state_dict(ckpt["opt"])
         start_step = int(ckpt.get("step", 0))
-        cumulative_samples_seen = int(ckpt.get("cumulative_samples_seen", start_step * effective_batch_size))
-        cumulative_cropped_residues_seen = int(
-            ckpt.get("cumulative_cropped_residues_seen", start_step * effective_batch_size * crop_size)
-        )
-        cumulative_nonpad_residues_seen = int(
-            ckpt.get(
-                "cumulative_nonpad_residues_seen",
-                ckpt.get("cumulative_residues_seen", cumulative_cropped_residues_seen),
-            )
-        )
         train_sampler_epoch = rank_sampling_state["epoch"]
         train_batches_consumed = rank_sampling_state["batches_consumed"]
         train_epoch_start_generator_state = rank_sampling_state["epoch_start_generator_state"]
@@ -1535,6 +1576,7 @@ def main() -> None:
                         expose_supervision=True,
                     )
                 pred_ca = out["pred_ca"]
+                batch_size = int(pred_ca.shape[0])
                 score = batch_lddt_ca(pred_ca, batch["ca_coords"], batch["ca_mask"], batch["residue_mask"])
                 scores.append(score.detach().cpu())
                 ca_rmsd = batch_rmsd_ca(pred_ca, batch["ca_coords"], batch["ca_mask"], batch["residue_mask"])
@@ -1547,8 +1589,8 @@ def main() -> None:
                 ca_rmsds.append(ca_rmsd.detach().cpu())
                 atom14_rmsds.append(atom14_rmsd.detach().cpu())
                 if "loss" in out:
-                    losses.append(out["loss"].detach().cpu())
-                _append_scalar_output_metrics(scalar_metrics, out)
+                    losses.append(out["loss"].detach().cpu().expand(batch_size))
+                _append_scalar_output_metrics(scalar_metrics, out, batch_size=batch_size)
                 if eval_foldscore_components:
                     pred_atom14 = out["pred_atom14"]
                     true_atom14 = batch["atom14_positions"]

@@ -465,6 +465,8 @@ def run_prediction_stage(
     image=image,
     gpu=GPU_SPEC,
     volumes={
+        str(PUBLIC_FEATURES_MOUNT): public_features_volume.read_only(),
+        str(PUBLIC_LABELS_MOUNT): public_labels_volume.read_only(),
         str(HIDDEN_FEATURES_MOUNT): hidden_features_volume.read_only(),
         str(HIDDEN_LABELS_MOUNT): hidden_labels_volume.read_only(),
         str(HIDDEN_META_MOUNT): hidden_meta_volume.read_only(),
@@ -481,8 +483,13 @@ def run_scoring_stage(
     description: str,
     team: str,
     commit: str,
+    checkpoint_steps: str,
 ) -> dict[str, Any]:
     os.chdir(REMOTE_ROOT)
+    public_features, public_labels = _stage_public_data()
+    modal_config = _write_modal_config(
+        config_path=Path(config), processed_features_dir=public_features, processed_labels_dir=public_labels,
+    )
     hidden_features = _stage_hidden_features()
     hidden_labels = _stage_hidden_labels()
     hidden_manifest = HIDDEN_META_MOUNT / HIDDEN_MANIFEST_VOLUME_PATH.relative_to("/")
@@ -503,7 +510,7 @@ def run_scoring_stage(
         "--submission",
         submission,
         "--config",
-        config,
+        str(modal_config),
         "--track",
         track,
         "--description",
@@ -514,6 +521,8 @@ def run_scoring_stage(
         commit,
         "--skip-train",
         "--score-hidden-only",
+        "--checkpoint-steps",
+        checkpoint_steps,
         "--hidden-manifest",
         str(hidden_manifest),
         "--hidden-features-dir",
@@ -692,6 +701,7 @@ def main(
             "description": run_description,
             "team": leaderboard_team,
             "commit": resolved_commit,
+            "checkpoint_steps": checkpoint_steps,
         }
         if background_score:
             call = run_scoring_stage.spawn(**scoring_kwargs)

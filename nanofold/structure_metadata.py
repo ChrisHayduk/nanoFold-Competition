@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 import gemmi
 import numpy as np
 
 STRUCTURE_METADATA_SCHEMA_VERSION = 2
+
+
+def validate_author_chain_id(chain_id: str) -> None:
+    """Require a lowercase PDB code and an unmodified, case-sensitive author chain."""
+    if not isinstance(chain_id, str) or not re.fullmatch(r"[0-9a-z]{4}_[^\s_]+", chain_id):
+        raise ValueError("Chain IDs must use a lowercase four-character PDB code and a case-sensitive author chain")
 
 
 def dihedral_degrees(a: Any, b: Any, c: Any, d: Any) -> float | None:
@@ -97,7 +104,7 @@ def normalize_domain_architecture_class(value: object) -> str:
         return "beta"
     if text in {"alpha_beta", "a_b", "a_b_two_layers", "a_b_three_layers", "a_b_four_layers", "mixed"}:
         return "alpha_beta"
-    if text in {"coil", "few_secondary_structures", "little_secondary_structure", "small_protein"}:
+    if text in {"coil", "few_secondary_structures", "little_secondary_structure"}:
         return "coil_or_sparse"
     if "alpha" in text and "beta" in text:
         return "alpha_beta"
@@ -134,8 +141,10 @@ def domain_architecture_from_scop_sccs(value: object) -> str:
         return "beta"
     if code in {"c", "d"}:
         return "alpha_beta"
-    if code in {"g", "h"}:
-        return "coil_or_sparse"
+    if code == "g":
+        return "small_protein"
+    if code == "h":
+        return "coiled_coil"
     return "other"
 
 

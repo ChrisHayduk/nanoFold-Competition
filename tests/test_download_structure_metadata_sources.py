@@ -215,31 +215,71 @@ def test_rcsb_instance_requires_verified_author_chain_mapping(
     def fake_json(url: str, **kwargs: object) -> tuple[dict[str, object], None]:
         requested_urls.append(url)
         if "/entry/" in url:
-            return {"entry": "safe entry metadata"}, None
+            return {"rcsb_entry_container_identifiers": {"polymer_entity_ids": ["1"]}}, None
         if "/polymer_entity_instance/" in url:
-            identifiers = {"entity_id": "1"}
+            identifiers = {"entity_id": "1", "asym_id": "A", "entry_id": "1ABC"}
             if author_chain is not None:
                 identifiers["auth_asym_id"] = author_chain
             return {"rcsb_polymer_entity_instance_container_identifiers": identifiers}, None
-        return {"entity": "mapped entity metadata"}, None
+        return {"rcsb_polymer_entity_container_identifiers": {"asym_ids": ["A"]}}, None
 
     monkeypatch.setattr(downloader, "_read_json_url", fake_json)
     destination = tmp_path / "rcsb.jsonl"
     summary = downloader._download_rcsb_jsonl(["1abc_A"], destination, dry_run=False, retries=0, retry_delay_seconds=0)
     record = json.loads(destination.read_text())
-    assert record["entry"] == {"entry": "safe entry metadata"}
+    assert record["entry"] == {"rcsb_entry_container_identifiers": {"polymer_entity_ids": ["1"]}}
     if author_chain == "A":
         assert record["instance"]
-        assert record["entity"] == {"entity": "mapped entity metadata"}
+        assert record["entity"] == {"rcsb_polymer_entity_container_identifiers": {"asym_ids": ["A"]}}
         assert record["errors"] == []
         assert summary["errors"] == 0
         assert len(requested_urls) == 3
     else:
         assert record["instance"] == {}
         assert record["entity"] == {}
-        assert "Unverified author-chain mapping" in record["errors"][0]
+        assert "mapping" in record["errors"][0]
         assert summary["errors"] == 1
-        assert len(requested_urls) == 2
+        assert len(requested_urls) == 3
+
+
+@pytest.mark.parametrize("ambiguous", [False, True])
+def test_rcsb_resolves_author_chain_through_label_asym_crosswalk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ambiguous: bool,
+) -> None:
+    """RCSB 2OR1 uses label C/D for author L/R, not the same-letter endpoint."""
+    requested: list[str] = []
+
+    def fake_json(url: str, **kwargs: object) -> tuple[dict[str, object], None]:
+        requested.append(url)
+        if "/entry/" in url:
+            return {"rcsb_entry_container_identifiers": {"polymer_entity_ids": ["3"]}}, None
+        if "/polymer_entity/" in url:
+            return {
+                "rcsb_polymer_entity_container_identifiers": {"asym_ids": ["C", "D"]},
+                "rcsb_entity_source_organism": [{"ncbi_taxonomy_id": 10712}],
+            }, None
+        label = url.rsplit("/", 1)[1]
+        assert label in {"C", "D"}
+        return {"rcsb_polymer_entity_instance_container_identifiers": {
+            "entity_id": "3", "entry_id": "2OR1", "asym_id": label,
+            "auth_asym_id": "L" if ambiguous or label == "C" else "R",
+        }}, None
+
+    monkeypatch.setattr(downloader, "_read_json_url", fake_json)
+    destination = tmp_path / "rcsb.jsonl"
+    summary = downloader._download_rcsb_jsonl(
+        ["2or1_L", "2or1_R"], destination, dry_run=False, retries=0, retry_delay_seconds=0,
+    )
+    records = [json.loads(line) for line in destination.read_text().splitlines()]
+    assert len(requested) == 4  # Both candidate chains share a single verified entry crosswalk.
+    if ambiguous:
+        assert all(record["instance"] == {} and record["entity"] == {} for record in records)
+        assert summary["errors"] == 2
+    else:
+        assert summary["errors"] == 0
+        assert records[0]["instance_url"].endswith("/2or1/C")
+        assert records[1]["instance_url"].endswith("/2or1/D")
+        assert records[0]["entity"]["rcsb_entity_source_organism"][0]["ncbi_taxonomy_id"] == 10712
 
 
 def test_all_dssp_failures_are_explicitly_skipped_in_reusable_lock(

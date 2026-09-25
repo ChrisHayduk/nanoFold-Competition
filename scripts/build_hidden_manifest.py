@@ -31,11 +31,13 @@ from build_manifests import (  # noqa: E402
     _mmseqs_version,
     _read_hidden_split_salt,
     _salt_digest,
+    _select_stratified,
     _sha256,
     _stable_random_score,
     _structure_metadata_source_record,
     _validate_generation_args,
     _validate_metadata_identity,
+    validate_author_chain_id,
 )
 
 
@@ -54,6 +56,8 @@ class SplitArgs:
     expected_chain_cache_sha256: str
     sampling_policy: str = "legacy-v1"
     require_monomer: bool = False
+    train_size: int = 1
+    val_size: int = 1
 
 
 @dataclass(frozen=True)
@@ -89,10 +93,11 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument(
         "--private-processability-exclusion-list",
         type=Path,
-        default=Path(".nanofold_private/manifests/hidden_processability_exclusions.txt"),
+        default=None,
         help=(
             "Maintainer-only chain ID list to exclude from hidden selection after private "
-            "preprocessing failures. This file must stay outside tracked public files."
+            "preprocessing failures. A supplied path must exist; omission means no private exclusions. "
+            "This file must stay outside tracked public files."
         ),
     )
     ap.add_argument("--hidden-split-salt-env", type=str, default="NANOFOLD_HIDDEN_SPLIT_SALT")
@@ -115,10 +120,15 @@ def _read_manifest(path: Path) -> list[str]:
     return ids
 
 
-def _read_optional_chain_list(path: Path) -> list[str]:
-    if not path.exists():
+def _read_optional_chain_list(path: Path | None) -> list[str]:
+    if path is None:
         return []
-    return [line.strip() for line in path.read_text().splitlines() if line.strip() and not line.startswith("#")]
+    if not path.is_file():
+        raise ValueError("A supplied private processability exclusion list must be an existing file.")
+    ids = [line.strip() for line in path.read_text().splitlines() if line.strip() and not line.lstrip().startswith("#")]
+    for chain_id in ids:
+        validate_author_chain_id(chain_id)
+    return ids
 
 
 def _load_lock_args(path: Path) -> SplitArgs:
@@ -145,8 +155,22 @@ def _load_lock_args(path: Path) -> SplitArgs:
         raise ValueError("Manifest lock has an unsupported sampling policy.")
     if args.get("sampling_policy", sampling_policy) != sampling_policy:
         raise ValueError("Manifest lock sampling policy disagrees with args.sampling_policy.")
+    if sampling_policy == SAMPLING_POLICY:
+        for key in ("sampling_policy", "train_size", "val_size", "require_monomer", "stratify_fields"):
+            if key not in args:
+                raise ValueError(f"Manifest lock missing args.{key}: {path}")
+        if args["stratify_fields"] != list(DEFAULT_STRATIFY_FIELDS):
+            raise ValueError("Manifest lock args.stratify_fields disagrees with cath-v2 policy.")
     _validate_generation_args(argparse.Namespace(**{**args, "require_monomer": args.get("require_monomer", False)}))
     expected_sha = str(raw.get("chain_data_cache_sha256") or args.get("expected_chain_cache_sha256") or "")
+    if sampling_policy == SAMPLING_POLICY:
+        recorded_sha = raw.get("chain_data_cache_sha256")
+        if not isinstance(recorded_sha, str) or len(recorded_sha) != 64 or any(
+            char not in "0123456789abcdef" for char in recorded_sha
+        ):
+            raise ValueError("Manifest lock chain_data_cache_sha256 is missing or invalid.")
+        if args.get("expected_chain_cache_sha256") not in (None, "", recorded_sha):
+            raise ValueError("Manifest lock cache digest disagrees with args.expected_chain_cache_sha256.")
     return SplitArgs(
         hidden_val_size=int(args["hidden_val_size"]),
         min_len=int(args["min_len"]),
@@ -161,7 +185,44 @@ def _load_lock_args(path: Path) -> SplitArgs:
         expected_chain_cache_sha256=expected_sha,
         sampling_policy=sampling_policy,
         require_monomer=args.get("require_monomer", False),
+        train_size=int(args.get("train_size", 1)),
+        val_size=int(args.get("val_size", 1)),
     )
+
+
+def _validate_public_sampling_contract(
+    lock_path: Path, lock_args: SplitArgs, components: list[DisjointComponent],
+    train_ids: list[str], val_ids: list[str],
+) -> None:
+    """Replay public selection so a lock cannot silently describe another sampling run."""
+    if lock_args.sampling_policy != SAMPLING_POLICY:
+        return
+    if len(train_ids) != lock_args.train_size or len(val_ids) != lock_args.val_size:
+        raise ValueError("Public manifest counts disagree with locked sampling sizes.")
+    lock = json.loads(lock_path.read_text())
+    filtering = lock.get("filtering", {})
+    expected = {
+        "candidate_count": sum(len(component.members) for component in components),
+        "disjoint_unit_count": len(components),
+        "target_policy": "known_monomer" if lock_args.require_monomer else "single_chain",
+        "representative_policy": "best_resolution_then_longest_then_release_date_seeded_tie",
+    }
+    if not isinstance(filtering, dict) or any(filtering.get(key) != value for key, value in expected.items()):
+        raise ValueError("Public source lock candidate universe or representative policy is missing or inconsistent.")
+    grouping = lock.get("grouping", {})
+    if not isinstance(grouping, dict) or any(grouping.get(key) is not True for key in (
+        "cluster_disjoint", "pdb_disjoint", "exact_sequence_disjoint",
+    )):
+        raise ValueError("Public source lock grouping policy disagrees with cath-v2.")
+    units = [component.representative for component in components]
+    val = _select_stratified(units, size=lock_args.val_size, seed=lock_args.seed, salt="val",
+                             stratify_fields=DEFAULT_STRATIFY_FIELDS)
+    val_set = {candidate.chain_id for candidate in val}
+    train = _select_stratified([candidate for candidate in units if candidate.chain_id not in val_set],
+                               size=lock_args.train_size, seed=lock_args.seed, salt="train",
+                               stratify_fields=DEFAULT_STRATIFY_FIELDS)
+    if val_ids != [candidate.chain_id for candidate in val] or train_ids != [candidate.chain_id for candidate in train]:
+        raise ValueError("Public manifests do not reproduce the locked seed, representative, and sampling policy.")
 
 
 def _with_cluster_ids(candidates: list[Candidate], cluster_map: dict[str, str]) -> list[Candidate]:
@@ -383,6 +444,7 @@ def _build_hidden_manifest(args: argparse.Namespace) -> dict[str, Any]:
     clustered_candidates = _with_cluster_ids(candidates, cluster_map)
     candidate_by_id = {candidate.chain_id: candidate for candidate in clustered_candidates}
     components = _componentize(clustered_candidates, cluster_map, seed=seed)
+    _validate_public_sampling_contract(args.lock_file, lock_args, components, train_ids, val_ids)
 
     public_components = [
         component
@@ -496,9 +558,9 @@ def _build_hidden_manifest(args: argparse.Namespace) -> dict[str, Any]:
             "hidden_candidate_unit_count": len(hidden_pool),
             "private_processability_exclusion_count": len(private_processability_exclusions),
             "private_processability_exclusions": {
-                "path": str(args.private_processability_exclusion_list),
+                "path": str(args.private_processability_exclusion_list) if args.private_processability_exclusion_list else None,
                 "sha256": _sha256(args.private_processability_exclusion_list)
-                if args.private_processability_exclusion_list.is_file() else None,
+                if args.private_processability_exclusion_list else None,
                 "canonical_ids_sha256": hashlib.sha256(
                     "".join(f"{chain_id}\n" for chain_id in sorted(private_processability_exclusions)).encode()
                 ).hexdigest(),
