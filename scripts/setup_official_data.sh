@@ -10,6 +10,8 @@ before downloading or preprocessing data.
 
 Options:
   --data-root <path>          Root for downloaded OpenProteinSet files (default: data/openproteinset)
+  --chain-data-cache <path>   Existing source cache matching the official manifest lock
+                              (default: download <data-root>/pdb_data/data_caches/chain_data_cache.json)
   --manifests-dir <path>      Target manifests dir to use (default: data/manifests)
   --processed-features-dir <path>
                               Output dir for feature .npz files (default: data/processed_features)
@@ -41,6 +43,8 @@ PREPARE_DATA_SCRIPT="$SCRIPT_DIR/prepare_data.py"
 PREPROCESS_SCRIPT="$SCRIPT_DIR/preprocess.py"
 
 DATA_ROOT="data/openproteinset"
+CHAIN_DATA_CACHE=""
+EXPLICIT_CHAIN_DATA_CACHE=0
 MANIFESTS_DIR="data/manifests"
 PROCESSED_FEATURES_DIR="data/processed_features"
 PROCESSED_LABELS_DIR="data/processed_labels"
@@ -62,6 +66,11 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --data-root)
       DATA_ROOT="$2"
+      shift 2
+      ;;
+    --chain-data-cache)
+      CHAIN_DATA_CACHE="${2:?Missing --chain-data-cache value}"
+      EXPLICIT_CHAIN_DATA_CACHE=1
       shift 2
       ;;
     --manifests-dir)
@@ -193,6 +202,34 @@ print("Verified official manifest hashes for track limited.")
 PY
 }
 
+verify_chain_cache() {
+  python - "$REPO_ROOT/leaderboard/official_manifest_source.lock.json" "$CHAIN_DATA_CACHE" "$1" <<'PY'
+import hashlib
+import json
+import re
+import sys
+from pathlib import Path
+
+lock_path, cache_path = (Path(value) for value in sys.argv[1:3])
+lock = json.loads(lock_path.read_text())
+expected = lock.get("chain_data_cache_sha256") if isinstance(lock, dict) else None
+if not isinstance(expected, str) or re.fullmatch(r"[0-9a-f]{64}", expected) is None:
+    raise SystemExit("Official manifest source lock requires a valid chain cache SHA256.")
+if not cache_path.is_file():
+    if sys.argv[3] == "1" and not cache_path.exists():
+        print("The downloaded chain cache will be verified against the official manifest source lock.")
+        raise SystemExit(0)
+    raise SystemExit("The selected chain cache must be an existing file.")
+digest = hashlib.sha256()
+with cache_path.open("rb") as handle:
+    for block in iter(lambda: handle.read(1024 * 1024), b""):
+        digest.update(block)
+if digest.hexdigest() != expected:
+    raise SystemExit("Chain cache does not match the official manifest source lock.")
+print("Verified chain cache against the official manifest source lock.")
+PY
+}
+
 if [[ "$DRY_RUN" -eq 0 ]] && ! command -v aws >/dev/null 2>&1; then
   echo "aws CLI not found. Install awscli first."
   exit 1
@@ -224,6 +261,9 @@ esac
 
 PDB_DIR="$DATA_ROOT/pdb_data"
 DATA_CACHES_DIR="$PDB_DIR/data_caches"
+if [[ -z "$CHAIN_DATA_CACHE" ]]; then
+  CHAIN_DATA_CACHE="$DATA_CACHES_DIR/chain_data_cache.json"
+fi
 MMCIF_ROOT="$PDB_DIR/mmcif_files"
 SOURCE_MANIFESTS_DIR="$REPO_ROOT/data/manifests"
 SOURCE_TRAIN="$SOURCE_MANIFESTS_DIR/train.txt"
@@ -238,11 +278,21 @@ if [[ ! -f "$SOURCE_TRAIN" || ! -f "$SOURCE_VAL" || ! -f "$SOURCE_ALL" ]]; then
 fi
 
 verify_manifest_hashes "$SOURCE_TRAIN" "$SOURCE_VAL" "$SOURCE_ALL"
-python - "$REPO_ROOT" "$MANIFESTS_DIR" "$DATA_ROOT" "$PROCESSED_FEATURES_DIR" "$PROCESSED_LABELS_DIR" <<'PYTHON'
+if [[ "$EXPLICIT_CHAIN_DATA_CACHE" -eq 1 ]]; then
+  ALLOW_MISSING_CHAIN_CACHE="$(python -c 'import pathlib, sys; print(int(pathlib.Path(sys.argv[1]).resolve() == pathlib.Path(sys.argv[2]).resolve()))' \
+    "$CHAIN_DATA_CACHE" "$DATA_CACHES_DIR/chain_data_cache.json")"
+else
+  ALLOW_MISSING_CHAIN_CACHE=1
+fi
+verify_chain_cache "$ALLOW_MISSING_CHAIN_CACHE"
+python - "$REPO_ROOT" "$MANIFESTS_DIR" "$DATA_ROOT" "$PROCESSED_FEATURES_DIR" "$PROCESSED_LABELS_DIR" \
+  "$CHAIN_DATA_CACHE" <<'PYTHON'
 import sys
 from pathlib import Path
 
-repo, manifests, *outputs = [Path(value).resolve() for value in sys.argv[1:]]
+repo, manifests, *outputs = [Path(value).resolve() for value in sys.argv[1:6]]
+cache_path = Path(sys.argv[6]).resolve()
+default_cache_path = outputs[0] / "pdb_data/data_caches/chain_data_cache.json"
 protected = [repo / name for name in ("leaderboard", "tracks", "data/manifests")]
 
 def overlaps(left, right):
@@ -253,6 +303,8 @@ for index, output in enumerate(outputs):
         raise SystemExit("Asset output directories must be separate from manifests, published contracts and each other.")
     if output.exists() and not output.is_dir():
         raise SystemExit("Asset outputs must be directories.")
+    if cache_path.is_relative_to(output) and cache_path != default_cache_path:
+        raise SystemExit("The chain cache must be outside asset output directories except at its standard raw cache path.")
 if manifests != (repo / "data/manifests").resolve() and any(
     overlaps(manifests, path.resolve()) for path in protected
 ):
@@ -283,7 +335,12 @@ if [[ "$DRY_RUN" -eq 0 ]]; then
 fi
 
 echo "[1/5] Downloading OpenFold cache metadata from RODA..."
-run_cmd aws s3 cp s3://openfold/data_caches/ "$DATA_CACHES_DIR/" --recursive --only-show-errors --no-sign-request
+CACHE_DOWNLOAD_CMD=(aws s3 cp s3://openfold/data_caches/ "$DATA_CACHES_DIR/" --recursive --only-show-errors --no-sign-request)
+if [[ "$EXPLICIT_CHAIN_DATA_CACHE" -eq 1 && -f "$CHAIN_DATA_CACHE" ]]; then
+  CACHE_DOWNLOAD_CMD+=(--exclude chain_data_cache.json)
+fi
+run_cmd "${CACHE_DOWNLOAD_CMD[@]}"
+run_cmd verify_chain_cache 0
 run_cmd aws s3 cp s3://openfold/duplicate_pdb_chains.txt "$PDB_DIR/" --only-show-errors --no-sign-request
 
 echo "[2/5] Downloading per-chain MSA + template hits for official manifests..."
@@ -327,10 +384,11 @@ fi
 if [[ "$SKIP_PREPROCESS" -eq 1 ]]; then
   echo "[4/5] Skipping preprocess (--skip-preprocess set)."
 else
-  echo "[4/5] Preprocessing official train/val manifests..."
+  echo "[4/5] Preprocessing the official public union manifest..."
   PREPROCESS_COMMON=(
     python "$PREPROCESS_SCRIPT"
     --raw-root "$DATA_ROOT"
+    --chain-data-cache "$CHAIN_DATA_CACHE"
     --mmcif-root "$MMCIF_ROOT"
     --processed-features-dir "$PROCESSED_FEATURES_DIR"
     --processed-labels-dir "$PROCESSED_LABELS_DIR"
@@ -350,8 +408,7 @@ else
   if [[ "$RESUME_PREPROCESS" -eq 1 ]]; then
     PREPROCESS_COMMON+=(--skip-existing)
   fi
-  run_cmd "${PREPROCESS_COMMON[@]}" --manifest "$TARGET_TRAIN"
-  run_cmd "${PREPROCESS_COMMON[@]}" --manifest "$TARGET_VAL"
+  run_cmd "${PREPROCESS_COMMON[@]}" --manifest "$TARGET_ALL"
 fi
 
 echo "[5/5] Done."

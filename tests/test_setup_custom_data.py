@@ -7,7 +7,11 @@ import subprocess
 import sys
 from pathlib import Path
 
+import gemmi
+import numpy as np
 import pytest
+
+from nanofold.chain_paths import chain_data_dir, chain_npz_path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "scripts/setup_custom_data.sh"
@@ -23,11 +27,14 @@ def _fixture(tmp_path: Path) -> tuple[list[str], Path, Path]:
         path.write_text(content)
         outputs[f"{split}_manifest_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
     lock = tmp_path / "public-source.lock.json"
-    lock.write_text(json.dumps({"outputs": outputs}))
+    cache = tmp_path / "chain_data_cache.json"
+    cache.write_text(json.dumps({"1abc_A": {"sequence": "ACD"}, "2abc_A": {"sequence": "EFG"}}))
+    lock.write_text(json.dumps({"outputs": outputs, "chain_data_cache_sha256": hashlib.sha256(cache.read_bytes()).hexdigest()}))
     args = [
         "--manifests-dir", str(manifests), "--manifest-lock-file", str(lock),
         "--data-root", str(tmp_path / "raw"), "--processed-features-dir", str(tmp_path / "features"),
         "--processed-labels-dir", str(tmp_path / "labels"),
+        "--chain-data-cache", str(cache),
     ]
     return args, manifests, lock
 
@@ -74,7 +81,7 @@ def test_custom_dry_run_uses_locked_manifests_without_writes(tmp_path: Path) -> 
     assert lock.read_bytes() == before[lock]
 
 
-def test_custom_setup_downloads_union_and_preprocesses_each_public_split(tmp_path: Path) -> None:
+def test_custom_setup_preprocesses_locked_public_union_once_for_complete_audit(tmp_path: Path) -> None:
     args, manifests, lock = _fixture(tmp_path)
     env, log = _stub_commands(tmp_path)
     originals = {path: path.read_bytes() for path in [*manifests.iterdir(), lock]}
@@ -87,11 +94,74 @@ def test_custom_setup_downloads_union_and_preprocesses_each_public_split(tmp_pat
     assert len(downloads) == 1
     assert f"--manifest {manifests}/all.txt" in downloads[0]
     preprocessing = [line for line in commands if "preprocess.py" in line]
-    assert len(preprocessing) == 2
-    assert f"--manifest {manifests}/train.txt" in preprocessing[0]
-    assert f"--manifest {manifests}/val.txt" in preprocessing[1]
+    assert len(preprocessing) == 1
+    assert f"--manifest {manifests}/all.txt" in preprocessing[0]
     assert all(f"--msa-row-filter {filter_path} --skip-existing" in command for command in preprocessing)
+    assert all(f"--chain-data-cache {tmp_path / 'chain_data_cache.json'}" in command for command in preprocessing)
     assert all(path.read_bytes() == content for path, content in originals.items())
+
+
+def test_custom_setup_writes_complete_public_msa_filter_audit(tmp_path: Path) -> None:
+    args, manifests, lock = _fixture(tmp_path)
+    env, _log = _stub_commands(tmp_path)
+    python = tmp_path / "bin/python"
+    python.write_text(
+        '#!/bin/bash\nif [[ "$1" == "-" || "$1" == "-c" ]]; then exec "$REAL_PYTHON" "$@"; fi\n'
+        'printf \'%s\\n\' "$*" >> "$COMMAND_LOG"\n'
+        'if [[ "$1" == */preprocess.py ]]; then exec "$REAL_PYTHON" "$@"; fi\n'
+    )
+    sequences = {"1abc_A": "A" * 40, "2abc_A": "R" * 40}
+    cache = tmp_path / "chain_data_cache.json"
+    cache.write_text(json.dumps({chain: {"sequence": sequence} for chain, sequence in sequences.items()}))
+    source_lock = json.loads(lock.read_bytes())
+    source_lock["chain_data_cache_sha256"] = hashlib.sha256(cache.read_bytes()).hexdigest()
+    lock.write_text(json.dumps(source_lock))
+    mmcifs = tmp_path / "raw/pdb_data/mmcif_files"
+    mmcifs.mkdir(parents=True)
+    excluded = "G" * 40
+    for chain_id, sequence in sequences.items():
+        alignment = chain_data_dir(tmp_path / "raw/roda_pdb", chain_id)
+        alignment.mkdir(parents=True)
+        (alignment / "uniref90_hits.a3m").write_text(
+            f">query\n{sequence}\n>excluded\n{excluded}\n>retained\n{sequence[:-1]}-\n"
+        )
+        structure = gemmi.Structure()
+        model = gemmi.Model(1)
+        chain = gemmi.Chain("A")
+        for index in range(len(sequence)):
+            residue = gemmi.Residue()
+            residue.name = "ALA" if sequence[index] == "A" else "ARG"
+            residue.seqid = gemmi.SeqId(index + 1, " ")
+            residue.label_seq = index + 1
+            residue.entity_type = gemmi.EntityType.Polymer
+            atom = gemmi.Atom()
+            atom.name = "CA"
+            atom.element = gemmi.Element("C")
+            atom.pos = gemmi.Position(index * 3.8, 0, 0)
+            atom.occ = 1
+            residue.add_atom(atom)
+            chain.add_residue(residue)
+        model.add_chain(chain)
+        structure.add_model(model)
+        structure.setup_entities()
+        structure.make_mmcif_document().write_file(str(mmcifs / f"{chain_id[:4]}.cif"))
+    filter_path = tmp_path / "private-filter.json"
+    filter_path.write_text(json.dumps({"excluded_sequence_sha256": [hashlib.sha256(excluded.encode()).hexdigest()]}))
+    result = _run([*args, "--msa-row-filter", str(filter_path)], env)
+    assert result.returncode == 0, result.stderr
+    features = tmp_path / "features"
+    audit = json.loads((features / "msa_row_filter_audit.json").read_bytes())
+    assert audit["manifest"] == str(manifests / "all.txt")
+    assert audit["chain_count"] == 2
+    assert {row["chain_id"] for row in audit["per_chain"]} == set(sequences)
+    assert audit["total_msa_rows_before_filter"] == 6
+    assert audit["total_msa_rows_removed"] == 2
+    assert audit["total_msa_rows_after_filter"] == 4
+    for chain_id in sequences:
+        with np.load(chain_npz_path(features, chain_id)) as arrays:
+            assert arrays["msa"].shape == (2, 40)
+        with np.load(chain_npz_path(tmp_path / "labels", chain_id)) as arrays:
+            assert np.count_nonzero(arrays["ca_mask"]) == 40
 
 
 @pytest.mark.parametrize("broken", ["train", "val", "all", "missing_union"])
@@ -150,3 +220,26 @@ def test_custom_outputs_cannot_alias_published_assets(tmp_path: Path) -> None:
     assert "separate from published paths" in proc.stderr
     assert not log.exists()
     assert not (tmp_path / "raw").exists()
+
+
+@pytest.mark.parametrize("broken", ["changed", "missing", "omitted", "unlocked"])
+def test_custom_cache_binding_fails_before_downloads_or_writes(tmp_path: Path, broken: str) -> None:
+    args, _manifests, lock = _fixture(tmp_path)
+    env, log = _stub_commands(tmp_path)
+    cache = tmp_path / "chain_data_cache.json"
+    if broken == "changed":
+        cache.write_text("{}")
+    elif broken == "missing":
+        cache.unlink()
+    elif broken == "omitted":
+        args = args[:-2]
+    else:
+        source = json.loads(lock.read_text())
+        source.pop("chain_data_cache_sha256")
+        lock.write_text(json.dumps(source))
+    result = _run(args, env)
+    assert result.returncode != 0
+    assert "cache" in result.stderr
+    assert not log.exists()
+    assert not (tmp_path / "raw").exists()
+    assert not (tmp_path / "features").exists()

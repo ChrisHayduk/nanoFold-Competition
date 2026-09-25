@@ -118,6 +118,15 @@ backbone_valid = batch["atom14_mask"][..., :4].all(dim=-1)
 
 Processed NPZ validation checks token ranges, nonnegative deletions, query/MSA agreement, finite coordinates, and matching feature/label lengths and residue indices. CA coordinates and masks must agree with atom14 slot 1. Query/structure sequence mismatches have all atom labels masked. Schema-3 preprocessing adds matching `preprocess_config_sha256` and `source_inputs_sha256` provenance to each pair; these are storage/audit metadata, not model inputs. Fingerprinting rejects mixed configurations and stored chain IDs that disagree with the manifest. Schema 3 requires the chain ID in both files.
 
+Maintainer setup wrappers bind preprocessing to the source-locked chain cache.
+Direct `scripts/preprocess.py` calls enable this with `--chain-data-cache <path>`.
+The acquired ungapped query must exactly equal the selected canonical cache
+sequence before coordinate projection. Missing or inconsistent cache records
+fail, and the cache SHA256 and selected chain/sequence mapping enter stored
+configuration and source provenance. Resume also checks processed `aatype`
+against the expected sequence; changed cache bytes or a newly enabled cache
+binding require fresh output directories. These checks add no model inputs.
+
 Feature archives must not contain supervision arrays. A features-only loader
 rejects such archives before passing data to submission code. Manifests must be
 nonempty and contain unique chain IDs; fingerprinted splits must be disjoint.

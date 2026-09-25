@@ -730,6 +730,7 @@ def run_mmseqs_homology(
         "mask": 0 if source_targets_only else 1,
         "comp_bias_corr": 0 if source_targets_only else 1,
         "search_type": 1,
+        "dbtype": 1,
     }
     threshold = {
         "min_seq_id": min_seq_id, "coverage": coverage, "cov_mode": 0, "alignment_mode": 3, "seq_id_mode": 0,
@@ -776,6 +777,7 @@ def run_mmseqs_homology(
             "--seq-id-mode",
             "0",
             "--search-type", "1",
+            "--dbtype", "1",
             "--prefilter-mode", str(search_parameters["prefilter_mode"]),
             "-e", str(search_parameters["evalue"]),
             "-s", str(search_parameters["sensitivity"]),

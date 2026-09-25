@@ -191,6 +191,11 @@ each pair's raw-input digest before reuse. Changed or missing run provenance
 requires fresh feature and label directories. New preprocessing bytes must still
 match the published fingerprint to qualify for the frozen benchmark.
 
+Setup verifies the chain cache against the manifest source lock and requires
+every acquired MSA query to match its selected cache sequence exactly before
+coordinate projection. Cache bytes and target identity are bound into each
+processed pair's provenance; changed cache bytes require fresh outputs.
+
 The setup script expects `aws`, `unzip`, and `python` on `PATH`; it keeps hidden validation assets out of the public setup path.
 
 Maintainer asset rebuilding against the frozen manifests requires
@@ -225,8 +230,11 @@ root.
 Automatic regeneration is disabled in both official wrappers.
 `scripts/regenerate_official_manifests.sh --help` gives staging guidance; new
 candidates use `scripts/stage_dataset_candidate.py` to build complete metadata,
-generate both source locks and independently verify fresh private outputs. The
-direct builders remain available with `--sampling-policy cath-v2`. The hidden builder requires a matching versioned public
+generate both source locks and independently verify fresh private outputs.
+Staging also requires both cache-target sequence audits to pass before issuing
+a verified receipt. This early gate does not replace processed-tensor and MSA
+audits. The direct builders remain available with `--sampling-policy cath-v2`.
+The hidden builder requires a matching versioned public
 source lock. Follow [DATA_SAMPLING.md](DATA_SAMPLING.md) for the complete workflow.
 Do not sync candidate hashes into the published track configuration. Asset
 rebuilds write candidate fingerprints and raw/hidden asset locks under

@@ -542,6 +542,7 @@ def _cluster_sequences_mmseqs(
             "--cov-mode",
             "0",
             *([] if alignment_mode is None else ["--alignment-mode", str(alignment_mode)]),
+            *([] if alignment_mode is None else ["--dbtype", "1"]),
             "--threads",
             "1",
         ]
@@ -558,6 +559,7 @@ def _cluster_sequences_mmseqs(
             "--cov-mode",
             "0",
             *([] if alignment_mode is None else ["--alignment-mode", str(alignment_mode)]),
+            *([] if alignment_mode is None else ["--dbtype", "1"]),
             "--threads",
             "1",
         ]

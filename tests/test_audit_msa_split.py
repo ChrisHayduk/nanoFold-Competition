@@ -299,3 +299,28 @@ def test_real_mmseqs_target_audit_finds_prefilter_missed_pair(tmp_path: Path) ->
     assert result["search_parameters"]["evalue"] == 1e308
     assert result["search_parameters"]["mask"] == 0
     assert result["input_binding"]["m8_sha256"]
+
+
+def test_real_mmseqs_treats_ac_only_target_sequences_as_proteins(tmp_path: Path) -> None:
+    import os
+    import shutil
+
+    import pytest
+
+    binary = os.environ.get("MMSEQS_TEST_BINARY") or shutil.which("mmseqs")
+    if not binary:
+        pytest.skip("Set MMSEQS_TEST_BINARY to run the protein database regression")
+    module = _load_audit_module()
+    features = tmp_path / "features"
+    _write_feature(features, "trn1_A", ["A" * 48])
+    for name, query, expected_hits in (("unrelated", "C" * 48, 0), ("homolog", "A" * 40 + "C" * 8, 1)):
+        _write_feature(features, "val1_A", [query])
+        output = tmp_path / name
+        output.mkdir()
+        result = module.run_mmseqs_homology(
+            train_ids=["trn1_A"], val_ids=["val1_A"], features_dir=features, out_dir=output,
+            mmseqs_bin=str(binary), min_seq_id=0.3, coverage=0.8, threads=1, max_seqs=100,
+            tmp_dir=None, include_identifiers=False, source_targets_only=True,
+        )
+        assert result["val_targets_with_train_target_homolog_hits"] == expected_hits
+        assert result["search_parameters"]["dbtype"] == 1

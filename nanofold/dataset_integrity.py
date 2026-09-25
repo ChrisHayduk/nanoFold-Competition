@@ -423,6 +423,7 @@ def preprocess_config_sha256(raw: Mapping[str, Any]) -> str:
     cli_args: Mapping[str, Any] = raw_cli_args if isinstance(raw_cli_args, dict) else {}
     stable_cli_keys = (
         "allow_failures",
+        "chain_data_cache_sha256",
         "disable_templates",
         "fail_fast",
         "max_msa_seqs",

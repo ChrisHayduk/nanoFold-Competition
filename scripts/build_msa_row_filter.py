@@ -293,6 +293,7 @@ def _run_mmseqs(
         "--seq-id-mode",
         "0",
         "--search-type", "1",
+        "--dbtype", "1",
         "--prefilter-mode", "0",
         "-e", "0.001",
         "-s", "5.7",
@@ -423,7 +424,7 @@ def main() -> None:
             "command": cmd,
             "max_seqs": int(args.max_seqs),
             "search_parameters": {"prefilter_mode": 0, "evalue": 0.001, "sensitivity": 5.7,
-                                  "mask": 1, "comp_bias_corr": 1, "search_type": 1},
+                                  "mask": 1, "comp_bias_corr": 1, "search_type": 1, "dbtype": 1},
             "hit_count": hit_count,
         },
         "source": {

@@ -76,6 +76,10 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--mmcif-root", type=str, default="data/mmcif", help="Directory containing mmCIF files")
     ap.add_argument("--manifest", type=str, required=True, help="train.txt or val.txt listing chain IDs")
     ap.add_argument(
+        "--chain-data-cache", type=Path,
+        help="Pinned chain cache; require exact selected target/query equality and bind its bytes to provenance",
+    )
+    ap.add_argument(
         "--processed-features-dir",
         type=str,
         default="data/processed_features",
@@ -396,6 +400,44 @@ def _sha256_file(path: Path) -> str:
 
 def _sequence_sha256(sequence: str) -> str:
     return hashlib.sha256(sequence.upper().encode("utf-8")).hexdigest()
+
+
+def _load_expected_sequences(path: Path, chain_ids: Sequence[str]) -> Tuple[Dict[str, str], str]:
+    def unique_object(pairs: List[Tuple[str, object]]) -> Dict[str, object]:
+        result: Dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("Chain cache contains a duplicate JSON key")
+            result[key] = value
+        return result
+
+    contents = path.read_bytes()
+    cache = json.loads(contents, object_pairs_hook=unique_object)
+    if not isinstance(cache, dict):
+        raise ValueError("Chain cache must be a JSON object keyed by manifest chain ID")
+    expected: Dict[str, str] = {}
+    for chain_id in chain_ids:
+        record = cache.get(chain_id)
+        if not isinstance(record, dict):
+            raise ValueError(f"Missing or malformed chain cache record for {chain_id}")
+        sequences: List[str] = []
+        for key in ("sequence", "seq", "seqres", "aatype_sequence"):
+            if key not in record:
+                continue
+            value = record[key]
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"Invalid chain cache sequence for {chain_id}")
+            sequences.append(value.strip().upper())
+        if not sequences or len(set(sequences)) != 1:
+            raise ValueError(f"Missing or conflicting chain cache sequences for {chain_id}")
+        sequence = sequences[0]
+        if any(aa not in RESTYPES for aa in sequence):
+            raise ValueError(f"Chain cache target must contain only canonical amino acids for {chain_id}")
+        for key in ("seq_length", "sequence_length"):
+            if key in record and (type(record[key]) is not int or record[key] != len(sequence)):
+                raise ValueError(f"Invalid or mismatched chain cache length for {chain_id}")
+        expected[chain_id] = sequence
+    return expected, hashlib.sha256(contents).hexdigest()
 
 
 def _msa_row_to_ungapped_sequence(row: np.ndarray) -> str:
@@ -743,12 +785,16 @@ def _save_npz(path: Path, arrays: Dict[str, np.ndarray]) -> None:
 
 def _source_inputs_sha256(
     chain_dir: Path, mmcif_path: Path, mmcif_root: Path, args: argparse.Namespace, *, requested_chain_id: str,
+    expected_sequence: str | None = None, chain_data_cache_sha256: str | None = None,
 ) -> str:
     """Bind a processed pair to all inputs that can influence this invocation."""
     sources: Dict[str, str | None] = {
         "requested_chain_id": requested_chain_id,
         "target_mmcif": _sha256_file(mmcif_path),
     }
+    if expected_sequence is not None:
+        sources["chain_data_cache_sha256"] = chain_data_cache_sha256
+        sources["expected_sequence_sha256"] = _sequence_sha256(expected_sequence)
     for name in _resolve_msa_names(args.msa_name, args.msa_names):
         path = _find_msa_path(chain_dir, name)
         sources[f"msa:{name}"] = _sha256_file(path) if path is not None else None
@@ -796,6 +842,7 @@ def _existing_outputs_are_valid(
     expected_msa_row_filter_sha256: str | None,
     expected_preprocess_config_sha256: str,
     expected_source_inputs_sha256: str,
+    expected_sequence: str | None = None,
 ) -> bool:
     if not feature_path.exists() or not label_path.exists():
         return False
@@ -833,6 +880,8 @@ def _existing_outputs_are_valid(
                 return False
             if not required_label_keys.issubset(set(labels.files)):
                 return False
+            if expected_sequence is not None and not np.array_equal(features["aatype"], sequence_to_ids(expected_sequence)):
+                return False
             for data in (features, labels):
                 if "preprocess_config_sha256" not in data.files:
                     return False
@@ -857,7 +906,10 @@ def _existing_outputs_are_valid(
         return False
 
 
-def _write_preprocess_meta(args: argparse.Namespace, out_dir: Path, msa_row_filter: MSARowFilter | None) -> str:
+def _write_preprocess_meta(
+    args: argparse.Namespace, out_dir: Path, msa_row_filter: MSARowFilter | None,
+    *, chain_data_cache_sha256: str | None = None,
+) -> str:
     stable_args = {
         k: (str(v) if isinstance(v, Path) else v)
         for k, v in vars(args).items()
@@ -865,6 +917,8 @@ def _write_preprocess_meta(args: argparse.Namespace, out_dir: Path, msa_row_filt
     }
     if msa_row_filter is not None:
         stable_args["msa_row_filter_sha256"] = msa_row_filter.sha256
+    if chain_data_cache_sha256 is not None:
+        stable_args["chain_data_cache_sha256"] = chain_data_cache_sha256
     meta = {
         "schema_version": 3,
         "cli_args": stable_args,
@@ -979,11 +1033,25 @@ def main() -> None:
     chain_ids = read_manifest(manifest)
     if any(re.fullmatch(r"[A-Za-z0-9]{4}_[^\s/\\]+", cid) is None for cid in chain_ids):
         raise ValueError("Preprocessing manifest requires PDB_chain IDs with a four-character PDB ID and nonempty chain")
+    expected_sequences: Dict[str, str] = {}
+    cache_sha256 = None
+    if args.chain_data_cache is not None:
+        cache_path = args.chain_data_cache.resolve()
+        writable_paths = [feature_root / "preprocess_meta.json", feature_root / "msa_row_filter_audit.json"]
+        writable_paths.extend(chain_error_path(feature_root, cid) for cid in chain_ids)
+        if (
+            any(cache_path == root or root in cache_path.parents for root in (feature_root, label_root))
+            or any(path.exists() and cache_path.samefile(path) for path in writable_paths)
+        ):
+            raise ValueError("Pinned chain cache must be separate from preprocessing outputs and their aliases")
+        expected_sequences, cache_sha256 = _load_expected_sequences(args.chain_data_cache, chain_ids)
     processed_features_dir.mkdir(parents=True, exist_ok=True)
     processed_labels_dir.mkdir(parents=True, exist_ok=True)
     msa_row_filter = _load_msa_row_filter(args.msa_row_filter)
 
-    config_sha256 = _write_preprocess_meta(args, processed_features_dir, msa_row_filter)
+    config_sha256 = _write_preprocess_meta(
+        args, processed_features_dir, msa_row_filter, chain_data_cache_sha256=cache_sha256,
+    )
 
     n_ok = 0
     n_fail = 0
@@ -1013,6 +1081,7 @@ def main() -> None:
 
             source_sha256 = _source_inputs_sha256(
                 chain_dir, mmcif_path, mmcif_root, args, requested_chain_id=cid,
+                expected_sequence=expected_sequences.get(cid), chain_data_cache_sha256=cache_sha256,
             )
 
             if args.skip_existing and _existing_outputs_are_valid(
@@ -1021,6 +1090,7 @@ def main() -> None:
                 expected_msa_row_filter_sha256=msa_row_filter.sha256 if msa_row_filter is not None else None,
                 expected_preprocess_config_sha256=config_sha256,
                 expected_source_inputs_sha256=source_sha256,
+                expected_sequence=expected_sequences.get(cid),
             ):
                 if err_marker.exists():
                     err_marker.unlink()
@@ -1038,6 +1108,8 @@ def main() -> None:
                 max_msa_seqs=args.max_msa_seqs,
                 msa_row_filter=msa_row_filter,
             )
+            if cid in expected_sequences and query_sequence != expected_sequences[cid]:
+                raise ValueError(f"Acquired MSA query differs from the pinned chain cache target for {cid}")
             chain_struct = extract_chain_atoms(
                 mmcif_path=mmcif_path,
                 pdb_id=pdb_id,

@@ -38,6 +38,9 @@ def test_full_refresh_dry_run_builds_and_applies_msa_row_filter() -> None:
     assert "--heldout-manifest data/manifests/val.txt" in stdout
     assert f"--output {filter_path}" in stdout
     assert f"--msa-row-filter {filter_path}" in stdout
+    preprocessing = [line for line in stdout.splitlines() if "/preprocess.py" in line]
+    assert len(preprocessing) == 1
+    assert preprocessing[0].endswith("--manifest data/manifests/all.txt")
 
 
 def test_full_refresh_runs_both_strict_msa_gates_before_fingerprints() -> None:
@@ -49,6 +52,13 @@ def test_full_refresh_runs_both_strict_msa_gates_before_fingerprints() -> None:
     assert stdout.count("--strict --run-mmseqs --skip-plot") == 2
     assert "--val-features-dir .nanofold_private/hidden_processed_features" in stdout
     assert stdout.index("audits/hidden_msa_split") < stdout.index("scripts/build_fingerprint.py")
+    preprocessing = [line for line in stdout.splitlines() if "/preprocess.py" in line]
+    assert len(preprocessing) == 2
+    assert "--processed-features-dir data/processed_features" in preprocessing[0]
+    assert preprocessing[0].endswith("--manifest data/manifests/all.txt")
+    assert "--processed-features-dir .nanofold_private/hidden_processed_features" in preprocessing[1]
+    assert "--manifest .nanofold_private/manifests/hidden_val.txt" in preprocessing[1]
+    assert stdout.index("scripts/sync_official_manifest_hashes.py --check") < stdout.index(preprocessing[0])
 
 
 def test_hidden_preprocess_failure_does_not_rewrite_exclusions_or_retry(tmp_path: Path) -> None:
@@ -78,7 +88,7 @@ def test_hidden_preprocess_failure_does_not_rewrite_exclusions_or_retry(tmp_path
     commands = command_log.read_text()
     assert "update_processability_exclusions.py" not in commands
     assert "build_fingerprint.py" not in commands
-    assert commands.count("/preprocess.py") == 3
+    assert commands.count("/preprocess.py") == 2
     assert "will not be changed" in proc.stdout
 
 
@@ -179,17 +189,27 @@ def test_refresh_rejects_colliding_candidate_fingerprints_before_writes(tmp_path
     assert not list(tmp_path.iterdir())
 
 
-def test_custom_raw_root_propagates_to_default_chain_cache(tmp_path: Path) -> None:
-    raw = tmp_path / "custom-raw"
+@pytest.mark.parametrize("cache_mode", ["default", "derived", "explicit"])
+def test_refresh_propagates_same_chain_cache_to_all_consumers(tmp_path: Path, cache_mode: str) -> None:
+    args: list[str] = []
+    raw = Path("data/openproteinset")
+    if cache_mode != "default":
+        raw = tmp_path / "custom raw"
+        args.extend(["--data-root", str(raw)])
+    cache = raw / "pdb_data/data_caches/chain_data_cache.json"
+    if cache_mode == "explicit":
+        cache = tmp_path / "pinned cache.json"
+        args.extend(["--chain-data-cache", str(cache)])
     result = subprocess.run(["bash", "scripts/full_official_data_refresh.sh", "--dry-run",
-                             "--skip-manifest-regen", "--data-root", str(raw)],
+                             "--skip-manifest-regen", *args],
                             cwd=REPO_ROOT, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
-    cache = raw / "pdb_data/data_caches/chain_data_cache.json"
-    commands = [line for line in result.stdout.splitlines() if "--chain-data-cache" in line]
-    assert len(commands) == 2
+    consumers = ["setup_official_data.sh", "build_msa_row_filter.py", "preprocess.py", "build_data_source_lock.py"]
+    commands = [line for line in result.stdout.splitlines()
+                if line.startswith("+ ") and any(f"scripts/{name}" in line for name in consumers)]
+    assert len(commands) == 5  # Setup, row filter, public/hidden preprocessing calls, source lock.
     assert all(f"--chain-data-cache {cache}" in command for command in commands)
-    assert not raw.exists()
+    assert not list(tmp_path.iterdir())
 
 
 @pytest.mark.parametrize("overlap", ["public_hidden_features", "hidden_features_labels", "features_under_raw"])

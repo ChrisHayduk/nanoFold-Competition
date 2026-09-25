@@ -227,6 +227,26 @@ def test_filter_with_real_mmseqs_identity_coverage_and_masked_exact_rows(tmp_pat
     assert result["mmseqs"]["version"]
 
 
+def test_real_mmseqs_filter_accepts_ac_only_protein_source_database(tmp_path: Path) -> None:
+    import os
+    import shutil
+
+    import pytest
+
+    binary = os.environ.get("MMSEQS_TEST_BINARY") or shutil.which("mmseqs")
+    if not binary:
+        pytest.skip("Set MMSEQS_TEST_BINARY to run the protein database regression")
+    heldout, source, output = [tmp_path / name for name in ("heldout.fa", "source.fa", "hits.m8")]
+    heldout.write_text(f">heldout_1\n{'D' * 48}\n")
+    source.write_text(f">source_1\n{'A' * 48}\n>source_2\n{'C' * 48}\n")
+    command = _load_filter_module()._run_mmseqs(
+        mmseqs_bin=str(binary), heldout_fasta=heldout, source_fasta=source, output_m8=output,
+        tmp_dir=tmp_path / "mmseqs-work", min_seq_id=0.3, coverage=0.8, threads=1, max_seqs=100,
+    )
+    assert output.read_text() == ""
+    assert command[command.index("--dbtype") + 1] == "1"
+
+
 def test_source_scanning_includes_all_feature_variants_for_the_same_chain(tmp_path: Path) -> None:
     module = _load_filter_module()
     manifest = tmp_path / "train.txt"

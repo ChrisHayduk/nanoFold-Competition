@@ -14,6 +14,7 @@ manifest mmCIF subset and preprocesses without templates.
 Required options:
   --manifests-dir <path>          Existing staged public train.txt, val.txt and all.txt
   --manifest-lock-file <path>     Existing candidate public source lock (read-only)
+  --chain-data-cache <path>       Source cache matching the candidate source lock
   --data-root <path>              Custom raw asset directory
   --processed-features-dir <path> Custom feature NPZ directory
   --processed-labels-dir <path>   Custom label NPZ directory
@@ -41,6 +42,7 @@ REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 DATA_ROOT=""
 MANIFESTS_DIR=""
 MANIFEST_LOCK_FILE=""
+CHAIN_DATA_CACHE=""
 PROCESSED_FEATURES_DIR=""
 PROCESSED_LABELS_DIR=""
 MSA_NAME="uniref90_hits.a3m"
@@ -56,6 +58,7 @@ while [[ $# -gt 0 ]]; do
     --data-root) DATA_ROOT="${2:?Missing --data-root value}"; shift 2 ;;
     --manifests-dir) MANIFESTS_DIR="${2:?Missing --manifests-dir value}"; shift 2 ;;
     --manifest-lock-file) MANIFEST_LOCK_FILE="${2:?Missing --manifest-lock-file value}"; shift 2 ;;
+    --chain-data-cache) CHAIN_DATA_CACHE="${2:?Missing --chain-data-cache value}"; shift 2 ;;
     --processed-features-dir) PROCESSED_FEATURES_DIR="${2:?Missing --processed-features-dir value}"; shift 2 ;;
     --processed-labels-dir) PROCESSED_LABELS_DIR="${2:?Missing --processed-labels-dir value}"; shift 2 ;;
     --msa-name) MSA_NAME="${2:?Missing --msa-name value}"; shift 2 ;;
@@ -74,8 +77,8 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ -z "$DATA_ROOT" || -z "$MANIFESTS_DIR" || -z "$MANIFEST_LOCK_FILE" || -z "$PROCESSED_FEATURES_DIR" || -z "$PROCESSED_LABELS_DIR" ]]; then
-  echo "Explicit custom data, manifest, source-lock, feature and label paths are required; see --help." >&2
+if [[ -z "$DATA_ROOT" || -z "$MANIFESTS_DIR" || -z "$MANIFEST_LOCK_FILE" || -z "$CHAIN_DATA_CACHE" || -z "$PROCESSED_FEATURES_DIR" || -z "$PROCESSED_LABELS_DIR" ]]; then
+  echo "Explicit custom data, manifest, source-lock, chain-cache, feature and label paths are required; see --help." >&2
   exit 1
 fi
 if ! command -v python >/dev/null 2>&1; then
@@ -85,7 +88,7 @@ fi
 
 # All validation is read-only and precedes even output directory creation.
 python - "$REPO_ROOT" "$MANIFESTS_DIR" "$MANIFEST_LOCK_FILE" "$MSA_ROW_FILTER" \
-  "$DATA_ROOT" "$PROCESSED_FEATURES_DIR" "$PROCESSED_LABELS_DIR" <<'PYTHON'
+  "$DATA_ROOT" "$PROCESSED_FEATURES_DIR" "$PROCESSED_LABELS_DIR" "$CHAIN_DATA_CACHE" <<'PYTHON'
 import hashlib
 import json
 import sys
@@ -94,6 +97,7 @@ from pathlib import Path
 repo, manifests, lock_path = (Path(p).resolve() for p in sys.argv[1:4])
 filter_path = Path(sys.argv[4]).resolve() if sys.argv[4] else None
 outputs = [Path(p).resolve() for p in sys.argv[5:8]]
+cache_path = Path(sys.argv[8]).resolve()
 protected = [repo / name for name in (
     "data/manifests", "data/openproteinset", "data/processed_features", "data/processed_labels",
     "data/hidden_processed_features", "data/hidden_processed_labels", ".nanofold_private/hidden_processed_features",
@@ -108,13 +112,19 @@ if manifests.is_relative_to(repo / "data/manifests"):
 for index, output in enumerate(outputs):
     if any(overlaps(output, path.resolve()) for path in [*protected, manifests, *outputs[:index]]):
         raise SystemExit("Custom asset paths must be separate from published paths, manifests and each other.")
-    if lock_path.is_relative_to(output) or (filter_path and filter_path.is_relative_to(output)):
+    if any(path.is_relative_to(output) for path in (lock_path, cache_path)) or (filter_path and filter_path.is_relative_to(output)):
         raise SystemExit("Custom asset output paths must not contain source inputs.")
     if output.exists() and not output.is_dir():
         raise SystemExit("Custom asset output paths must be directories.")
-if not lock_path.is_file() or (filter_path and not filter_path.is_file()):
-    raise SystemExit("The source lock and optional MSA filter must already exist.")
+if not lock_path.is_file() or not cache_path.is_file() or (filter_path and not filter_path.is_file()):
+    raise SystemExit("The source lock, chain cache and optional MSA filter must already exist.")
 lock = json.loads(lock_path.read_text())
+cache_hash = hashlib.sha256()
+with cache_path.open("rb") as handle:
+    for block in iter(lambda: handle.read(1024 * 1024), b""):
+        cache_hash.update(block)
+if lock.get("chain_data_cache_sha256") != cache_hash.hexdigest():
+    raise SystemExit("Candidate chain cache does not match its source lock.")
 records = lock.get("outputs", {})
 if not isinstance(records, dict):
     raise SystemExit("Candidate source lock outputs must be an object.")
@@ -169,7 +179,7 @@ if [[ "$SKIP_PREPROCESS" -eq 0 ]]; then
   PREPROCESS_COMMON=(
     python "$SCRIPT_DIR/preprocess.py" --raw-root "$DATA_ROOT" --mmcif-root "$PDB_DIR/mmcif_files"
     --processed-features-dir "$PROCESSED_FEATURES_DIR" --processed-labels-dir "$PROCESSED_LABELS_DIR"
-    --msa-name "$MSA_NAME" --disable-templates
+    --msa-name "$MSA_NAME" --disable-templates --chain-data-cache "$CHAIN_DATA_CACHE"
   )
   if [[ -n "$MSA_ROW_FILTER" ]]; then
     PREPROCESS_COMMON+=(--msa-row-filter "$MSA_ROW_FILTER")
@@ -177,8 +187,7 @@ if [[ "$SKIP_PREPROCESS" -eq 0 ]]; then
   if [[ "$RESUME_PREPROCESS" -eq 1 ]]; then
     PREPROCESS_COMMON+=(--skip-existing)
   fi
-  run_cmd "${PREPROCESS_COMMON[@]}" --manifest "$MANIFESTS_DIR/train.txt"
-  run_cmd "${PREPROCESS_COMMON[@]}" --manifest "$MANIFESTS_DIR/val.txt"
+  run_cmd "${PREPROCESS_COMMON[@]}" --manifest "$MANIFESTS_DIR/all.txt"
 fi
 
 echo "Custom public asset setup complete. Manifests and source lock are unchanged."

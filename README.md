@@ -151,6 +151,12 @@ It requires schema-2 structure metadata and an explicit
   CATH familiarity are recorded for review. Structural balancing does not itself
   create a family-disjoint generalization test.
 
+Candidate staging requires complete cache-target sequence audits across both
+split boundaries before issuing a verified receipt, even with precomputed
+clusters. Asset setup then requires acquired MSA queries to match the pinned
+cache targets exactly and records that binding in preprocessing provenance.
+Processed-tensor and residual MSA audits remain separate release gates.
+
 The published benchmark's broad structural metadata and existing results must
 not be relabeled as `cath-v2` results. See [dataset sampling](docs/DATA_SAMPLING.md)
 for the staging workflow, validation gates, and remaining scientific limits.

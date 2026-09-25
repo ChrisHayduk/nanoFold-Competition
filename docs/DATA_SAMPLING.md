@@ -66,7 +66,7 @@ input, including through symlink or hardlink aliases.
 
 ## Stage a new candidate
 
-Use a fresh directory for every candidate and retain its source lock. The chain cache must already be available. The following defaults match the 40–256/3 Å single-chain policy; MMseqs2 must be installed separately.
+Use a fresh directory for every candidate and retain its source lock. The chain cache must already be available. The following defaults match the 40–256/3 Å single-chain policy; MMseqs2 must be installed separately and is required even with precomputed cluster assignments.
 
 ```bash
 sources=.nanofold_private/cath-v2-sources-01
@@ -86,7 +86,9 @@ python scripts/stage_dataset_candidate.py \
   --metadata-source-lock "$sources/sources.lock.json"
 ```
 
-The stage command builds metadata, invokes the joint generator with both locks, then runs the independent verifier. It creates the directory with owner-only access, retains step logs privately, and refuses existing directories. Paths inside this repository must be under ignored `.nanofold_private/`; external private directories are also supported. `candidate_status.json` becomes `manifests_verified` only after every step succeeds and includes artifact hashes. Failed or interrupted stages must not be adopted; preserve their diagnostics and start a fresh directory. This receipt explicitly leaves processed-asset validation outstanding. The direct builders remain available for specialized workflows.
+The stage command builds metadata, invokes the joint generator with both locks, runs the independent verifier, then requires target-sequence audits for train→public validation and public-all→hidden. Both comparisons are retained even if one fails. The audits compare complete cache targets with the same identity/coverage thresholds, all-pair local alignment, explicit protein database type, and independent exact-sequence/chain/PDB checks. They bind the cache, manifests, code, binary, commands and results to hashes. `--audit-threads` controls their CPU use. Source/manifest changes between verification and auditing fail staging.
+
+Staging creates the directory with owner-only access, retains step logs privately, and refuses existing directories. Paths inside this repository must be under ignored `.nanofold_private/`; external private directories are also supported. `candidate_status.json` becomes `manifests_verified` only after every step succeeds, sets `target_sequences_audited=true`, and includes the target-audit receipt hash. Failed or interrupted stages must not be adopted; preserve their diagnostics and start a fresh directory. This receipt explicitly leaves processed-tensor and MSA validation outstanding. The direct builders remain available for specialized workflows; their output alone does not pass this staging gate. `scripts/audit_cache_targets.py --help` describes the standalone cache-target audit.
 
 The secret environment variable is `NANOFOLD_HIDDEN_SPLIT_SALT`; alternatively pass `--hidden-split-salt-file` to the generator. Do not expose the salt or its digest in public artifacts. The downloader pins CATH 4.4.0, verifies existing locked bytes instead of repinning them, and records unavailable optional sources. Source filenames are resolved under `--out-dir` by the downloader and `--metadata-sources-dir` by the metadata builder. Use a new directory/lock for a deliberate source update.
 
@@ -99,17 +101,20 @@ stage=.nanofold_private/cath-v2-candidate-01
 bash scripts/setup_custom_data.sh \
   --manifests-dir "$stage/public" \
   --manifest-lock-file "$stage/public-source.lock.json" \
+  --chain-data-cache "$cache" \
   --data-root "$stage/raw" \
   --processed-features-dir "$stage/features" \
   --processed-labels-dir "$stage/labels"
 ```
 
-This command verifies the locked public hashes/counts and union before downloads,
+This command verifies the locked cache and public hashes/counts and union before downloads,
 preserves manifests and locks, and prepares only public assets with templates
 disabled. It cannot generate splits; generation flags fail before work starts.
 `--dry-run` validates inputs and prints commands without creating outputs. Pass
 `--msa-row-filter` for an existing private filter and `--resume-preprocess` for
-matching raw-input/configuration provenance. Hidden asset preparation, both
+matching raw-input/configuration provenance. Acquired MSA queries must exactly
+match the pinned cache targets; cache bytes and selected sequence identity are
+bound into preprocessing provenance. Hidden asset preparation, both
 strict homology audits and candidate fingerprints remain required separately.
 
 ## Training exposure and resume

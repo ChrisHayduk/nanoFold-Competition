@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import sys
@@ -58,15 +59,124 @@ def preprocessing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     argv = [
         "preprocess.py", "--manifest", str(manifest), "--alignments-root", str(alignments),
         "--mmcif-root", str(mmcifs), "--processed-features-dir", str(features),
-        "--processed-labels-dir", str(labels), "--disable-templates", "--strict", "--fail-fast",
+        "--processed-labels-dir", str(labels), "--disable-templates", "--fail-fast",
         "--min-projection-valid-ca", "3",
     ]
 
-    def run(*extra: str) -> None:
-        monkeypatch.setattr(sys, "argv", [*argv, *extra])
+    def run(*extra: str, strict: bool = True) -> None:
+        monkeypatch.setattr(sys, "argv", [*argv, *(["--strict"] if strict else []), *extra])
         module.main()
 
     return module, run, features, labels, msa, cif
+
+
+def test_pinned_cache_rejects_wrong_fallback_query_that_passes_projection(preprocessing, tmp_path: Path) -> None:
+    _, run, features, labels, msa, cif = preprocessing
+    cached_sequence = "A" * 40
+    fallback_query = "A" * 39 + "R"
+    msa.write_text(">query\n" + fallback_query + "\n")
+    _write_structure(cif, length=40)
+    cache = tmp_path / "cache.json"
+    cache.write_text(json.dumps({"1abc_A": {"seq": cached_sequence, "seq_length": 40}}))
+    control_features = tmp_path / "unbound_features"
+    control_labels = tmp_path / "unbound_labels"
+    run("--processed-features-dir", str(control_features), "--processed-labels-dir", str(control_labels),
+        "--min-projection-valid-ca", "32", strict=False)
+    with np.load(chain_npz_path(control_labels, "1abc_A")) as data:
+        assert np.count_nonzero(data["ca_mask"]) == 39
+    with pytest.raises(ValueError, match="Acquired MSA query differs from the pinned chain cache target"):
+        run("--chain-data-cache", str(cache), "--min-projection-valid-ca", "32", strict=False)
+    assert not list(features.glob("*.npz"))
+    assert not list(labels.glob("*.npz"))
+
+
+@pytest.mark.parametrize("contents", [
+    "[]", "{}", '{"1abc_a":{"seq":"AAA"}}', '{"1abc_A":[]}',
+    '{"1abc_A":{"seq":123}}', '{"1abc_A":{"seq":""}}',
+    '{"1abc_A":{"seq":"AAA","sequence":"AAR"}}',
+    '{"1abc_A":{"seq":"AAA","sequence":null}}',
+    '{"1abc_A":{"seq":"AAX"}}', '{"1abc_A":{"seq":"A-A"}}',
+    '{"1abc_A":{"seq":"AAA","seq_length":2}}',
+    '{"1abc_A":{"seq":"AAA","seq_length":3,"sequence_length":4}}',
+    '{"1abc_A":{"seq":"AAA","seq_length":"3"}}',
+    '{"1abc_A":{"seq":"AAA","seq_length":3.0}}',
+    '{"1abc_A":{"seq":"AAA","seq_length":true}}',
+    '{"1abc_A":{"seq":"AAA"},"1abc_A":{"seq":"AAR"}}',
+    '{"1abc_A":{"seq":"AAR","seq":"AAA"}}',
+])
+def test_invalid_selected_cache_fails_before_outputs(preprocessing, tmp_path: Path, contents: str) -> None:
+    _, run, features, labels, _, _ = preprocessing
+    cache = tmp_path / "cache.json"
+    cache.write_text(contents)
+    with pytest.raises(ValueError):
+        run("--chain-data-cache", str(cache))
+    assert not features.exists()
+    assert not labels.exists()
+
+
+def test_cache_provenance_binds_bytes_and_resume_checks_target(preprocessing, tmp_path: Path) -> None:
+    from nanofold.dataset_integrity import preprocess_config_sha256
+
+    _, run, features, labels, _, _ = preprocessing
+    cache = tmp_path / "cache.json"
+    cache.write_text(json.dumps({"1abc_A": {"seq": "AAA", "seq_length": 3}}))
+    run("--chain-data-cache", str(cache))
+    feature_path = chain_npz_path(features, "1abc_A")
+    label_path = chain_npz_path(labels, "1abc_A")
+    meta_path = features / "preprocess_meta.json"
+    metadata = json.loads(meta_path.read_bytes())
+    assert metadata["cli_args"]["chain_data_cache_sha256"] == hashlib.sha256(cache.read_bytes()).hexdigest()
+    bound_config = preprocess_config_sha256(metadata)
+    del metadata["cli_args"]["chain_data_cache_sha256"]
+    assert preprocess_config_sha256(metadata) != bound_config
+    before_mtime = feature_path.stat().st_mtime_ns
+    run("--chain-data-cache", str(cache), "--skip-existing")
+    assert feature_path.stat().st_mtime_ns == before_mtime
+    with np.load(feature_path) as data:
+        arrays = dict(data)
+    arrays["aatype"][:] = 1
+    arrays["msa"][0] = arrays["aatype"]
+    np.savez_compressed(feature_path, **arrays)
+    run("--chain-data-cache", str(cache), "--skip-existing")
+    with np.load(feature_path) as data:
+        assert np.array_equal(data["aatype"], np.zeros(3, dtype=np.int32))
+    before = (feature_path.read_bytes(), label_path.read_bytes(), meta_path.read_bytes())
+    cache.write_text(cache.read_text() + "\n")
+    with pytest.raises(ValueError, match="different preprocessing provenance"):
+        run("--chain-data-cache", str(cache), "--skip-existing")
+    assert (feature_path.read_bytes(), label_path.read_bytes(), meta_path.read_bytes()) == before
+
+
+def test_uncached_outputs_cannot_be_resumed_as_cache_bound(preprocessing, tmp_path: Path) -> None:
+    _, run, features, _, _, _ = preprocessing
+    run()
+    meta_path = features / "preprocess_meta.json"
+    before = meta_path.read_bytes()
+    assert "chain_data_cache_sha256" not in json.loads(before)["cli_args"]
+    cache = tmp_path / "cache.json"
+    cache.write_text(json.dumps({"1abc_A": {"seq": "AAA", "seq_length": 3}}))
+    with pytest.raises(ValueError, match="different preprocessing provenance"):
+        run("--chain-data-cache", str(cache), "--skip-existing")
+    assert meta_path.read_bytes() == before
+
+
+@pytest.mark.parametrize("output_name", ["preprocess_meta.json", "msa_row_filter_audit.json", "chain_316162635f41.error.txt"])
+@pytest.mark.parametrize("hardlink", [False, True])
+def test_pinned_cache_cannot_alias_written_outputs(preprocessing, tmp_path: Path, output_name: str, hardlink: bool) -> None:
+    _, run, features, labels, _, _ = preprocessing
+    features.mkdir()
+    output = features / output_name
+    output.write_text(json.dumps({"1abc_A": {"seq": "AAA", "seq_length": 3}}))
+    cache = output
+    if hardlink:
+        cache = tmp_path / "pinned-cache.json"
+        cache.hardlink_to(output)
+    before = cache.read_bytes()
+    with pytest.raises(ValueError, match="Pinned chain cache must be separate"):
+        run("--chain-data-cache", str(cache))
+    assert cache.read_bytes() == output.read_bytes() == before
+    assert not labels.exists()
+    assert list(features.iterdir()) == [output]
 
 
 def test_resume_preserves_metadata_and_skips_only_unchanged_inputs(preprocessing) -> None:

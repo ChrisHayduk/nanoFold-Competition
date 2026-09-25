@@ -145,11 +145,14 @@ That script does five things:
 2. Downloads OpenFold cache metadata from anonymous S3:
    - `s3://openfold/data_caches/`
    - `s3://openfold/duplicate_pdb_chains.txt`
+   The chain cache must match the committed source-lock hash. Supply
+   `--chain-data-cache <path>` to reuse that pinned cache.
 3. Downloads per-chain OpenFold assets for the public union manifest, `data/manifests/all.txt`.
    - The official default MSA file is `uniref90_hits.a3m`.
    - Template hits are skipped when `--disable-templates` is set.
 4. Downloads the manifest mmCIF subset from RCSB when `--mmcif-mode subset` is used.
-5. Runs `scripts/preprocess.py` separately for train and public validation manifests.
+5. Runs `scripts/preprocess.py` once on the verified public union, `all.txt`, so
+   the MSA filtering audit includes every train and public validation chain.
 
 Direct URL downloads in `scripts/prepare_data.py` time out after 60 seconds per
 attempt. Set `--download-url-timeout-seconds <seconds>` to adjust this limit;
@@ -209,7 +212,7 @@ If preprocessing is interrupted, rerun the same command with:
 bash scripts/setup_official_data.sh ... --resume-preprocess
 ```
 
-Resume requires the same raw inputs, preprocessing implementation and configuration. New outputs contain source-content and configuration hashes; a changed or missing provenance record requires a fresh output directory. Existing files are validated before they can be skipped.
+Resume requires the same raw inputs, pinned chain-cache bytes, preprocessing implementation and configuration. New outputs contain source-content and configuration hashes; a changed or missing provenance record requires a fresh output directory. Existing files are validated before they can be skipped, including exact target equality to the selected cache sequence when cache binding is enabled.
 
 ## 3. How Dataset Splits Are Determined
 
@@ -218,9 +221,12 @@ The committed train and public-validation manifests, fingerprints and source loc
 New candidate datasets use `--sampling-policy cath-v2` and metadata schema 2. `scripts/stage_dataset_candidate.py` builds metadata, generates both locks and independently verifies the candidate in a fresh private directory. Metadata must describe the complete eligible universe; debug sample limits and permissive nonstandard-amino-acid filters cannot enter release sampling. See [Dataset sampling](DATA_SAMPLING.md) for reproducible commands, the CATH schema, selection policy, release gates and scientific limitations.
 
 `scripts/setup_custom_data.sh` consumes a staged public manifest directory and
-its source lock, with explicit custom raw/features/labels directories. It checks
-the locked public manifests before downloading and never regenerates them.
+its source lock, with required `--chain-data-cache <path>` and explicit custom
+raw/features/labels directories. It checks the cache hash and locked public
+manifests before downloading and never regenerates them.
 This public-asset step does not replace hidden preparation or the strict audits.
+Both setup wrappers and the full-refresh wrapper preprocess the public union in
+one call. Hidden preprocessing uses its separate private output roots and audit.
 
 The generation path:
 
@@ -240,6 +246,19 @@ The published source lock's broad-class distributions describe its frozen select
 ## 4. How Input Data Is Prepped
 
 Preprocessing is handled by `scripts/preprocess.py`.
+
+The official and custom setup wrappers pass the pinned chain cache into
+preprocessing. Direct research invocations can opt in with
+`--chain-data-cache <path>`. Every selected chain must have one unambiguous,
+canonical amino-acid sequence and consistent integer length fields in that
+cache. Missing records, conflicting sequence fields and duplicate JSON keys
+fail before output directories are created. The acquired, ungapped A3M query
+must exactly equal that sequence before coordinate projection; passing the
+projection thresholds alone cannot establish target identity. The cache byte
+hash enters the preprocessing configuration, and each pair's source hash also
+binds its selected chain ID and expected sequence. Adding or changing this
+binding requires fresh outputs. The pinned cache must be separate from processed
+output directories and their aliases.
 
 For each chain ID, preprocessing:
 

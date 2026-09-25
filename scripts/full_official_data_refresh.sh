@@ -453,6 +453,7 @@ if [[ "$SKIP_SETUP" -eq 0 ]]; then
   SETUP_CMD=(
     bash "$SCRIPT_DIR/setup_official_data.sh"
     --data-root "$DATA_ROOT"
+    --chain-data-cache "$CHAIN_DATA_CACHE"
     --manifests-dir "$MANIFESTS_DIR"
     --processed-features-dir "$PROCESSED_FEATURES_DIR"
     --processed-labels-dir "$PROCESSED_LABELS_DIR"
@@ -547,6 +548,7 @@ if [[ "$SKIP_SETUP" -eq 0 ]]; then
   PUBLIC_PREPROCESS_COMMON=(
     python "$SCRIPT_DIR/preprocess.py"
     --raw-root "$DATA_ROOT"
+    --chain-data-cache "$CHAIN_DATA_CACHE"
     --mmcif-root "$DATA_ROOT/pdb_data/mmcif_files"
     --processed-features-dir "$PROCESSED_FEATURES_DIR"
     --processed-labels-dir "$PROCESSED_LABELS_DIR"
@@ -565,12 +567,7 @@ if [[ "$SKIP_SETUP" -eq 0 ]]; then
   if [[ "$RESUME_PREPROCESS" -eq 1 ]]; then
     PUBLIC_PREPROCESS_COMMON+=(--skip-existing)
   fi
-  if ! run_cmd "${PUBLIC_PREPROCESS_COMMON[@]}" --manifest "$MANIFESTS_DIR/train.txt"; then
-    echo "Data refresh stopped. Inspect the preprocessing error audit in the corresponding feature root."
-    echo "Manifests and exclusion lists will not be changed in response to preprocessing failures."
-    exit 1
-  fi
-  if ! run_cmd "${PUBLIC_PREPROCESS_COMMON[@]}" --manifest "$MANIFESTS_DIR/val.txt"; then
+  if ! run_cmd "${PUBLIC_PREPROCESS_COMMON[@]}" --manifest "$MANIFESTS_DIR/all.txt"; then
     echo "Data refresh stopped. Inspect the preprocessing error audit in the corresponding feature root."
     echo "Manifests and exclusion lists will not be changed in response to preprocessing failures."
     exit 1
@@ -584,6 +581,7 @@ if [[ "$SKIP_HIDDEN" -eq 0 && "$SKIP_SETUP" -eq 0 ]]; then
   HIDDEN_PREPROCESS_CMD=(
     python "$SCRIPT_DIR/preprocess.py"
     --raw-root "$DATA_ROOT"
+    --chain-data-cache "$CHAIN_DATA_CACHE"
     --mmcif-root "$DATA_ROOT/pdb_data/mmcif_files"
     --processed-features-dir "$HIDDEN_FEATURES_DIR"
     --processed-labels-dir "$HIDDEN_LABELS_DIR"

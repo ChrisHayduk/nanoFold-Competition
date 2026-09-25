@@ -12,6 +12,25 @@ import pytest
 TEST_HIDDEN_SPLIT_SALT = "test-hidden-split-salt-with-enough-length-000000"
 
 
+def test_real_mmseqs_clusters_ac_only_sequences_as_proteins() -> None:
+    import shutil
+
+    from scripts.build_manifests import _cluster_sequences_mmseqs
+
+    binary = os.environ.get("MMSEQS_TEST_BINARY") or shutil.which("mmseqs")
+    if not binary:
+        pytest.skip("Set MMSEQS_TEST_BINARY to run the protein clustering regression")
+    sequences = {"1abc_A": "A" * 48, "2abc_A": "A" * 48, "3abc_A": "C" * 48}
+    clusters, command = _cluster_sequences_mmseqs(
+        sequences=sequences, mmseqs_bin=str(binary), min_seq_id=0.3, coverage=0.8,
+    )
+    assert clusters is not None
+    assert set(clusters) == set(sequences)
+    assert clusters["1abc_A"] == clusters["2abc_A"]
+    assert clusters["1abc_A"] != clusters["3abc_A"]
+    assert command is not None and command[command.index("--dbtype") + 1] == "1"
+
+
 def _cache_sha(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
