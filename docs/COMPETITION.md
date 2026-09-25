@@ -231,6 +231,8 @@ Setup verifies the chain cache against the manifest source lock and requires
 every acquired MSA query to match its selected cache sequence exactly before
 coordinate projection. Cache bytes and target identity are bound into each
 processed pair's provenance; changed cache bytes require fresh outputs.
+Coordinate labels require a unique observed-residue mapping across all optimal
+deposited-polymer alignments; unresolved positions may have equivalent placements.
 
 The setup script expects `aws`, `unzip`, and `python` on `PATH`; it keeps hidden validation assets out of the public setup path.
 

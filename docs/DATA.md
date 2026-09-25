@@ -276,7 +276,7 @@ For each chain ID, preprocessing:
 6. Caps raw MSA depth with `--max-msa-seqs` before writing NPZ files.
 7. Loads the matching mmCIF file.
 8. Extracts chain atom coordinates into the canonical atom14 layout.
-9. Aligns the full deposited polymer sequence to the MSA query, then places observed coordinates using `label_seq_id`. Missing coordinates retain their polymer positions, including within repeated sequences. Without polymer context, sequence-only projection must be unambiguous.
+9. Aligns the full deposited polymer sequence to the MSA query, then places observed coordinates using `label_seq_id`. Missing coordinates retain their polymer positions, including within repeated sequences. All optimal alignments must induce the same mapping for every observed residue; differences confined to unresolved positions are allowed. More than 1,024 optimal alignments fail closed because uniqueness has not been established. Without polymer context, sequence-only projection must be unambiguous.
 10. Projects atom14 coordinates onto query positions, masking every label at a sequence mismatch.
 11. Rejects chains that fail projection quality thresholds, including the valid-CA minimum in strict alignment mode.
 12. Validates and writes one feature NPZ and one label NPZ per chain, with matching configuration and source-content hashes.

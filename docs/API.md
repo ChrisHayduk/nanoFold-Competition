@@ -135,6 +135,9 @@ configuration and source provenance. Resume also checks processed `aatype`
 against the expected sequence; changed cache bytes or a newly enabled cache
 binding require fresh output directories. These checks add no model inputs. Maintainers can run `scripts/audit_target_identity.py` with complete manifests and expected counts to verify raw and/or processed target identity independently; it requires actual assets and leaves labels, geometry and homology to their separate gates.
 
+Coordinate projection requires all optimal deposited-polymer alignments to agree
+on every observed residue's query position; ambiguous observed mappings fail.
+
 Maintainers can run `scripts/audit_label_geometry.py --chain-data-cache CACHE --split NAME MANIFEST FEATURES LABELS COUNT --out-dir PRIVATE_AUDIT`, repeating `--split` for train, public validation and hidden validation. It requires complete selected manifests, exact cache/feature/label identities, valid feature and label schemas, and atom14 masks supported by each actual residue type. Nonexistent observed atoms fail. The receipt binds source and asset hashes and reports masked CA and peptide C–N distances, skipping explicit segment breaks, nonconsecutive residue indices and missing atoms. Distance outliers are diagnostics only; they do not reject experimental structures. An optional verified `--split-group-tsv` adds group summaries. Keep all reports private.
 
 Feature archives must not contain supervision arrays. A features-only loader

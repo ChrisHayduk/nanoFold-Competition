@@ -122,7 +122,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help=(
             "Require exact coordinate-sequence and MSA-query equality. Projection uses deposited "
-            "polymer residue indices when available; ambiguous sequence alignments always fail."
+            "polymer residue indices when available; ambiguous observed-coordinate mappings always fail."
         ),
     )
     ap.add_argument("--min-projection-seq-identity", type=float, default=0.90)
@@ -316,30 +316,39 @@ def _make_global_aligner() -> PairwiseAligner:
 
 
 _GLOBAL_ALIGNER = _make_global_aligner()
+_MAX_OPTIMAL_ALIGNMENTS = 1024
 
 
-def _global_alignment_pairs(query_seq: str, template_seq: str) -> List[Tuple[int, int]]:
+def _global_alignment_pairs(
+    query_seq: str, template_seq: str, *, observed_template_indices: set[int] | None = None,
+) -> List[Tuple[int, int]]:
+    """Require a unique mapping for every observed residue across all optima."""
     if not query_seq or not template_seq:
         return []
 
-    alignments = iter(_GLOBAL_ALIGNER.align(query_seq, template_seq))
-    aln = next(alignments, None)
-    if aln is None:
-        return []
-    if next(alignments, None) is not None:
-        raise ValueError("Ambiguous sequence alignment: coordinate-to-query correspondence is not unique")
-
-    q_segments, t_segments = aln.aligned
-    pairs: List[Tuple[int, int]] = []
-    for (q_start, q_end), (t_start, t_end) in zip(q_segments, t_segments, strict=False):
-        seg_len = min(int(q_end) - int(q_start), int(t_end) - int(t_start))
-        if seg_len <= 0:
-            continue
-        q0 = int(q_start)
-        t0 = int(t_start)
-        for off in range(seg_len):
-            pairs.append((q0 + off, t0 + off))
-    return pairs
+    unique_pairs: List[Tuple[int, int]] | None = None
+    for alignment_index, aln in enumerate(_GLOBAL_ALIGNER.align(query_seq, template_seq)):
+        if alignment_index >= _MAX_OPTIMAL_ALIGNMENTS:
+            raise ValueError(
+                "Ambiguous sequence alignment: cannot prove observed-coordinate uniqueness within "
+                f"{_MAX_OPTIMAL_ALIGNMENTS} optimal alignments"
+            )
+        if unique_pairs is not None and observed_template_indices is None:
+            raise ValueError("Ambiguous sequence alignment: coordinate-to-query correspondence is not unique")
+        q_segments, t_segments = aln.aligned
+        pairs: List[Tuple[int, int]] = []
+        for (q_start, q_end), (t_start, t_end) in zip(q_segments, t_segments, strict=False):
+            seg_len = min(int(q_end) - int(q_start), int(t_end) - int(t_start))
+            q0, t0 = int(q_start), int(t_start)
+            for off in range(seg_len):
+                if observed_template_indices is None or t0 + off in observed_template_indices:
+                    pairs.append((q0 + off, t0 + off))
+        # Compare complete observed mappings, including residues lacking CA or
+        # matching identity. A residue becoming unmatched changes this list.
+        if unique_pairs is not None and pairs != unique_pairs:
+            raise ValueError("Ambiguous sequence alignment: coordinate-to-query correspondence is not unique")
+        unique_pairs = pairs
+    return unique_pairs if unique_pairs is not None else []
 
 
 def _pairs_from_aligned_strings(query_aligned: str, template_aligned: str) -> Tuple[List[Tuple[int, int]], int]:
@@ -597,10 +606,12 @@ def _project_atom14_to_query(
             if letter.upper() != deposited_letter and "X" not in (letter.upper(), deposited_letter):
                 raise ValueError("Observed residue identity disagrees with its deposited polymer position")
         observed_by_polymer = {polymer: observed for observed, polymer in enumerate(indices)}
-        polymer_pairs = _global_alignment_pairs(query_seq=query_seq, template_seq=polymer_sequence)
+        polymer_pairs = _global_alignment_pairs(
+            query_seq=query_seq, template_seq=polymer_sequence, observed_template_indices=set(indices),
+        )
         pairs = [
             (query, observed_by_polymer[polymer])
-            for query, polymer in polymer_pairs if polymer in observed_by_polymer
+            for query, polymer in polymer_pairs
         ]
     else:
         # Without a deposited sequence, unresolved repeats cannot be positioned

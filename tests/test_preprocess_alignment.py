@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 
 from nanofold.a3m import ungap_query_columns
-from nanofold.residue_constants import ATOM14_NUM_SLOTS, CA_ATOM14_SLOT
+from nanofold.residue_constants import ATOM14_NUM_SLOTS, CA_ATOM14_SLOT, RESTYPE_1TO3
 
 
 def _load_preprocess_module():
@@ -228,6 +228,58 @@ def test_projection_rejects_ambiguous_query_mapping_even_with_polymer_context() 
         )
 
 
+@pytest.mark.parametrize("repeat_count", [2, 3])
+def test_projection_accepts_equivalent_optima_outside_observed_residues(repeat_count: int) -> None:
+    module = _load_preprocess_module()
+    polymer = "C" + "A" * repeat_count + "DE"
+    query = "C" + "A" * (repeat_count - 1) + "DE"
+    observed_indices = np.array([0, repeat_count + 1, repeat_count + 2])
+    positions = np.arange(3 * 14 * 3, dtype=np.float32).reshape(3, 14, 3)
+    mask = np.ones((3, 14), dtype=bool)
+
+    projected, projected_mask, stats = module._project_atom14_to_query(
+        query, "CDE", positions, mask, polymer_sequence=polymer, polymer_residue_index=observed_indices,
+    )
+
+    expected_query_indices = [0, repeat_count, repeat_count + 1]
+    np.testing.assert_array_equal(projected[expected_query_indices], positions)
+    assert np.flatnonzero(projected_mask[:, CA_ATOM14_SLOT]).tolist() == expected_query_indices
+    assert stats["projection_seq_identity"] == 1.0
+    assert stats["projection_alignment_coverage"] == 3 / len(query)
+    assert stats["projection_valid_ca_count"] == 3
+
+
+def test_projection_checks_later_optima_even_for_observed_residues_without_ca() -> None:
+    module = _load_preprocess_module()
+    mask = np.ones((4, 14), dtype=bool)
+    mask[1] = False
+    # The first two optima map polymer residue 3 to query residue 2. The third
+    # leaves it unmatched, so identical coordinate masks cannot establish safety.
+    with pytest.raises(ValueError, match="Ambiguous sequence alignment"):
+        module._project_atom14_to_query(
+            "CAADE", "CADE", np.zeros((4, 14, 3)), mask,
+            polymer_sequence="CAAADE", polymer_residue_index=np.array([0, 3, 4, 5]),
+        )
+
+
+@pytest.mark.parametrize("limit", [2, 3])
+def test_projection_requires_exhaustion_within_optimal_alignment_limit(limit: int, monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _load_preprocess_module()
+    monkeypatch.setattr(module, "_MAX_OPTIMAL_ALIGNMENTS", limit)
+    arguments = {
+        "query_seq": "CAADE", "structure_seq": "CDE",
+        "structure_atom14_positions": np.zeros((3, 14, 3)),
+        "structure_atom14_mask": np.ones((3, 14), dtype=bool),
+        "polymer_sequence": "CAAADE", "polymer_residue_index": np.array([0, 4, 5]),
+    }
+    if limit == 2:
+        with pytest.raises(ValueError, match="cannot prove.*within 2 optimal alignments"):
+            module._project_atom14_to_query(**arguments)
+    else:
+        _, mask, _ = module._project_atom14_to_query(**arguments)
+        assert mask[:, CA_ATOM14_SLOT].sum() == 3
+
+
 def test_projection_rejects_residue_identity_at_wrong_polymer_position() -> None:
     module = _load_preprocess_module()
     with pytest.raises(ValueError, match="identity disagrees"):
@@ -247,8 +299,13 @@ def test_projection_rejects_invalid_deposited_coordinate_mapping(indices: list[i
         )
 
 
+@pytest.mark.parametrize("polymer,query,observed,query_indices", [
+    ("AAAAAAAAAA", "AAAAAAAAAA", [0, 1, 2, 3, 5, 6, 7, 8, 9], [0, 1, 2, 3, 5, 6, 7, 8, 9]),
+    ("CAAADEFGHIK", "CAADEFGHIK", [0, 4, 5, 6, 7, 8, 9, 10], [0, 3, 4, 5, 6, 7, 8, 9]),
+])
 def test_preprocess_preserves_unresolved_polymer_position_with_author_insertion_codes(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, polymer: str, query: str,
+    observed: list[int], query_indices: list[int],
 ) -> None:
     import gemmi
 
@@ -258,11 +315,9 @@ def test_preprocess_preserves_unresolved_polymer_position_with_author_insertion_
     structure = gemmi.Structure()
     model = gemmi.Model(1)
     chain = gemmi.Chain("A")
-    for index in range(10):
-        if index == 4:
-            continue
+    for index in observed:
         residue = gemmi.Residue()
-        residue.name = "ALA"
+        residue.name = RESTYPE_1TO3[polymer[index]]
         residue.seqid = gemmi.SeqId(100 + index // 2, "A" if index % 2 else " ")
         residue.label_seq = index + 1
         residue.entity_type = gemmi.EntityType.Polymer
@@ -276,14 +331,14 @@ def test_preprocess_preserves_unresolved_polymer_position_with_author_insertion_
     model.add_chain(chain)
     structure.add_model(model)
     structure.setup_entities()
-    structure.get_entity_of(structure[0][0].get_polymer()).full_sequence = ["ALA"] * 10
+    structure.get_entity_of(structure[0][0].get_polymer()).full_sequence = [RESTYPE_1TO3[letter] for letter in polymer]
     mmcif_root = tmp_path / "mmcif"
     mmcif_root.mkdir()
     structure.make_mmcif_document().write_file(str(mmcif_root / "1abc.cif"))
     alignments = tmp_path / "alignments"
     chain_dir = chain_data_dir(alignments, "1abc_A")
     chain_dir.mkdir(parents=True)
-    (chain_dir / "uniref90_hits.a3m").write_text(">query\nAAAAAAAAAA\n")
+    (chain_dir / "uniref90_hits.a3m").write_text(f">query\n{query}\n")
     manifest = tmp_path / "manifest.txt"
     manifest.write_text("1abc_A\n")
     features, labels = tmp_path / "features", tmp_path / "labels"
@@ -295,6 +350,5 @@ def test_preprocess_preserves_unresolved_polymer_position_with_author_insertion_
     ])
     module.main()
     with np.load(chain_npz_path(labels, "1abc_A")) as data:
-        assert np.flatnonzero(~data["ca_mask"]).tolist() == [4]
-        observed = np.array([0, 1, 2, 3, 5, 6, 7, 8, 9])
-        np.testing.assert_allclose(data["ca_coords"][observed, 0], observed * 3.8)
+        assert np.flatnonzero(data["ca_mask"]).tolist() == query_indices
+        np.testing.assert_allclose(data["ca_coords"][query_indices, 0], np.asarray(observed) * 3.8)
