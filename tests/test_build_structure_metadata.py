@@ -9,6 +9,18 @@ import pytest
 
 from scripts import build_structure_metadata as metadata
 
+# Official v295.2 distribution uses an uncommented header and contains both
+# experimental PDB and predicted non-PDB domains, with trailing empty columns.
+ECOD_CURRENT_HEADER = (
+    "uid\tecod_domain_id\tmanual_rep\tf_id\tpdb\tchain\tpdb_range\tseqid_range\tarchitecture_name\t"
+    "x_name\th_name\tt_name\tf_name\tassembly_id\tdomain_id_short\trange_count\tarch_manual\tx_manual\t"
+    "h_manual\tt_manual\tf_manual\tvalid_structure\tligand_binding\tligand_comp_ids\tligand_pdbnum"
+)
+ECOD_PDB_ROW = (
+    "0\te2nmzA1\tTrue\t1.1.1.3\t2nmz\tA\tA:1-99\tA:1-99\tbeta barrels\tcradle loop barrel\t"
+    "RIFT-related\tacid protease\tRVP\t\t\t1\tFalse\tFalse\tFalse\tFalse\tTrue\tTrue\tFalse\tNO_LIGANDS_4A\t"
+)
+
 
 def _write_sources(tmp_path: Path, cache: Path, cath_text: str | None = None) -> tuple[Path, Path]:
     sources = tmp_path / "sources"
@@ -412,3 +424,62 @@ def test_scope_small_protein_and_coiled_coil_do_not_become_unstructured_coil(tmp
     from nanofold.structure_metadata import normalize_domain_architecture_class
 
     assert normalize_domain_architecture_class("small protein") == "small_protein"
+
+
+def test_ecod_current_distribution_maps_pdb_and_cross_chain_domains_only(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    path = tmp_path / "ecod.txt"
+    cross_chain = ECOD_PDB_ROW.split("\t")
+    cross_chain[:8] = ["11", "e1htr.1", "True", "1.1.1.2", "1htr", "P-B", "P:1-43,B:1-329", "P:1-43,B:1-329"]
+    predicted = ECOD_PDB_ROW.split("\t")
+    predicted[:8] = ["3163557", "P44140_F1_nD2", "False", "2004.1.1.123", "", "", "131-315", "131-315"]
+    mixed_case = ECOD_PDB_ROW.split("\t")
+    mixed_case[:8] = ["2463825", "e6nd52o1", "False", "101.1.1.1", "6nd5", "2o", "2o:2-89", "2o:2-89"]
+    path.write_text(
+        "# ECOD Domain List\n# Version: v295.2\n" + ECOD_CURRENT_HEADER + "\n" + ECOD_PDB_ROW + "\n"
+        + "\t".join(cross_chain) + "\n" + "\t".join(predicted) + "\n" + "\t".join(mixed_case) + "\n"
+    )
+    assert metadata._load_ecod_annotations(path) == {
+        "2nmz_A": {"annotated"}, "1htr_P": {"annotated"}, "1htr_B": {"annotated"}, "6nd5_2o": {"annotated"},
+    }
+    assert "3 PDB domains; excluded 1 non-PDB" in capsys.readouterr().err
+
+
+def test_ecod_archived_distribution_supports_commented_named_header(tmp_path: Path) -> None:
+    path = tmp_path / "ecod.txt"
+    path.write_text(
+        "#ECOD version develop291\n#Domain list version 1.6\n"
+        "#uid\tecod_domain_id\tmanual_rep\tt_id\tpdb\tchain\tpdb_range\tseqid_range\tunp_acc\tarch_name\t"
+        "x_name\th_name\tt_name\tf_name\tasm_status\tligand\n"
+        "000000267\te1udzA1\tMANUAL_REP\t1.1.1\t1udz\tA\tA:203-381\tA:4-182\tP56690\tbeta barrels\t"
+        '"cradle loop barrel"\t"RIFT-related"\t"acid protease"\tF_UNCLASSIFIED\tNOT_DOMAIN_ASSEMBLY\tNO_LIGANDS_4A\n'
+    )
+    assert metadata._load_ecod_annotations(path) == {"1udz_A": {"annotated"}}
+
+
+@pytest.mark.parametrize("mutation", ["missing_header", "missing_column", "duplicate_header", "short_row", "uid", "pdb", "partial_non_pdb", "cross_chain", "empty_chain", "hierarchy"])
+def test_ecod_malformed_inputs_fail_instead_of_silently_losing_coverage(tmp_path: Path, mutation: str) -> None:
+    header, row = ECOD_CURRENT_HEADER, ECOD_PDB_ROW.split("\t")
+    if mutation == "missing_header":
+        header = "# no column declaration"
+    elif mutation == "missing_column":
+        header = header.replace("\tpdb\t", "\tunknown\t")
+    elif mutation == "duplicate_header":
+        header += "\n" + header
+    elif mutation == "short_row":
+        row.pop()
+    elif mutation == "uid":
+        row[0] = "not-an-id"
+    elif mutation == "pdb":
+        row[4] = "not-a-pdb"
+    elif mutation == "partial_non_pdb":
+        row[4] = ""
+    elif mutation == "cross_chain":
+        row[5] = "A-B"
+    elif mutation == "empty_chain":
+        row[5] = "-"
+    else:
+        row[3] = "not-a-hierarchy"
+    path = tmp_path / "ecod.txt"
+    path.write_text(header + "\n" + "\t".join(row) + "\n")
+    with pytest.raises(ValueError, match="ECOD"):
+        metadata._load_ecod_annotations(path)

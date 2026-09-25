@@ -267,17 +267,76 @@ def _load_scope_annotations(path: Path) -> dict[str, set[str]]:
 
 
 def _load_ecod_annotations(path: Path) -> dict[str, set[str]]:
-    """Record mapped ECOD coverage without inferring a class from free text."""
+    """Read named ECOD columns, retaining only explicitly identified PDB chains.
+
+    ECOD distributions include both PDB domains and non-PDB predicted domains.
+    The latter have empty PDB/chain fields and cannot annotate our PDB targets.
+    """
     annotations: dict[str, set[str]] = {}
-    for line_number, raw_line in enumerate(path.read_text().splitlines(), start=1):
-        if not raw_line.strip() or raw_line.lstrip().startswith("#"):
-            continue
-        parts = raw_line.split("\t")
-        if len(parts) < 6 or not re.fullmatch(r"[0-9A-Za-z]{4}", parts[4]):
-            raise ValueError(f"Malformed ECOD row at {path.name}:{line_number}")
-        chain = parts[5].strip()
-        if chain and chain not in {"-", ".", "_"}:
-            _add_source_value(annotations, _chain_key(parts[4], chain), "annotated")
+    columns: dict[str, int] | None = None
+    counts: Counter[str] = Counter()
+    required = {"uid", "ecod_domain_id", "manual_rep", "pdb", "chain", "pdb_range", "seqid_range"}
+    with path.open() as handle:
+        for line_number, raw_line in enumerate(handle, start=1):
+            line = raw_line.rstrip("\r\n")
+            if not line.strip():
+                continue
+            parts = line.removeprefix("#").split("\t")
+            if parts[0] == "uid":
+                if (
+                    columns is not None or len(parts) != len(set(parts)) or any(not field for field in parts)
+                    or not required.issubset(parts) or len({"f_id", "t_id"}.intersection(parts)) != 1
+                ):
+                    raise ValueError(f"Invalid ECOD header at {path.name}:{line_number}")
+                columns = {name: index for index, name in enumerate(parts)}
+                continue
+            if line.lstrip().startswith("#"):
+                continue
+            if columns is None or len(parts) != len(columns):
+                raise ValueError(f"Malformed ECOD row or missing header at {path.name}:{line_number}")
+            hierarchy = parts[columns["f_id" if "f_id" in columns else "t_id"]]
+            if (
+                not parts[columns["uid"]].isdigit()
+                or not parts[columns["ecod_domain_id"]]
+                or any(char.isspace() for char in parts[columns["ecod_domain_id"]])
+                or parts[columns["manual_rep"]] not in {"True", "False", "MANUAL_REP", "MANUAL_NONREP", "AUTO_REP", "AUTO_NONREP"}
+                or not re.fullmatch(r"[0-9]+(?:\.[0-9]+){2,3}", hierarchy)
+                or ("valid_structure" in columns and parts[columns["valid_structure"]] not in {"True", "False"})
+            ):
+                raise ValueError(f"Malformed ECOD identity fields at {path.name}:{line_number}")
+            counts["domains"] += 1
+            pdb_id, chain_field = parts[columns["pdb"]], parts[columns["chain"]]
+            if not pdb_id and not chain_field:
+                counts["non_pdb_domains"] += 1
+                continue
+            if not re.fullmatch(r"[0-9A-Za-z]{4}", pdb_id) or not re.fullmatch(r"[^\s_:,]+", chain_field):
+                raise ValueError(f"Malformed ECOD PDB/chain fields at {path.name}:{line_number}")
+            if "valid_structure" in columns and parts[columns["valid_structure"]] == "False":
+                counts["invalid_structure_domains"] += 1
+                continue
+            chains = set(chain_field.split("-"))
+            if not all(chains) or chains.intersection({".", "?"}):
+                raise ValueError(f"Malformed ECOD chain identifiers at {path.name}:{line_number}")
+            if len(chains) > 1:
+                # A cross-chain domain uses e.g. P-B; corroborate each chain in
+                # the explicit ranges rather than inventing an author chain P-B.
+                range_chains = {
+                    segment.split(":", 1)[0]
+                    for segment in parts[columns["seqid_range"]].split(",") if ":" in segment
+                }
+                if chains != range_chains:
+                    raise ValueError(f"Ambiguous ECOD cross-chain mapping at {path.name}:{line_number}")
+            for chain in sorted(chains):
+                _add_source_value(annotations, _chain_key(pdb_id, chain), "annotated")
+            counts["pdb_domains"] += 1
+    if columns is None or not counts["domains"]:
+        raise ValueError(f"ECOD domain list has no header or domain records: {path.name}")
+    print(
+        f"ECOD metadata: {counts['pdb_domains']} PDB domains; "
+        f"excluded {counts['non_pdb_domains']} non-PDB and "
+        f"{counts['invalid_structure_domains']} invalid-structure domains.",
+        file=sys.stderr,
+    )
     return annotations
 
 

@@ -23,7 +23,7 @@ Official nanoFold data is built from public structure and alignment sources, the
 | RCSB mmCIF files, `https://files.rcsb.org/download/<PDB>.cif` | Atomic labels for C-alpha and atom14 supervision/scoring | mmCIF is the authoritative coordinate source used to build geometry labels. |
 | Pinned CATH 4.4.0 domain list | CATH hierarchy for new sampling candidates | Preserves Class, Architecture, Topology, Homologous superfamily and all domains; unannotated chains remain unknown. |
 | SCOPe classification file | Optional annotation audit | Retains source classifications without treating them as CATH assignments. |
-| ECOD domain file | Optional annotation audit | Retains source classifications without imputing missing CATH labels. |
+| ECOD domain file | Optional annotation audit | Uses named source columns to map PDB domains to author chains; excludes non-PDB predicted domains and invalid structures. Cross-chain domains require corroborating chain ranges. Does not impute missing CATH labels. |
 | Optional RCSB REST metadata | Extra split audit metadata when explicitly enabled | Can enrich structural metadata, but the default bulk split path does not require per-chain REST calls. |
 | Pinned feature/processability exclusion lists | Split eligibility | Prevents known missing-assets or unprocessable-label chains from entering official manifests. |
 
