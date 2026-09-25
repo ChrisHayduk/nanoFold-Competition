@@ -24,6 +24,9 @@ AUDIT_ARTIFACTS = frozenset({
 
 
 def _validate_group_coverage(report: dict[str, Any], lock: dict[str, Any], args: argparse.Namespace) -> None:
+    if args.sampling_policy == "cath-v4":
+        _validate_retained_group_coverage(report, lock, args)
+        return
     coverage = report.get("group_coverage")
     groups = lock.get("split_groups")
     if not isinstance(coverage, dict) or not isinstance(groups, dict):
@@ -45,6 +48,41 @@ def _validate_group_coverage(report: dict[str, Any], lock: dict[str, Any], args:
             or any(type(coverage[key]) is not type(value) or coverage[key] != value for key, value in expected.items())
             or any(type(value) is not int for value in coverage["split_group_counts"].values())):
         raise ValueError("cath-v3 verification did not cover every locked group with the required split ownership.")
+
+
+def _validate_retained_group_coverage(report: dict[str, Any], lock: dict[str, Any], args: argparse.Namespace) -> None:
+    coverage = report.get("group_coverage")
+    groups = lock.get("split_groups")
+    if not isinstance(coverage, dict) or not isinstance(groups, dict):
+        raise ValueError("cath-v4 verification must prove complete retained-group coverage.")
+    original = groups.get("group_count")
+    retained = groups.get("retained_group_count")
+    excluded = groups.get("approved_excluded_group_count")
+    original_units = groups.get("original_unit_count")
+    units = groups.get("selection_unit_count")
+    digest = groups.get("selection_unit_ids_sha256")
+    if (type(original) is not int or type(retained) is not int or type(excluded) is not int
+            or type(original_units) is not int or type(units) is not int):
+        raise ValueError("cath-v4 source lock must bind integer original, excluded and retained population counts.")
+    if (excluded < 0 or original != retained + excluded
+            or retained <= args.val_size + args.hidden_val_size
+            or original_units < original or units < retained or units > original_units
+            or units < args.train_size + args.val_size + args.hidden_val_size
+            or not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None):
+        raise ValueError("cath-v4 source lock has inconsistent original, excluded or retained population counts.")
+    expected = {
+        "required": "all_retained_groups", "retained_group_coverage_verified": True,
+        "original_group_count": original, "approved_excluded_group_count": excluded,
+        "retained_group_count": retained, "covered_group_count": retained,
+        "original_unit_count": original_units, "selection_unit_count": units,
+        "selection_unit_ids_sha256": digest,
+        "split_group_counts": {"train": retained - args.val_size - args.hidden_val_size,
+                               "val": args.val_size, "hidden_val": args.hidden_val_size},
+    }
+    if (set(coverage) != set(expected)
+            or any(type(coverage[key]) is not type(value) or coverage[key] != value for key, value in expected.items())
+            or any(type(value) is not int for value in coverage["split_group_counts"].values())):
+        raise ValueError("cath-v4 verification did not cover every retained group with the required split ownership.")
 
 
 def _read_audit_json(path: Path) -> dict[str, Any]:
@@ -161,12 +199,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--stage-dir", type=Path, required=True,
                         help="Fresh private output directory; in-repository paths must be under .nanofold_private/.")
-    parser.add_argument("--sampling-policy", choices=("cath-v2", "cath-v3"), default="cath-v3",
-                        help="cath-v3 covers every full group and keeps whole groups in one split.")
+    parser.add_argument("--sampling-policy", choices=("cath-v2", "cath-v3", "cath-v4"), default="cath-v3",
+                        help="cath-v4 covers every source-qualified group after explicit, proven group exclusions.")
     parser.add_argument("--split-group-tsv", type=Path,
-                        help="Required for cath-v3: complete homology-closed groups for the eligible universe.")
+                        help="Required for cath-v3/v4: complete homology-closed groups for the original eligible universe.")
     parser.add_argument("--split-group-receipt", type=Path,
-                        help="Required for cath-v3: source-bound complete homology-group audit receipt.")
+                        help="Required for cath-v3/v4: source-bound complete homology-group audit receipt.")
+    parser.add_argument("--representative-eligibility-receipt", type=Path,
+                        help="Required for cath-v4: source-bound qualification of all original selection units.")
+    parser.add_argument("--approved-group-exclusions", type=Path,
+                        help="Required for cath-v4: explicit excluded-group catalogue; must match exhausted groups exactly.")
     parser.add_argument("--chain-data-cache", type=Path, required=True)
     parser.add_argument("--metadata-sources-dir", type=Path, required=True)
     parser.add_argument("--metadata-source-lock", type=Path, required=True)
@@ -204,7 +246,7 @@ def stage_candidate(args: argparse.Namespace) -> Path:
     source_hashes: dict[Path, str] = {}
     for name in ("chain_data_cache", "metadata_source_lock", "feature_exclusion_list",
                  "processability_exclusion_list", "cluster_tsv", "split_group_tsv", "split_group_receipt",
-                 "hidden_split_salt_file"):
+                 "representative_eligibility_receipt", "approved_group_exclusions", "hidden_split_salt_file"):
         value = getattr(args, name)
         if value is not None:
             path = value.resolve()
@@ -212,10 +254,15 @@ def stage_candidate(args: argparse.Namespace) -> Path:
                 raise ValueError(f"Missing input for --{name.replace('_', '-')}: {path}")
             setattr(args, name, path)
             source_hashes[path] = _sha256(path)
-    if args.sampling_policy == "cath-v3" and (args.split_group_tsv is None or args.split_group_receipt is None):
-        raise ValueError("cath-v3 requires --split-group-tsv and --split-group-receipt for the complete eligible universe.")
-    if args.sampling_policy != "cath-v3" and (args.split_group_tsv is not None or args.split_group_receipt is not None):
-        raise ValueError("--split-group-tsv and --split-group-receipt are only supported for cath-v3.")
+    if args.sampling_policy in {"cath-v3", "cath-v4"} and (args.split_group_tsv is None or args.split_group_receipt is None):
+        raise ValueError(f"{args.sampling_policy} requires --split-group-tsv and --split-group-receipt for the complete eligible universe.")
+    if args.sampling_policy not in {"cath-v3", "cath-v4"} and (args.split_group_tsv is not None or args.split_group_receipt is not None):
+        raise ValueError("--split-group-tsv and --split-group-receipt are only supported for cath-v3 and cath-v4.")
+    if args.sampling_policy == "cath-v4":
+        if args.representative_eligibility_receipt is None or args.approved_group_exclusions is None:
+            raise ValueError("cath-v4 requires --representative-eligibility-receipt and --approved-group-exclusions.")
+    elif args.representative_eligibility_receipt is not None or args.approved_group_exclusions is not None:
+        raise ValueError("Representative eligibility and approved group exclusions require cath-v4.")
     args.metadata_sources_dir = args.metadata_sources_dir.resolve()
     if not args.metadata_sources_dir.is_dir():
         raise ValueError("--metadata-sources-dir must be a directory containing pinned annotation sources.")
@@ -271,6 +318,9 @@ def stage_candidate(args: argparse.Namespace) -> Path:
         cluster_options = ["--cluster-tsv", str(args.cluster_tsv)] if args.cluster_tsv else []
         group_options = (["--split-group-tsv", str(args.split_group_tsv),
                           "--split-group-receipt", str(args.split_group_receipt)] if args.split_group_tsv else [])
+        eligibility_options = (["--representative-eligibility-receipt", str(args.representative_eligibility_receipt),
+                                "--approved-group-exclusions", str(args.approved_group_exclusions)]
+                               if args.representative_eligibility_receipt else [])
         salt_options = (["--hidden-split-salt-file", str(args.hidden_split_salt_file)]
                         if args.hidden_split_salt_file else [])
         run_step("manifests", "build_manifests.py", [
@@ -280,7 +330,8 @@ def stage_candidate(args: argparse.Namespace) -> Path:
             "--private-lock-file", str(private_lock), "--train-size", str(args.train_size),
             "--val-size", str(args.val_size), "--hidden-val-size", str(args.hidden_val_size),
             "--seed", str(args.seed), "--min-seq-id", str(args.min_seq_id), "--coverage", str(args.coverage),
-            "--mmseqs-bin", args.mmseqs_bin, *policy_options, *cluster_options, *group_options, *salt_options,
+            "--mmseqs-bin", args.mmseqs_bin, *policy_options, *cluster_options, *group_options,
+            *eligibility_options, *salt_options,
         ])
         artifacts = [metadata, public_lock, private_lock,
                      stage / "public/train.txt", stage / "public/val.txt", stage / "public/all.txt",
@@ -297,9 +348,10 @@ def stage_candidate(args: argparse.Namespace) -> Path:
         verified_report = _read_audit_json(verification)
         if verified_report.get("status") != "ok" or verified_report.get("sampling_policy") != args.sampling_policy:
             raise ValueError("Manifest verification did not produce a successful report.")
-        if args.sampling_policy == "cath-v3":
+        if args.sampling_policy in {"cath-v3", "cath-v4"}:
             _validate_group_coverage(verified_report, _read_audit_json(public_lock), args)
-            status["all_group_coverage_verified"] = True
+            status[("retained_group_coverage_verified" if args.sampling_policy == "cath-v4"
+                    else "all_group_coverage_verified")] = True
             status["group_coverage"] = verified_report["group_coverage"]
         verified_inputs[verification] = _sha256(verification)
         target_audit = stage / "target_audit"

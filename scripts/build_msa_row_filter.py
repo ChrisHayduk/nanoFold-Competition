@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -26,7 +27,15 @@ if str(REPO_ROOT) not in sys.path:
 
 from nanofold.a3m import GAP_ID, MASK_ID, RESTYPES, read_a3m, ungap_query_columns
 from nanofold.chain_paths import chain_data_dir, chain_npz_path
-from nanofold.mmseqs import canonical_target_sequence, iter_mmseqs_hits, load_msa_for_audit, validate_search_parameters
+from nanofold.mmseqs import (
+    batched_mmseqs_summary,
+    canonical_target_sequence,
+    iter_batched_mmseqs_hits,
+    iter_mmseqs_hits,
+    load_msa_for_audit,
+    run_batched_mmseqs,
+    validate_search_parameters,
+)
 
 MSA_TOKEN_TO_AA = {idx: aa for idx, aa in enumerate(RESTYPES)}
 MSA_TOKEN_TO_AA[20] = "X"
@@ -78,7 +87,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument(
         "--exhaustive", action="store_true",
         help="Compare every held-out/source row pair without masking or a heuristic prefilter. "
-        "This can require billions of local alignments; max-seqs must cover all unique source rows.",
+        "This can require billions of local alignments; max-seqs must cover all unique source rows or each checkpoint batch.",
     )
     ap.add_argument(
         "--inventory-only", action="store_true",
@@ -94,6 +103,12 @@ def parse_args() -> argparse.Namespace:
         default=1_000_000,
         help="MMseqs max reported hits per held-out target. Keep high for filtering.",
     )
+    ap.add_argument("--checkpoint-dir", type=Path, default=None,
+                    help="Private resumable exhaustive search directory; requires --exhaustive, sequences <=256 residues.")
+    ap.add_argument("--source-batch-size", type=int, default=1_000_000, help="Maximum source records per batch (1..1000000).")
+    ap.add_argument("--query-batch-size", type=int, default=256, help="Maximum held-out records per batch (1..256).")
+    ap.add_argument("--search-disk-reserve-gib", type=int, default=100, help="Free-disk reserve during bounded search.")
+    ap.add_argument("--search-max-rss-gib", type=int, default=48, help="Sampled caller plus native process-tree RSS ceiling.")
     ap.add_argument("--tmp-dir", type=Path, default=None)
     ap.add_argument("--output", type=Path, required=True)
     return ap.parse_args()
@@ -132,8 +147,29 @@ def _source_asset_record(snapshots: dict[Path, str]) -> dict[str, Any]:
     }
 
 
-def _hash_sequence_set(sequence_hashes: set[str]) -> str:
-    return hashlib.sha256("".join(f"{digest}\n" for digest in sorted(sequence_hashes)).encode()).hexdigest()
+def _hash_sequence_set(sequence_hashes: set[str] | dict[str, str]) -> str:
+    digest = hashlib.sha256()
+    for sequence_hash in sorted(sequence_hashes):
+        digest.update(f"{sequence_hash}\n".encode())
+    return digest.hexdigest()
+
+
+def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, prefix=f".{path.name}.", delete=False) as handle:
+        temporary = Path(handle.name)
+        try:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+    try:
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _read_manifest(path: Path) -> list[str]:
@@ -276,24 +312,29 @@ def _scan_raw_msa_rows(
     return sequences_by_hash, stats
 
 
-def _write_heldout_fasta(path: Path, *, manifest_paths: Sequence[Path], cache: dict[str, Any]) -> int:
+def _write_heldout_fasta(
+    path: Path, *, manifest_paths: Sequence[Path], cache: dict[str, Any], sort_headers: bool = False,
+) -> int:
     seen: set[str] = set()
+    records: list[tuple[str, str]] = []
+    for manifest_path in manifest_paths:
+        for chain_id in _read_manifest(manifest_path):
+            sequence = _chain_sequence(cache, chain_id)
+            digest = _sequence_sha256(sequence)
+            if digest in seen:
+                continue
+            seen.add(digest)
+            records.append((f"heldout_{len(seen)}", sequence))
     with path.open("w") as handle:
-        for manifest_path in manifest_paths:
-            for chain_id in _read_manifest(manifest_path):
-                sequence = _chain_sequence(cache, chain_id)
-                digest = _sequence_sha256(sequence)
-                if digest in seen:
-                    continue
-                seen.add(digest)
-                handle.write(f">heldout_{len(seen)}\n{sequence}\n")
+        for header, sequence in sorted(records) if sort_headers else records:
+            handle.write(f">{header}\n{sequence}\n")
     return len(seen)
 
 
 def _write_source_fasta(path: Path, sequences_by_hash: dict[str, str]) -> None:
     with path.open("w") as handle:
-        for digest, sequence in sorted(sequences_by_hash.items()):
-            handle.write(f">seq_{digest}\n{sequence}\n")
+        for digest in sorted(sequences_by_hash):
+            handle.write(f">seq_{digest}\n{sequences_by_hash[digest]}\n")
 
 
 def _mmseqs_version(mmseqs_bin: str) -> str | None:
@@ -385,6 +426,12 @@ def main() -> None:
     validate_search_parameters(
         min_seq_id=args.min_seq_id, coverage=args.coverage, threads=args.threads, max_seqs=args.max_seqs,
     )
+    if args.checkpoint_dir is not None and not args.exhaustive:
+        raise ValueError("--checkpoint-dir requires --exhaustive")
+    if not 1 <= args.source_batch_size <= 1_000_000 or not 1 <= args.query_batch_size <= 256:
+        raise ValueError("Source/query batch sizes must be in 1..1000000 and 1..256 respectively")
+    if args.search_disk_reserve_gib < 1 or args.search_max_rss_gib < 1:
+        raise ValueError("Search disk reserve and RSS limits must be positive GiB counts")
     mmseqs_path = shutil.which(args.mmseqs_bin)
     if mmseqs_path is None and not args.inventory_only:
         raise SystemExit(f"MMseqs binary not found: {args.mmseqs_bin}")
@@ -448,10 +495,15 @@ def main() -> None:
             "source_unique_sequence_count": len(sequences_by_hash),
             "heldout_unique_sequence_count": len(heldout_hashes),
             "all_pair_comparisons": len(sequences_by_hash) * len(heldout_hashes),
-            "required_exhaustive_max_seqs": max(1, len(sequences_by_hash)),
+            "required_exhaustive_max_seqs": max(1, min(args.source_batch_size, len(sequences_by_hash)))
+            if args.checkpoint_dir else max(1, len(sequences_by_hash)),
             "configured_max_seqs": args.max_seqs,
-            "exhaustive_hit_capacity_sufficient": args.max_seqs >= len(sequences_by_hash),
-            "source_sequence_set_sha256": _hash_sequence_set(set(sequences_by_hash)),
+            "exhaustive_hit_capacity_sufficient": args.max_seqs >= (
+                min(args.source_batch_size, len(sequences_by_hash)) if args.checkpoint_dir else len(sequences_by_hash)
+            ),
+            "source_batch_size": args.source_batch_size if args.checkpoint_dir else None,
+            "query_batch_size": args.query_batch_size if args.checkpoint_dir else None,
+            "source_sequence_set_sha256": _hash_sequence_set(sequences_by_hash),
             "heldout_sequence_set_sha256": _hash_sequence_set(heldout_hashes),
             "chain_data_cache_sha256": input_snapshots[args.chain_data_cache],
             "source_manifests": source_manifest_records,
@@ -470,18 +522,18 @@ def main() -> None:
             },
             "mmseqs_search_executed": False,
         }
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+        _write_json_atomic(args.output, payload)
         print(f"Wrote search inventory for {payload['all_pair_comparisons']} pairs to {args.output}; no search executed")
         return
     if not sequences_by_hash:
         raise SystemExit("No source MSA rows were found for filtering.")
-    if args.exhaustive and args.max_seqs < len(sequences_by_hash):
+    if args.exhaustive and args.checkpoint_dir is None and args.max_seqs < len(sequences_by_hash):
         raise ValueError(
             f"Exhaustive MSA filtering requires --max-seqs >= {len(sequences_by_hash)} unique source rows; "
             f"got {args.max_seqs}."
         )
 
+    batch_result: dict[str, Any] | None = None
     work_parent = args.tmp_dir
     with tempfile.TemporaryDirectory(prefix="nanofold_msa_row_filter_", dir=str(work_parent) if work_parent else None) as tmp:
         tmp_path = Path(tmp)
@@ -489,43 +541,62 @@ def main() -> None:
         source_fasta = tmp_path / "source_msa_rows.fasta"
         output_m8 = tmp_path / "heldout_vs_source_msa_rows.m8"
         mmseqs_tmp = tmp_path / "mmseqs_tmp"
-        heldout_unique_count = _write_heldout_fasta(heldout_fasta, manifest_paths=heldout_manifests, cache=cache)
+        heldout_unique_count = _write_heldout_fasta(
+            heldout_fasta, manifest_paths=heldout_manifests, cache=cache, sort_headers=args.checkpoint_dir is not None,
+        )
         if heldout_unique_count == 0:
             raise ValueError("Held-out manifests must contain target sequences")
         _write_source_fasta(source_fasta, sequences_by_hash)
-        cmd = _run_mmseqs(
-            mmseqs_bin=args.mmseqs_bin,
-            heldout_fasta=heldout_fasta,
-            source_fasta=source_fasta,
-            output_m8=output_m8,
-            tmp_dir=mmseqs_tmp,
-            min_seq_id=float(args.min_seq_id),
-            coverage=float(args.coverage),
-            threads=int(args.threads),
-            max_seqs=int(args.max_seqs),
-            exhaustive=bool(args.exhaustive),
-        )
         input_binding = {
             **_source_asset_record(source_asset_sha256),
             "source_fasta_sha256": _sha256_file(source_fasta),
             "heldout_fasta_sha256": _sha256_file(heldout_fasta),
-            "m8_sha256": _sha256_file(output_m8),
-            "source_sequence_set_sha256": _hash_sequence_set(set(sequences_by_hash)),
+            "source_sequence_set_sha256": _hash_sequence_set(sequences_by_hash),
             "heldout_sequence_set_sha256": _hash_sequence_set(heldout_hashes),
         }
-        excluded, hit_count = _parse_excluded_hashes(
-            output_m8,
-            query_ids={f"heldout_{index}" for index in range(1, heldout_unique_count + 1)},
-            source_hashes=set(sequences_by_hash), min_seq_id=args.min_seq_id, coverage=args.coverage,
-        )
+        if args.checkpoint_dir is not None:
+            batch_result = run_batched_mmseqs(
+                query_fasta=heldout_fasta, source_fasta=source_fasta, checkpoint_dir=args.checkpoint_dir,
+                mmseqs_bin=args.mmseqs_bin, min_seq_id=args.min_seq_id, coverage=args.coverage,
+                threads=args.threads, max_seqs=args.max_seqs,
+                source_batch_size=args.source_batch_size, query_batch_size=args.query_batch_size,
+                reserve_disk_bytes=args.search_disk_reserve_gib * 1024**3,
+                max_rss_bytes=args.search_max_rss_gib * 1024**3,
+                input_binding_sha256=hashlib.sha256(json.dumps({
+                    "files": [{"path": str(path), "sha256": digest}
+                              for path, digest in sorted(input_snapshots.items())],
+                    "source_assets": input_binding["source_assets"],
+                }, sort_keys=True).encode()).hexdigest(),
+            )
+            excluded: set[str] = set()
+            hit_count = 0
+            for _query, target in iter_batched_mmseqs_hits(
+                batch_result, min_seq_id=args.min_seq_id, coverage=args.coverage,
+            ):
+                excluded.add(target.removeprefix("seq_"))
+                hit_count += 1
+            input_binding["batch_receipt_sha256"] = batch_result["receipt_sha256"]
+            cmd: list[str] = []
+        else:
+            cmd = _run_mmseqs(
+                mmseqs_bin=args.mmseqs_bin, heldout_fasta=heldout_fasta, source_fasta=source_fasta,
+                output_m8=output_m8, tmp_dir=mmseqs_tmp, min_seq_id=args.min_seq_id, coverage=args.coverage,
+                threads=args.threads, max_seqs=args.max_seqs, exhaustive=args.exhaustive,
+            )
+            input_binding["m8_sha256"] = _sha256_file(output_m8)
+            excluded, hit_count = _parse_excluded_hashes(
+                output_m8, query_ids={f"heldout_{index}" for index in range(1, heldout_unique_count + 1)},
+                source_hashes=set(sequences_by_hash), min_seq_id=args.min_seq_id, coverage=args.coverage,
+            )
 
     # Composition masking and unknown residues can hide even identical rows from
     # MMseqs. Exact filtering must be independent of heuristic search sensitivity.
-    exact_excluded = set(sequences_by_hash) & heldout_hashes
+    exact_excluded = heldout_hashes.intersection(sequences_by_hash)
     excluded.update(exact_excluded)
 
     recorded_command = list(cmd)
-    recorded_command[2:6] = ["<heldout_targets.fasta>", "<source_msa_rows.fasta>", "<output.m8>", "<tmp_dir>"]
+    if recorded_command:
+        recorded_command[2:6] = ["<heldout_targets.fasta>", "<source_msa_rows.fasta>", "<output.m8>", "<tmp_dir>"]
     payload = {
         "schema_version": 1,
         "filter_type": "heldout_target_homology",
@@ -581,9 +652,10 @@ def main() -> None:
         "excluded_sequence_sha256": sorted(excluded),
     }
 
+    if batch_result is not None:
+        payload["mmseqs"]["batching"] = batched_mmseqs_summary(batch_result)
     _assert_inputs_unchanged({**input_snapshots, **source_asset_sha256})
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    _write_json_atomic(args.output, payload)
     print(f"Wrote MSA row filter with {len(excluded)} excluded sequence hashes to {args.output}")
 
 

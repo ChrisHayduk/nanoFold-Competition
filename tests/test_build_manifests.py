@@ -153,6 +153,122 @@ def test_hidden_member_salt_changes_only_members_inside_assigned_groups() -> Non
     assert len({tuple(c.chain_id for c in outcome) for outcome in outcomes}) > 1
 
 
+def test_original_unit_identity_preserves_all_transitive_links_before_qualification() -> None:
+    from dataclasses import replace
+
+    from scripts.build_manifests import _original_unit_memberships
+
+    candidates, clusters, _ = _group_fixture([4, 1])
+    clusters[candidates[1].chain_id] = clusters[candidates[0].chain_id]
+    candidates[2] = replace(candidates[2], pdb_id=candidates[1].pdb_id, resolution=1.0)
+    candidates[3] = replace(candidates[3], sequence=candidates[2].sequence)
+    expected_id = hashlib.sha256("".join(f"{index:04d}_A\n" for index in range(4)).encode()).hexdigest()
+    units = _original_unit_memberships(candidates, clusters, seed=13)
+    assert len(units) == 2
+    assert {candidate.chain_id for candidate in units[expected_id]} == {candidate.chain_id for candidate in candidates[:4]}
+    assert units[expected_id][0] == candidates[2]
+    assert _original_unit_memberships(list(reversed(candidates)), clusters, seed=13) == units
+    assert set(_original_unit_memberships(candidates, clusters, seed=99)) == set(units)
+
+
+def _qualified_fixture():
+    from dataclasses import replace
+
+    from scripts.build_manifests import _original_unit_memberships
+
+    candidates, clusters, groups = _group_fixture([10, 3, 2, 1, 1, 1, 1, 1, 1, 1])
+    alternate = replace(candidates[0], chain_id="9000_A", pdb_id="9000", resolution=2.5)
+    candidates.append(alternate)
+    clusters[alternate.chain_id] = clusters[candidates[0].chain_id]
+    groups[alternate.chain_id] = groups[candidates[0].chain_id]
+    units = _original_unit_memberships(candidates, clusters, seed=17)
+    selection: dict[str, str | None] = {unit_id: members[0].chain_id for unit_id, members in units.items()}
+    unit_by_chain = {candidate.chain_id: unit_id for unit_id, members in units.items() for candidate in members}
+    selection[unit_by_chain[candidates[0].chain_id]] = alternate.chain_id
+    selection[unit_by_chain[candidates[1].chain_id]] = None
+    selection[unit_by_chain[candidates[-2].chain_id]] = None
+    excluded = {groups[candidates[-2].chain_id]}
+    return candidates, clusters, groups, selection, excluded
+
+
+def test_qualified_sampling_keeps_original_graph_and_covers_exact_retained_groups() -> None:
+    from functools import partial
+
+    from scripts.build_manifests import DEFAULT_STRATIFY_FIELDS, _assert_split_disjointness, _split_candidates
+
+    candidates, clusters, groups, selection, excluded = _qualified_fixture()
+    eligibility = {"selected_chain_by_original_unit": selection, "approved_excluded_group_ids": sorted(excluded)}
+    split = partial(
+        _split_candidates, cluster_map=clusters, train_size=15, val_size=2, hidden_val_size=2, seed=17,
+        stratify_fields=DEFAULT_STRATIFY_FIELDS, disallow_pdb_overlap=True,
+        cluster_method="fixture", cluster_command=None, structural_metadata_source="fixture",
+        sampling_policy="cath-v4", split_group_map=groups, representative_eligibility=eligibility,
+    )
+    result = split(candidates=candidates, hidden_split_salt_digest="first-private-salt")
+    changed = split(candidates=list(reversed(candidates)), hidden_split_salt_digest="other-private-salt")
+    _assert_split_disjointness(result)
+    assert (result.train_ids, result.val_ids) == (changed.train_ids, changed.val_ids)
+    assert result.split_group_map == groups and len(result.cluster_map) == len(candidates) == 23
+    assert {groups[chain] for chain in result.selected_candidates} == set(groups.values()) - excluded
+    assert set(result.selected_candidates) <= {chain for chain in selection.values() if chain is not None}
+    assert candidates[0].chain_id not in result.selected_candidates
+    report = result.quality_report["group_sampling"]
+    assert report["original_unit_count"] == 22 and report["selectable_unit_count"] == 20
+    assert report["original_group_count"] == 10 and report["retained_group_count"] == 9
+    assert report["approved_excluded_group_count"] == 1
+    assert report["exhausted_original_unit_count"] == 2
+    assert report["replacement_representative_count"] == 1
+    assert report["split_group_counts"] == {"train": 5, "val": 2, "hidden_val": 2}
+    assert report["original_representative_ids_sha256"] != report["selection_unit_ids_sha256"]
+    assert result.group_policy["all_retained_groups_covered"]
+    assert "all_groups_covered" not in result.group_policy
+
+
+def test_representative_eligibility_is_required_only_by_the_explicit_policy() -> None:
+    from functools import partial
+
+    from scripts.build_manifests import DEFAULT_STRATIFY_FIELDS, _split_candidates
+
+    candidates, clusters, groups, selection, excluded = _qualified_fixture()
+    split = partial(
+        _split_candidates, candidates=candidates, cluster_map=clusters, split_group_map=groups,
+        train_size=15, val_size=2, hidden_val_size=2, seed=17, hidden_split_salt_digest="private-test-salt",
+        stratify_fields=DEFAULT_STRATIFY_FIELDS, disallow_pdb_overlap=True,
+        cluster_method="fixture", cluster_command=None, structural_metadata_source="fixture",
+    )
+    with pytest.raises(ValueError, match="requires validated representative eligibility"):
+        split(sampling_policy="cath-v4")
+    with pytest.raises(ValueError, match="eligibility requires cath-v4"):
+        split(sampling_policy="cath-v3", representative_eligibility={
+            "selected_chain_by_original_unit": selection, "approved_excluded_group_ids": sorted(excluded),
+        })
+
+
+@pytest.mark.parametrize("corruption", ["missing_unit", "extra_unit", "wrong_member", "unapproved_group", "nonempty_group", "unknown_group"])
+def test_qualified_units_require_complete_original_identity_and_exact_exclusion_catalog(corruption) -> None:
+    from scripts.build_manifests import _qualified_group_sampling_units
+
+    candidates, clusters, groups, selection, excluded = _qualified_fixture()
+    if corruption == "missing_unit":
+        selection.pop(next(iter(selection)))
+    elif corruption == "extra_unit":
+        selection["extra-unit"] = None
+    elif corruption == "wrong_member":
+        unit = next(unit for unit, chain in selection.items() if chain == candidates[-1].chain_id)
+        selection[unit] = candidates[-3].chain_id
+    elif corruption == "unapproved_group":
+        excluded.clear()
+    elif corruption == "nonempty_group":
+        excluded.add(groups[candidates[0].chain_id])
+    else:
+        excluded.add("outside-original-graph")
+    with pytest.raises(ValueError, match="every original unit|immutable original unit|group exclusion catalog|outside the original"):
+        _qualified_group_sampling_units(
+            candidates, clusters, groups, seed=17, selected_chain_by_original_unit=selection,
+            approved_excluded_group_ids=excluded,
+        )
+
+
 def test_real_mmseqs_clusters_ac_only_sequences_as_proteins() -> None:
     import shutil
 

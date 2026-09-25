@@ -3,23 +3,30 @@
 This maintainer tool verifies transport and ZIP integrity only. It does not
 validate target identity, biological suitability, geometry, or a revision cutoff.
 It never falls back to downloading the complete archive or another source.
+Transient transport and HTTP 429/5xx failures receive at most four attempts,
+with 1, 2, and 4 second backoffs. Integrity validation failures are never retried.
 """
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import json
 import os
 import re
+import socket
+import ssl
 import stat
 import struct
 import sys
 import tempfile
+import time
 import zlib
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, NoReturn
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
@@ -35,6 +42,7 @@ MAX_COMPRESSED = 64 * 1024**2
 MAX_UNCOMPRESSED = 256 * 1024**2
 MAX_ENTRIES = 1_000_000
 MAX_MANIFEST = 10 * 1024**2
+MAX_RANGE_ATTEMPTS = 4
 U32 = 0xFFFFFFFF
 
 
@@ -54,6 +62,23 @@ def require(condition: bool, message: str) -> None:
 
 def sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def transient_transport_failure(error: OSError) -> bool:
+    """Classify transport failures without treating invalid bytes as retryable."""
+    if isinstance(error, HTTPError):
+        return error.code == 429 or 500 <= error.code < 600
+    reason = error.reason if isinstance(error, URLError) else error
+    if isinstance(reason, ssl.SSLCertVerificationError):
+        return False
+    if isinstance(reason, (TimeoutError, ConnectionError, ssl.SSLEOFError, ssl.SSLZeroReturnError)):
+        return True
+    if isinstance(reason, socket.gaierror):
+        return reason.errno == socket.EAI_AGAIN
+    return isinstance(reason, OSError) and reason.errno in {
+        errno.ETIMEDOUT, errno.ECONNRESET, errno.ECONNABORTED, errno.ECONNREFUSED,
+        errno.EPIPE, errno.ENETRESET, errno.ENETDOWN, errno.ENETUNREACH, errno.EHOSTUNREACH,
+    }
 
 
 @dataclass(frozen=True)
@@ -79,6 +104,45 @@ class RangeReader:
         self.pin = pin
         self.ranges: list[dict[str, Any]] = []
 
+    def _read_chunk(self, request: Request, offset: int, count: int, proof: dict[str, Any]) -> bytes:
+        attempts: list[dict[str, Any]] = []
+        proof["attempts"] = attempts
+        for attempt in range(1, MAX_RANGE_ATTEMPTS + 1):
+            outcome: dict[str, Any] = {"number": attempt, "verified": False}
+            attempts.append(outcome)
+            try:
+                with open_range(request, timeout=90) as response:
+                    proof.update(status=response.status, etag=response.headers.get("ETag"),
+                                 version_id=response.headers.get("x-amz-version-id"),
+                                 content_range=response.headers.get("Content-Range"),
+                                 content_length=response.headers.get("Content-Length"))
+                    require(response.status == 206, "Server did not honor the range; body was not read")
+                    require(response.geturl() == self.pin.url, "Archive request was redirected")
+                    for header in ("ETag", "Content-Range", "Content-Length", "x-amz-version-id", "Content-Encoding"):
+                        require(len(response.headers.get_all(header, [])) <= 1, "Ambiguous response headers")
+                    require(proof["etag"] == self.pin.etag, "Archive ETag changed")
+                    require(proof["version_id"] == self.pin.version_id, "Archive version changed")
+                    require(proof["content_range"] == f"bytes {offset}-{offset + count - 1}/{self.pin.size}",
+                            "Incorrect Content-Range")
+                    require(proof["content_length"] == str(count), "Incorrect Content-Length")
+                    require(response.headers.get("Content-Encoding", "identity") == "identity", "Encoded range response")
+                    data = response.read(count + 1)
+                    require(len(data) == count, "Range body length mismatch")
+                outcome["verified"] = True
+                return data
+            except OSError as error:
+                retryable = transient_transport_failure(error)
+                outcome.update(error_type=type(error).__name__, retryable=retryable)
+                if isinstance(error, HTTPError):
+                    outcome["http_status"] = error.code
+                    error.close()  # Never read an error response body.
+                if not retryable or attempt == MAX_RANGE_ATTEMPTS:
+                    raise
+                delay = min(2 ** (attempt - 1), 4)
+                outcome["backoff_seconds"] = delay
+                time.sleep(delay)
+        raise RuntimeError("Range attempts exhausted")
+
     def read(self, start: int, length: int) -> bytes:
         require(0 <= start < self.pin.size and 0 < length <= MAX_DIRECTORY and start + length <= self.pin.size,
                 "Archive range is outside permitted bounds")
@@ -93,22 +157,7 @@ class RangeReader:
             request = Request(self.pin.url, headers={
                 "Range": f"bytes={offset}-{end}", "If-Match": self.pin.etag, "Accept-Encoding": "identity",
             })
-            with open_range(request, timeout=90) as response:
-                proof.update(status=response.status, etag=response.headers.get("ETag"),
-                             version_id=response.headers.get("x-amz-version-id"),
-                             content_range=response.headers.get("Content-Range"),
-                             content_length=response.headers.get("Content-Length"))
-                require(response.status == 206, "Server did not honor the range; body was not read")
-                require(response.geturl() == self.pin.url, "Archive request was redirected")
-                for header in ("ETag", "Content-Range", "Content-Length", "x-amz-version-id", "Content-Encoding"):
-                    require(len(response.headers.get_all(header, [])) <= 1, "Ambiguous response headers")
-                require(proof["etag"] == self.pin.etag, "Archive ETag changed")
-                require(proof["version_id"] == self.pin.version_id, "Archive version changed")
-                require(proof["content_range"] == f"bytes {offset}-{end}/{self.pin.size}", "Incorrect Content-Range")
-                require(proof["content_length"] == str(count), "Incorrect Content-Length")
-                require(response.headers.get("Content-Encoding", "identity") == "identity", "Encoded range response")
-                data = response.read(count + 1)
-                require(len(data) == count, "Range body length mismatch")
+            data = self._read_chunk(request, offset, count, proof)
             proof.update(sha256=sha256(data), verified=True)
             pieces.append(data)
         return b"".join(pieces)

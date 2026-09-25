@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import errno
 import io
 import json
 import os
 import re
+import socket
+import ssl
 import struct
 import zipfile
 import zlib
@@ -11,6 +14,7 @@ from email.message import Message
 from http.client import HTTPMessage
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError, URLError
 from urllib.request import Request
 
 import pytest
@@ -186,6 +190,8 @@ def test_range_rejection_preserves_failure_receipt_without_reading_untrusted_bod
     assert result["status"] == "failed" and result["retrieved_structure_count"] == 0
     assert not result["ranges"][0]["verified"]
     assert server.responses[0].read_calls == (1 if fault in ("short", "long") else 0)
+    assert len(server.requests) == 1
+    assert len(result["ranges"][0]["attempts"]) == 1
     assert not list((tmp_path / "raw").rglob("*.cif"))
 
 
@@ -415,3 +421,132 @@ def test_real_redirect_handler_rejects_before_draining_body_or_following(code: i
     with pytest.raises(ValueError, match="redirects are not permitted"):
         handler.http_error_302(request, response, code, "redirect", headers)
     assert response.read_calls == 0
+
+
+@pytest.mark.parametrize("failure", ["reset", "timeout", "temporary_dns", "429", "500", "503"])
+def test_transient_failures_retry_the_entire_pinned_range_with_finite_backoff(
+        monkeypatch: pytest.MonkeyPatch, failure: str) -> None:
+    server = Server(make_zip())
+    delays: list[int] = []
+    requests: list[tuple[str, str | None, str | None]] = []
+    error_bodies: list[Response] = []
+
+    def flaky(request: Request, timeout: int) -> Response:
+        requests.append((request.full_url, request.get_header("Range"), request.get_header("If-match")))
+        if len(requests) <= 3:
+            if failure.isdigit():
+                body = Response(b"do not read error bodies", Message(), int(failure), request.full_url)
+                error_bodies.append(body)
+                raise HTTPError(request.full_url, int(failure), "transient", Message(), body)
+            if failure == "reset":
+                reason: OSError = ConnectionResetError(errno.ECONNRESET, "Connection reset by peer")
+            elif failure == "timeout":
+                reason = TimeoutError("timed out")
+            else:
+                reason = socket.gaierror(socket.EAI_AGAIN, "temporary lookup failure")
+            raise URLError(reason)
+        return server(request, timeout)
+
+    monkeypatch.setattr(fetch, "open_range", flaky)
+    monkeypatch.setattr(fetch.time, "sleep", delays.append)
+    reader = fetch.RangeReader(fetch.ArchivePin(len(server.data), ETAG, "null"))
+    assert reader.read(5, 20) == server.data[5:25]
+    assert len(requests) == 4 and len(set(requests)) == 1
+    assert delays == [1, 2, 4]
+    assert [row["verified"] for row in reader.ranges[0]["attempts"]] == [False, False, False, True]
+    assert all(body.closed and body.read_calls == 0 for body in error_bodies)
+
+
+def test_exhausted_transport_retries_leave_failed_receipt_and_no_cifs(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    args, _ = install(tmp_path, monkeypatch)
+    requests: list[str | None] = []
+    delays: list[int] = []
+
+    def always_reset(request: Request, timeout: int) -> Response:
+        requests.append(request.get_header("Range"))
+        raise URLError(ConnectionResetError(errno.ECONNRESET, "Connection reset by peer"))
+
+    monkeypatch.setattr(fetch, "open_range", always_reset)
+    monkeypatch.setattr(fetch.time, "sleep", delays.append)
+    assert fetch.main(args) == 1
+    assert len(requests) == 4 and len(set(requests)) == 1 and delays == [1, 2, 4]
+    result = receipt(tmp_path)
+    assert result["status"] == "failed" and result["source_inputs_unchanged"]
+    assert len(result["ranges"][0]["attempts"]) == 4
+    assert not any(row["verified"] for row in result["ranges"][0]["attempts"])
+    assert not list((tmp_path / "raw").rglob("*.cif"))
+
+
+def test_connection_reset_after_partial_body_restarts_whole_range_before_publication(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    args, server = install(tmp_path, monkeypatch)
+    partial_lengths: list[int] = []
+    delays: list[int] = []
+
+    def reset_member_body_once(request: Request, timeout: int) -> Response:
+        response = server(request, timeout)
+        if len(server.requests) == 7:
+            def reset_after_prefix(size: int) -> bytes:
+                partial_lengths.append(len(io.BytesIO.read(response, size // 2)))
+                assert not (tmp_path / "raw/pdb_data/mmcif_files/0001.cif").exists()
+                raise ConnectionResetError(errno.ECONNRESET, "Connection reset by peer")
+            monkeypatch.setattr(response, "read", reset_after_prefix)
+        return response
+
+    monkeypatch.setattr(fetch, "open_range", reset_member_body_once)
+    monkeypatch.setattr(fetch.time, "sleep", delays.append)
+    assert fetch.main(args) == 0
+    assert partial_lengths and partial_lengths[0] > 0 and delays == [1]
+    assert server.requests[6] == server.requests[7]
+    assert (tmp_path / "raw/pdb_data/mmcif_files/0001.cif").read_bytes() == PAYLOAD
+    result = receipt(tmp_path)
+    assert len(result["ranges"][6]["attempts"]) == 2
+    assert result["members"][0]["crc32_verified"]
+
+
+@pytest.mark.parametrize("failure", ["403", "404", "412", "certificate", "permanent_dns", "permission"])
+def test_permanent_request_failures_are_not_retried(
+        monkeypatch: pytest.MonkeyPatch, failure: str) -> None:
+    calls = 0
+    delays: list[int] = []
+
+    def rejected(request: Request, timeout: int) -> Response:
+        nonlocal calls
+        calls += 1
+        if failure.isdigit():
+            raise HTTPError(request.full_url, int(failure), "permanent", Message(), io.BytesIO())
+        if failure == "certificate":
+            raise URLError(ssl.SSLCertVerificationError("certificate verification failed"))
+        if failure == "permanent_dns":
+            raise URLError(socket.gaierror(socket.EAI_NONAME, "permanent lookup failure"))
+        raise PermissionError(errno.EACCES, "permission denied")
+
+    monkeypatch.setattr(fetch, "open_range", rejected)
+    monkeypatch.setattr(fetch.time, "sleep", delays.append)
+    reader = fetch.RangeReader(fetch.ArchivePin(100, ETAG, "null"))
+    with pytest.raises(OSError):
+        reader.read(1, 5)
+    assert calls == 1 and delays == []
+
+
+@pytest.mark.parametrize("fault", ["etag", "version", "range", "length", "short", "long"])
+def test_integrity_failure_after_transport_retry_is_terminal(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str) -> None:
+    args, server = install(tmp_path, monkeypatch, fault=fault)
+    calls = 0
+    delays: list[int] = []
+
+    def reset_then_invalid(request: Request, timeout: int) -> Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise URLError(ConnectionResetError(errno.ECONNRESET, "Connection reset by peer"))
+        return server(request, timeout)
+
+    monkeypatch.setattr(fetch, "open_range", reset_then_invalid)
+    monkeypatch.setattr(fetch.time, "sleep", delays.append)
+    assert fetch.main(args) == 1
+    assert calls == 2 and delays == [1]
+    assert receipt(tmp_path)["error"]["type"] == "ValueError"
+    assert not list((tmp_path / "raw").rglob("*.cif"))

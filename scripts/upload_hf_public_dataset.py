@@ -31,6 +31,7 @@ if str(REPO_ROOT) not in sys.path:
 from nanofold.chain_paths import chain_npz_path
 from nanofold.data import read_manifest
 from nanofold.dataset_integrity import FINGERPRINT_COMPARISON_KEYS, verify_dataset_against_fingerprint
+from nanofold.msa_filter_summary import BATCHING_PUBLIC_FIELDS, validate_batching_summary
 from nanofold.utils import sha256_file
 
 DEFAULT_TRAIN_MANIFEST = Path("data/manifests/train.txt")
@@ -650,11 +651,12 @@ def _validate_filter_summary(path: Path) -> dict[str, Any]:
     }
     binding_fields = {
         "source_fasta_sha256", "heldout_fasta_sha256", "m8_sha256", "source_sequence_set_sha256",
-        "heldout_sequence_set_sha256", "source_asset_manifest_sha256",
+        "heldout_sequence_set_sha256", "source_asset_manifest_sha256", "batch_receipt_sha256",
     }
     new_fields_by_location = {
         "msa_row_filter": {"search_contract", "exhaustive", "input_binding"},
-        "msa_row_filter.mmseqs": {"search_parameters", "possible_pair_count"},
+        "msa_row_filter.mmseqs": {"search_parameters", "possible_pair_count", "batching"},
+        "msa_row_filter.mmseqs.batching": BATCHING_PUBLIC_FIELDS,
         "msa_row_filter.mmseqs.search_parameters": search_parameter_fields,
         "msa_row_filter.input_binding": binding_fields,
         "msa_row_filter.source": {"complete", "minimum_non_query_sequence_length"},
@@ -740,6 +742,7 @@ def _validate_filter_summary(path: Path) -> dict[str, Any]:
             raise ValueError("Public MSA command parameters must be numeric strings") from exc
         if not math.isfinite(number) or number < 0:
             raise ValueError("Public MSA command parameters must be finite nonnegative numbers")
+    validate_batching_summary(row_filter, public_safe=True)
     return raw
 
 

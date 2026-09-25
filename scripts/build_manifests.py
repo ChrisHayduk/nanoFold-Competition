@@ -50,7 +50,9 @@ published cache metadata and requires source-bound versioned structural metadata
 STANDARD_AAS = set("ARNDCQEGHILKMFPSTWYV")
 SAMPLING_POLICY = "cath-v2"
 GROUP_SAMPLING_POLICY = "cath-v3"
-CATH_SAMPLING_POLICIES = (SAMPLING_POLICY, GROUP_SAMPLING_POLICY)
+PROCESSABLE_GROUP_SAMPLING_POLICY = "cath-v4"
+GROUP_SAMPLING_POLICIES = (GROUP_SAMPLING_POLICY, PROCESSABLE_GROUP_SAMPLING_POLICY)
+CATH_SAMPLING_POLICIES = (SAMPLING_POLICY, *GROUP_SAMPLING_POLICIES)
 GROUP_ALLOCATOR_POLICY = "joint_heldout_groups_mandatory_train_v1"
 DEFAULT_STRATIFY_FIELDS = ("cath_architecture_ids", "length_bin", "resolution_bin")
 LEGACY_STRATIFY_FIELDS = (
@@ -101,16 +103,21 @@ class SplitResult:
     group_policy: dict[str, bool]
     quality_report: dict[str, Any]
     split_group_map: dict[str, str] | None = None
+    approved_excluded_group_ids: frozenset[str] = frozenset()
 
 
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser()
     ap.add_argument("--sampling-policy", choices=CATH_SAMPLING_POLICIES, required=True,
-                    help="Versioned CATH sampling: cath-v3 covers every full group while preserving whole-group split ownership.")
+                    help="Versioned CATH sampling: cath-v4 covers every retained full group with source-validated representatives.")
     ap.add_argument("--split-group-tsv", default="",
-                    help="Required for cath-v3: complete eligible-chain full-group representative/member TSV, nesting original clusters, PDBs and exact sequences.")
+                    help="Required for cath-v3/v4: complete original eligible-chain full-group TSV, nesting original clusters, PDBs and exact sequences.")
     ap.add_argument("--split-group-receipt", default="",
-                    help="Required for cath-v3: validated full-universe homology graph provenance receipt.")
+                    help="Required for cath-v3/v4: validated original full-universe homology graph provenance receipt.")
+    ap.add_argument("--representative-eligibility-receipt", default="",
+                    help="Required for cath-v4: source-validated ranked representative eligibility for every original unit.")
+    ap.add_argument("--approved-group-exclusions", default="",
+                    help="Required for cath-v4: explicit approved catalog of fully exhausted original full groups.")
     ap.add_argument("--chain-data-cache", type=str, required=True, help="Path to chain_data_cache.json")
     ap.add_argument("--out-dir", type=str, required=True, help="Where to write public train.txt, val.txt, and all.txt")
     ap.add_argument(
@@ -703,26 +710,26 @@ def _build_candidates(
     return candidates, reject_reasons, secondary_source
 
 
-def _choose_representative(candidates: list[Candidate], seed: int) -> Candidate:
-    return min(
-        candidates,
-        key=lambda item: (
-            item.resolution if item.resolution and item.resolution < 999.0 else 999.0,
-            -item.length,
-            item.release_date or "",
-            _stable_random_score(seed, "representative", item.chain_id),
-            item.chain_id,
-        ),
+def _representative_rank(candidate: Candidate, seed: int) -> tuple[float, int, str, int, str]:
+    return (
+        candidate.resolution if candidate.resolution and candidate.resolution < 999.0 else 999.0,
+        -candidate.length,
+        candidate.release_date or "",
+        _stable_random_score(seed, "representative", candidate.chain_id),
+        candidate.chain_id,
     )
 
 
-def _disjoint_units(
+def _choose_representative(candidates: list[Candidate], seed: int) -> Candidate:
+    return min(candidates, key=lambda candidate: _representative_rank(candidate, seed))
+
+
+def _disjoint_components(
     candidates: list[Candidate],
     cluster_map: dict[str, str],
     *,
     disallow_pdb_overlap: bool,
-    seed: int,
-) -> list[Candidate]:
+) -> list[list[Candidate]]:
     chain_ids = sorted(candidate.chain_id for candidate in candidates)
     parent = {chain_id: chain_id for chain_id in chain_ids}
 
@@ -760,10 +767,31 @@ def _disjoint_units(
     for chain_id in chain_ids:
         by_component[find(chain_id)].append(by_id[chain_id])
 
-    units: list[Candidate] = []
-    for component_members in by_component.values():
-        units.append(_choose_representative(component_members, seed))
-    return units
+    return list(by_component.values())
+
+
+def _disjoint_units(
+    candidates: list[Candidate], cluster_map: dict[str, str], *, disallow_pdb_overlap: bool, seed: int,
+) -> list[Candidate]:
+    return [_choose_representative(members, seed) for members in _disjoint_components(
+        candidates, cluster_map, disallow_pdb_overlap=disallow_pdb_overlap,
+    )]
+
+
+def _original_unit_memberships(
+    candidates: list[Candidate], cluster_map: dict[str, str], *, seed: int,
+) -> dict[str, list[Candidate]]:
+    """Return the unchanged original components and their deterministic candidate order."""
+    ids = {candidate.chain_id for candidate in candidates}
+    if len(ids) != len(candidates) or set(cluster_map) != ids:
+        raise ValueError("Original unit memberships require the complete eligible candidate universe exactly.")
+    units = {}
+    for members in _disjoint_components(candidates, cluster_map, disallow_pdb_overlap=True):
+        unit_id = hashlib.sha256("".join(chain + "\n" for chain in sorted(
+            candidate.chain_id for candidate in members
+        )).encode()).hexdigest()
+        units[unit_id] = sorted(members, key=lambda candidate: _representative_rank(candidate, seed))
+    return dict(sorted(units.items()))
 
 
 def _apportion_counts(
@@ -877,10 +905,9 @@ def _select_stratified(
     return sorted(selected, key=lambda item: (_stable_random_score(seed, f"{salt}:selected", item.chain_id), item.chain_id))
 
 
-def _group_sampling_units(
-    candidates: list[Candidate], cluster_map: dict[str, str], split_group_map: dict[str, str], *, seed: int,
-) -> tuple[list[Candidate], dict[str, list[Candidate]]]:
-    """Validate full-universe nesting and retain one representative per original unit."""
+def _validate_group_nesting(
+    candidates: list[Candidate], cluster_map: dict[str, str], split_group_map: dict[str, str],
+) -> None:
     ids = {candidate.chain_id for candidate in candidates}
     if len(ids) != len(candidates) or set(cluster_map) != ids or set(split_group_map) != ids:
         raise ValueError("Original clusters and full split groups must cover the complete eligible candidate universe exactly.")
@@ -893,6 +920,13 @@ def _group_sampling_units(
             if value in seen and seen[value] != group:
                 raise ValueError("Full split groups must contain every original cluster, PDB entry and exact-sequence component.")
             seen[value] = group
+
+
+def _group_sampling_units(
+    candidates: list[Candidate], cluster_map: dict[str, str], split_group_map: dict[str, str], *, seed: int,
+) -> tuple[list[Candidate], dict[str, list[Candidate]]]:
+    """Validate full-universe nesting and retain one representative per original unit."""
+    _validate_group_nesting(candidates, cluster_map, split_group_map)
     clustered = [replace(candidate, cluster_id=cluster_map[candidate.chain_id]) for candidate in candidates]
     units = _disjoint_units(clustered, cluster_map, disallow_pdb_overlap=True, seed=seed)
     groups: defaultdict[str, list[Candidate]] = defaultdict(list)
@@ -900,6 +934,36 @@ def _group_sampling_units(
         groups[split_group_map[candidate.chain_id]].append(candidate)
     if set(groups) != set(split_group_map.values()):
         raise RuntimeError("Original representative population does not cover every full split group.")
+    return units, dict(groups)
+
+
+def _qualified_group_sampling_units(
+    candidates: list[Candidate], cluster_map: dict[str, str], split_group_map: dict[str, str], *, seed: int,
+    selected_chain_by_original_unit: dict[str, str | None], approved_excluded_group_ids: set[str],
+) -> tuple[list[Candidate], dict[str, list[Candidate]]]:
+    """Apply validated eligibility inside immutable units without deleting graph vertices."""
+    _validate_group_nesting(candidates, cluster_map, split_group_map)
+    memberships = _original_unit_memberships(candidates, cluster_map, seed=seed)
+    if set(selected_chain_by_original_unit) != set(memberships):
+        raise ValueError("Representative eligibility must account for every original unit exactly.")
+    units: list[Candidate] = []
+    groups: defaultdict[str, list[Candidate]] = defaultdict(list)
+    for unit_id, members in memberships.items():
+        selected = selected_chain_by_original_unit[unit_id]
+        if selected is None:
+            continue
+        by_id = {candidate.chain_id: candidate for candidate in members}
+        if not isinstance(selected, str) or selected not in by_id:
+            raise ValueError("Qualified representative does not belong to its immutable original unit.")
+        candidate = replace(by_id[selected], cluster_id=cluster_map[selected])
+        units.append(candidate)
+        groups[split_group_map[selected]].append(candidate)
+    original_groups = set(split_group_map.values())
+    if not approved_excluded_group_ids <= original_groups:
+        raise ValueError("Approved exclusions include a group outside the original full graph.")
+    exhausted_groups = original_groups - set(groups)
+    if exhausted_groups != approved_excluded_group_ids:
+        raise ValueError("Fully exhausted groups must exactly match the approved group exclusion catalog.")
     return units, dict(groups)
 
 
@@ -1069,14 +1133,32 @@ def _split_candidates(
     structural_metadata_source: str,
     sampling_policy: str = SAMPLING_POLICY,
     split_group_map: dict[str, str] | None = None,
+    representative_eligibility: dict[str, Any] | None = None,
 ) -> SplitResult:
     candidate_by_id = {candidate.chain_id: candidate for candidate in candidates}
     candidates_with_clusters = [replace(candidate, cluster_id=cluster_map[candidate.chain_id]) for candidate in candidates]
-    if sampling_policy == GROUP_SAMPLING_POLICY:
+    original_representatives: list[Candidate] | None = None
+    approved_excluded_groups: set[str] = set()
+    if sampling_policy in GROUP_SAMPLING_POLICIES:
         if split_group_map is None or not disallow_pdb_overlap or stratify_fields != DEFAULT_STRATIFY_FIELDS:
-            raise ValueError("cath-v3 requires complete split groups, PDB disjointness and the declared CATH hierarchy.")
-        units, groups = _group_sampling_units(candidates_with_clusters, cluster_map, split_group_map, seed=seed)
-    elif sampling_policy == SAMPLING_POLICY and split_group_map is None:
+            raise ValueError("Grouped CATH sampling requires complete split groups, PDB disjointness and the declared CATH hierarchy.")
+        if sampling_policy == PROCESSABLE_GROUP_SAMPLING_POLICY:
+            if representative_eligibility is None:
+                raise ValueError("cath-v4 requires validated representative eligibility.")
+            original_representatives = [members[0] for members in _original_unit_memberships(
+                candidates_with_clusters, cluster_map, seed=seed,
+            ).values()]
+            approved_excluded_groups = set(representative_eligibility["approved_excluded_group_ids"])
+            units, groups = _qualified_group_sampling_units(
+                candidates_with_clusters, cluster_map, split_group_map, seed=seed,
+                selected_chain_by_original_unit=representative_eligibility["selected_chain_by_original_unit"],
+                approved_excluded_group_ids=approved_excluded_groups,
+            )
+        else:
+            if representative_eligibility is not None:
+                raise ValueError("Representative eligibility requires cath-v4.")
+            units, groups = _group_sampling_units(candidates_with_clusters, cluster_map, split_group_map, seed=seed)
+    elif sampling_policy == SAMPLING_POLICY and split_group_map is None and representative_eligibility is None:
         units = _disjoint_units(candidates_with_clusters, cluster_map, disallow_pdb_overlap=disallow_pdb_overlap, seed=seed)
         groups = {}
     else:
@@ -1088,7 +1170,7 @@ def _split_candidates(
             "The candidate source set is too small for the official split contract."
         )
 
-    if sampling_policy == GROUP_SAMPLING_POLICY:
+    if sampling_policy in GROUP_SAMPLING_POLICIES:
         train, val, hidden_groups = _plan_group_splits(
             units, groups, train_size=train_size, val_size=val_size, hidden_val_size=hidden_val_size, seed=seed,
         )
@@ -1139,7 +1221,28 @@ def _split_candidates(
             "max_train_group_share": max(split_counts["train"].values(), default=0) / max(1, len(train)),
             "hidden_membership_privacy": "Group coverage reveals the hidden group complement when the full universe is known; singleton target membership is inferable.",
         }
-        group_policy.update(full_group_disjoint=True, all_groups_covered=True)
+        if sampling_policy == PROCESSABLE_GROUP_SAMPLING_POLICY:
+            assert original_representatives is not None
+            group_report = quality_report["group_sampling"]
+            group_report.update(
+                reference_population="source_validated_original_unit_representatives",
+                full_group_count=len(set(split_group_map.values())),
+                original_group_count=len(set(split_group_map.values())),
+                retained_group_count=len(groups),
+                approved_excluded_group_count=len(approved_excluded_groups),
+                original_unit_count=len(original_representatives),
+                original_representative_ids_sha256=hashlib.sha256("".join(
+                    chain + "\n" for chain in sorted(candidate.chain_id for candidate in original_representatives)
+                ).encode()).hexdigest(),
+                selectable_unit_count=len(units),
+                exhausted_original_unit_count=len(original_representatives) - len(units),
+                replacement_representative_count=len(
+                    {candidate.chain_id for candidate in units} - {candidate.chain_id for candidate in original_representatives}
+                ),
+            )
+            group_policy.update(full_group_disjoint=True, all_retained_groups_covered=True)
+        else:
+            group_policy.update(full_group_disjoint=True, all_groups_covered=True)
     return SplitResult(
         train_ids=[candidate.chain_id for candidate in train],
         val_ids=[candidate.chain_id for candidate in val],
@@ -1154,6 +1257,7 @@ def _split_candidates(
         group_policy=group_policy,
         quality_report=quality_report,
         split_group_map=split_group_map,
+        approved_excluded_group_ids=frozenset(approved_excluded_groups),
     )
 
 
@@ -1194,8 +1298,8 @@ def _assert_split_disjointness(result: SplitResult) -> None:
                 if group in ownership and ownership[group] != split_name:
                     raise RuntimeError("Full split group appears in multiple selected splits.")
                 ownership[group] = split_name
-        if set(ownership) != set(result.split_group_map.values()):
-            raise RuntimeError("Selected splits do not cover every full eligible group.")
+        if set(ownership) != set(result.split_group_map.values()) - result.approved_excluded_group_ids:
+            raise RuntimeError("Selected splits do not cover exactly every retained full eligible group.")
 
 
 def _split_distribution(result: SplitResult, ids: list[str]) -> dict[str, Any]:
@@ -1423,11 +1527,16 @@ def _write_manifest(path: Path, chain_ids: list[str]) -> None:
 def main() -> None:
     args = parse_args()
     _validate_generation_args(args)
-    if args.sampling_policy == GROUP_SAMPLING_POLICY:
+    if args.sampling_policy in GROUP_SAMPLING_POLICIES:
         if not args.split_group_tsv or not args.split_group_receipt:
-            raise ValueError("cath-v3 requires --split-group-tsv and --split-group-receipt.")
+            raise ValueError("Grouped CATH sampling requires --split-group-tsv and --split-group-receipt.")
     elif args.split_group_tsv or args.split_group_receipt:
-        raise ValueError("Full split-group inputs require --sampling-policy cath-v3.")
+        raise ValueError("Full split-group inputs require --sampling-policy cath-v3 or cath-v4.")
+    if args.sampling_policy == PROCESSABLE_GROUP_SAMPLING_POLICY:
+        if not args.representative_eligibility_receipt or not args.approved_group_exclusions:
+            raise ValueError("cath-v4 requires --representative-eligibility-receipt and --approved-group-exclusions.")
+    elif args.representative_eligibility_receipt or args.approved_group_exclusions:
+        raise ValueError("Representative eligibility and approved group exclusions require --sampling-policy cath-v4.")
     if not args.lock_file.strip() or not args.private_lock_file.strip():
         raise ValueError("CATH sampling requires nonempty --lock-file and --private-lock-file paths.")
 
@@ -1515,6 +1624,21 @@ def main() -> None:
             cluster_map=cluster_map, candidate_ids=set(candidate_ids),
             min_seq_id=float(args.min_seq_id), coverage=float(args.coverage),
         )
+    representative_eligibility: dict[str, Any] | None = None
+    if args.sampling_policy == PROCESSABLE_GROUP_SAMPLING_POLICY:
+        from nanofold.representative_eligibility import validate_representative_eligibility_receipt
+
+        assert split_group_map is not None
+        memberships = _original_unit_memberships(candidates, cluster_map, seed=int(args.seed))
+        representative_eligibility = validate_representative_eligibility_receipt(
+            Path(args.representative_eligibility_receipt),
+            approved_group_exclusions_path=Path(args.approved_group_exclusions),
+            chain_data_cache_path=cache_path, structure_metadata_path=Path(args.structure_metadata),
+            cluster_map=cluster_map, split_group_map=split_group_map,
+            split_group_receipt_path=Path(args.split_group_receipt),
+            original_units={unit_id: [candidate.chain_id for candidate in members] for unit_id, members in memberships.items()},
+            seed=int(args.seed),
+        )
     stratify_fields = DEFAULT_STRATIFY_FIELDS
     result = _split_candidates(
         candidates=candidates,
@@ -1531,9 +1655,11 @@ def main() -> None:
         structural_metadata_source=structural_metadata_source,
         sampling_policy=args.sampling_policy,
         split_group_map=split_group_map,
+        representative_eligibility=representative_eligibility,
     )
     _assert_split_disjointness(result)
-    if group_receipt is not None and group_receipt.get("original_unit_count") != result.unit_count:
+    original_unit_count = result.quality_report.get("group_sampling", {}).get("original_unit_count", result.unit_count)
+    if group_receipt is not None and group_receipt.get("original_unit_count") != original_unit_count:
         raise ValueError("Full-group receipt original-unit count disagrees with the reconstructed sampling population.")
     split_groups_record = None if split_group_map is None else {
         "path": str(args.split_group_tsv), "sha256": _sha256(Path(args.split_group_tsv)),
@@ -1543,6 +1669,15 @@ def main() -> None:
         "selection_unit_ids_sha256": result.quality_report["group_sampling"]["selection_unit_ids_sha256"],
         "receipt_path": str(args.split_group_receipt), "receipt_sha256": _sha256(Path(args.split_group_receipt)),
     }
+    if representative_eligibility is not None:
+        assert split_groups_record is not None
+        group_report = result.quality_report["group_sampling"]
+        split_groups_record.update(
+            coverage="all_retained_groups", original_unit_count=original_unit_count,
+            original_representative_ids_sha256=group_report["original_representative_ids_sha256"],
+            retained_group_count=group_report["retained_group_count"],
+            approved_excluded_group_count=group_report["approved_excluded_group_count"],
+        )
 
     out_dir = Path(args.out_dir)
     hidden_out_dir = Path(args.hidden_out_dir)
@@ -1615,7 +1750,7 @@ def main() -> None:
             },
             "filtering": {
                 "candidate_count": result.candidate_count,
-                "disjoint_unit_count": result.unit_count,
+                "disjoint_unit_count": original_unit_count,
                 "target_policy": "known_monomer" if args.require_monomer else "single_chain",
                 "candidate_annotation_coverage": _annotation_coverage(candidates),
                 "representative_policy": "best_resolution_then_longest_then_release_date_seeded_tie",
@@ -1653,6 +1788,16 @@ def main() -> None:
         if split_groups_record is not None:
             lock["split_groups"] = split_groups_record
             lock["args"].update(split_group_tsv=str(args.split_group_tsv), split_group_receipt=str(args.split_group_receipt))
+        if representative_eligibility is not None:
+            lock["representative_eligibility"] = representative_eligibility["binding"]
+            lock["args"].update(
+                representative_eligibility_receipt=str(args.representative_eligibility_receipt),
+                approved_group_exclusions=str(args.approved_group_exclusions),
+            )
+            lock["filtering"].update(
+                selectable_unit_count=result.unit_count,
+                representative_policy="source_validated_best_resolution_then_longest_then_release_date_seeded_tie",
+            )
         lock_path = Path(args.lock_file)
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         _atomic_write(lock_path, json.dumps(lock, indent=2) + "\n")
@@ -1690,6 +1835,9 @@ def main() -> None:
                     "canonical_ids_sha256": hashlib.sha256(b"").hexdigest(),
                 },
             }
+        if representative_eligibility is not None:
+            private_lock["representative_eligibility"] = representative_eligibility["binding"]
+            private_lock["stratification"]["reference"] = "source_validated_disjoint_units"
         private_lock_path = Path(args.private_lock_file)
         private_lock_path.parent.mkdir(parents=True, exist_ok=True)
         _atomic_write(private_lock_path, json.dumps(private_lock, indent=2) + "\n")

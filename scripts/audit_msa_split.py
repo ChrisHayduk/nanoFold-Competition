@@ -30,8 +30,11 @@ if str(REPO_ROOT) not in sys.path:
 from nanofold.a3m import GAP_ID, MASK_ID, RESTYPES
 from nanofold.chain_paths import chain_data_dir, chain_npz_path
 from nanofold.mmseqs import (
+    batched_mmseqs_summary,
+    iter_batched_mmseqs_hits,
     iter_mmseqs_hits,
     load_msa_for_audit,
+    run_batched_mmseqs,
     sequence_records_sha256,
     validate_search_parameters,
 )
@@ -78,13 +81,19 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument(
         "--exhaustive", action="store_true",
         help="With --run-mmseqs, also compare every held-out target/non-query MSA-row pair without "
-        "masking or a heuristic prefilter. Requires max-seqs to cover all unique source rows.",
+        "masking or a heuristic prefilter. Requires max-seqs to cover all unique source rows or each checkpoint batch.",
     )
     ap.add_argument("--mmseqs-bin", default="mmseqs")
     ap.add_argument("--min-seq-id", type=float, default=0.30)
     ap.add_argument("--coverage", type=float, default=0.80)
     ap.add_argument("--threads", type=int, default=8)
     ap.add_argument("--max-seqs", type=int, default=1_000_000)
+    ap.add_argument("--checkpoint-dir", type=Path, default=None,
+                    help="Private resumable exhaustive search directory; requires --exhaustive, anonymous headers, lengths <=256.")
+    ap.add_argument("--source-batch-size", type=int, default=1_000_000, help="Maximum source records per batch (1..1000000).")
+    ap.add_argument("--query-batch-size", type=int, default=256, help="Maximum held-out records per batch (1..256).")
+    ap.add_argument("--search-disk-reserve-gib", type=int, default=100, help="Free-disk reserve during bounded search.")
+    ap.add_argument("--search-max-rss-gib", type=int, default=48, help="Sampled caller plus native process-tree RSS ceiling.")
     ap.add_argument("--tmp-dir", type=Path, default=None)
     ap.add_argument(
         "--include-examples",
@@ -124,6 +133,30 @@ def _read_optional_set(path: Path | None) -> set[str]:
 def _sha256_file(path: Path) -> str:
     with path.open("rb") as handle:
         return hashlib.file_digest(handle, "sha256").hexdigest()
+
+
+
+def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, prefix=f".{path.name}.", delete=False) as handle:
+        temporary = Path(handle.name)
+        try:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+    try:
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _assert_inputs_unchanged(snapshots: dict[Path, str]) -> None:
+    for path, expected in snapshots.items():
+        if not path.is_file() or _sha256_file(path) != expected:
+            raise ValueError("MSA audit input changed during scanning or search; no report was published")
 
 
 def _sequence_sha256(sequence: str) -> str:
@@ -658,11 +691,28 @@ def _collect_mmseqs_records(
     include_identifiers: bool,
     val_features_dir: Path | None = None,
     source_targets_only: bool = False,
+    input_snapshots: dict[Path, str] | None = None,
+    require_complete: bool = False,
 ) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    def load_bound(root: Path, chain_id: str) -> tuple[np.ndarray, int] | None:
+        path = chain_npz_path(root, chain_id)
+        if not path.exists():
+            if require_complete:
+                raise ValueError("Checkpointed audit requires every source and held-out feature file")
+            return None
+        path = path.resolve(strict=True)
+        if input_snapshots is not None:
+            digest = _sha256_file(path)
+            if path in input_snapshots and input_snapshots[path] != digest:
+                raise ValueError("MSA audit input changed during record collection")
+            input_snapshots[path] = digest
+        msa = load_msa_for_audit(path, chain_id=chain_id)
+        return msa, int(msa.shape[1])
+
     target_records: list[tuple[str, str]] = []
     seen_targets: set[str] = set()
     for target_index, chain_id in enumerate(val_ids):
-        loaded = _load_feature_msa(val_features_dir or features_dir, chain_id)
+        loaded = load_bound(val_features_dir or features_dir, chain_id)
         if loaded is None:
             continue
         sequence = _msa_row_to_ungapped_sequence(loaded[0][0])
@@ -678,7 +728,7 @@ def _collect_mmseqs_records(
     source_records: list[tuple[str, str]] = []
     seen_sources: set[str] = set()
     for chain_id in train_ids:
-        loaded = _load_feature_msa(features_dir, chain_id)
+        loaded = load_bound(features_dir, chain_id)
         if loaded is None:
             continue
         msa = loaded[0]
@@ -715,10 +765,19 @@ def run_mmseqs_homology(
     val_features_dir: Path | None = None,
     source_targets_only: bool = False,
     exhaustive: bool = False,
+    checkpoint_dir: Path | None = None,
+    source_batch_size: int = 1_000_000,
+    query_batch_size: int = 256,
+    reserve_disk_bytes: int = 100 * 1024**3,
+    max_rss_bytes: int = 48 * 1024**3,
+    input_binding_sha256: str | None = None,
 ) -> dict[str, Any]:
     validate_search_parameters(min_seq_id=min_seq_id, coverage=coverage, threads=threads, max_seqs=max_seqs)
     if shutil.which(mmseqs_bin) is None:
         raise SystemExit(f"MMseqs binary not found: {mmseqs_bin}")
+    if checkpoint_dir is not None and (not exhaustive or include_identifiers):
+        raise ValueError("Checkpointed audit requires --exhaustive and anonymous MMseqs headers")
+    snapshots: dict[Path, str] = {}
     target_records, source_records = _collect_mmseqs_records(
         train_ids=train_ids,
         val_ids=val_ids,
@@ -726,6 +785,8 @@ def run_mmseqs_homology(
         include_identifiers=include_identifiers,
         val_features_dir=val_features_dir,
         source_targets_only=source_targets_only,
+        input_snapshots=snapshots,
+        require_complete=checkpoint_dir is not None,
     )
     if not target_records:
         raise SystemExit("Could not collect held-out target records for MMseqs audit.")
@@ -751,11 +812,12 @@ def run_mmseqs_homology(
     threshold = {
         "min_seq_id": min_seq_id, "coverage": coverage, "cov_mode": 0, "alignment_mode": 3, "seq_id_mode": 0,
     }
-    if all_pairs and max_seqs < len(source_records):
+    if all_pairs and checkpoint_dir is None and max_seqs < len(source_records):
         raise ValueError(
             f"Exhaustive audit requires --max-seqs >= {len(source_records)} unique source records; got {max_seqs}."
         )
     if not source_records:
+        _assert_inputs_unchanged(snapshots)
         return {
             "threshold": threshold,
             "search_contract": search_contract,
@@ -771,6 +833,45 @@ def run_mmseqs_homology(
         }
 
     source_name = "train_targets" if source_targets_only else "train_msa"
+    if checkpoint_dir is not None:
+        binding_records = [{"path": str(path), "sha256": digest} for path, digest in sorted(snapshots.items())]
+        bound_inputs = hashlib.sha256(json.dumps({
+            "source_assets": binding_records, "upstream_input_binding_sha256": input_binding_sha256,
+        }, sort_keys=True).encode()).hexdigest()
+        with tempfile.TemporaryDirectory(prefix="nanofold_msa_split_audit_", dir=str(tmp_dir) if tmp_dir else None) as tmp:
+            target_fasta = Path(tmp) / "val_targets.fasta"
+            source_fasta = Path(tmp) / f"{source_name}.fasta"
+            _write_fasta(target_fasta, sorted(target_records))
+            _write_fasta(source_fasta, sorted(source_records))
+            result = run_batched_mmseqs(
+                query_fasta=target_fasta, source_fasta=source_fasta, checkpoint_dir=checkpoint_dir / source_name,
+                mmseqs_bin=mmseqs_bin, min_seq_id=min_seq_id, coverage=coverage, threads=threads, max_seqs=max_seqs,
+                source_batch_size=source_batch_size, query_batch_size=query_batch_size,
+                reserve_disk_bytes=reserve_disk_bytes, max_rss_bytes=max_rss_bytes,
+                input_binding_sha256=bound_inputs,
+            )
+            unique_target_hits: set[str] = set()
+            hit_count = 0
+            for query, _target in iter_batched_mmseqs_hits(result, min_seq_id=min_seq_id, coverage=coverage):
+                unique_target_hits.add(query)
+                hit_count += 1
+        _assert_inputs_unchanged(snapshots)
+        return {
+            "threshold": threshold, "search_contract": search_contract, "exhaustive": True,
+            "possible_pair_count": len(target_records) * len(source_records), "search_parameters": search_parameters,
+            "mmseqs": {"binary": mmseqs_bin, "version": _mmseqs_version(mmseqs_bin), "command": [],
+                       "batching": batched_mmseqs_summary(result)},
+            "target_records": len(target_records), source_count_key: len(source_records),
+            "hit_count": hit_count, hit_count_key: len(unique_target_hits), "m8_path": None,
+            "input_binding": {
+                "schema_version": 1, "source_records_sha256": sequence_records_sha256(source_records),
+                "target_records_sha256": sequence_records_sha256(target_records),
+                "query_ids": [header for header, _ in target_records],
+                "source_assets": binding_records, "upstream_input_binding_sha256": input_binding_sha256,
+                "batch_receipt_sha256": result["receipt_sha256"],
+            },
+            "identifiers_in_m8": False, "search_executed": True,
+        }
     m8_out = out_dir / f"val_targets_vs_{source_name}.mmseqs_m8"
     m8_out.unlink(missing_ok=True)
     with tempfile.TemporaryDirectory(prefix="nanofold_msa_split_audit_", dir=str(tmp_dir) if tmp_dir else None) as tmp:
@@ -817,7 +918,7 @@ def run_mmseqs_homology(
         if proc.returncode != 0:
             raise RuntimeError(f"MMseqs failed with exit code {proc.returncode}: {' '.join(cmd)}")
 
-    unique_target_hits: set[str] = set()
+    unique_target_hits = set()
     hit_count = 0
     for query, _target in iter_mmseqs_hits(
         m8_out, query_ids={header for header, _ in target_records},
@@ -825,6 +926,7 @@ def run_mmseqs_homology(
     ):
         hit_count += 1
         unique_target_hits.add(query)
+    _assert_inputs_unchanged(snapshots)
     return {
         "threshold": threshold,
         "search_contract": search_contract,
@@ -885,8 +987,35 @@ def main() -> None:
     validate_search_parameters(
         min_seq_id=args.min_seq_id, coverage=args.coverage, threads=args.threads, max_seqs=args.max_seqs,
     )
+    if args.checkpoint_dir is not None and (not args.exhaustive or args.include_identifiers_in_mmseqs):
+        raise ValueError("--checkpoint-dir requires --exhaustive and anonymous MMseqs headers")
+    if not 1 <= args.source_batch_size <= 1_000_000 or not 1 <= args.query_batch_size <= 256:
+        raise ValueError("Source/query batch sizes must be in 1..1000000 and 1..256 respectively")
+    if args.search_disk_reserve_gib < 1 or args.search_max_rss_gib < 1:
+        raise ValueError("Search disk reserve and RSS limits must be positive GiB counts")
+    args.train_manifest = args.train_manifest.resolve(strict=True)
+    args.val_manifest = args.val_manifest.resolve(strict=True)
+    metadata_paths = [args.train_manifest, args.val_manifest]
+    if args.cluster_tsv is not None:
+        args.cluster_tsv = args.cluster_tsv.resolve(strict=True)
+        metadata_paths.append(args.cluster_tsv)
+    if args.feature_exclusion_list is not None:
+        args.feature_exclusion_list = args.feature_exclusion_list.resolve(strict=True)
+        metadata_paths.append(args.feature_exclusion_list)
+    snapshots = {path: _sha256_file(path) for path in metadata_paths}
     train_ids = read_manifest(args.train_manifest)
     val_ids = read_manifest(args.val_manifest)
+    feature_origins: dict[Path, Path] = {}
+    if args.checkpoint_dir is not None:
+        for root, chain_ids in ((args.features_dir, train_ids), (args.val_features_dir or args.features_dir, val_ids)):
+            for chain_id in chain_ids:
+                origin = chain_npz_path(root, chain_id).absolute()
+                resolved = origin.resolve(strict=True)
+                feature_origins[origin] = resolved
+                snapshots[resolved] = _sha256_file(resolved)
+    upstream_binding = hashlib.sha256(json.dumps(
+        [{"path": str(path), "sha256": digest} for path, digest in sorted(snapshots.items())], sort_keys=True,
+    ).encode()).hexdigest()
     args.out_dir.mkdir(parents=True, exist_ok=True)
     depth_bin_edges = _parse_depth_bin_edges(str(args.depth_bin_edges))
     raw_msa_names = _resolve_msa_names(args.raw_msa_name, args.raw_msa_names)
@@ -955,6 +1084,11 @@ def main() -> None:
             val_features_dir=args.val_features_dir,
             source_targets_only=True,
             exhaustive=bool(args.exhaustive),
+            checkpoint_dir=args.checkpoint_dir,
+            source_batch_size=args.source_batch_size, query_batch_size=args.query_batch_size,
+            reserve_disk_bytes=args.search_disk_reserve_gib * 1024**3,
+            max_rss_bytes=args.search_max_rss_gib * 1024**3,
+            input_binding_sha256=upstream_binding,
         )
         summary["mmseqs_homology"] = run_mmseqs_homology(
             train_ids=train_ids,
@@ -970,6 +1104,11 @@ def main() -> None:
             include_identifiers=bool(args.include_identifiers_in_mmseqs),
             val_features_dir=args.val_features_dir,
             exhaustive=bool(args.exhaustive),
+            checkpoint_dir=args.checkpoint_dir,
+            source_batch_size=args.source_batch_size, query_batch_size=args.query_batch_size,
+            reserve_disk_bytes=args.search_disk_reserve_gib * 1024**3,
+            max_rss_bytes=args.search_max_rss_gib * 1024**3,
+            input_binding_sha256=upstream_binding,
         )
     failures = strict_failures(summary)
     summary["validation"] = {
@@ -990,7 +1129,10 @@ def main() -> None:
     }
     if not args.run_mmseqs:
         summary["validation"]["homology_scope"] = "MMseqs homology was not checked; --run-mmseqs was not requested."
-    (args.out_dir / "msa_split_audit_summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+    if any(origin.resolve(strict=True) != resolved for origin, resolved in feature_origins.items()):
+        raise ValueError("MSA audit feature path changed during scanning or search")
+    _assert_inputs_unchanged(snapshots)
+    _write_json_atomic(args.out_dir / "msa_split_audit_summary.json", summary)
     print(f"Wrote MSA split audit to {args.out_dir}")
     if args.strict and failures:
         raise SystemExit("MSA split audit failed: " + "; ".join(failures))

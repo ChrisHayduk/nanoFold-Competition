@@ -89,10 +89,11 @@ def test_staging_runs_real_builders_and_verifier_without_changing_release(tmp_pa
         staging.stage_candidate(args)
 
 
-def test_full_coverage_staging_with_real_homology_graph_and_extra_train_target(tmp_path: Path) -> None:
+@pytest.mark.parametrize("policy", ["cath-v3", "cath-v4"])
+def test_full_coverage_staging_with_real_homology_graph_and_extra_train_target(tmp_path: Path, policy: str) -> None:
     from scripts import build_homology_groups as graph
 
-    args = staging.parse_args([*_inputs(tmp_path), "--sampling-policy", "cath-v3",
+    args = staging.parse_args([*_inputs(tmp_path), "--sampling-policy", policy,
                                "--mmseqs-bin", _mmseqs_binary()])
     cache = json.loads(args.chain_data_cache.read_text())
     template = cache["0000_A"]["seq"]
@@ -104,6 +105,10 @@ def test_full_coverage_staging_with_real_homology_graph_and_extra_train_target(t
     source_lock = json.loads(args.metadata_source_lock.read_text())
     source_lock["chain_data_cache"]["sha256"] = staging._sha256(args.chain_data_cache)
     args.metadata_source_lock.write_text(json.dumps(source_lock))
+    if policy == "cath-v4":
+        args.cluster_tsv.write_text("".join(
+            f"{'0000_A' if chain == '0001_A' else chain}\t{chain}\n" for chain in cache
+        ))
     metadata = tmp_path / "graph-metadata.json"
     subprocess.run([
         sys.executable, str(staging.SCRIPT_DIR / "build_structure_metadata.py"),
@@ -121,17 +126,62 @@ def test_full_coverage_staging_with_real_homology_graph_and_extra_train_target(t
     ]))
     args.split_group_receipt = receipt
     args.split_group_tsv = receipt.parent / "split-groups.tsv"
+    group_map = graph.load_map(args.split_group_tsv, set(cache), canonical=True)
+    rejected_ids: set[str] = set()
+    if policy == "cath-v4":
+        from representative_eligibility_helpers import source_backed_eligibility_fixture
+
+        from scripts import build_manifests as sampler
+        from scripts import build_representative_eligibility as qualification
+
+        accepted, annotations = sampler._load_structure_metadata(str(metadata), require_schema_version=2)
+        candidates, _, _ = sampler._build_candidates(
+            cache, min_len=40, max_len=256, max_resolution=3.0, structure_metadata=annotations,
+            structure_metadata_accepted=accepted, sampling_policy=policy, require_monomer=True,
+        )
+        cluster_map = sampler._load_cluster_tsv(str(args.cluster_tsv), set(cache))
+        units = {unit: [member.chain_id for member in ranked]
+                 for unit, ranked in sampler._original_unit_memberships(candidates, cluster_map, seed=0).items()}
+        replaced = next(ranked[0] for ranked in units.values() if len(ranked) == 2)
+        rejected_ids = {replaced, "0007_A"}
+        fixture = source_backed_eligibility_fixture(
+            tmp_path / "qualified-sources", cache_path=args.chain_data_cache, metadata_path=metadata,
+            groups_path=args.split_group_tsv, graph_receipt_path=receipt,
+            sequences={chain: value["seq"] for chain, value in cache.items()}, cluster_map=cluster_map,
+            group_map=group_map, original_units=units, observed={chain: 10 for chain in rejected_ids},
+            excluded_groups=[group_map["0007_A"]],
+        )
+        args.approved_group_exclusions = fixture["catalog_path"]
+        args.representative_eligibility_receipt = tmp_path / "generated-eligibility.json"
+        qualification.run(qualification.parse_args([
+            "--chain-data-cache", str(args.chain_data_cache), "--structure-metadata", str(metadata),
+            "--cluster-tsv", str(args.cluster_tsv), "--split-group-tsv", str(args.split_group_tsv),
+            "--split-group-receipt", str(receipt), "--approved-group-exclusions", str(fixture["catalog_path"]),
+            "--historical-retrieval-receipt", str(fixture["retrieval"]), "--raw-root", str(fixture["raw_root"]),
+            "--require-monomer", "--output", str(args.representative_eligibility_receipt),
+        ]))
     status = json.loads(staging.stage_candidate(args).read_text())
     assert status["status"] == "manifests_verified"
     assert status["target_sequences_audited"] is True
-    assert status["all_group_coverage_verified"] is True
-    assert status["group_coverage"]["complete_group_count"] == 9
-    assert status["group_coverage"]["covered_group_count"] == 9
-    assert status["group_coverage"]["split_group_counts"] == {"train": 5, "val": 2, "hidden_val": 2}
+    if policy == "cath-v3":
+        assert status["all_group_coverage_verified"] is True
+        assert status["group_coverage"]["complete_group_count"] == 9
+        assert status["group_coverage"]["covered_group_count"] == 9
+        assert status["group_coverage"]["split_group_counts"] == {"train": 5, "val": 2, "hidden_val": 2}
+    else:
+        assert "all_group_coverage_verified" not in status
+        assert status["retained_group_coverage_verified"] is True
+        assert status["group_coverage"]["original_group_count"] == 9
+        assert status["group_coverage"]["approved_excluded_group_count"] == 1
+        assert status["group_coverage"]["covered_group_count"] == 8
+        assert status["group_coverage"]["split_group_counts"] == {"train": 4, "val": 2, "hidden_val": 2}
+        selected = set((args.stage_dir / "public/all.txt").read_text().splitlines())
+        selected.update((args.stage_dir / "hidden/hidden_val.txt").read_text().splitlines())
+        assert not selected & rejected_ids
+        assert {group_map[chain] for chain in selected} == set(group_map.values()) - {group_map["0007_A"]}
     assert len((args.stage_dir / "public/train.txt").read_text().splitlines()) == 6
-    group_map = graph.load_map(args.split_group_tsv, set(cache), canonical=True)
     train = (args.stage_dir / "public/train.txt").read_text().splitlines()
-    assert sum(group_map[chain] == group_map["0000_A"] for chain in train) == 2
+    assert sum(group_map[chain] == group_map["0000_A"] for chain in train) == (2 if policy == "cath-v3" else 3)
 
 
 def test_cluster_disjoint_but_related_targets_fail_staging_and_retain_both_audits(tmp_path: Path) -> None:
@@ -202,6 +252,65 @@ def test_full_coverage_receipt_requires_every_locked_group(tmp_path: Path, mutat
         coverage["split_group_counts"] = {"train": 5, "val": 2, "hidden_val": True}
     with pytest.raises(ValueError, match="cover every locked group"):
         staging._validate_group_coverage({"group_coverage": coverage}, lock, args)
+
+
+@pytest.mark.parametrize("mutation", [
+    "omitted_group", "original_relabelled", "extra_exclusion", "wrong_owner_count", "false_coverage",
+    "boolean_count", "changed_population", "original_units_lost", "claims_original_coverage",
+])
+def test_retained_coverage_keeps_original_population_and_exact_exclusions(tmp_path: Path, mutation: str) -> None:
+    args = staging.parse_args([*_inputs(tmp_path), "--sampling-policy", "cath-v4"])
+    groups = {
+        "group_count": 10, "retained_group_count": 9, "approved_excluded_group_count": 1,
+        "original_unit_count": 13, "selection_unit_count": 12, "selection_unit_ids_sha256": "0" * 64,
+    }
+    coverage = {
+        "required": "all_retained_groups", "retained_group_coverage_verified": True,
+        "original_group_count": 10, "approved_excluded_group_count": 1,
+        "retained_group_count": 9, "covered_group_count": 9, "original_unit_count": 13,
+        "selection_unit_count": 12, "selection_unit_ids_sha256": "0" * 64,
+        "split_group_counts": {"train": 5, "val": 2, "hidden_val": 2},
+    }
+    lock = {"split_groups": groups}
+    staging._validate_group_coverage({"group_coverage": coverage}, lock, args)
+    if mutation == "omitted_group":
+        coverage["covered_group_count"] = 8
+    elif mutation == "original_relabelled":
+        groups["group_count"] = 9
+        coverage["original_group_count"] = 9
+    elif mutation == "extra_exclusion":
+        coverage["approved_excluded_group_count"] = 2
+    elif mutation == "wrong_owner_count":
+        coverage["split_group_counts"] = {"train": 6, "val": 2, "hidden_val": 1}
+    elif mutation == "false_coverage":
+        coverage["retained_group_coverage_verified"] = 1
+    elif mutation == "boolean_count":
+        groups["approved_excluded_group_count"] = True
+    elif mutation == "changed_population":
+        coverage["selection_unit_ids_sha256"] = "1" * 64
+    elif mutation == "original_units_lost":
+        groups["original_unit_count"] = 11
+        coverage["original_unit_count"] = 11
+    else:
+        coverage["all_group_coverage_verified"] = True
+    with pytest.raises(ValueError, match="cath-v4"):
+        staging._validate_group_coverage({"group_coverage": coverage}, lock, args)
+
+
+def test_source_qualification_inputs_are_mandatory_and_cannot_downgrade(tmp_path: Path) -> None:
+    args = staging.parse_args([*_inputs(tmp_path), "--sampling-policy", "cath-v4"])
+    args.split_group_tsv = args.cluster_tsv
+    args.split_group_receipt = args.metadata_source_lock
+    for supplied in (None, args.chain_data_cache):
+        args.representative_eligibility_receipt = supplied
+        with pytest.raises(ValueError, match="requires --representative-eligibility-receipt"):
+            staging.stage_candidate(args)
+        assert not args.stage_dir.exists()
+    args.approved_group_exclusions = args.feature_exclusion_list
+    args.sampling_policy = "cath-v3"
+    with pytest.raises(ValueError, match="require cath-v4"):
+        staging.stage_candidate(args)
+    assert not args.stage_dir.exists()
 
 
 def test_inputs_changed_after_audit_cannot_receive_verified_receipt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

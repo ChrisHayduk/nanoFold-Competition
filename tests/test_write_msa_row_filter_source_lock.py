@@ -5,6 +5,8 @@ import importlib.util
 import json
 from pathlib import Path
 
+import pytest
+
 
 def _load_lock_module():
     script_path = Path(__file__).resolve().parents[1] / "scripts" / "write_msa_row_filter_source_lock.py"
@@ -245,3 +247,68 @@ def test_source_lock_rejects_search_inventory_as_a_completed_filter(tmp_path: Pa
     _write_json(inventory, {"schema_version": 1, "inventory_type": "msa_search_inventory"})
     with pytest.raises(ValueError, match="inventory is not a row filter"):
         _load_lock_module().build_source_lock(row_filter_path=inventory, processed_filter_audit_paths=[])
+
+
+def _write_batched_filter(path: Path) -> dict:
+    _write_filter(path)
+    payload = json.loads(path.read_text())
+    payload.update(search_contract="mmseqs-local-all-pairs-v1", exhaustive=True,
+                   input_binding={"batch_receipt_sha256": "c" * 64})
+    payload["mmseqs"].update(command=[], possible_pair_count=100, batching={
+        "schema_version": 1, "status": "complete", "source_batch_size": 20, "query_batch_size": 1,
+        "source_partition_count": 3, "query_partition_count": 2, "batch_count": 6,
+        "source_count": 50, "query_count": 2, "alignments_calculated": 80,
+        "receipt_path": "/private/checkpoints/search/receipt.json", "receipt_sha256": "c" * 64,
+    })
+    _write_json(path, payload)
+    return payload
+
+
+def test_batched_source_lock_retains_only_public_aggregates_and_redacted_bindings(tmp_path: Path) -> None:
+    module = _load_lock_module()
+    row_filter = tmp_path / "filter.json"
+    payload = _write_batched_filter(row_filter)
+    public = module.build_source_lock(row_filter_path=row_filter, processed_filter_audit_paths=[])
+    summary = public["msa_row_filter"]
+    expected = dict(payload["mmseqs"]["batching"])
+    expected.pop("receipt_path")
+    expected["receipt_sha256"] = "<private>"
+    assert summary["mmseqs"]["batching"] == expected
+    assert summary["input_binding"]["batch_receipt_sha256"] == "<private>"
+    assert summary["mmseqs"]["command"] == []
+    assert "/private/checkpoints" not in json.dumps(public)
+    assert "c" * 64 not in json.dumps(public)
+    sealed = module.build_source_lock(row_filter_path=row_filter, processed_filter_audit_paths=[], include_private_paths=True)
+    assert sealed["msa_row_filter"]["mmseqs"]["batching"] == payload["mmseqs"]["batching"]
+    assert sealed["msa_row_filter"]["input_binding"]["batch_receipt_sha256"] == "c" * 64
+
+
+@pytest.mark.parametrize("corruption", [
+    "incomplete", "unbound", "unknown_jobs", "partial_grid", "mismatched_sources", "boolean_count",
+    "bad_receipt", "single_result", "orphan_receipt",
+])
+def test_batched_source_lock_rejects_incomplete_or_inconsistent_receipts(tmp_path: Path, corruption: str) -> None:
+    row_filter = tmp_path / "filter.json"
+    payload = _write_batched_filter(row_filter)
+    batching = payload["mmseqs"]["batching"]
+    if corruption == "incomplete":
+        batching["status"] = "running"
+    elif corruption == "unbound":
+        payload["input_binding"]["batch_receipt_sha256"] = "d" * 64
+    elif corruption == "unknown_jobs":
+        batching["jobs"] = []
+    elif corruption == "partial_grid":
+        batching["batch_count"] = 5
+    elif corruption == "mismatched_sources":
+        batching["source_count"] = 49
+    elif corruption == "boolean_count":
+        batching["query_batch_size"] = True
+    elif corruption == "bad_receipt":
+        batching["receipt_sha256"] = "invalid"
+    elif corruption == "single_result":
+        payload["input_binding"]["m8_sha256"] = "e" * 64
+    else:
+        del payload["mmseqs"]["batching"]
+    _write_json(row_filter, payload)
+    with pytest.raises(ValueError, match="MSA batching|MSA batch receipt"):
+        _load_lock_module().build_source_lock(row_filter_path=row_filter, processed_filter_audit_paths=[])

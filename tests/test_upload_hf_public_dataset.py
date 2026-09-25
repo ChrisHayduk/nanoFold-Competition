@@ -407,7 +407,9 @@ def test_main_revalidates_before_any_network_write(public_inputs: Namespace, mon
     assert hub.api.calls == []
 
 
-def _attach_public_filter_summary(args: Namespace, tmp_path: Path, *, exhaustive: bool | None = None) -> Path:
+def _attach_public_filter_summary(
+    args: Namespace, tmp_path: Path, *, exhaustive: bool | None = None, bounded: bool = False,
+) -> Path:
     raw_filter = tmp_path / "row_filter.json"
     payload: dict[str, Any] = {
         "source": {"manifests": [], "stats": {}}, "heldout": {"manifests": []}, "mmseqs": {},
@@ -436,6 +438,17 @@ def _attach_public_filter_summary(args: Namespace, tmp_path: Path, *, exhaustive
                        "max_seqs": 100},
         })
         payload["source"].update(complete=True, minimum_non_query_sequence_length=20)
+    if bounded:
+        assert exhaustive is True
+        payload["source"]["stats"]["unique_non_query_rows"] = 10
+        payload["heldout"]["unique_target_sequence_count"] = 4
+        payload["input_binding"]["batch_receipt_sha256"] = "d" * 64
+        payload["mmseqs"].update(command=[], possible_pair_count=40, hit_count=7, batching={
+            "schema_version": 1, "status": "complete", "source_batch_size": 3, "query_batch_size": 3,
+            "source_partition_count": 4, "query_partition_count": 2, "batch_count": 8,
+            "source_count": 10, "query_count": 4, "alignments_calculated": 30,
+            "receipt_path": "/private/checkpoint/receipt.json", "receipt_sha256": "d" * 64,
+        })
     raw_filter.write_text(json.dumps(payload))
     digest = sha256_file(raw_filter)
     for chain in exporter.read_manifest(args.all_manifest):
@@ -538,5 +551,97 @@ def test_new_filter_fields_cannot_expand_public_disclosure(
     path.write_text(json.dumps(summary))
     monkeypatch.setattr(exporter, "parse_args", lambda: public_inputs)
     monkeypatch.setattr(exporter, "_require_hf_modules", lambda: pytest.fail("Unsafe metadata reached HF"))
+    with pytest.raises(ValueError):
+        exporter.main()
+
+
+def test_batched_filter_summary_is_redacted_and_bound_to_exported_features(public_inputs: Namespace, tmp_path: Path) -> None:
+    path = _attach_public_filter_summary(public_inputs, tmp_path, exhaustive=True, bounded=True)
+    validated = exporter._validate_public_inputs(public_inputs)
+    assert validated.auxiliary_files["metadata/msa_row_filter_source_lock_public_safe.json"] == path.read_bytes()
+    summary = json.loads(path.read_text())["msa_row_filter"]
+    assert summary["mmseqs"]["batching"]["batch_count"] == 8
+    assert summary["mmseqs"]["batching"]["receipt_sha256"] == "<private>"
+    assert summary["input_binding"]["batch_receipt_sha256"] == "<private>"
+    assert summary["mmseqs"]["command"] == []
+    assert "receipt_path" not in summary["mmseqs"]["batching"]
+    assert "/private/checkpoint" not in path.read_text()
+    assert "d" * 64 not in path.read_text()
+
+
+@pytest.mark.parametrize("corruption", [
+    "receipt_digest", "binding_digest", "receipt_path", "checkpoint_id", "jobs", "per_job_fasta",
+    "incomplete", "missing_field", "boolean_schema", "boolean_count", "zero_batch_size", "negative_count",
+    "wrong_partition", "partial_grid", "source_count", "query_count", "possible_pairs", "excess_alignments",
+    "excess_hits", "missing_binding", "single_result", "single_command", "orphan_receipt", "misplaced_batching",
+    "empty_sources", "empty_queries",
+])
+def test_batched_filter_summary_rejects_private_or_inconsistent_metadata_before_hf(
+    public_inputs: Namespace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, corruption: str,
+) -> None:
+    path = _attach_public_filter_summary(public_inputs, tmp_path, exhaustive=True, bounded=True)
+    summary = json.loads(path.read_text())
+    row_filter = summary["msa_row_filter"]
+    mmseqs = row_filter["mmseqs"]
+    batching = mmseqs["batching"]
+    if corruption == "receipt_digest":
+        batching["receipt_sha256"] = "d" * 64
+    elif corruption == "binding_digest":
+        row_filter["input_binding"]["batch_receipt_sha256"] = "d" * 64
+    elif corruption == "receipt_path":
+        batching["receipt_path"] = "leaderboard/receipt.json"
+    elif corruption == "checkpoint_id":
+        batching["checkpoint_id"] = "otherwise-harmless-identifier"
+    elif corruption == "jobs":
+        batching["jobs"] = []
+    elif corruption == "per_job_fasta":
+        batching["source_fasta_sha256"] = "a" * 64
+    elif corruption == "incomplete":
+        batching["status"] = "running"
+    elif corruption == "missing_field":
+        del batching["batch_count"]
+    elif corruption == "boolean_schema":
+        batching["schema_version"] = True
+    elif corruption == "boolean_count":
+        batching["query_partition_count"] = True
+    elif corruption == "zero_batch_size":
+        batching["source_batch_size"] = 0
+    elif corruption == "negative_count":
+        batching["alignments_calculated"] = -1
+    elif corruption == "wrong_partition":
+        batching["source_partition_count"] = 3
+    elif corruption == "partial_grid":
+        batching["batch_count"] = 7
+    elif corruption == "source_count":
+        batching["source_count"] = 11
+    elif corruption == "query_count":
+        batching["query_count"] = 5
+    elif corruption == "possible_pairs":
+        mmseqs["possible_pair_count"] = 39
+    elif corruption == "excess_alignments":
+        batching["alignments_calculated"] = 41
+    elif corruption == "excess_hits":
+        mmseqs["hit_count"] = 31
+    elif corruption == "missing_binding":
+        del row_filter["input_binding"]["batch_receipt_sha256"]
+    elif corruption == "single_result":
+        row_filter["input_binding"]["m8_sha256"] = "<private>"
+    elif corruption == "single_command":
+        mmseqs["command"] = ["mmseqs", "easy-search", "<heldout_targets.fasta>", "<source_msa_rows.fasta>", "<output.m8>", "<tmp_dir>"]
+    elif corruption == "orphan_receipt":
+        del mmseqs["batching"]
+    elif corruption in {"empty_sources", "empty_queries"}:
+        role = "source" if corruption == "empty_sources" else "query"
+        batching.update({f"{role}_count": 0, f"{role}_partition_count": 0, "batch_count": 0, "alignments_calculated": 0})
+        mmseqs.update(possible_pair_count=0, hit_count=0)
+        if role == "source":
+            row_filter["source"]["stats"]["unique_non_query_rows"] = 0
+        else:
+            row_filter["heldout"]["unique_target_sequence_count"] = 0
+    else:
+        summary["validation"]["batching"] = mmseqs.pop("batching")
+    path.write_text(json.dumps(summary))
+    monkeypatch.setattr(exporter, "parse_args", lambda: public_inputs)
+    monkeypatch.setattr(exporter, "_require_hf_modules", lambda: pytest.fail("Unsafe batch metadata reached HF"))
     with pytest.raises(ValueError):
         exporter.main()

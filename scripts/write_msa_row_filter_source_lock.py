@@ -5,6 +5,8 @@ hash. This helper produces a small, public-safe summary that records the
 thresholds, source manifests, MMseqs settings, row-filter hash, and aggregate
 processed-feature filtering counts without copying raw sequences, excluded hash
 lists, hidden chain IDs, or private paths into the summary by default.
+Completed bounded searches retain validated aggregate counts while batch receipt
+paths and hashes remain private.
 """
 
 from __future__ import annotations
@@ -13,8 +15,15 @@ import argparse
 import hashlib
 import json
 import math
+import sys
 from pathlib import Path
 from typing import Any, Sequence
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from nanofold.msa_filter_summary import validate_batching_summary
 
 PUBLIC_PATHS = frozenset({
     "data/manifests/train.txt", "data/manifests/val.txt", "data/manifests/all.txt",
@@ -161,7 +170,7 @@ def _safe_input_binding(value: Any, *, include_private_paths: bool) -> dict[str,
     if not isinstance(value, dict):
         raise ValueError("Row-filter input binding must be an object")
     result = {}
-    for field in ("source_fasta_sha256", "heldout_fasta_sha256", "m8_sha256",
+    for field in ("source_fasta_sha256", "heldout_fasta_sha256", "m8_sha256", "batch_receipt_sha256",
                   "source_sequence_set_sha256", "heldout_sequence_set_sha256", "source_asset_manifest_sha256"):
         if field not in value:
             continue
@@ -193,8 +202,9 @@ def _summarize_row_filter(filter_path: Path, *, include_private_paths: bool) -> 
     source_stats = source.get("stats", {})
     if not isinstance(source_stats, dict):
         raise ValueError("Row filter source stats must be an object.")
+    validate_batching_summary(payload, public_safe=False)
 
-    return {
+    summary: dict[str, Any] = {
         "path": _safe_path(str(filter_path), include_private_paths=include_private_paths),
         "sha256": _sha256_file(filter_path),
         "filter_type": payload.get("filter_type"),
@@ -238,6 +248,13 @@ def _summarize_row_filter(filter_path: Path, *, include_private_paths: bool) -> 
             "sha256": chain_data_cache.get("sha256"),
         },
     }
+    if "batching" in mmseqs:
+        batching = dict(mmseqs["batching"])
+        if not include_private_paths:
+            batching.pop("receipt_path")
+            batching["receipt_sha256"] = "<private>"
+        summary["mmseqs"]["batching"] = batching
+    return summary
 
 
 def _summarize_processed_audit(path: Path, *, include_private_paths: bool) -> dict[str, Any]:

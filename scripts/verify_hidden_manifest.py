@@ -16,6 +16,7 @@ from build_hidden_manifest import (  # noqa: E402
     _assert_public_manifests,
     _componentize,
     _load_lock_args,
+    _load_representative_eligibility,
     _load_split_group_map,
     _read_manifest,
     _read_optional_chain_list,
@@ -28,8 +29,10 @@ from build_hidden_manifest import (  # noqa: E402
 from build_manifests import (  # noqa: E402
     CATH_SAMPLING_POLICIES,
     DEFAULT_STRATIFY_FIELDS,
+    GROUP_SAMPLING_POLICIES,
     GROUP_SAMPLING_POLICY,
     LEGACY_STRATIFY_FIELDS,
+    PROCESSABLE_GROUP_SAMPLING_POLICY,
     SAMPLING_POLICY,
     _assert_quality_report,
     _atomic_write,
@@ -52,7 +55,8 @@ def parse_args() -> argparse.Namespace:
             "Verify that maintainer-only hidden validation is disjoint from the fixed public "
             "manifests and respects structural stratification gates. For CATH sampling policies, replay public and "
             "hidden selection against the locked candidate universe, sizes, seed, and private salt digest."
-            " cath-v3 additionally requires complete full-group coverage and disjoint group ownership."
+            " cath-v3 requires complete full-group coverage. cath-v4 requires source-qualified representatives "
+            "and coverage of every group outside the approved exclusion catalogue; both require disjoint group ownership."
         )
     )
     parser.add_argument(
@@ -73,9 +77,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--structure-metadata", type=Path, default=None)
     parser.add_argument("--cluster-tsv", type=Path, default=None)
     parser.add_argument("--split-group-tsv", type=Path, default=None,
-                        help="Relocated cath-v3 group assignments; bytes must match the source lock.")
+                        help="Relocated cath-v3/cath-v4 group assignments; bytes must match the source lock.")
     parser.add_argument("--split-group-receipt", type=Path, default=None,
-                        help="Relocated cath-v3 group-construction receipt; bytes must match the source lock.")
+                        help="Relocated cath-v3/cath-v4 group-construction receipt; bytes must match the source lock.")
+    parser.add_argument("--representative-eligibility-receipt", type=Path, default=None,
+                        help="Relocated cath-v4 representative qualification receipt; bytes must match the source lock.")
+    parser.add_argument("--approved-group-exclusions", type=Path, default=None,
+                        help="Relocated cath-v4 approved whole-group exclusion catalogue; bytes must match the source lock.")
     parser.add_argument("--mmseqs-bin", type=str, default=None)
     parser.add_argument(
         "--private-processability-exclusion-list", type=Path, default=None,
@@ -111,10 +119,14 @@ def _validate_private_lock(
     check(private_lock, "chain_data_cache_sha256", cache_sha)
     check(private_lock, "sampling_policy", sampling_policy, mandatory=required)
     check(private_lock, "source_lock_sha256", _sha256(args.lock_file), mandatory=required)
-    if sampling_policy == GROUP_SAMPLING_POLICY:
+    if sampling_policy in GROUP_SAMPLING_POLICIES:
         public_groups = json.loads(args.lock_file.read_text()).get("split_groups")
         if not isinstance(public_groups, dict) or private_lock.get("split_groups") != public_groups:
             raise ValueError("Private hidden manifest lock split-group provenance does not match the public source lock.")
+    if sampling_policy == PROCESSABLE_GROUP_SAMPLING_POLICY:
+        eligibility = json.loads(args.lock_file.read_text()).get("representative_eligibility")
+        if not isinstance(eligibility, dict) or private_lock.get("representative_eligibility") != eligibility:
+            raise ValueError("Private hidden manifest lock representative eligibility provenance does not match the public source lock.")
     contract = private_lock.get("public_contract", {})
     if not isinstance(contract, dict):
         raise ValueError("Private hidden manifest lock public_contract must be an object.")
@@ -139,6 +151,8 @@ def _validate_private_lock(
     permitted = {"eligible_disjoint_units", "public_train_plus_public_val"} if required else {
         "selected_chains", "public_train_plus_public_val",
     }
+    if sampling_policy == PROCESSABLE_GROUP_SAMPLING_POLICY:
+        permitted = {"source_validated_disjoint_units"}
     if reference not in permitted:
         raise ValueError("Private hidden manifest lock has an unsupported stratification reference.")
     if sampling_policy == GROUP_SAMPLING_POLICY and reference != "eligible_disjoint_units":
@@ -203,10 +217,15 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
                   args.public_val_manifest, args.public_all_manifest, args.hidden_manifest, structure_metadata_path]
         if cluster_tsv:
             inputs.append(Path(cluster_tsv))
-        if lock_args.sampling_policy == GROUP_SAMPLING_POLICY:
+        if lock_args.sampling_policy in GROUP_SAMPLING_POLICIES:
             inputs.extend([
                 getattr(args, "split_group_tsv", None) or Path(lock_args.split_group_tsv),
                 getattr(args, "split_group_receipt", None) or Path(lock_args.split_group_receipt),
+            ])
+        if lock_args.sampling_policy == PROCESSABLE_GROUP_SAMPLING_POLICY:
+            inputs.extend([
+                getattr(args, "representative_eligibility_receipt", None) or Path(lock_args.representative_eligibility_receipt),
+                getattr(args, "approved_group_exclusions", None) or Path(lock_args.approved_group_exclusions),
             ])
         private_record = _load_private_lock(args.private_lock_file)
         filtering = private_record.get("filtering", {})
@@ -332,12 +351,23 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
     )
     private_exclusions = _validate_private_exclusions(
         private_lock, override_path=getattr(args, "private_processability_exclusion_list", None),
-        required=lock_args.sampling_policy == GROUP_SAMPLING_POLICY or (
+        required=lock_args.sampling_policy in GROUP_SAMPLING_POLICIES or (
             lock_args.sampling_policy == SAMPLING_POLICY and reference_population == "public_train_plus_public_val"
         ),
     )
     _fail_if_nonempty("Public/private processability exclusion", public_ids & private_exclusions)
     components = _componentize(clustered_candidates, cluster_map, seed=lock_args.seed)
+    eligibility = _load_representative_eligibility(
+        args, lock_args, clustered_candidates, cluster_map=cluster_map, split_group_map=split_group_map,
+        structure_metadata_path=structure_metadata_path,
+    )
+    if report_path is not None and eligibility is not None:
+        for source_path in eligibility["validated_source_paths"]:
+            path = Path(source_path)
+            if report_path.resolve() == path.resolve() or (
+                report_path.exists() and path.exists() and report_path.samefile(path)
+            ):
+                raise ValueError("Verification report output must not alias an audited eligibility source.")
     split_by_id = {chain_id: name for name, ids in splits.items() for chain_id in ids}
     shared_components = 0
     repeated_units = 0
@@ -356,9 +386,10 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
         raise RuntimeError(f"Hidden split touches {excluded_hidden_components} privately excluded connected components.")
     group_coverage = None
     if split_group_map is not None:
-        group_coverage = _validate_group_selection(components, split_group_map, splits, private_exclusions)
+        group_coverage = _validate_group_selection(components, split_group_map, splits, private_exclusions, eligibility=eligibility)
     fixed_hidden_groups = _validate_public_sampling_contract(
         args.lock_file, lock_args, components, train_ids, val_ids, split_group_map=split_group_map,
+        eligibility=eligibility,
     )
     if lock_args.sampling_policy in CATH_SAMPLING_POLICIES:
         digest = private_lock.get("hidden_split_salt_sha256")
@@ -385,6 +416,10 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
     reference_candidates = None
     if reference_population == "eligible_disjoint_units":
         reference_candidates = [component.representative for component in components]
+    elif reference_population == "source_validated_disjoint_units":
+        if eligibility is None:
+            raise ValueError("Source-validated quality reference requires the complete qualification receipt.")
+        reference_candidates = [candidate_by_id[chain] for chain in eligibility["selected_chain_by_original_unit"].values() if chain is not None]
     elif reference_population == "public_train_plus_public_val":
         reference_candidates = [candidate_by_id[chain_id] for chain_id in train_ids + val_ids]
     stratify_fields = DEFAULT_STRATIFY_FIELDS if lock_args.sampling_policy in CATH_SAMPLING_POLICIES else LEGACY_STRATIFY_FIELDS

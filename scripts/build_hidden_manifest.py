@@ -18,7 +18,8 @@ from build_manifests import (  # noqa: E402
     CATH_SAMPLING_POLICIES,
     DEFAULT_STRATIFY_FIELDS,
     GROUP_ALLOCATOR_POLICY,
-    GROUP_SAMPLING_POLICY,
+    GROUP_SAMPLING_POLICIES,
+    PROCESSABLE_GROUP_SAMPLING_POLICY,
     Candidate,
     _allocate_hierarchical,
     _assert_quality_report,
@@ -33,7 +34,9 @@ from build_manifests import (  # noqa: E402
     _load_cluster_tsv,
     _load_structure_metadata,
     _mmseqs_version,
+    _original_unit_memberships,
     _plan_group_splits,
+    _qualified_group_sampling_units,
     _read_hidden_split_salt,
     _salt_digest,
     _sample_hidden_groups,
@@ -66,6 +69,8 @@ class SplitArgs:
     val_size: int = 1
     split_group_tsv: str = ""
     split_group_receipt: str = ""
+    representative_eligibility_receipt: str = ""
+    approved_group_exclusions: str = ""
 
 
 @dataclass(frozen=True)
@@ -114,9 +119,13 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--structure-metadata", type=Path, default=None)
     ap.add_argument("--cluster-tsv", type=Path, default=None)
     ap.add_argument("--split-group-tsv", type=Path, default=None,
-                    help="Relocated cath-v3 full-universe group assignments; bytes must match the source lock.")
+                    help="Relocated cath-v3/cath-v4 full-universe group assignments; bytes must match the source lock.")
     ap.add_argument("--split-group-receipt", type=Path, default=None,
-                    help="Relocated cath-v3 group-construction receipt; bytes must match the source lock.")
+                    help="Relocated cath-v3/cath-v4 group-construction receipt; bytes must match the source lock.")
+    ap.add_argument("--representative-eligibility-receipt", type=Path, default=None,
+                    help="Relocated cath-v4 representative qualification receipt; bytes must match the source lock.")
+    ap.add_argument("--approved-group-exclusions", type=Path, default=None,
+                    help="Relocated cath-v4 approved whole-group exclusion catalogue; bytes must match the source lock.")
     ap.add_argument("--mmseqs-bin", type=str, default=None)
     ap.add_argument("--seed", type=int, default=None)
     return ap.parse_args()
@@ -173,10 +182,14 @@ def _load_lock_args(path: Path) -> SplitArgs:
                 raise ValueError(f"Manifest lock missing args.{key}: {path}")
         if args["stratify_fields"] != list(DEFAULT_STRATIFY_FIELDS):
             raise ValueError("Manifest lock args.stratify_fields disagrees with CATH sampling policy.")
-    if sampling_policy == GROUP_SAMPLING_POLICY:
+    if sampling_policy in GROUP_SAMPLING_POLICIES:
         for key in ("split_group_tsv", "split_group_receipt"):
             if not isinstance(args.get(key), str) or not args[key].strip():
-                raise ValueError(f"Manifest lock missing args.{key} for cath-v3.")
+                raise ValueError(f"Manifest lock missing args.{key} for {sampling_policy}.")
+    if sampling_policy == PROCESSABLE_GROUP_SAMPLING_POLICY:
+        for key in ("representative_eligibility_receipt", "approved_group_exclusions"):
+            if not isinstance(args.get(key), str) or not args[key].strip():
+                raise ValueError(f"Manifest lock missing args.{key} for cath-v4.")
     _validate_generation_args(argparse.Namespace(**{**args, "require_monomer": args.get("require_monomer", False)}))
     expected_sha = str(raw.get("chain_data_cache_sha256") or args.get("expected_chain_cache_sha256") or "")
     if sampling_policy in CATH_SAMPLING_POLICIES:
@@ -205,13 +218,15 @@ def _load_lock_args(path: Path) -> SplitArgs:
         val_size=int(args.get("val_size", 1)),
         split_group_tsv=str(args.get("split_group_tsv") or ""),
         split_group_receipt=str(args.get("split_group_receipt") or ""),
+        representative_eligibility_receipt=str(args.get("representative_eligibility_receipt") or ""),
+        approved_group_exclusions=str(args.get("approved_group_exclusions") or ""),
     )
 
 
 def _validate_public_sampling_contract(
     lock_path: Path, lock_args: SplitArgs, components: list[DisjointComponent],
     train_ids: list[str], val_ids: list[str],
-    *, split_group_map: dict[str, str] | None = None,
+    *, split_group_map: dict[str, str] | None = None, eligibility: dict[str, Any] | None = None,
 ) -> list[list[Candidate]] | None:
     """Replay public selection so a lock cannot silently describe another sampling run."""
     if lock_args.sampling_policy not in CATH_SAMPLING_POLICIES:
@@ -226,6 +241,11 @@ def _validate_public_sampling_contract(
         "target_policy": "known_monomer" if lock_args.require_monomer else "single_chain",
         "representative_policy": "best_resolution_then_longest_then_release_date_seeded_tie",
     }
+    if lock_args.sampling_policy == PROCESSABLE_GROUP_SAMPLING_POLICY:
+        if eligibility is None:
+            raise ValueError("cath-v4 requires validated representative eligibility.")
+        expected["representative_policy"] = "source_validated_best_resolution_then_longest_then_release_date_seeded_tie"
+        expected["selectable_unit_count"] = sum(value is not None for value in eligibility["selected_chain_by_original_unit"].values())
     if not isinstance(filtering, dict) or any(filtering.get(key) != value for key, value in expected.items()):
         raise ValueError("Public source lock candidate universe or representative policy is missing or inconsistent.")
     grouping = lock.get("grouping", {})
@@ -234,24 +254,40 @@ def _validate_public_sampling_contract(
     )):
         raise ValueError("Public source lock grouping policy disagrees with CATH sampling policy.")
     units = [component.representative for component in components]
-    if lock_args.sampling_policy == GROUP_SAMPLING_POLICY:
+    if lock_args.sampling_policy in GROUP_SAMPLING_POLICIES:
         if split_group_map is None:
-            raise ValueError("cath-v3 requires complete split-group assignments.")
+            raise ValueError("Group sampling requires complete split-group assignments.")
         candidates = [member for component in components for member in component.members]
-        units, groups = _group_sampling_units(
-            candidates, {candidate.chain_id: candidate.cluster_id for candidate in candidates},
-            split_group_map, seed=lock_args.seed,
-        )
+        cluster_map = {candidate.chain_id: candidate.cluster_id for candidate in candidates}
+        original_ids_digest = hashlib.sha256(
+            "".join(f"{chain}\n" for chain in sorted(candidate.chain_id for candidate in units)).encode()
+        ).hexdigest()
+        if eligibility is not None:
+            units, groups = _qualified_group_sampling_units(
+                candidates, cluster_map, split_group_map, seed=lock_args.seed,
+                selected_chain_by_original_unit=eligibility["selected_chain_by_original_unit"],
+                approved_excluded_group_ids=set(eligibility["approved_excluded_group_ids"]),
+            )
+        else:
+            units, groups = _group_sampling_units(candidates, cluster_map, split_group_map, seed=lock_args.seed)
         record = lock.get("split_groups", {})
-        if not isinstance(record, dict) or any(record.get(key) != value for key, value in {
-            "group_count": len(groups), "selection_unit_count": len(units), "coverage": "all_groups",
+        expected_groups = {
+            "group_count": len(set(split_group_map.values())), "selection_unit_count": len(units), "coverage": "all_groups",
             "allocator_policy": GROUP_ALLOCATOR_POLICY,
             "selection_unit_ids_sha256": hashlib.sha256(
                 "".join(f"{chain}\n" for chain in sorted(candidate.chain_id for candidate in units)).encode()
             ).hexdigest(),
-        }.items()):
+        }
+        if eligibility is not None:
+            expected_groups.update({
+                "coverage": "all_retained_groups", "retained_group_count": len(groups),
+                "approved_excluded_group_count": len(eligibility["approved_excluded_group_ids"]),
+                "original_unit_count": len(components), "original_representative_ids_sha256": original_ids_digest,
+            })
+        if not isinstance(record, dict) or any(record.get(key) != value for key, value in expected_groups.items()):
             raise ValueError("Public source lock split-group population or coverage requirement is inconsistent.")
-        if grouping.get("full_group_disjoint") is not True or grouping.get("all_groups_covered") is not True:
+        coverage_field = "all_retained_groups_covered" if eligibility is not None else "all_groups_covered"
+        if grouping.get("full_group_disjoint") is not True or grouping.get(coverage_field) is not True:
             raise ValueError("Public source lock must require disjoint full groups and complete group coverage.")
         train, val, hidden_groups = _plan_group_splits(
             units, groups, train_size=lock_args.train_size, val_size=lock_args.val_size,
@@ -280,9 +316,9 @@ def _load_split_group_map(
     receipt_override_path: Path | None, chain_data_cache_path: Path, structure_metadata_path: Path,
     cluster_map: dict[str, str],
 ) -> dict[str, str] | None:
-    if lock_args.sampling_policy != GROUP_SAMPLING_POLICY:
+    if lock_args.sampling_policy not in GROUP_SAMPLING_POLICIES:
         if override_path is not None or receipt_override_path is not None:
-            raise ValueError("Split-group overrides require a cath-v3 source lock.")
+            raise ValueError("Split-group overrides require a group-sampling source lock.")
         return None
     path = override_path or Path(lock_args.split_group_tsv)
     record = json.loads(lock_path.read_text()).get("split_groups")
@@ -299,14 +335,52 @@ def _load_split_group_map(
         structure_metadata=structure_metadata_path, cluster_map=cluster_map,
         candidate_ids=candidate_ids, min_seq_id=lock_args.min_seq_id, coverage=lock_args.coverage,
     )
-    if receipt.get("original_unit_count") != record.get("selection_unit_count"):
+    unit_count_field = "original_unit_count" if lock_args.sampling_policy == PROCESSABLE_GROUP_SAMPLING_POLICY else "selection_unit_count"
+    if receipt.get("original_unit_count") != record.get(unit_count_field):
         raise ValueError("Split-group receipt original-unit count disagrees with source lock.")
     return group_map
+
+
+def _load_representative_eligibility(
+    args: argparse.Namespace, lock_args: SplitArgs, candidates: list[Candidate], *,
+    cluster_map: dict[str, str], split_group_map: dict[str, str] | None, structure_metadata_path: Path,
+) -> dict[str, Any] | None:
+    receipt_override = getattr(args, "representative_eligibility_receipt", None)
+    exclusions_override = getattr(args, "approved_group_exclusions", None)
+    if lock_args.sampling_policy != PROCESSABLE_GROUP_SAMPLING_POLICY:
+        if receipt_override is not None or exclusions_override is not None:
+            raise ValueError("Representative eligibility overrides require a cath-v4 source lock.")
+        return None
+    from nanofold.representative_eligibility import validate_representative_eligibility_receipt
+
+    if split_group_map is None:
+        raise ValueError("cath-v4 requires the unchanged complete split-group graph.")
+    receipt_path = receipt_override or Path(lock_args.representative_eligibility_receipt)
+    exclusions_path = exclusions_override or Path(lock_args.approved_group_exclusions)
+    binding = json.loads(args.lock_file.read_text()).get("representative_eligibility")
+    if not isinstance(binding, dict):
+        raise ValueError("Source lock representative eligibility binding is missing or invalid.")
+    for path, field in ((receipt_path, "receipt_sha256"), (exclusions_path, "approved_group_exclusions_sha256")):
+        if not path.is_file() or binding.get(field) != _sha256(path):
+            raise ValueError(f"Representative eligibility {field} disagrees with source lock.")
+    original_units = _original_unit_memberships(candidates, cluster_map, seed=lock_args.seed)
+    eligibility = validate_representative_eligibility_receipt(
+        receipt_path, approved_group_exclusions_path=exclusions_path,
+        chain_data_cache_path=args.chain_data_cache, structure_metadata_path=structure_metadata_path,
+        cluster_map=cluster_map, split_group_map=split_group_map,
+        split_group_receipt_path=getattr(args, "split_group_receipt", None) or Path(lock_args.split_group_receipt),
+        original_units={unit_id: [member.chain_id for member in members] for unit_id, members in original_units.items()},
+        seed=lock_args.seed,
+    )
+    if eligibility["binding"] != binding:
+        raise ValueError("Source lock representative eligibility provenance does not match the validated receipt.")
+    return eligibility
 
 
 def _validate_group_selection(
     components: list[DisjointComponent], split_group_map: dict[str, str],
     splits: dict[str, list[str]], private_exclusions: set[str],
+    *, eligibility: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Check group coverage and ownership independently of the selection algorithm."""
     universe = {member.chain_id for component in components for member in component.members}
@@ -317,6 +391,17 @@ def _validate_group_selection(
     if len(selected) != len(selected_ids):
         raise RuntimeError("Selected targets contain repeated chain IDs.")
     representatives = {component.representative.chain_id for component in components}
+    original_groups = set(split_group_map.values())
+    approved_excluded_groups = set() if eligibility is None else set(eligibility["approved_excluded_group_ids"])
+    if not approved_excluded_groups <= original_groups:
+        raise RuntimeError("Approved exclusions reference groups outside the original complete graph.")
+    if any(split_group_map[chain] in approved_excluded_groups for chain in selected if chain in split_group_map):
+        raise RuntimeError("Selected manifests contain an approved excluded full-group member.")
+    if eligibility is not None:
+        qualified = [chain for chain in eligibility["selected_chain_by_original_unit"].values() if chain is not None]
+        representatives = set(qualified)
+        if len(representatives) != len(qualified) or not representatives <= universe:
+            raise RuntimeError("Qualified representatives must be unique members of the original eligible universe.")
     if not selected <= representatives:
         raise RuntimeError("Selected targets must be the locked original-unit quality representatives.")
     for component in components:
@@ -331,13 +416,25 @@ def _validate_group_selection(
     overlapping = sum(len(split_names) > 1 for split_names in owners.values())
     if overlapping:
         raise RuntimeError(f"Selected splits share {overlapping} full homology groups.")
-    missing = len(set(split_group_map.values()) - owners.keys())
+    retained_groups = original_groups - approved_excluded_groups
+    missing = len(retained_groups - owners.keys())
     if missing:
         raise RuntimeError(f"Selected manifests leave {missing} full homology groups uncovered.")
     hidden_groups = {split_group_map[chain_id] for chain_id in splits["hidden_val"]}
     excluded_groups = {split_group_map[chain_id] for chain_id in private_exclusions if chain_id in split_group_map}
     if hidden_groups & excluded_groups:
         raise RuntimeError("Private exclusions touch fixed hidden full groups; complete group coverage cannot be preserved.")
+    if eligibility is not None:
+        return {
+            "required": "all_retained_groups", "retained_group_coverage_verified": True,
+            "original_group_count": len(original_groups), "approved_excluded_group_count": len(approved_excluded_groups),
+            "retained_group_count": len(retained_groups), "covered_group_count": len(owners),
+            "original_unit_count": len(components), "selection_unit_count": len(representatives),
+            "selection_unit_ids_sha256": hashlib.sha256(
+                "".join(f"{chain}\n" for chain in sorted(representatives)).encode()
+            ).hexdigest(),
+            "split_group_counts": {name: sum(name in split_names for split_names in owners.values()) for name in splits},
+        }
     return {
         "required": "all_groups", "all_group_coverage_verified": True,
         "complete_group_count": len(set(split_group_map.values())), "covered_group_count": len(owners),
@@ -572,8 +669,13 @@ def _build_hidden_manifest(args: argparse.Namespace) -> dict[str, Any]:
     clustered_candidates = _with_cluster_ids(candidates, cluster_map)
     candidate_by_id = {candidate.chain_id: candidate for candidate in clustered_candidates}
     components = _componentize(clustered_candidates, cluster_map, seed=seed)
+    eligibility = _load_representative_eligibility(
+        args, lock_args, clustered_candidates, cluster_map=cluster_map, split_group_map=split_group_map,
+        structure_metadata_path=structure_metadata_path,
+    )
     fixed_hidden_groups = _validate_public_sampling_contract(
         args.lock_file, lock_args, components, train_ids, val_ids, split_group_map=split_group_map,
+        eligibility=eligibility,
     )
 
     public_components = [
@@ -642,21 +744,25 @@ def _build_hidden_manifest(args: argparse.Namespace) -> dict[str, Any]:
     if split_group_map is not None:
         _validate_group_selection(
             components, split_group_map, {"train": train_ids, "val": val_ids, "hidden_val": hidden_ids},
-            private_processability_exclusions,
+            private_processability_exclusions, eligibility=eligibility,
         )
 
     selected_candidates = {
         chain_id: candidate_by_id[chain_id]
         for chain_id in train_ids + val_ids + hidden_ids
     }
+    reference_candidates = [component.representative for component in components] if fixed_hidden_groups is not None else public_reference
+    reference_population = "eligible_disjoint_units" if fixed_hidden_groups is not None else "fixed_public_chains"
+    if eligibility is not None:
+        reference_candidates = [candidate_by_id[chain] for chain in eligibility["selected_chain_by_original_unit"].values() if chain is not None]
+        reference_population = "source_validated_disjoint_units"
     quality_report = _build_quality_report(
         selected_candidates=selected_candidates,
         split_ids={"train": train_ids, "val": val_ids, "hidden_val": hidden_ids},
         stratify_fields=stratify_fields,
-        reference_candidates=[component.representative for component in components]
-        if fixed_hidden_groups is not None else public_reference,
+        reference_candidates=reference_candidates,
     )
-    quality_report["reference_population"] = "eligible_disjoint_units" if fixed_hidden_groups is not None else "fixed_public_chains"
+    quality_report["reference_population"] = reference_population
     _assert_quality_report(quality_report)
 
     args.hidden_out_dir.mkdir(parents=True, exist_ok=True)
@@ -726,14 +832,17 @@ def _build_hidden_manifest(args: argparse.Namespace) -> dict[str, Any]:
         "stratification": {
             "fields": list(stratify_fields),
             "structural_metadata_source": structural_metadata_source,
-            "reference": "eligible_disjoint_units" if fixed_hidden_groups is not None else "public_train_plus_public_val",
+            "reference": reference_population if fixed_hidden_groups is not None else "public_train_plus_public_val",
             "allocation": {"|".join(key): count for key, count in sorted(allocation.items())},
             "quality_report": quality_report,
         },
     }
     if split_group_map is not None:
         private_lock["split_groups"] = json.loads(args.lock_file.read_text())["split_groups"]
-        private_lock["grouping"].update(full_group_disjoint=True, all_groups_covered=True)
+        private_lock["grouping"]["full_group_disjoint"] = True
+        private_lock["grouping"]["all_retained_groups_covered" if eligibility is not None else "all_groups_covered"] = True
+    if eligibility is not None:
+        private_lock["representative_eligibility"] = eligibility["binding"]
     args.private_lock_file.parent.mkdir(parents=True, exist_ok=True)
     _atomic_write(args.private_lock_file, json.dumps(private_lock, indent=2, sort_keys=True) + "\n")
 
