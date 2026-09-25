@@ -3,9 +3,13 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+from argparse import Namespace
 from pathlib import Path
 
 import pytest
+from msa_filter_policy_helpers import write_valid_policy_case
+
+from nanofold.msa_filter_policy import load_msa_filter_policy
 
 
 def _load_lock_module():
@@ -254,7 +258,8 @@ def _write_batched_filter(path: Path) -> dict:
     payload = json.loads(path.read_text())
     payload.update(search_contract="mmseqs-local-all-pairs-v1", exhaustive=True,
                    input_binding={"batch_receipt_sha256": "c" * 64})
-    payload["mmseqs"].update(command=[], possible_pair_count=100, batching={
+    payload["mmseqs"].update(command=[], possible_pair_count=100,
+                             search_parameters={"max_accept": 1_000_000, "max_rejected": 1_000_000}, batching={
         "schema_version": 1, "status": "complete", "source_batch_size": 20, "query_batch_size": 1,
         "source_partition_count": 3, "query_partition_count": 2, "batch_count": 6,
         "source_count": 50, "query_count": 2, "alignments_calculated": 80,
@@ -312,3 +317,182 @@ def test_batched_source_lock_rejects_incomplete_or_inconsistent_receipts(tmp_pat
     _write_json(row_filter, payload)
     with pytest.raises(ValueError, match="MSA batching|MSA batch receipt"):
         _load_lock_module().build_source_lock(row_filter_path=row_filter, processed_filter_audit_paths=[])
+
+
+@pytest.mark.parametrize("corruption", ["source_size", "query_size", "native_capacity", "short_capacity", "accept_capacity", "reject_capacity"])
+def test_batched_summary_rejects_counts_outside_native_search_contract(tmp_path: Path, corruption: str) -> None:
+    row_filter = tmp_path / "filter.json"
+    payload = _write_batched_filter(row_filter)
+    mmseqs = payload["mmseqs"]
+    batching = mmseqs["batching"]
+    if corruption == "source_size":
+        batching.update(source_batch_size=1_000_001, source_partition_count=1, batch_count=2)
+    elif corruption == "query_size":
+        batching.update(query_batch_size=257, query_partition_count=1, batch_count=3)
+    elif corruption in {"native_capacity", "short_capacity"}:
+        capacity = 2_147_483_648 if corruption == "native_capacity" else 19
+        mmseqs["max_seqs"] = capacity
+        mmseqs["search_parameters"].update(max_accept=capacity, max_rejected=capacity)
+    else:
+        field = "max_accept" if corruption == "accept_capacity" else "max_rejected"
+        mmseqs["search_parameters"][field] = 19
+    _write_json(row_filter, payload)
+    with pytest.raises(ValueError, match="bounds|capacity"):
+        _load_lock_module().build_source_lock(row_filter_path=row_filter, processed_filter_audit_paths=[])
+
+
+def test_batched_capacity_may_equal_actual_short_final_batch(tmp_path: Path) -> None:
+    row_filter = tmp_path / "filter.json"
+    payload = _write_batched_filter(row_filter)
+    payload["mmseqs"]["batching"].update(source_batch_size=1_000_000, source_partition_count=1, batch_count=2)
+    payload["mmseqs"].update(max_seqs=50, search_parameters={"max_accept": 50, "max_rejected": 50})
+    _write_json(row_filter, payload)
+    summary = _load_lock_module().build_source_lock(row_filter_path=row_filter, processed_filter_audit_paths=[])
+    assert summary["msa_row_filter"]["mmseqs"]["max_seqs"] == 50
+
+
+def _write_preprocessing_audit(path: Path, paths: dict[str, Path], split: str) -> dict:
+    row_filter = paths[f"{split}_filter"]
+    count = json.loads(row_filter.read_text())["excluded_sequence_count"]
+    payload = {
+        "schema_version": 1, "manifest": str(paths[f"{split}_manifest"]), "chain_count": 1,
+        "msa_row_filter_sha256": hashlib.sha256(row_filter.read_bytes()).hexdigest(),
+        "msa_row_filter_path": str(row_filter), "excluded_sequence_count": count,
+        "total_msa_rows_before_filter": 3, "total_msa_rows_removed": count,
+        "total_msa_rows_after_filter": 3 - count,
+        "per_chain": [{"chain_id": paths[f"{split}_manifest"].read_text().strip(),
+                       "input_rows": 3, "removed_rows": count, "output_rows": 3 - count}],
+    }
+    _write_json(path, payload)
+    return payload
+
+
+@pytest.mark.parametrize("split", ["train", "val"])
+def test_directed_writer_binds_policy_and_normalizes_preprocessing_audit(tmp_path: Path, split: str) -> None:
+    paths = write_valid_policy_case(tmp_path / ".nanofold_private")
+    audit = tmp_path / "audits" / f"msa_row_filter_audit.{split}.json"
+    _write_preprocessing_audit(audit, paths, split)
+    summary = _load_lock_module().build_source_lock(
+        row_filter_path=paths[f"{split}_filter"], processed_filter_audit_paths=[audit],
+        msa_filter_policy_path=paths["policy_path"], split=split,
+    )
+    assert summary["filter_scope"] == {"split": split, "policy": load_msa_filter_policy(paths["policy_path"]).provenance}
+    assert summary["msa_row_filter"]["source"]["manifests"][0]["role"] == ("train" if split == "train" else "public_validation")
+    targets = summary["msa_row_filter"]["heldout"]["manifests"]
+    assert [target["role"] for target in targets] == (["public_validation", "hidden"] if split == "train" else ["hidden"])
+    normalized = summary["processed_feature_filter_passes"][0]
+    assert normalized["operation"] == "raw_a3m_msa_row_filter"
+    assert normalized["filtered_chain_count"] == 1 and normalized["missing_chain_count"] == 0
+    rendered = json.dumps(summary)
+    assert ".nanofold_private" not in rendered
+    assert paths["hidden_manifest"].read_text().strip() not in rendered
+    assert hashlib.sha256(paths["hidden_manifest"].read_bytes()).hexdigest() not in rendered
+    assert "per_chain" not in normalized
+
+
+@pytest.mark.parametrize("corruption", ["wrong_filter", "wrong_audit_split", "wrong_audit_filter", "missing_chain", "duplicate_chain", "row_total"])
+def test_directed_writer_rejects_misbound_or_incomplete_audit(tmp_path: Path, corruption: str) -> None:
+    paths = write_valid_policy_case(tmp_path / ".nanofold_private")
+    audit = tmp_path / "audit.json"
+    payload = _write_preprocessing_audit(audit, paths, "train")
+    row_filter = paths["train_filter"]
+    if corruption == "wrong_filter":
+        row_filter = paths["val_filter"]
+    elif corruption == "wrong_audit_split":
+        payload = _write_preprocessing_audit(audit, paths, "val")
+    elif corruption == "wrong_audit_filter":
+        payload["msa_row_filter_sha256"] = "f" * 64
+    elif corruption == "missing_chain":
+        payload.update(chain_count=0, per_chain=[], total_msa_rows_before_filter=0,
+                       total_msa_rows_removed=0, total_msa_rows_after_filter=0)
+    elif corruption == "duplicate_chain":
+        payload["per_chain"] *= 2
+        payload["chain_count"] = 2
+    else:
+        payload["total_msa_rows_before_filter"] = 4
+        payload["total_msa_rows_after_filter"] = 2
+    _write_json(audit, payload)
+    with pytest.raises(ValueError):
+        _load_lock_module().build_source_lock(row_filter_path=row_filter, processed_filter_audit_paths=[audit],
+                                             msa_filter_policy_path=paths["policy_path"], split="train")
+
+
+@pytest.mark.parametrize("target_name", ["policy_path", "train_filter", "cache", "train_manifest", "train_msa", "audit", "batch_receipt", "job_result"])
+@pytest.mark.parametrize("alias", ["same", "symlink", "hardlink"])
+def test_directed_writer_preserves_all_aliased_inputs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target_name: str, alias: str) -> None:
+    paths = write_valid_policy_case(tmp_path / ".nanofold_private")
+    paths["audit"] = tmp_path / "audit.json"
+    _write_preprocessing_audit(paths["audit"], paths, "train")
+    paths["batch_receipt"] = Path(json.loads(paths["train_filter"].read_text())["mmseqs"]["batching"]["receipt_path"])
+    paths["job_result"] = Path(json.loads(paths["batch_receipt"].read_text())["jobs"][0]["m8_path"])
+    target = paths[target_name]
+    before = target.read_bytes()
+    output = target if alias == "same" else tmp_path / "output.json"
+    if alias == "symlink":
+        output.symlink_to(target)
+    elif alias == "hardlink":
+        output.hardlink_to(target)
+    module = _load_lock_module()
+    monkeypatch.setattr(module, "parse_args", lambda: Namespace(
+        msa_row_filter=paths["train_filter"], processed_filter_audit=[paths["audit"]], output=output,
+        msa_filter_policy=paths["policy_path"], split="train", include_private_paths=False,
+    ))
+    with pytest.raises(ValueError, match="overwrite"):
+        module.main()
+    assert target.read_bytes() == before and output.read_bytes() == before
+
+
+@pytest.mark.parametrize("target_name", ["filter", "audit"])
+@pytest.mark.parametrize("alias", ["same", "symlink", "hardlink"])
+def test_unscoped_writer_preserves_direct_input_aliases(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target_name: str, alias: str) -> None:
+    paths = {"filter": tmp_path / "filter.json", "audit": tmp_path / "audit.json"}
+    _write_filter(paths["filter"])
+    _write_audit(paths["audit"], paths["filter"])
+    target = paths[target_name]
+    before = target.read_bytes()
+    output = target if alias == "same" else tmp_path / "output.json"
+    if alias == "symlink":
+        output.symlink_to(target)
+    elif alias == "hardlink":
+        output.hardlink_to(target)
+    module = _load_lock_module()
+    monkeypatch.setattr(module, "parse_args", lambda: Namespace(
+        msa_row_filter=paths["filter"], processed_filter_audit=[paths["audit"]], output=output,
+        msa_filter_policy=None, split=None, include_private_paths=False,
+    ))
+    with pytest.raises(ValueError, match="overwrite"):
+        module.main()
+    assert target.read_bytes() == before and output.read_bytes() == before
+
+
+def test_directed_writer_cli_atomically_writes_public_summary(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    paths = write_valid_policy_case(tmp_path / ".nanofold_private")
+    audit = tmp_path / "audit.json"
+    _write_preprocessing_audit(audit, paths, "train")
+    output = tmp_path / "leaderboard" / "train_summary.json"
+    module = _load_lock_module()
+    monkeypatch.setattr(module, "parse_args", lambda: Namespace(
+        msa_row_filter=paths["train_filter"], processed_filter_audit=[audit], output=output,
+        msa_filter_policy=paths["policy_path"], split="train", include_private_paths=False,
+    ))
+    module.main()
+    summary = json.loads(output.read_text())
+    assert summary["public_safe"] is True and summary["filter_scope"]["split"] == "train"
+    assert list(output.parent.iterdir()) == [output]
+
+
+def test_source_lock_rejects_audit_changed_after_parsing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    row_filter, audit = tmp_path / "filter.json", tmp_path / "audit.json"
+    _write_filter(row_filter)
+    _write_audit(audit, row_filter)
+    module = _load_lock_module()
+    original = module._summarize_processed_audit
+
+    def mutate(path: Path, **kwargs):
+        summary = original(path, **kwargs)
+        path.write_text(path.read_text() + "\n")
+        return summary
+
+    monkeypatch.setattr(module, "_summarize_processed_audit", mutate)
+    with pytest.raises(ValueError, match="input changed"):
+        module.build_source_lock(row_filter_path=row_filter, processed_filter_audit_paths=[audit])

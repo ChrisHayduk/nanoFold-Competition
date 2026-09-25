@@ -31,6 +31,7 @@ if str(REPO_ROOT) not in sys.path:
 from nanofold.chain_paths import chain_npz_path
 from nanofold.data import read_manifest
 from nanofold.dataset_integrity import FINGERPRINT_COMPARISON_KEYS, verify_dataset_against_fingerprint
+from nanofold.msa_filter_policy import validate_msa_filter_policy_provenance
 from nanofold.msa_filter_summary import BATCHING_PUBLIC_FIELDS, validate_batching_summary
 from nanofold.utils import sha256_file
 
@@ -111,6 +112,8 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Reviewed public MSA filtering summary under leaderboard/; private/staged metadata is rejected.",
     )
+    parser.add_argument("--train-msa-row-filter-source-lock", type=Path, help="Reviewed directed train-filter summary; requires the validation summary.")
+    parser.add_argument("--val-msa-row-filter-source-lock", type=Path, help="Reviewed directed validation-filter summary; requires the train summary.")
     parser.add_argument(
         "--eval-yaml",
         type=Path,
@@ -378,13 +381,25 @@ def _load_msa_row_filter_source_lock(path: Path | None) -> dict[str, Any]:
     }
 
 
+def _filter_source_lock_paths(args: argparse.Namespace) -> dict[str, Path]:
+    train = getattr(args, "train_msa_row_filter_source_lock", None)
+    val = getattr(args, "val_msa_row_filter_source_lock", None)
+    shared = args.msa_row_filter_source_lock
+    if (train is None) != (val is None) or (train is not None and shared is not None):
+        raise ValueError("Supply both directed filter summaries, or one shared summary, without mixing them")
+    if train is not None:
+        assert val is not None
+        return {"train": Path(train), "val": Path(val)}
+    return {"all": Path(shared)} if shared is not None else {}
+
+
 def _summary(args: argparse.Namespace, fingerprint: dict[str, Any]) -> dict[str, Any]:
     train_ids = read_manifest(args.train_manifest)
     val_ids = read_manifest(args.val_manifest)
     limit = int(args.max_examples_per_split)
     if limit > 0:
         train_ids, val_ids = train_ids[:limit], val_ids[:limit]
-    return {
+    summary = {
         "local_subset": limit > 0,
         "train_count": len(train_ids),
         "validation_count": len(val_ids),
@@ -394,6 +409,12 @@ def _summary(args: argparse.Namespace, fingerprint: dict[str, Any]) -> dict[str,
         "dataset_fingerprint": fingerprint,
         "msa_row_filter_source_lock": _load_msa_row_filter_source_lock(args.msa_row_filter_source_lock),
     }
+    paths = _filter_source_lock_paths(args)
+    if "train" in paths:
+        summary["msa_row_filter_source_locks"] = {
+            split: _load_msa_row_filter_source_lock(path) for split, path in paths.items()
+        }
+    return summary
 
 
 def render_dataset_card(summary: Mapping[str, Any]) -> str:
@@ -418,6 +439,20 @@ The reviewed MSA filtering summary records the filter and aggregate row-removal 
 - excluded MSA-row sequence hashes: `{msa_filter.get("excluded_sequence_count", "")}`
 - cumulative MSA rows removed across filtering passes: `{msa_filter.get("cumulative_msa_rows_removed", "")}`
 """
+    directed_filters = summary.get("msa_row_filter_source_locks")
+    if isinstance(directed_filters, Mapping) and set(directed_filters) == {"train", "val"}:
+        rows = []
+        for split, label in (("train", "Train"), ("val", "Validation")):
+            record = directed_filters[split]
+            rows.append(f"| {label} | `{record['filter_sha256']}` | `{record['sha256']}` | {record['cumulative_msa_rows_removed']} |")
+        msa_filter_section = """
+## MSA Row Filtering
+
+Training MSAs exclude homologs of validation and hidden targets. Validation MSAs exclude homologs of hidden targets. Query rows are preserved. Each example records the filter applied to its split. This provenance summary does not establish zero residual homology or improved model performance.
+
+| Split | Filter SHA256 | Public summary SHA256 | MSA rows removed |
+| --- | --- | --- | --- |
+""" + "\n".join(rows) + "\n"
 
     feature_rows = "\n".join(f"| `{name}` | {description} |" for name, description in FEATURE_DESCRIPTIONS)
 
@@ -618,7 +653,8 @@ def _validate_filter_summary(path: Path) -> dict[str, Any]:
         "schema_version", "artifact_type", "public_safe", "validation", "safety", "msa_row_filter",
         "processed_feature_filter_passes", "aggregate_processed_filtering",
     }
-    if set(raw) != allowed_sections or raw.get("public_safe") is not True:
+    expected_sections = allowed_sections | ({"filter_scope"} if "filter_scope" in raw else set())
+    if set(raw) != expected_sections or raw.get("public_safe") is not True:
         raise ValueError("MSA filter metadata must be a reviewed public-safe source-lock summary")
     if raw.get("schema_version") != 1 or raw.get("artifact_type") != "msa_row_filter_source_lock":
         raise ValueError("Unsupported public MSA filter source-lock schema")
@@ -654,6 +690,12 @@ def _validate_filter_summary(path: Path) -> dict[str, Any]:
         "heldout_sequence_set_sha256", "source_asset_manifest_sha256", "batch_receipt_sha256",
     }
     new_fields_by_location = {
+        "": {"filter_scope"},
+        "filter_scope": {"split", "policy"},
+        "filter_scope.policy": {"policy_type", "policy_sha256", "splits"},
+        "filter_scope.policy.splits": {"train", "val"},
+        "filter_scope.policy.splits.train": {"manifest_sha256", "filter_sha256"},
+        "filter_scope.policy.splits.val": {"manifest_sha256", "filter_sha256"},
         "msa_row_filter": {"search_contract", "exhaustive", "input_binding"},
         "msa_row_filter.mmseqs": {"search_parameters", "possible_pair_count", "batching"},
         "msa_row_filter.mmseqs.batching": BATCHING_PUBLIC_FIELDS,
@@ -743,10 +785,18 @@ def _validate_filter_summary(path: Path) -> dict[str, Any]:
         if not math.isfinite(number) or number < 0:
             raise ValueError("Public MSA command parameters must be finite nonnegative numbers")
     validate_batching_summary(row_filter, public_safe=True)
+    if "filter_scope" in raw:
+        scope = raw["filter_scope"]
+        if not isinstance(scope, dict) or set(scope) != {"split", "policy"} or scope["split"] not in ("train", "val"):
+            raise ValueError("Unsupported directed filter scope")
+        validate_msa_filter_policy_provenance(scope["policy"])
+        if scope["policy"]["splits"][scope["split"]]["filter_sha256"] != row_filter.get("sha256"):
+            raise ValueError("Directed filter scope does not bind this filter digest")
     return raw
 
 
 def _validate_public_inputs(args: argparse.Namespace) -> PublicExport:
+    filter_lock_paths = _filter_source_lock_paths(args)
     limit = int(args.max_examples_per_split)
     if limit < 0:
         raise ValueError("--max-examples-per-split must be nonnegative")
@@ -851,16 +901,45 @@ def _validate_public_inputs(args: argparse.Namespace) -> PublicExport:
             raise ValueError("eval.yaml must target only the public validation split")
         _check_public_metadata(config)
         auxiliary_paths["eval.yaml"] = args.eval_yaml
-    if args.msa_row_filter_source_lock is not None:
-        raw_filter = _validate_filter_summary(args.msa_row_filter_source_lock)
+    preprocess_meta_path = args.processed_features_dir / "preprocess_meta.json"
+    preprocess_meta = _json_object(preprocess_meta_path) if preprocess_meta_path.exists() else {}
+    root_policy = preprocess_meta.get("msa_filter_policy")
+    if root_policy is not None:
+        if preprocess_meta.get("schema_version") != 3:
+            raise ValueError("Directed preprocessing requires current configuration-bound root metadata")
+        validate_msa_filter_policy_provenance(root_policy)
+        if set(filter_lock_paths) != {"train", "val"}:
+            raise ValueError("Directed preprocessing requires both split-specific filter summaries for export")
+    policy = None
+    for split, path in filter_lock_paths.items():
+        raw_filter = _validate_filter_summary(path)
         recorded_filter = raw_filter.get("msa_row_filter", {}).get("sha256")
         if not isinstance(recorded_filter, str) or not re.fullmatch(r"[0-9a-f]{64}", recorded_filter):
             raise ValueError("Invalid filter digest in public MSA source lock")
-        for chain_id in all_ids:
+        if split == "all":
+            if "filter_scope" in raw_filter:
+                raise ValueError("A directed filter summary cannot be applied to both public splits")
+            chain_ids = all_ids
+            name = "msa_row_filter_source_lock_public_safe.json"
+        else:
+            scope = raw_filter.get("filter_scope")
+            if not isinstance(scope, dict) or scope.get("split") != split:
+                raise ValueError("Directed filter summary is missing its expected split scope")
+            current_policy = scope["policy"]
+            if current_policy != root_policy or (policy is not None and current_policy != policy):
+                raise ValueError("Directed filter summaries do not match the preprocessing policy")
+            policy = current_policy
+            for role, manifest, ids in (("train", args.train_manifest, train_ids), ("val", args.val_manifest, val_ids)):
+                record = current_policy["splits"][role]
+                if record["manifest_sha256"] != sha256_file(manifest) or record["chain_count"] != len(ids):
+                    raise ValueError("Directed filter policy does not match the exported public manifests")
+            chain_ids = train_ids if split == "train" else val_ids
+            name = f"msa_row_filter_source_lock_{split}_public_safe.json"
+        for chain_id in chain_ids:
             with np.load(chain_npz_path(args.processed_features_dir, chain_id)) as data:
                 if _optional_str(data, "msa_row_filter_sha256") != recorded_filter:
                     raise ValueError("MSA source lock does not match the exported feature filtering pass")
-        auxiliary_paths["metadata/msa_row_filter_source_lock_public_safe.json"] = args.msa_row_filter_source_lock
+        auxiliary_paths[f"metadata/{name}"] = path
     auxiliary_files = {name: path.read_bytes() for name, path in auxiliary_paths.items()}
     input_digest = hashlib.sha256(json.dumps({
         "fingerprint": fingerprint,

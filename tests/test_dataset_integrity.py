@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
@@ -11,11 +12,13 @@ from nanofold.dataset_integrity import (
     PREPROCESS_META_FILENAME,
     build_dataset_fingerprint,
     build_split_fingerprint,
+    preprocess_config_sha256,
     validate_label_npz_schema,
     validate_npz_schema,
     verify_dataset_against_fingerprint,
     verify_split_against_fingerprint,
 )
+from nanofold.utils import sha256_file
 
 
 def _write_feature_npz(path: Path, *, bad_dtype: bool = False) -> None:
@@ -323,7 +326,7 @@ def test_preprocess_meta_hash_ignores_local_paths_and_dependency_versions(tmp_pa
         _write_feature_npz(chain_npz_path(features, "1abc_A"))
         _write_label_npz(chain_npz_path(labels, "1abc_A"))
 
-    stable_meta = {
+    stable_meta: dict[str, Any] = {
         "aligner": {"match_score": 2.0, "mode": "global"},
         "atom14_num_slots": 14,
         "ca_atom14_slot": 1,
@@ -389,7 +392,7 @@ def test_preprocess_meta_hash_captures_msa_row_filter_sha256(tmp_path: Path) -> 
         _write_feature_npz(chain_npz_path(features, "1abc_A"))
         _write_label_npz(chain_npz_path(labels, "1abc_A"))
 
-    base_meta = {
+    base_meta: dict[str, Any] = {
         "aligner": {"match_score": 2.0, "mode": "global"},
         "atom14_num_slots": 14,
         "ca_atom14_slot": 1,
@@ -510,7 +513,7 @@ def test_frozen_schema_optional_chain_ids_are_checked_when_present(tmp_path: Pat
     path = chain_npz_path(features, "1abc_A")
     _write_feature_npz(path)
     (features / PREPROCESS_META_FILENAME).write_text(json.dumps({"schema_version": schema_version}))
-    args = {
+    args: dict[str, Any] = {
         "processed_features_dir": features, "manifest_paths": {"train": manifest},
         "require_no_missing": True, "require_labels": False,
     }
@@ -602,3 +605,149 @@ def test_fingerprint_rejects_colliding_normalized_split_names(tmp_path: Path) ->
             require_no_missing=False,
             require_labels=False,
         )
+
+
+@pytest.fixture
+def directed_dataset(tmp_path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+    features, labels = tmp_path / "features", tmp_path / "labels"
+    features.mkdir()
+    labels.mkdir()
+    manifests = {role: tmp_path / f"{role}.txt" for role in ("train", "val")}
+    chains = {"train": ["1abc_A", "2def_B"], "val": ["3ghi_C"]}
+    filters = {"train": "a" * 64, "val": "b" * 64}
+    for role, path in manifests.items():
+        path.write_text("".join(f"{chain}\n" for chain in chains[role]))
+    meta = {
+        "schema_version": 3,
+        "cli_args": {"max_msa_seqs": 2048, "msa_row_filter_sha256": None},
+        "msa_filter_policy": {
+            "schema_version": 1, "policy_type": "directed-heldout-v1", "policy_sha256": "c" * 64,
+            "splits": {role: {"manifest_sha256": sha256_file(path), "chain_count": len(chains[role]),
+                              "filter_sha256": filters[role]} for role, path in manifests.items()},
+        },
+    }
+    config_hash = preprocess_config_sha256(meta)
+    (features / PREPROCESS_META_FILENAME).write_text(json.dumps(meta))
+    for role, chain_ids in chains.items():
+        for chain_id in chain_ids:
+            feature_path, label_path = chain_npz_path(features, chain_id), chain_npz_path(labels, chain_id)
+            _write_feature_npz(feature_path)
+            _write_label_npz(label_path)
+            for path in (feature_path, label_path):
+                with np.load(path) as data:
+                    arrays = dict(data)
+                arrays.update(chain_id=np.asarray(chain_id), preprocess_config_sha256=np.asarray(config_hash),
+                              source_inputs_sha256=np.asarray("d" * 64))
+                if path == feature_path:
+                    arrays["msa_row_filter_sha256"] = np.asarray(filters[role])
+                np.savez_compressed(path, **arrays)
+    return {
+        "processed_features_dir": features, "processed_labels_dir": labels, "manifest_paths": manifests,
+        "require_no_missing": True, "require_labels": True,
+    }, meta
+
+
+def test_directed_policy_fingerprints_accept_exact_public_roles_and_single_role_subsets(
+    directed_dataset: tuple[dict[str, Any], dict[str, Any]],
+) -> None:
+    args, meta = directed_dataset
+    full = build_split_fingerprint(**args)
+    assert full["present_feature_chain_count"] == 3
+    assert full["present_label_chain_count"] == 3
+    assert full["preprocess_config_sha256"] == preprocess_config_sha256(meta)
+    for role in ("train", "val"):
+        subset = build_split_fingerprint(**{**args, "manifest_paths": {role: args["manifest_paths"][role]}})
+        assert subset["unique_chain_count"] == meta["msa_filter_policy"]["splits"][role]["chain_count"]
+        assert subset["preprocess_config_sha256"] == full["preprocess_config_sha256"]
+
+
+@pytest.mark.parametrize("chain_id", ["1abc_A", "2def_B", "3ghi_C"])
+@pytest.mark.parametrize("validate_schema", [True, False])
+def test_directed_policy_checks_actual_filter_on_every_feature(
+    directed_dataset: tuple[dict[str, Any], dict[str, Any]], chain_id: str, validate_schema: bool,
+) -> None:
+    args, _ = directed_dataset
+    path = chain_npz_path(args["processed_features_dir"], chain_id)
+    wrong_filter = "a" * 64 if chain_id == "3ghi_C" else "b" * 64
+    _replace_npz_array(path, "msa_row_filter_sha256", np.asarray(wrong_filter))
+    with pytest.raises(ValueError, match="MSA filter provenance.*manifest split"):
+        build_split_fingerprint(**args, validate_schema=validate_schema)
+
+
+@pytest.mark.parametrize("value", [None, np.asarray(["a" * 64]), np.asarray(""), np.asarray(7)])
+def test_directed_policy_rejects_missing_or_invalid_feature_filter_provenance(
+    directed_dataset: tuple[dict[str, Any], dict[str, Any]], value: np.ndarray | None,
+) -> None:
+    args, _ = directed_dataset
+    path = chain_npz_path(args["processed_features_dir"], "2def_B")
+    with np.load(path) as data:
+        arrays = dict(data)
+    if value is None:
+        del arrays["msa_row_filter_sha256"]
+    else:
+        arrays["msa_row_filter_sha256"] = value
+    np.savez_compressed(path, **arrays)
+    with pytest.raises(ValueError, match="msa_row_filter_sha256|MSA filter provenance"):
+        build_split_fingerprint(**args)
+
+
+@pytest.mark.parametrize("assignment", ["swap", "unknown", "subset", "reordered"])
+def test_directed_policy_rejects_manifests_without_exact_role_binding(
+    directed_dataset: tuple[dict[str, Any], dict[str, Any]], tmp_path: Path, assignment: str,
+) -> None:
+    args, _ = directed_dataset
+    manifests = args["manifest_paths"]
+    if assignment == "swap":
+        changed = {"train": manifests["val"], "val": manifests["train"]}
+    elif assignment == "unknown":
+        changed = {"hidden_val": manifests["val"]}
+    else:
+        subset = tmp_path / "subset.txt"
+        subset.write_text("2def_B\n1abc_A\n" if assignment == "reordered" else "1abc_A\n")
+        changed = {"train": subset}
+    with pytest.raises(ValueError, match="[Mm]anifest|known train or val split"):
+        build_split_fingerprint(**{**args, "manifest_paths": changed})
+
+
+@pytest.mark.parametrize("change", ["filter", "policy_hash", "manifest_hash", "chain_count"])
+def test_directed_policy_changes_invalidate_common_preprocessing_config(
+    directed_dataset: tuple[dict[str, Any], dict[str, Any]], change: str,
+) -> None:
+    args, meta = directed_dataset
+    original = preprocess_config_sha256(meta)
+    reordered = json.loads(json.dumps(meta, sort_keys=True))
+    reordered["cli_args"]["raw_root"] = "/different/local/path"
+    assert preprocess_config_sha256(reordered) == original
+    policy = meta["msa_filter_policy"]
+    if change == "policy_hash":
+        policy["policy_sha256"] = "e" * 64
+    else:
+        field = {"filter": "filter_sha256", "manifest_hash": "manifest_sha256", "chain_count": "chain_count"}[change]
+        policy["splits"]["train"][field] = 3 if change == "chain_count" else "e" * 64
+    assert preprocess_config_sha256(meta) != original
+    (args["processed_features_dir"] / PREPROCESS_META_FILENAME).write_text(json.dumps(meta))
+    with pytest.raises(ValueError, match="provenance mismatch|does not match the directed"):
+        build_split_fingerprint(**args)
+
+
+@pytest.mark.parametrize("change", ["private_path", "unknown_split", "bad_digest", "bool_count", "null", "old_schema"])
+def test_fingerprint_rejects_invalid_public_policy_metadata_even_without_array_validation(
+    directed_dataset: tuple[dict[str, Any], dict[str, Any]], change: str,
+) -> None:
+    args, meta = directed_dataset
+    policy = meta["msa_filter_policy"]
+    if change == "private_path":
+        policy["path"] = "/private/hidden-policy.json"
+    elif change == "unknown_split":
+        policy["splits"]["hidden"] = dict(policy["splits"]["val"])
+    elif change == "bad_digest":
+        policy["splits"]["train"]["filter_sha256"] = "NOT_A_DIGEST"
+    elif change == "bool_count":
+        policy["splits"]["train"]["chain_count"] = True
+    elif change == "null":
+        meta["msa_filter_policy"] = None
+    else:
+        meta["schema_version"] = 2
+    (args["processed_features_dir"] / PREPROCESS_META_FILENAME).write_text(json.dumps(meta))
+    with pytest.raises(ValueError):
+        build_split_fingerprint(**args, validate_schema=False)

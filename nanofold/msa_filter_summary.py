@@ -47,6 +47,16 @@ def validate_batching_summary(row_filter: dict[str, Any], *, public_safe: bool) 
         raise ValueError("MSA batching requires source and heldout sequence counts")
     source_count = count(source["stats"].get("unique_non_query_rows"), "source sequence count", 1)
     query_count = count(heldout.get("unique_target_sequence_count"), "heldout sequence count", 1)
+    if batching["source_batch_size"] > 1_000_000 or batching["query_batch_size"] > 256:
+        raise ValueError("MSA batching sizes exceed the supported search bounds")
+    capacity = count(mmseqs.get("max_seqs"), "search capacity", 1)
+    if capacity > 2_147_483_647 or capacity < min(batching["source_batch_size"], source_count):
+        raise ValueError("MSA batching search capacity does not cover every source batch within native limits")
+    parameters = mmseqs.get("search_parameters")
+    if not isinstance(parameters, dict) or any(
+        count(parameters.get(field), field, 1) != capacity for field in ("max_accept", "max_rejected")
+    ) or ("max_seqs" in parameters and count(parameters["max_seqs"], "max_seqs", 1) != capacity):
+        raise ValueError("MSA batching search parameters disagree with the declared exhaustive capacity")
     possible = count(mmseqs.get("possible_pair_count"), "possible-pair count")
     hits = count(mmseqs.get("hit_count"), "hit count")
     if batching["source_count"] != source_count or batching["query_count"] != query_count or possible != source_count * query_count:

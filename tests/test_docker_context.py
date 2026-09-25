@@ -588,11 +588,25 @@ def test_wrapper_rejects_unapproved_processed_asset_contents(
 
 
 @pytest.mark.parametrize("asset", ["public_labels", "hidden_labels"])
-@pytest.mark.parametrize("sidecar", ["preprocess_meta.json", "msa_row_filter_audit.json"])
+@pytest.mark.parametrize("sidecar", [
+    "preprocess_meta.json", "msa_row_filter_audit.json",
+    "msa_row_filter_audit.train.json", "msa_row_filter_audit.val.json",
+])
 def test_wrapper_does_not_allow_feature_sidecars_in_labels(
     docker_harness: DockerHarness, asset: str, sidecar: str
 ) -> None:
     directory, _ = _processed_assets(docker_harness)[asset]
+    (directory / sidecar).write_text("{}\n")
+    proc = docker_harness.run()
+    assert proc.returncode != 0
+    assert not docker_harness.events()
+
+
+@pytest.mark.parametrize("sidecar", ["msa_row_filter_audit.train.json", "msa_row_filter_audit.val.json"])
+def test_wrapper_rejects_public_filter_sidecars_in_hidden_features(
+    docker_harness: DockerHarness, sidecar: str,
+) -> None:
+    directory, _ = _processed_assets(docker_harness)["hidden_features"]
     (directory / sidecar).write_text("{}\n")
     proc = docker_harness.run()
     assert proc.returncode != 0
@@ -606,6 +620,9 @@ def test_wrapper_accepts_manifest_files_and_feature_sidecars(docker_harness: Doc
         chain_npz_path(directory, chain_id).touch()
         if asset.endswith("features"):
             for sidecar in ("preprocess_meta.json", "msa_row_filter_audit.json"):
+                (directory / sidecar).write_text("{}\n")
+        if asset == "public_features":
+            for sidecar in ("msa_row_filter_audit.train.json", "msa_row_filter_audit.val.json"):
                 (directory / sidecar).write_text("{}\n")
     _assert_success(docker_harness.run())
     assert len(docker_harness.runs_logged()) == 3

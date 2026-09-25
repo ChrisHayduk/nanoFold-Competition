@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -30,16 +31,32 @@ def test_full_refresh_dry_run_builds_and_applies_msa_row_filter() -> None:
     )
 
     stdout = proc.stdout
-    filter_path = ".nanofold_private/asset_rebuild/msa_row_filters/official_heldout_target_homology_filter.json"
+    filter_root = ".nanofold_private/asset_rebuild/msa_row_filters"
     assert "--skip-preprocess" in stdout
-    assert "scripts/build_msa_row_filter.py" in stdout
-    assert "--source-manifest data/manifests/train.txt" in stdout
-    assert "--source-manifest data/manifests/val.txt" in stdout
-    assert "--heldout-manifest data/manifests/val.txt" in stdout
-    assert f"--output {filter_path}" in stdout
-    assert f"--msa-row-filter {filter_path}" in stdout
+    filters = [shlex.split(line)[1:] for line in stdout.splitlines() if "/build_msa_row_filter.py" in line]
+    assert len(filters) == 2
+    for command, source, heldout, checkpoint in (
+        (filters[0], "train", ["data/manifests/val.txt", ".nanofold_private/manifests/hidden_val.txt"], "train"),
+        (filters[1], "val", [".nanofold_private/manifests/hidden_val.txt"], "val"),
+    ):
+        assert [command[i + 1] for i, part in enumerate(command) if part == "--source-manifest"] == [
+            f"data/manifests/{source}.txt"
+        ]
+        assert [command[i + 1] for i, part in enumerate(command) if part == "--heldout-manifest"] == heldout
+        assert "--exhaustive" in command
+        assert command[command.index("--min-seq-id") + 1] == "0.30"
+        assert command[command.index("--coverage") + 1] == "0.80"
+        assert command[command.index("--checkpoint-dir") + 1] == f"{filter_root}/checkpoints/{checkpoint}"
+    assert f"--output {filter_root}/train_filter.json" in stdout
+    assert f"--output {filter_root}/val_filter.json" in stdout
+    policy_commands = [line for line in stdout.splitlines() if "/build_msa_filter_policy.py" in line]
+    assert len(policy_commands) == 1
+    assert f"--train-msa-row-filter {filter_root}/train_filter.json" in policy_commands[0]
+    assert f"--val-msa-row-filter {filter_root}/val_filter.json" in policy_commands[0]
     preprocessing = [line for line in stdout.splitlines() if "/preprocess.py" in line]
     assert len(preprocessing) == 1
+    assert f"--msa-filter-policy {filter_root}/public_directed_policy.json" in preprocessing[0]
+    assert "--msa-row-filter" not in preprocessing[0]
     assert preprocessing[0].endswith("--manifest data/manifests/all.txt")
 
 
@@ -49,7 +66,10 @@ def test_full_refresh_runs_both_strict_msa_gates_before_fingerprints() -> None:
         cwd=REPO_ROOT, capture_output=True, text=True, check=True,
     )
     stdout = proc.stdout
-    assert stdout.count("--strict --run-mmseqs --skip-plot") == 2
+    assert stdout.count("--strict --run-mmseqs --exhaustive --skip-plot") == 2
+    assert stdout.count("--min-seq-id 0.30 --coverage 0.80") == 4
+    assert "/checkpoints/residual_train_val" in stdout
+    assert "/checkpoints/residual_public_hidden" in stdout
     assert "--val-features-dir .nanofold_private/hidden_processed_features" in stdout
     assert stdout.index("audits/hidden_msa_split") < stdout.index("scripts/build_fingerprint.py")
     preprocessing = [line for line in stdout.splitlines() if "/preprocess.py" in line]
@@ -58,6 +78,8 @@ def test_full_refresh_runs_both_strict_msa_gates_before_fingerprints() -> None:
     assert preprocessing[0].endswith("--manifest data/manifests/all.txt")
     assert "--processed-features-dir .nanofold_private/hidden_processed_features" in preprocessing[1]
     assert "--manifest .nanofold_private/manifests/hidden_val.txt" in preprocessing[1]
+    assert "--msa-filter-policy" not in preprocessing[1]
+    assert "--msa-row-filter" not in preprocessing[1]
     assert stdout.index("scripts/sync_official_manifest_hashes.py --check") < stdout.index(preprocessing[0])
 
 
@@ -166,7 +188,8 @@ def test_refresh_rejects_published_fingerprint_alias_before_writes(tmp_path: Pat
 
 @pytest.mark.parametrize("source_option,output_option", [
     ("--chain-data-cache", "--data-source-lock"),
-    ("--msa-row-filter", "--fingerprint-out"),
+    ("--train-msa-row-filter", "--fingerprint-out"),
+    ("--val-msa-row-filter", "--msa-filter-policy-out"),
 ])
 @pytest.mark.parametrize("alias", ["direct", "symlink", "hardlink"])
 def test_refresh_rejects_source_input_alias_before_writes(
@@ -186,12 +209,18 @@ def test_refresh_rejects_source_input_alias_before_writes(
             output.symlink_to(source)
         else:
             output.hardlink_to(source)
+    extra = []
+    if source_option in {"--train-msa-row-filter", "--val-msa-row-filter"}:
+        counterpart = tmp_path / "other filter.json"
+        counterpart.write_text("{}\n")
+        other = "--val-msa-row-filter" if source_option == "--train-msa-row-filter" else "--train-msa-row-filter"
+        extra = [other, str(counterpart)]
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     (fake_bin / "python").symlink_to(sys.executable)
     before = set(tmp_path.rglob("*"))
     proc = subprocess.run(
-        ["bash", str(refresh), "--skip-manifest-regen", source_option, str(source), output_option, str(output)],
+        ["bash", str(refresh), "--skip-manifest-regen", source_option, str(source), output_option, str(output), *extra],
         env=dict(os.environ, PATH=f"{fake_bin}:{os.environ['PATH']}"),
         capture_output=True, text=True, check=False,
     )
@@ -246,7 +275,7 @@ def test_refresh_propagates_same_chain_cache_to_all_consumers(tmp_path: Path, ca
     consumers = ["setup_official_data.sh", "build_msa_row_filter.py", "preprocess.py", "build_data_source_lock.py"]
     commands = [line for line in result.stdout.splitlines()
                 if line.startswith("+ ") and any(f"scripts/{name}" in line for name in consumers)]
-    assert len(commands) == 5  # Setup, row filter, public/hidden preprocessing calls, source lock.
+    assert len(commands) == 6  # Setup, two row filters, public/hidden preprocessing, source lock.
     assert all(f"--chain-data-cache {cache}" in command for command in commands)
     assert not list(tmp_path.iterdir())
 
@@ -269,3 +298,73 @@ def test_refresh_rejects_overlapping_asset_roots_before_work(tmp_path: Path, ove
     assert "must be separate" in result.stderr
     assert "[1/5]" not in result.stdout
     assert not root.exists()
+
+
+@pytest.mark.parametrize("args,message", [
+    (["--msa-row-filter", "global.json"], "Global MSA filters"),
+    (["--msa-row-filter-out", "global.json"], "Global MSA filters"),
+    (["--train-msa-row-filter", "train.json"], "Supply both"),
+    (["--val-msa-row-filter", "val.json"], "Supply both"),
+    (["--skip-msa-row-filter-build"], "requires existing filters"),
+    (["--skip-setup"], "use --resume-preprocess for validated reuse"),
+])
+def test_refresh_rejects_incomplete_or_global_filter_policy_before_work(args: list[str], message: str) -> None:
+    result = subprocess.run(
+        ["bash", "scripts/full_official_data_refresh.sh", "--dry-run", "--skip-manifest-regen", *args],
+        cwd=REPO_ROOT, capture_output=True, text=True,
+    )
+    assert result.returncode != 0
+    assert message in result.stderr
+    assert "[1/5]" not in result.stdout
+
+
+def test_refresh_reuses_two_filters_but_rebuilds_and_validates_their_policy(tmp_path: Path) -> None:
+    train, val = tmp_path / "train.json", tmp_path / "val.json"
+    train.write_text('{"preserve": "train"}\n')
+    val.write_text('{"preserve": "val"}\n')
+    policy = tmp_path / "candidate" / "policy.json"
+    checkpoint = tmp_path / "checkpoints"
+    result = subprocess.run(
+        ["bash", "scripts/full_official_data_refresh.sh", "--dry-run", "--skip-manifest-regen",
+         "--train-msa-row-filter", str(train), "--val-msa-row-filter", str(val),
+         "--skip-msa-row-filter-build", "--msa-filter-policy-out", str(policy),
+         "--msa-filter-checkpoint-dir", str(checkpoint)],
+        cwd=REPO_ROOT, capture_output=True, text=True, check=True,
+    )
+    assert "/build_msa_row_filter.py" not in result.stdout
+    policy_commands = [line for line in result.stdout.splitlines() if "/build_msa_filter_policy.py" in line]
+    assert len(policy_commands) == 1
+    assert f"--train-msa-row-filter {train}" in policy_commands[0]
+    assert f"--val-msa-row-filter {val}" in policy_commands[0]
+    assert f"--output {policy}" in policy_commands[0]
+    assert f"--checkpoint-dir {checkpoint}/residual_train_val" in result.stdout
+    assert f"--checkpoint-dir {checkpoint}/residual_public_hidden" in result.stdout
+    assert train.read_text() == '{"preserve": "train"}\n'
+    assert val.read_text() == '{"preserve": "val"}\n'
+    assert not policy.parent.exists()
+    assert not checkpoint.exists()
+
+
+@pytest.mark.parametrize("collision", ["raw_policy", "raw_checkpoint", "policy_checkpoint", "filter_policy"])
+def test_refresh_rejects_filter_output_and_checkpoint_collisions_before_work(tmp_path: Path, collision: str) -> None:
+    raw = tmp_path / "raw"
+    policy = tmp_path / "filters" / "policy.json"
+    checkpoint = tmp_path / "checkpoints"
+    if collision == "raw_policy":
+        policy = raw / "policy.json"
+    elif collision == "raw_checkpoint":
+        checkpoint = raw / "checkpoints"
+    elif collision == "policy_checkpoint":
+        checkpoint = policy.parent
+    else:
+        policy = policy.parent / "train_filter.json"
+    result = subprocess.run(
+        ["bash", "scripts/full_official_data_refresh.sh", "--dry-run", "--skip-manifest-regen",
+         "--data-root", str(raw), "--msa-filter-policy-out", str(policy),
+         "--msa-filter-checkpoint-dir", str(checkpoint)],
+        cwd=REPO_ROOT, capture_output=True, text=True,
+    )
+    assert result.returncode != 0
+    assert "must be separate" in result.stderr or "must be distinct" in result.stderr
+    assert "[1/5]" not in result.stdout
+    assert not list(tmp_path.iterdir())

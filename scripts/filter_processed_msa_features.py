@@ -1,9 +1,10 @@
 """Apply an MSA-row filter to already processed feature NPZs.
 
 This is a maintainer/rebuttal utility for existing processed features. The
-preferred official data-refresh path is still ``scripts/preprocess.py
---msa-row-filter`` because that filters raw A3M rows before depth capping and
-can backfill with deeper non-filtered rows. This script accepts features without raw preprocessing provenance and preserves every feature
+preferred official data-refresh path is ``scripts/preprocess.py
+--msa-filter-policy`` for the public split union, with separate unfiltered hidden
+preprocessing. Filtering raw A3M rows before depth capping can backfill with
+deeper permitted rows. This script accepts features without raw preprocessing provenance and preserves every feature
 array except ``msa`` and ``deletions`` and is useful when raw alignments are
 incomplete locally or when a fast sanitized-feature root is needed for audits or
 experimental reruns.

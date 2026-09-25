@@ -10,6 +10,7 @@ import numpy as np
 from .a3m import GAP_ID, UNK_ID
 from .chain_paths import chain_npz_path
 from .data import LABEL_ONLY_KEYS, read_manifest
+from .msa_filter_policy import validate_msa_filter_policy_provenance
 from .residue_constants import CA_ATOM14_SLOT
 from .utils import sha256_file
 
@@ -331,6 +332,7 @@ def _files_sha256(
     validate_schema: bool,
     schema_validator,
     expected_preprocess_config_sha256: str | None = None,
+    expected_msa_filter_sha256: Mapping[str, str] | None = None,
 ) -> str | None:
     if base_dir is None:
         return None
@@ -347,7 +349,7 @@ def _files_sha256(
                 joined = "; ".join(schema_errors[:8])
                 raise ValueError(f"Invalid schema for {npz_path}: {joined}")
 
-        if validate_schema:
+        if validate_schema or expected_msa_filter_sha256 is not None:
             with np.load(npz_path) as data:
                 if expected_preprocess_config_sha256 is None and any(
                     key in data.files for key in ("preprocess_config_sha256", "source_inputs_sha256")
@@ -363,16 +365,23 @@ def _files_sha256(
                 if identity_errors:
                     raise ValueError(f"Invalid identity for {npz_path}: {'; '.join(identity_errors)}")
 
-        if expected_preprocess_config_sha256 is not None:
+        if expected_preprocess_config_sha256 is not None or expected_msa_filter_sha256 is not None:
             with np.load(npz_path) as data:
-                for key in ("preprocess_config_sha256", "source_inputs_sha256"):
+                if expected_preprocess_config_sha256 is not None:
+                    for key in ("preprocess_config_sha256", "source_inputs_sha256"):
+                        if key not in data.files or data[key].shape != ():
+                            raise ValueError(f"Missing scalar `{key}` in {npz_path}")
+                        value = str(data[key].item())
+                        if len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
+                            raise ValueError(f"Invalid `{key}` in {npz_path}")
+                    if str(data["preprocess_config_sha256"].item()) != expected_preprocess_config_sha256:
+                        raise ValueError(f"Preprocessing provenance mismatch in {npz_path}")
+                if expected_msa_filter_sha256 is not None:
+                    key = "msa_row_filter_sha256"
                     if key not in data.files or data[key].shape != ():
                         raise ValueError(f"Missing scalar `{key}` in {npz_path}")
-                    value = str(data[key].item())
-                    if len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
-                        raise ValueError(f"Invalid `{key}` in {npz_path}")
-                if str(data["preprocess_config_sha256"].item()) != expected_preprocess_config_sha256:
-                    raise ValueError(f"Preprocessing provenance mismatch in {npz_path}")
+                    if str(data[key].item()) != expected_msa_filter_sha256[chain_id]:
+                        raise ValueError(f"MSA filter provenance does not match the manifest split in {npz_path}")
 
         file_hash = sha256_file(npz_path)
         hasher.update(chain_id.encode("utf-8"))
@@ -447,6 +456,10 @@ def preprocess_config_sha256(raw: Mapping[str, Any]) -> str:
     }
     if "implementation_sha256" in raw:
         stable["implementation_sha256"] = raw["implementation_sha256"]
+    if "msa_filter_policy" in raw:
+        if type(raw.get("schema_version")) is not int or raw["schema_version"] != 3:
+            raise ValueError("Directed MSA filter policy requires schema-version 3 preprocessing metadata")
+        stable["msa_filter_policy"] = validate_msa_filter_policy_provenance(raw["msa_filter_policy"])
     payload = json.dumps(stable, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
 
@@ -470,14 +483,24 @@ def build_split_fingerprint(
     preprocess_meta_path = processed_features_dir / PREPROCESS_META_FILENAME
     preprocess_config_hash = _stable_preprocess_meta_sha256(preprocess_meta_path)
     expected_preprocess_config_hash = None
-    if validate_schema and preprocess_meta_path.exists():
-        raw_meta = json.loads(preprocess_meta_path.read_text())
-        if isinstance(raw_meta, dict) and raw_meta.get("schema_version") == 3:
+    msa_filter_policy = None
+    if preprocess_meta_path.exists():
+        try:
+            raw_meta = json.loads(preprocess_meta_path.read_text())
+        except json.JSONDecodeError:
+            if validate_schema:
+                raise
+            raw_meta = None
+        if isinstance(raw_meta, dict) and "msa_filter_policy" in raw_meta:
+            msa_filter_policy = validate_msa_filter_policy_provenance(raw_meta["msa_filter_policy"])
+            preprocess_config_hash = preprocess_config_sha256(raw_meta)
+        if (validate_schema or msa_filter_policy is not None) and isinstance(raw_meta, dict) and raw_meta.get("schema_version") == 3:
             expected_preprocess_config_hash = preprocess_config_hash
 
     manifest_meta: Dict[str, Dict[str, Any]] = {}
     manifest_chain_ids: Dict[str, set[str]] = {}
     all_chain_ids_unsorted: List[str] = []
+    expected_msa_filters: Dict[str, str] | None = {} if msa_filter_policy is not None else None
     for split_name, manifest_path in manifest_map.items():
         chain_ids = read_manifest(manifest_path)
         current_chain_ids = set(chain_ids)
@@ -493,6 +516,14 @@ def build_split_fingerprint(
             "chain_count": len(chain_ids),
             "sha256": sha256_file(manifest_path),
         }
+        if msa_filter_policy is not None and expected_msa_filters is not None:
+            if split_name not in msa_filter_policy["splits"]:
+                raise ValueError("Directed MSA filter policy fingerprints require a known train or val split")
+            policy_split = msa_filter_policy["splits"][split_name]
+            if (manifest_meta[split_name]["sha256"] != policy_split["manifest_sha256"]
+                    or len(chain_ids) != policy_split["chain_count"]):
+                raise ValueError(f"Manifest for split {split_name!r} does not match the directed MSA filter policy")
+            expected_msa_filters.update({chain_id: policy_split["filter_sha256"] for chain_id in chain_ids})
         all_chain_ids_unsorted.extend(chain_ids)
     all_chain_ids = sorted(set(all_chain_ids_unsorted))
 
@@ -506,6 +537,7 @@ def build_split_fingerprint(
         validate_schema=validate_schema,
         schema_validator=validate_feature_npz_schema,
         expected_preprocess_config_sha256=expected_preprocess_config_hash,
+        expected_msa_filter_sha256=expected_msa_filters,
     )
     label_hash = _files_sha256(
         base_dir=processed_labels_dir_path if require_labels else None,

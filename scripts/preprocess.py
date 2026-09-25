@@ -61,6 +61,7 @@ from nanofold.dataset_integrity import (
     validate_label_npz_schema,
 )
 from nanofold.mmcif import extract_chain_atoms
+from nanofold.msa_filter_policy import MSAFilterPolicy, MSARowFilter, load_msa_filter_policy, load_msa_row_filter
 from nanofold.residue_constants import ATOM14_NUM_SLOTS, CA_ATOM14_SLOT
 
 
@@ -110,6 +111,11 @@ def parse_args() -> argparse.Namespace:
             "Optional JSON from scripts/build_msa_row_filter.py. Non-query MSA rows whose ungapped "
             "sequence hash appears in the filter are removed before --max-msa-seqs is applied."
         ),
+    )
+    ap.add_argument(
+        "--msa-filter-policy", type=Path, default=None,
+        help="Directed public split policy: train removes val/hidden target homologs, val removes hidden homologs. "
+        "Requires the exact public manifest union and --chain-data-cache; mutually exclusive with --msa-row-filter.",
     )
     ap.add_argument("--template-hhr-name", type=str, default="pdb70_hits.hhr", help="Template hits file name under chain dir")
     ap.add_argument(
@@ -169,13 +175,6 @@ class HHRHit:
     template_aligned: str
     aligned_pairs: Tuple[Tuple[int, int], ...]
     aligned_residue_pairs: Tuple[Tuple[int, int, str, str], ...]
-
-
-@dataclass(frozen=True)
-class MSARowFilter:
-    path: Path
-    sha256: str
-    excluded_sequence_sha256: frozenset[str]
 
 
 @dataclass(frozen=True)
@@ -461,22 +460,7 @@ def _msa_row_to_ungapped_sequence(row: np.ndarray) -> str:
 
 def _load_msa_row_filter(path_value: str | Path) -> MSARowFilter | None:
     path_text = str(path_value).strip()
-    if not path_text:
-        return None
-    path = Path(path_text)
-    raw = json.loads(path.read_text())
-    if not isinstance(raw, dict):
-        raise ValueError(f"MSA row filter must be a JSON object: {path}")
-    values = raw.get("excluded_sequence_sha256")
-    if not isinstance(values, list):
-        raise ValueError(f"MSA row filter missing `excluded_sequence_sha256` list: {path}")
-    excluded: set[str] = set()
-    for value in values:
-        text = str(value).strip().lower()
-        if not re.fullmatch(r"[0-9a-f]{64}", text):
-            raise ValueError(f"Bad sequence SHA256 in MSA row filter {path}: {value!r}")
-        excluded.add(text)
-    return MSARowFilter(path=path, sha256=_sha256_file(path), excluded_sequence_sha256=frozenset(excluded))
+    return load_msa_row_filter(Path(path_text)) if path_text else None
 
 
 def _apply_msa_row_filter(
@@ -516,6 +500,7 @@ def _read_merged_msa(
     msa_names: str | Sequence[str] | None,
     max_msa_seqs: int,
     msa_row_filter: MSARowFilter | None = None,
+    bound_msa_paths: Dict[str, Path | None] | None = None,
 ) -> Tuple[np.ndarray, np.ndarray, str, MSAFilterStats]:
     resolved_names = _resolve_msa_names(msa_name, msa_names)
     merged_rows: List[np.ndarray] = []
@@ -527,12 +512,13 @@ def _read_merged_msa(
     filter_stats = MSAFilterStats()
 
     for source_name in resolved_names:
-        msa_path = _find_msa_path(chain_dir, source_name)
+        msa_path = (bound_msa_paths[source_name] if bound_msa_paths is not None
+                    else _find_msa_path(chain_dir, source_name))
         if msa_path is None:
             continue
 
         a3m = read_a3m(msa_path)
-        source_msa, source_deletions = a3m.to_tokens(max_seqs=None if msa_row_filter is not None else (row_limit or None))
+        source_msa, source_deletions = a3m.to_tokens(max_seqs=None)
         aligned_msa, _ = a3m.to_aligned_msa()
         query_aligned = aligned_msa[0]
         source_msa, source_deletions, source_query_sequence = ungap_query_columns(
@@ -797,6 +783,7 @@ def _save_npz(path: Path, arrays: Dict[str, np.ndarray]) -> None:
 def _source_inputs_sha256(
     chain_dir: Path, mmcif_path: Path, mmcif_root: Path, args: argparse.Namespace, *, requested_chain_id: str,
     expected_sequence: str | None = None, chain_data_cache_sha256: str | None = None,
+    bound_msa_paths: Dict[str, Path | None] | None = None,
 ) -> str:
     """Bind a processed pair to all inputs that can influence this invocation."""
     sources: Dict[str, str | None] = {
@@ -807,7 +794,7 @@ def _source_inputs_sha256(
         sources["chain_data_cache_sha256"] = chain_data_cache_sha256
         sources["expected_sequence_sha256"] = _sequence_sha256(expected_sequence)
     for name in _resolve_msa_names(args.msa_name, args.msa_names):
-        path = _find_msa_path(chain_dir, name)
+        path = bound_msa_paths[name] if bound_msa_paths is not None else _find_msa_path(chain_dir, name)
         sources[f"msa:{name}"] = _sha256_file(path) if path is not None else None
     if not args.disable_templates and args.max_templates > 0:
         hhr_path = next(iter(sorted(chain_dir.rglob(args.template_hhr_name))), None)
@@ -919,28 +906,28 @@ def _existing_outputs_are_valid(
 
 def _write_preprocess_meta(
     args: argparse.Namespace, out_dir: Path, msa_row_filter: MSARowFilter | None,
-    *, chain_data_cache_sha256: str | None = None,
+    *, chain_data_cache_sha256: str | None = None, msa_filter_policy: MSAFilterPolicy | None = None,
 ) -> str:
     stable_args = {
         k: (str(v) if isinstance(v, Path) else v)
         for k, v in vars(args).items()
-        if k not in {"manifest", "skip_existing", "msa_row_filter", "fail_fast", "allow_failures"}
+        if k not in {"manifest", "skip_existing", "msa_row_filter", "msa_filter_policy", "fail_fast", "allow_failures"}
     }
     if msa_row_filter is not None:
         stable_args["msa_row_filter_sha256"] = msa_row_filter.sha256
     if chain_data_cache_sha256 is not None:
         stable_args["chain_data_cache_sha256"] = chain_data_cache_sha256
+    implementation_files = [
+        "scripts/preprocess.py", "nanofold/a3m.py", "nanofold/mmcif.py", "nanofold/residue_constants.py",
+    ]
+    if msa_filter_policy is not None:
+        implementation_files.append("nanofold/msa_filter_policy.py")
     meta = {
         "schema_version": 3,
         "cli_args": stable_args,
         "implementation_sha256": {
             name: _sha256_file(REPO_ROOT / name)
-            for name in (
-                "scripts/preprocess.py",
-                "nanofold/a3m.py",
-                "nanofold/mmcif.py",
-                "nanofold/residue_constants.py",
-            )
+            for name in implementation_files
         },
         "split_manifest": None,
         "dependency_metadata": _dependency_metadata(),
@@ -955,6 +942,8 @@ def _write_preprocess_meta(
         "atom14_num_slots": ATOM14_NUM_SLOTS,
         "ca_atom14_slot": CA_ATOM14_SLOT,
     }
+    if msa_filter_policy is not None:
+        meta["msa_filter_policy"] = msa_filter_policy.provenance
     out_path = out_dir / "preprocess_meta.json"
     config_sha256 = preprocess_config_sha256(meta)
     populated = any(out_dir.glob("*.npz")) or any(Path(args.processed_labels_dir).glob("*.npz"))
@@ -984,6 +973,7 @@ def _write_msa_row_filter_audit(
     manifest: Path,
     msa_row_filter: MSARowFilter,
     per_chain_stats: List[Dict[str, object]],
+    output_name: str = "msa_row_filter_audit.json",
 ) -> None:
     total_input = sum(int(cast(int | str, row["input_rows"])) for row in per_chain_stats)
     total_removed = sum(int(cast(int | str, row["removed_rows"])) for row in per_chain_stats)
@@ -999,7 +989,7 @@ def _write_msa_row_filter_audit(
         "total_msa_rows_after_filter": total_input - total_removed,
         "per_chain": per_chain_stats,
     }
-    (out_dir / "msa_row_filter_audit.json").write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    (out_dir / output_name).write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
 
 def _read_existing_msa_row_filter_audit_row(feature_path: Path, chain_id: str) -> Dict[str, object] | None:
@@ -1032,6 +1022,10 @@ def main() -> None:
     if args.max_msa_seqs < 0 or args.max_templates < 0:
         raise ValueError("--max-msa-seqs and --max-templates must be nonnegative")
 
+    if args.msa_filter_policy is not None and args.msa_row_filter:
+        raise ValueError("--msa-filter-policy and --msa-row-filter are mutually exclusive")
+    if args.msa_filter_policy is not None and args.chain_data_cache is None:
+        raise ValueError("--msa-filter-policy requires --chain-data-cache")
     raw_root = Path(args.raw_root)
     alignments_root = Path(args.alignments_root) if args.alignments_root else None
     mmcif_root = Path(args.mmcif_root)
@@ -1056,12 +1050,22 @@ def main() -> None:
         ):
             raise ValueError("Pinned chain cache must be separate from preprocessing outputs and their aliases")
         expected_sequences, cache_sha256 = _load_expected_sequences(args.chain_data_cache, chain_ids)
+    msa_row_filter = _load_msa_row_filter(args.msa_row_filter)
+    msa_filter_policy = (
+        load_msa_filter_policy(args.msa_filter_policy, expected_chain_ids=chain_ids)
+        if args.msa_filter_policy is not None else None
+    )
+    if msa_filter_policy is not None:
+        if cache_sha256 != msa_filter_policy.chain_data_cache_sha256:
+            raise ValueError("Preprocessing chain cache does not match the directed MSA filter policy")
+        msa_filter_policy.assert_output_roots_safe([feature_root, label_root])
+        msa_filter_policy.assert_msa_names(_resolve_msa_names(args.msa_name, args.msa_names))
     processed_features_dir.mkdir(parents=True, exist_ok=True)
     processed_labels_dir.mkdir(parents=True, exist_ok=True)
-    msa_row_filter = _load_msa_row_filter(args.msa_row_filter)
 
     config_sha256 = _write_preprocess_meta(
         args, processed_features_dir, msa_row_filter, chain_data_cache_sha256=cache_sha256,
+        msa_filter_policy=msa_filter_policy,
     )
 
     n_ok = 0
@@ -1069,6 +1073,8 @@ def main() -> None:
     msa_filter_audit_rows: List[Dict[str, object]] = []
 
     for cid in tqdm(chain_ids, desc="preprocess"):
+        if msa_filter_policy is not None:
+            msa_row_filter = msa_filter_policy.filter_for(cid)
         try:
             pdb_id, chain_id = cid.split("_", 1)
             pdb_id = pdb_id.lower()
@@ -1090,9 +1096,17 @@ def main() -> None:
             if not mmcif_path.exists():
                 raise FileNotFoundError(f"Missing mmCIF: {mmcif_path}")
 
+            bound_msa_paths = None
+            if msa_filter_policy is not None:
+                bound_msa_paths = {}
+                for name in _resolve_msa_names(args.msa_name, args.msa_names):
+                    path = _find_msa_path(chain_dir, name)
+                    bound_msa_paths[name] = path.resolve(strict=True) if path is not None else None
+                msa_filter_policy.assert_msa_inputs(cid, bound_msa_paths)
             source_sha256 = _source_inputs_sha256(
                 chain_dir, mmcif_path, mmcif_root, args, requested_chain_id=cid,
                 expected_sequence=expected_sequences.get(cid), chain_data_cache_sha256=cache_sha256,
+                bound_msa_paths=bound_msa_paths,
             )
 
             if args.skip_existing and _existing_outputs_are_valid(
@@ -1118,6 +1132,7 @@ def main() -> None:
                 msa_names=args.msa_names,
                 max_msa_seqs=args.max_msa_seqs,
                 msa_row_filter=msa_row_filter,
+                bound_msa_paths=bound_msa_paths,
             )
             if cid in expected_sequences and query_sequence != expected_sequences[cid]:
                 raise ValueError(f"Acquired MSA query differs from the pinned chain cache target for {cid}")
@@ -1236,8 +1251,18 @@ def main() -> None:
             err_marker.write_text(str(e) + "\n")
             continue
 
+    if msa_filter_policy is not None:
+        msa_filter_policy.assert_unchanged()
+        for split in ("train", "val"):
+            _write_msa_row_filter_audit(
+                processed_features_dir, manifest=msa_filter_policy.manifest_paths[split],
+                msa_row_filter=msa_filter_policy.filters[split],
+                per_chain_stats=[row for row in msa_filter_audit_rows
+                                 if msa_filter_policy.assignments[str(row["chain_id"])] == split],
+                output_name=f"msa_row_filter_audit.{split}.json",
+            )
     print(f"Preprocess complete: ok={n_ok}, fail={n_fail}")
-    if msa_row_filter is not None:
+    if msa_filter_policy is None and msa_row_filter is not None:
         _write_msa_row_filter_audit(
             processed_features_dir,
             manifest=manifest,

@@ -81,7 +81,7 @@ def overlaps(first, second):
     return within(first, second) or within(second, first)
 
 
-def processed_directory(root, manifest, *, feature_sidecars=False):
+def processed_directory(root, manifest, *, feature_sidecars=False, public_filter_sidecars=False):
     chain_ids = {
         line.strip() for line in manifest.read_text().splitlines()
         if line.strip() and not line.lstrip().startswith("#")
@@ -89,6 +89,8 @@ def processed_directory(root, manifest, *, feature_sidecars=False):
     allowed = {"chain_" + chain_id.encode("utf-8").hex() + ".npz" for chain_id in chain_ids}
     if feature_sidecars:
         allowed.update({"preprocess_meta.json", "msa_row_filter_audit.json"})
+    if public_filter_sidecars:
+        allowed.update({"msa_row_filter_audit.train.json", "msa_row_filter_audit.val.json"})
     for entry in root.iterdir():
         if entry.name not in allowed or not stat.S_ISREG(entry.lstat().st_mode):
             raise SystemExit("ERROR: processed asset directory contains files outside its manifest or unexpected subdirectories/links")
@@ -116,7 +118,7 @@ labels = require(os.environ.get("NANOFOLD_PUBLIC_LABELS_DIR", str(trusted / "dat
 if overlaps(features, labels):
     raise SystemExit("ERROR: public features and labels must be separate directories")
 public_manifest = require(trusted / "data/manifests/all.txt")
-processed_directory(features, public_manifest, feature_sidecars=True)
+processed_directory(features, public_manifest, feature_sidecars=True, public_filter_sidecars=True)
 processed_directory(labels, public_manifest)
 runs_argument = Path(os.environ.get("NANOFOLD_RUNS_ROOT", str(trusted / "runs"))).expanduser()
 if runs_argument.is_symlink():

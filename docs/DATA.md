@@ -212,25 +212,19 @@ examples always causes failure. These are local audit outputs. Keep the
 official manifests fixed: official execution requires every requested chain
 and still verifies the NPZ schema and fingerprint.
 
-Maintainer asset refreshes require `--skip-manifest-regen` and sanitize MSAs by default. The published manifests remain fixed. After the
-train/public-validation/hidden-validation manifests are known,
-`scripts/full_official_data_refresh.sh` downloads raw public and hidden
-OpenProteinSet assets, builds a private held-out-target MSA row filter with
-`scripts/build_msa_row_filter.py`, and preprocesses public plus hidden feature
-NPZs with that filter. The generated filter scans source MSAs from train, public
-validation, and hidden validation, then removes non-query rows homologous to
-public or hidden validation targets before the MSA depth cap. Hidden-validation
-filters are private artifacts and must not be published. Automatically rebuilt
-filters default to `.nanofold_private/asset_rebuild/msa_row_filters/`, alongside
-the candidate asset rebuild rather than the existing filter reference.
+Maintainer asset refreshes require `--skip-manifest-regen`; published manifests remain fixed. `scripts/full_official_data_refresh.sh` prepares two private filters from raw MSAs: training sources against public-plus-hidden validation targets, and public-validation sources against hidden targets. One public `all.txt` preprocessing pass assigns the correct filter to every chain. Hidden preprocessing receives no row filter. Query row 0 is always preserved, and row removal precedes the depth cap. Hidden-derived filters and policy files remain private under the candidate asset-rebuild directory.
 
-Ad hoc maintainer/research refreshes can still pass an explicit
-`--msa-row-filter <json>` to `scripts/setup_official_data.sh` or
-`scripts/full_official_data_refresh.sh`. The filter JSON stores only SHA256
-hashes of ungapped MSA-row sequences to remove.
-When auditing existing processed features instead of raw A3Ms,
-`--source-processed-features-dir` can be repeated so public and private hidden
-feature roots are scanned together.
+The wrapper accepts an existing pair with `--train-msa-row-filter` and `--val-msa-row-filter`; `--skip-msa-row-filter-build` requires that pair. `--msa-filter-policy-out` chooses the private policy output (default `.nanofold_private/asset_rebuild/msa_row_filters/public_directed_policy.json`); automatic filters are written alongside it as `train_filter.json` and `val_filter.json`. `--msa-filter-checkpoint-dir` selects the search workspace, whose default is the policy directory's `checkpoints/`, with separate `train/`, `val/`, `residual_train_val/` and `residual_public_hidden/` searches. Filter construction and residual audits all use exhaustive checkpointed searches. The wrapper rejects scalar `--msa-row-filter` and `--msa-row-filter-out` arguments. `--skip-hidden` skips hidden asset preparation and the hidden residual audit, but the hidden manifest and pinned cache targets remain required to sanitize both public splits. The wrapper rejects `--skip-setup`; use `--resume-preprocess` for validated reuse.
+
+The direction is part of the data contract:
+
+| Source split | Target homologs excluded from non-query MSA rows |
+|---|---|
+| Training | Public validation and hidden validation |
+| Public validation | Hidden validation |
+| Hidden validation | None |
+
+No filter is built against its source split's own target set or an earlier split. A row that matches a forbidden later-split target is still removed. Hidden MSAs still undergo normal query/format validation, merging, deduplication and depth capping. The same target-homology thresholds apply to both filters. Standalone single-filter research preprocessing remains available, but a single undirected filter does not encode this three-split policy.
 
 MSA split audits live in `scripts/audit_msa_split.py`. The script reports
 processed feature availability, MSA-depth quantiles and binned Jensen-Shannon
@@ -239,13 +233,9 @@ optional MMseqs target-to-target and target-to-MSA homology, and optional raw A3
 overlap. Its default JSON output avoids raw sequences and hidden identifiers;
 depth CSVs also omit identifiers by default. Use identifier flags only when the output may contain those identities. `--strict` fails incomplete coverage, split overlap and exact held-out target leakage; `--run-mmseqs` adds separate thresholded searches against source targets and non-query MSA rows of at least 20 residues. Either kind of hit fails a strict audit. Missing or malformed MMseqs output is an error. Use `--val-features-dir` when held-out features have a separate root. Shared background MSA rows alone are descriptive overlap, not evidence of target leakage.
 
-If preprocessing is interrupted, rerun the same command with:
+If asset preprocessing is interrupted, rerun the same full-refresh command with `--resume-preprocess`. For direct `scripts/preprocess.py` commands, add `--skip-existing`.
 
-```bash
-bash scripts/setup_official_data.sh ... --resume-preprocess
-```
-
-Resume requires the same raw inputs, pinned chain-cache bytes, preprocessing implementation and configuration. New outputs contain source-content and configuration hashes; a changed or missing provenance record requires a fresh output directory. Existing files are validated before they can be skipped, including exact target equality to the selected cache sequence when cache binding is enabled.
+Resume requires the same raw inputs, pinned chain-cache bytes, split policy, effective filters, preprocessing implementation and configuration. New outputs contain source-content and configuration hashes; a changed or missing provenance record requires a fresh output directory. Existing files are validated before they can be skipped, including exact target equality to the selected cache sequence when cache binding is enabled.
 
 ## 3. How Dataset Splits Are Determined
 
@@ -303,8 +293,10 @@ For each chain ID, preprocessing:
 1. Resolves the encoded OpenProteinSet chain directory.
 2. Reads one or more A3M files.
 3. Removes query-gap columns from the MSA.
-4. Optionally removes non-query MSA rows whose ungapped sequence hash appears
-   in `--msa-row-filter`, always preserving the query row.
+4. Selects the effective filter from `--msa-filter-policy` for each public chain,
+   or uses `--msa-row-filter` for a standalone single-filter job. The two options
+   are mutually exclusive. Only non-query rows are removed; query row 0 is kept.
+   Hidden preprocessing supplies neither option.
 5. Merges and deduplicates MSA rows.
 6. Caps raw MSA depth with `--max-msa-seqs` before writing NPZ files.
 7. Loads the matching mmCIF file.
@@ -325,33 +317,20 @@ unambiguous assignments and cover every evaluated chain.
 
 For an independent whole-corpus target check, `scripts/audit_target_identity.py` accepts repeated `--manifest` paths with exact `--expected-counts`, the pinned `--chain-data-cache`, and `--raw-root` and/or repeated `--features-dir` roots. It compares every selected raw query and processed target to its cache sequence, validates processed feature schema, rehashes audited inputs and writes a fresh private receipt via `--out-dir`. It cannot pass from cache records alone or tolerate missing selected targets. Raw-only checks are available before preprocessing; label/geometry and homology validation remain separate.
 
-The MSA row filter is meant to sanitize evolutionary input features against
-held-out target homologs. The recommended split-aligned threshold is `30%`
-sequence identity with `80%` coverage. Official trio refreshes build this filter
-from train + public validation + hidden validation source MSAs against the
-public and hidden validation target sets, then apply it to public and hidden
-preprocessing so train MSAs do not carry held-out validation homolog rows.
-Filtering runs before `--max-msa-seqs`, so deeper non-filtered rows can backfill
-rows removed near the top of an MSA.
-When enabled, preprocessing writes `msa_row_filter_sha256`,
-`msa_rows_before_filter`, and `msa_rows_removed_by_filter` into each feature NPZ
-and writes `msa_row_filter_audit.json` into the feature directory. The filter
-hash is also folded into `preprocess_meta.json` and therefore into dataset
-fingerprints.
+Directional row filtering protects the two evaluation boundaries while retaining each split's permitted evolutionary context. The threshold is 30% sequence identity with 80% bidirectional coverage. Training excludes homologs of public and hidden validation targets; public validation excludes homologs of hidden targets; hidden validation is unfiltered. Each filter scans only its intended source split. Query row 0 is retained even if its sequence appears in a filter.
+
+`scripts/build_msa_filter_policy.py` binds `--train-manifest`, `--val-manifest`, `--hidden-manifest`, `--train-msa-row-filter` and `--val-msa-row-filter` into the private `--output` policy. It requires duplicate-free disjoint manifests, matching chain-cache bytes, and complete exhaustive raw-A3M filters at 30% identity and 80% bidirectional coverage. Keep both completed checkpoint directories: the policy loader verifies their source partitions and full job evidence, then rederives exclusions from alignments and exact sequence intersections. Unbatched filters remain available for standalone exploration but cannot satisfy this production policy. `preprocess.py --msa-filter-policy` requires `--chain-data-cache` and the exact public union; MSA names and consumed source paths/hashes must match the filter evidence. Hidden preprocessing omits both policy and scalar-filter options. See [the complete commands](DATA_SAMPLING.md#bounded-resumable-exhaustive-msa-searches).
+
+Filtering runs before `--max-msa-seqs`, so deeper permitted rows can fill positions freed by removal. Public train and validation share one output root and one bound preprocessing policy, while each chain records `msa_row_filter_sha256`, `msa_rows_before_filter` and `msa_rows_removed_by_filter`. The feature root contains `msa_row_filter_audit.train.json` and `msa_row_filter_audit.val.json`. Policy provenance in `preprocess_meta.json` retains the policy digest and public manifest/filter digests without hidden manifest references. Hidden features use a separate unfiltered preprocessing configuration. Fingerprints bind these configurations, and changed policy/filter/manifest inputs require fresh outputs.
 
 Use `scripts/audit_msa_split.py` before and after filtered regeneration to
 compare feature availability, MSA depth bins, exact row overlap, optional MMseqs
 homology hits, and available raw A3M hit-identifier overlap. Hidden validation
 audits should be reported only as aggregate counts.
 
-For private pre-regeneration checks, `scripts/build_msa_row_filter.py` can build
-a processed-feature filter by repeating `--source-processed-features-dir` for
-the public feature root and the private hidden feature root. That produces a
-de-identified filter for current features, but official camera-ready
-regeneration should prefer raw A3Ms when all source alignments are available so
-filtering still occurs before depth capping.
+For standalone checks of existing research assets, `scripts/build_msa_row_filter.py` accepts repeated `--source-processed-features-dir` paths and scans the requested source manifest. Directed public preprocessing requires complete raw-A3M filters so removal occurs before depth capping.
 
-MSA search is heuristic by default. Add `--exhaustive` to the filter builder and `--strict --run-mmseqs --exhaustive` to the split auditor for all collected query/source pairs under the recorded protein local-alignment contract. This disables prefiltering, masking and composition correction and uses E-value limit `1e308`; it does not enumerate every possible alignment or cover all biological homology. Non-query rows shorter than 20 residues are outside the search. Unbatched exhaustive searches require `--max-seqs` at least as large as the full source population; checkpointed searches require capacity for each complete source batch. Reporting caps cannot silently truncate results. The full-refresh wrapper does not enable this opt-in mode automatically.
+Standalone MSA search is heuristic by default. Add `--exhaustive` to the filter builder and `--strict --run-mmseqs --exhaustive` to the split auditor for all collected query/source pairs under the recorded protein local-alignment contract. This disables prefiltering, masking and composition correction and uses E-value limit `1e308`; it does not enumerate every possible alignment or cover all biological homology. Non-query rows shorter than 20 residues are outside the search. Unbatched exhaustive searches require `--max-seqs` at least as large as the full source population; checkpointed searches require capacity for each complete source batch. Reporting caps cannot silently truncate results. The full-refresh wrapper enables exhaustive checkpointed searches for both directed filters and both residual audits.
 
 Use the filter builder's `--exhaustive --inventory-only --output <private-inventory.json>` with the intended source and held-out manifests before an expensive search. It scans rows without running or requiring MMseqs and reports unique source/held-out counts, `all_pair_comparisons`, `required_exhaustive_max_seqs` and `source_complete`. Cost grows with the product of those populations; the count is not a runtime estimate. Missing sources do not establish complete coverage, and the inventory cannot be consumed as a row filter. See [dataset sampling](DATA_SAMPLING.md#before-adopting-a-dataset) for the search scope and release gates.
 
@@ -379,7 +358,7 @@ compact audit/source-lock summary. By default it redacts private paths and
 private manifest hashes and omits raw sequences, excluded sequence-hash lists,
 and per-chain processed-feature rows while retaining thresholds, normalized
 MMseqs settings, manifest counts, public manifest hashes, filter hashes, and
-aggregate row-removal counts.
+aggregate row-removal counts. For directed public preprocessing, pass `--msa-filter-policy`, `--split train` or `--split val`, the matching `--msa-row-filter` and that split's `--processed-filter-audit`; write one summary per split.
 
 Official projection thresholds:
 
@@ -404,7 +383,7 @@ Feature NPZ keys:
 | `template_ca_coords` | `(T, L, 3)` | `float32` | Template C-alpha coordinates. Official track uses `T=0`. |
 | `template_ca_mask` | `(T, L)` | `bool` | Template coordinate mask. Official track uses `T=0`. |
 | `projection_*` | scalar | numeric | Projection diagnostics used for audit/debugging. |
-| `msa_row_filter_*` | scalar | mixed | Present only when `--msa-row-filter` is used; records the filter hash and row-removal counts. |
+| `msa_row_filter_sha256`, `msa_rows_before_filter`, `msa_rows_removed_by_filter` | scalar | mixed | When row filtering is enabled, records the chain's effective filter hash and row-removal counts. |
 | `preprocess_config_sha256`, `source_inputs_sha256` | scalar | string | Schema-3 provenance shared with the label NPZ; used for resume and fingerprint validation, not passed to models. |
 | `resolved_author_chain_id`, `chain_mapping_method` | scalar | string | Resolved coordinate chain and mapping evidence (`author_id`, `label_id`, or unique `sequence` match), shared with labels. |
 

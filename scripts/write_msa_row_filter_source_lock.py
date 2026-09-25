@@ -15,7 +15,9 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -23,6 +25,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from nanofold.msa_filter_policy import load_msa_filter_policy
 from nanofold.msa_filter_summary import validate_batching_summary
 
 PUBLIC_PATHS = frozenset({
@@ -36,6 +39,8 @@ SOURCE_STAT_KEYS = ("chains", "missing_features", "missing_msa_files", "rows", "
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--msa-row-filter", type=Path, required=True)
+    ap.add_argument("--msa-filter-policy", type=Path, help="Hash-bound directed policy used to produce this split's features.")
+    ap.add_argument("--split", choices=("train", "val"), help="Public source split; requires --msa-filter-policy.")
     ap.add_argument(
         "--processed-filter-audit",
         type=Path,
@@ -57,11 +62,12 @@ def _sha256_file(path: Path) -> str:
         return hashlib.file_digest(handle, "sha256").hexdigest()
 
 
-def _load_json(path: Path) -> dict[str, Any]:
-    raw = json.loads(path.read_text())
+def _load_json(path: Path) -> tuple[dict[str, Any], str]:
+    data = path.read_bytes()
+    raw = json.loads(data)
     if not isinstance(raw, dict):
         raise ValueError(f"Expected JSON object: {path}")
-    return raw
+    return raw, hashlib.sha256(data).hexdigest()
 
 
 def _is_private_path(value: str | None) -> bool:
@@ -91,15 +97,19 @@ def _manifest_role(path: str | None) -> str:
     return "manifest"
 
 
-def _safe_manifest(record: Any, *, include_private_paths: bool) -> dict[str, Any]:
+def _safe_manifest(
+    record: Any, *, include_private_paths: bool, manifest_roles: dict[str, str] | None = None,
+) -> dict[str, Any]:
     if not isinstance(record, dict):
         raise ValueError(f"Manifest record must be an object, got {record!r}")
     path = record.get("path")
     if path is not None and not isinstance(path, str):
         raise ValueError(f"Manifest path must be a string, got {path!r}")
     private = _is_private_path(path)
+    digest = record.get("sha256")
+    role = manifest_roles.get(digest) if manifest_roles and isinstance(digest, str) else None
     safe: dict[str, Any] = {
-        "role": _manifest_role(path),
+        "role": role or _manifest_role(path),
         "path": _safe_path(path, include_private_paths=include_private_paths),
         "chain_count": record.get("chain_count"),
     }
@@ -110,12 +120,14 @@ def _safe_manifest(record: Any, *, include_private_paths: bool) -> dict[str, Any
     return safe
 
 
-def _safe_manifests(records: Any, *, include_private_paths: bool) -> list[dict[str, Any]]:
+def _safe_manifests(
+    records: Any, *, include_private_paths: bool, manifest_roles: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
     if records is None:
         return []
     if not isinstance(records, list):
         raise ValueError("Manifest records must be a list.")
-    return [_safe_manifest(record, include_private_paths=include_private_paths) for record in records]
+    return [_safe_manifest(record, include_private_paths=include_private_paths, manifest_roles=manifest_roles) for record in records]
 
 
 def _normalize_mmseqs_command(command: Any) -> list[str]:
@@ -181,8 +193,10 @@ def _safe_input_binding(value: Any, *, include_private_paths: bool) -> dict[str,
     return result
 
 
-def _summarize_row_filter(filter_path: Path, *, include_private_paths: bool) -> dict[str, Any]:
-    payload = _load_json(filter_path)
+def _summarize_row_filter(
+    filter_path: Path, *, include_private_paths: bool, manifest_roles: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    payload, filter_sha256 = _load_json(filter_path)
     if payload.get("inventory_type") is not None:
         raise ValueError("Search inventory is not a row filter; run the search before writing a filter source lock")
     search_contract = payload.get("search_contract")
@@ -206,7 +220,7 @@ def _summarize_row_filter(filter_path: Path, *, include_private_paths: bool) -> 
 
     summary: dict[str, Any] = {
         "path": _safe_path(str(filter_path), include_private_paths=include_private_paths),
-        "sha256": _sha256_file(filter_path),
+        "sha256": filter_sha256,
         "filter_type": payload.get("filter_type"),
         "search_contract": search_contract,
         "exhaustive": payload.get("exhaustive") if isinstance(payload.get("exhaustive"), bool) else None,
@@ -227,7 +241,7 @@ def _summarize_row_filter(filter_path: Path, *, include_private_paths: bool) -> 
             "mode": source.get("mode"),
             "complete": source.get("complete") if isinstance(source.get("complete"), bool) else None,
             "minimum_non_query_sequence_length": source.get("minimum_non_query_sequence_length"),
-            "manifests": _safe_manifests(source.get("manifests"), include_private_paths=include_private_paths),
+            "manifests": _safe_manifests(source.get("manifests"), include_private_paths=include_private_paths, manifest_roles=manifest_roles),
             "raw_root": _safe_path(source.get("raw_root"), include_private_paths=include_private_paths),
             "processed_features_dirs": [
                 _safe_path(str(path), include_private_paths=include_private_paths)
@@ -240,7 +254,7 @@ def _summarize_row_filter(filter_path: Path, *, include_private_paths: bool) -> 
             },
         },
         "heldout": {
-            "manifests": _safe_manifests(heldout.get("manifests"), include_private_paths=include_private_paths),
+            "manifests": _safe_manifests(heldout.get("manifests"), include_private_paths=include_private_paths, manifest_roles=manifest_roles),
             "unique_target_sequence_count": heldout.get("unique_target_sequence_count"),
         },
         "chain_data_cache": {
@@ -257,18 +271,63 @@ def _summarize_row_filter(filter_path: Path, *, include_private_paths: bool) -> 
     return summary
 
 
-def _summarize_processed_audit(path: Path, *, include_private_paths: bool) -> dict[str, Any]:
-    payload = _load_json(path)
+def _summarize_processed_audit(
+    path: Path, *, include_private_paths: bool, expected_binding: dict[str, Any] | None = None,
+    manifest_roles: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    payload, audit_sha256 = _load_json(path)
+    if "manifest" in payload:
+        from nanofold.data import read_manifest
+
+        if payload.get("schema_version") != 1 or "manifests" in payload or not isinstance(payload["manifest"], str):
+            raise ValueError("Invalid preprocessing MSA filter audit manifest")
+        manifest = Path(payload["manifest"]).resolve(strict=True)
+        manifest_sha256 = _sha256_file(manifest)
+        chain_ids = read_manifest(manifest)
+        rows = payload.get("per_chain")
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            raise ValueError("Preprocessing MSA filter audit requires per-chain row counts")
+        observed = [row.get("chain_id") for row in rows]
+        if (any(not isinstance(chain_id, str) for chain_id in observed)
+                or len(set(chain_ids)) != len(chain_ids) or len(set(observed)) != len(observed)
+                or not set(observed).issubset(chain_ids) or type(payload.get("chain_count")) is not int
+                or payload.get("chain_count") != len(rows)):
+            raise ValueError("Preprocessing MSA filter audit chain coverage disagrees with its manifest")
+        for row in rows:
+            values = [row.get(field) for field in ("input_rows", "removed_rows", "output_rows")]
+            if (any(type(value) is not int or value < 0 for value in values)
+                    or not 1 <= values[2] <= values[0] - values[1]):
+                raise ValueError("Preprocessing MSA filter audit has invalid per-chain row counts")
+        if (sum(row["input_rows"] for row in rows) != payload.get("total_msa_rows_before_filter")
+                or sum(row["removed_rows"] for row in rows) != payload.get("total_msa_rows_removed")):
+            raise ValueError("Preprocessing MSA filter audit totals disagree with its per-chain counts")
+        if _sha256_file(manifest) != manifest_sha256:
+            raise ValueError("Preprocessing MSA filter audit manifest changed during validation")
+        payload.update(
+            operation="raw_a3m_msa_row_filter", out_features_dir=str(path.parent),
+            manifests=[{"path": str(manifest), "sha256": manifest_sha256, "chain_count": len(chain_ids)}],
+            chain_count=len(chain_ids), filtered_chain_count=len(rows), missing_chain_count=len(chain_ids) - len(rows),
+        )
+    if expected_binding is not None:
+        manifests = payload.get("manifests")
+        if (not isinstance(manifests, list) or len(manifests) != 1 or not isinstance(manifests[0], dict)
+                or manifests[0].get("sha256") != expected_binding["manifest_sha256"]
+                or manifests[0].get("chain_count") != expected_binding["chain_count"]
+                or payload.get("chain_count") != expected_binding["chain_count"]
+                or payload.get("filtered_chain_count") != expected_binding["chain_count"]
+                or payload.get("missing_chain_count") != 0
+                or payload.get("msa_row_filter_sha256") != expected_binding["filter_sha256"]):
+            raise ValueError("Processed-filter audit does not match the complete directed policy split")
     return {
         "path": _safe_path(str(path), include_private_paths=include_private_paths),
-        "sha256": _sha256_file(path),
+        "sha256": audit_sha256,
         "operation": payload.get("operation"),
         "out_features_dir": _safe_path(payload.get("out_features_dir"), include_private_paths=include_private_paths),
         "source_processed_features_dirs": [
             _safe_path(str(source_path), include_private_paths=include_private_paths)
             for source_path in payload.get("source_processed_features_dirs", [])
         ],
-        "manifests": _safe_manifests(payload.get("manifests"), include_private_paths=include_private_paths),
+        "manifests": _safe_manifests(payload.get("manifests"), include_private_paths=include_private_paths, manifest_roles=manifest_roles),
         "chain_count": payload.get("chain_count"),
         "filtered_chain_count": payload.get("filtered_chain_count"),
         "missing_chain_count": payload.get("missing_chain_count"),
@@ -291,15 +350,44 @@ def _sum_int(records: Sequence[dict[str, Any]], key: str) -> int | None:
     return sum(values) if values else None
 
 
+def _validate_output_path(output: Path, inputs: Sequence[Path]) -> Path:
+    target = output.resolve()
+    for path in inputs:
+        source = path.resolve(strict=True)
+        if target == source or (target.exists() and target.samefile(source)):
+            raise ValueError("Source-lock output would overwrite an input dependency")
+    return target
+
+
 def build_source_lock(
     *,
     row_filter_path: Path,
     processed_filter_audit_paths: Sequence[Path],
     include_private_paths: bool = False,
+    msa_filter_policy_path: Path | None = None,
+    split: str | None = None,
+    output_path: Path | None = None,
 ) -> dict[str, Any]:
-    filter_summary = _summarize_row_filter(row_filter_path, include_private_paths=include_private_paths)
+    if (msa_filter_policy_path is None) != (split is None) or split not in (None, "train", "val"):
+        raise ValueError("Directed source locks require both --msa-filter-policy and --split train|val")
+    policy = load_msa_filter_policy(msa_filter_policy_path) if msa_filter_policy_path is not None else None
+    if output_path is not None:
+        _validate_output_path(output_path, [row_filter_path, *processed_filter_audit_paths])
+        if policy is not None:
+            policy.validate_output_paths([output_path])
+    manifest_roles = None if policy is None else {
+        policy.provenance["splits"][role]["manifest_sha256"]: label
+        for role, label in (("train", "train"), ("val", "public_validation"))
+    }
+    filter_summary = _summarize_row_filter(row_filter_path, include_private_paths=include_private_paths, manifest_roles=manifest_roles)
+    expected_binding = None
+    if policy is not None and split is not None:
+        expected_binding = policy.provenance["splits"][split]
+        if row_filter_path.resolve(strict=True) != policy.filters[split].path or filter_summary["sha256"] != expected_binding["filter_sha256"]:
+            raise ValueError("Supplied row filter does not match the directed policy split")
     audit_summaries = [
-        _summarize_processed_audit(path, include_private_paths=include_private_paths)
+        _summarize_processed_audit(path, include_private_paths=include_private_paths, expected_binding=expected_binding,
+                                  manifest_roles=manifest_roles)
         for path in processed_filter_audit_paths
     ]
     if audit_summaries and audit_summaries[-1]["msa_row_filter_sha256"] != filter_summary["sha256"]:
@@ -312,7 +400,7 @@ def build_source_lock(
             raise ValueError("Processed-filter audit must contain nonnegative integer row counts")
         if before - after != removed:
             raise ValueError("Processed-filter audit row counts are inconsistent")
-    return {
+    summary = {
         "schema_version": 1,
         "artifact_type": "msa_row_filter_source_lock",
         "public_safe": not include_private_paths,
@@ -341,18 +429,43 @@ def build_source_lock(
             "final_msa_row_filter_sha256": audit_summaries[-1].get("msa_row_filter_sha256") if audit_summaries else None,
         },
     }
+    if policy is not None:
+        policy.assert_unchanged()
+        summary["filter_scope"] = {"split": split, "policy": policy.provenance}
+    for path, digest in [(row_filter_path, filter_summary["sha256"]), *(
+        (path, audit["sha256"]) for path, audit in zip(processed_filter_audit_paths, audit_summaries, strict=True)
+    )]:
+        if _sha256_file(path) != digest:
+            raise ValueError("A source-lock input changed during validation")
+    if output_path is not None:
+        _validate_output_path(output_path, [row_filter_path, *processed_filter_audit_paths])
+        if policy is not None:
+            policy.validate_output_paths([output_path])
+    return summary
 
 
 def main() -> None:
     args = parse_args()
+    output = args.output.resolve()
     payload = build_source_lock(
         row_filter_path=args.msa_row_filter,
         processed_filter_audit_paths=args.processed_filter_audit,
         include_private_paths=bool(args.include_private_paths),
+        msa_filter_policy_path=args.msa_filter_policy,
+        split=args.split,
+        output_path=output,
     )
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
-    print(f"Wrote MSA row-filter source lock to {args.output}")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{output.name}.", suffix=".tmp", dir=output.parent)
+    try:
+        with os.fdopen(fd, "w") as handle:
+            handle.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, output)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+    print(f"Wrote MSA row-filter source lock to {output}")
 
 
 if __name__ == "__main__":

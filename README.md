@@ -241,27 +241,30 @@ real MSA gaps from padding; maintained submissions use it for MSA statistics.
 Scoring rejects truncated or nonfinite predictions and binds official scoring
 inputs to the maintainer's evaluation contract.
 
-Maintainer preprocessing uses a private held-out-target MSA row filter built
-from the train/public-validation/hidden-validation source MSAs against both
-held-out target sets. It removes detected non-query homolog rows before the MSA
-depth cap while retaining each query. The filter digest is recorded in the
-features and preprocessing metadata. Filters derived from hidden targets remain
-private.
+Maintainer preprocessing applies directional MSA exclusions: training removes
+non-query rows homologous to public or hidden validation targets; public
+validation removes rows homologous to hidden targets; hidden validation receives
+no held-out-target row filter. Row 0, the exact target query, is always preserved.
+Filtering precedes the MSA depth cap. Ordinary normalization, deduplication and
+depth limits still apply to every split, with the cap applied after deduplication.
+The policy requires both complete search checkpoints and binds each effective
+filter into preprocessing provenance; hidden-derived artifacts remain private.
 
 `scripts/audit_msa_split.py` reports availability, MSA-depth balance, target
 chain/PDB/cluster overlap, exact sequence overlap, and optional MMseqs homology
 and raw A3M identifier overlap. Add `--strict --run-mmseqs` to fail on incomplete
 features, target overlap, or residual held-out-target hits. A cluster audit
 requires a complete supplied cluster TSV; without it, cluster separation is
-reported as unchecked. Zero MMseqs hits applies to the configured heuristic
+reported as unchecked. Zero MMseqs hits applies to the recorded local-alignment
 search over non-query rows of at least 20 residues, not all possible homology.
 The default depth CSV and examples omit identifiers; identifier flags are
 explicit opt-ins for public or sealed private reports.
 
 The fixed-manifest asset workflow uses
-`scripts/full_official_data_refresh.sh --skip-manifest-regen` and runs strict
-public/hidden MSA audits before fingerprinting. Preprocessing failures stop the
-workflow without changing exclusion lists or resampling targets. A processed
+`scripts/full_official_data_refresh.sh --skip-manifest-regen`, builds both filters
+with exhaustive checkpointed searches, and runs strict exhaustive
+train→public-validation and public-all→hidden MSA audits before fingerprinting.
+Preprocessing failures stop the workflow without changing exclusion lists or resampling targets. A processed
 feature filter can support local audits of unbound research assets when raw
 A3Ms are unavailable. Schema-3 assets require preprocessing again from raw
 inputs; postprocessing cannot preserve their paired provenance or recover rows

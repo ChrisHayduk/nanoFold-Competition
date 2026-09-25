@@ -13,8 +13,8 @@ regenerate_official_manifests.sh --help. Automatic manifest replacement is refus
 Asset rebuild flow:
   1) verify the frozen official manifest hashes/counts
   2) download OpenFold assets for public + hidden splits
-  3) build a heldout-target MSA row filter for the manifest trio
-  4) preprocess public + hidden split NPZs (features + labels) with that filter
+  3) build directed train-to-heldout and public-validation-to-hidden MSA filters
+  4) preprocess public NPZs with split-specific filters and hidden NPZs unfiltered
   5) require complete features and zero cross-split target/target and target/MSA hits
   6) stage candidate fingerprints/locks and verify published manifest hashes
 
@@ -62,15 +62,16 @@ Options:
   --private-manifest-lock <path>      Hidden manifest source lock path
                                       (default: <private-root>/leaderboard/private_hidden_manifest_source.lock.json)
   --msa-names <csv>                   Comma-separated MSA filenames to download/preprocess
-  --msa-row-filter <path>             Existing JSON of held-out-homolog MSA row hashes for public/hidden preprocessing
-  --msa-row-filter-out <path>         Output path when auto-building the held-out MSA row filter
-                                      (default: <private-root>/asset_rebuild/msa_row_filters/official_heldout_target_homology_filter.json)
-  --skip-msa-row-filter-build         Do not auto-build an MSA row filter when --msa-row-filter is omitted.
-                                      This is for exploratory/debug runs only, not official trio refreshes.
+  --train-msa-row-filter <path>       Existing exhaustive train-to-public/hidden-validation filter
+  --val-msa-row-filter <path>         Existing exhaustive public-validation-to-hidden filter
+                                      Supply both filters together, or both are built from raw MSAs.
+  --msa-filter-policy-out <path>      Split-filter policy output (default: <private-root>/asset_rebuild/msa_row_filters/public_directed_policy.json)
+                                      Auto-built train_filter.json and val_filter.json are written beside it.
+  --msa-filter-checkpoint-dir <path>  Bounded exhaustive MSA search checkpoint root (default: beside policy, checkpoints/)
+  --skip-msa-row-filter-build         Require the two existing filters when preprocessing.
   --skip-manifest-regen               Required: keep the frozen published manifests
-  --skip-setup                        Skip download+preprocess step
   --skip-fingerprint                  Skip fingerprint rebuild step
-  --skip-hidden                       Skip hidden split download/preprocess/fingerprint/pinning
+  --skip-hidden                       Skip hidden assets; hidden target manifest/cache remain required for public filters
   --resume-preprocess                 Reuse readable feature+label NPZs and preprocess only missing or invalid chains
   --enable-templates                  Pass through to setup_official_data.sh
   --disable-templates                 Pass through to setup_official_data.sh (default)
@@ -114,9 +115,13 @@ DOWNLOAD_RETRY_DELAY_SECONDS=2.0
 DOWNLOAD_WORKERS=32
 MMCIF_MODE="subset"
 MSA_NAMES=""
-MSA_ROW_FILTER=""
-MSA_ROW_FILTER_OUT=""
-USER_MSA_ROW_FILTER=0
+MSA_MIN_SEQ_ID=0.30
+MSA_COVERAGE=0.80
+TRAIN_MSA_ROW_FILTER=""
+VAL_MSA_ROW_FILTER=""
+MSA_FILTER_POLICY_OUT=""
+MSA_FILTER_CHECKPOINT_DIR=""
+USER_MSA_ROW_FILTERS=0
 USE_TEMPLATES=0
 SKIP_MANIFEST_REGEN=0
 SKIP_SETUP=0
@@ -225,8 +230,8 @@ while [[ $# -gt 0 ]]; do
       shift 1
       ;;
     --skip-setup)
-      SKIP_SETUP=1
-      shift 1
+      echo "--skip-setup cannot establish directed MSA provenance; use --resume-preprocess for validated reuse." >&2
+      exit 1
       ;;
     --skip-fingerprint)
       SKIP_FINGERPRINT=1
@@ -252,14 +257,25 @@ while [[ $# -gt 0 ]]; do
       MSA_NAMES="$2"
       shift 2
       ;;
-    --msa-row-filter)
-      MSA_ROW_FILTER="$2"
-      USER_MSA_ROW_FILTER=1
+    --train-msa-row-filter)
+      TRAIN_MSA_ROW_FILTER="$2"
       shift 2
       ;;
-    --msa-row-filter-out)
-      MSA_ROW_FILTER_OUT="$2"
+    --val-msa-row-filter)
+      VAL_MSA_ROW_FILTER="$2"
       shift 2
+      ;;
+    --msa-filter-policy-out)
+      MSA_FILTER_POLICY_OUT="$2"
+      shift 2
+      ;;
+    --msa-filter-checkpoint-dir)
+      MSA_FILTER_CHECKPOINT_DIR="$2"
+      shift 2
+      ;;
+    --msa-row-filter|--msa-row-filter-out)
+      echo "Global MSA filters are not supported here; supply --train-msa-row-filter and --val-msa-row-filter together." >&2
+      exit 1
       ;;
     --skip-msa-row-filter-build)
       SKIP_MSA_ROW_FILTER_BUILD=1
@@ -331,11 +347,27 @@ fi
 if [[ -z "$PRIVATE_MANIFEST_LOCK" ]]; then
   PRIVATE_MANIFEST_LOCK="$PRIVATE_ROOT/leaderboard/private_hidden_manifest_source.lock.json"
 fi
-if [[ -z "$MSA_ROW_FILTER_OUT" ]]; then
-  MSA_ROW_FILTER_OUT="$PRIVATE_ROOT/asset_rebuild/msa_row_filters/official_heldout_target_homology_filter.json"
+if [[ -n "$TRAIN_MSA_ROW_FILTER" || -n "$VAL_MSA_ROW_FILTER" ]]; then
+  if [[ -z "$TRAIN_MSA_ROW_FILTER" || -z "$VAL_MSA_ROW_FILTER" ]]; then
+    echo "Supply both --train-msa-row-filter and --val-msa-row-filter." >&2
+    exit 1
+  fi
+  USER_MSA_ROW_FILTERS=1
 fi
-if [[ "$SKIP_SETUP" -eq 0 && "$SKIP_MSA_ROW_FILTER_BUILD" -eq 0 && "$USER_MSA_ROW_FILTER" -eq 0 ]]; then
-  MSA_ROW_FILTER="$MSA_ROW_FILTER_OUT"
+if [[ "$SKIP_SETUP" -eq 0 && "$SKIP_MSA_ROW_FILTER_BUILD" -eq 1 && "$USER_MSA_ROW_FILTERS" -eq 0 ]]; then
+  echo "Preprocessing requires both directed filters; --skip-msa-row-filter-build requires existing filters." >&2
+  exit 1
+fi
+if [[ -z "$MSA_FILTER_POLICY_OUT" ]]; then
+  MSA_FILTER_POLICY_OUT="$PRIVATE_ROOT/asset_rebuild/msa_row_filters/public_directed_policy.json"
+fi
+MSA_FILTER_DIR="$(dirname -- "$MSA_FILTER_POLICY_OUT")"
+if [[ -z "$MSA_FILTER_CHECKPOINT_DIR" ]]; then
+  MSA_FILTER_CHECKPOINT_DIR="$MSA_FILTER_DIR/checkpoints"
+fi
+if [[ "$USER_MSA_ROW_FILTERS" -eq 0 ]]; then
+  TRAIN_MSA_ROW_FILTER="$MSA_FILTER_DIR/train_filter.json"
+  VAL_MSA_ROW_FILTER="$MSA_FILTER_DIR/val_filter.json"
 fi
 
 run_cmd() {
@@ -391,23 +423,28 @@ if [[ "$SKIP_FINGERPRINT" -eq 0 ]]; then
     CANDIDATE_OUTPUTS+=("$HIDDEN_FINGERPRINT_OUT" "$HIDDEN_LOCK_FILE")
   fi
 fi
-if [[ "$SKIP_SETUP" -eq 0 && "$USER_MSA_ROW_FILTER" -eq 0 && "$SKIP_MSA_ROW_FILTER_BUILD" -eq 0 ]]; then
-  CANDIDATE_OUTPUTS+=("$MSA_ROW_FILTER_OUT")
+if [[ "$SKIP_SETUP" -eq 0 ]]; then
+  CANDIDATE_OUTPUTS+=("$MSA_FILTER_POLICY_OUT")
+  if [[ "$USER_MSA_ROW_FILTERS" -eq 0 ]]; then
+    CANDIDATE_OUTPUTS+=("$TRAIN_MSA_ROW_FILTER" "$VAL_MSA_ROW_FILTER")
+  fi
 fi
-PROTECTED_MSA_ROW_FILTER=""
-if [[ "$USER_MSA_ROW_FILTER" -eq 1 ]]; then
-  PROTECTED_MSA_ROW_FILTER="$MSA_ROW_FILTER"
+PROTECTED_TRAIN_MSA_ROW_FILTER=""
+PROTECTED_VAL_MSA_ROW_FILTER=""
+if [[ "$USER_MSA_ROW_FILTERS" -eq 1 ]]; then
+  PROTECTED_TRAIN_MSA_ROW_FILTER="$TRAIN_MSA_ROW_FILTER"
+  PROTECTED_VAL_MSA_ROW_FILTER="$VAL_MSA_ROW_FILTER"
 fi
 python - "$REPO_ROOT" "$PRIVATE_ROOT" "$MANIFESTS_DIR" "$HIDDEN_MANIFESTS_DIR" \
   "$LOCK_FILE" "$TRACK_FILE" "$PRIVATE_MANIFEST_LOCK" "$STRUCTURE_METADATA" \
   "$METADATA_SOURCE_LOCK" "$FEATURE_EXCLUSION_LIST" "$PROCESSABILITY_EXCLUSION_LIST" \
-  "$CHAIN_DATA_CACHE" "$PROTECTED_MSA_ROW_FILTER" \
+  "$CHAIN_DATA_CACHE" "$PROTECTED_TRAIN_MSA_ROW_FILTER" "$PROTECTED_VAL_MSA_ROW_FILTER" \
   "${CANDIDATE_OUTPUTS[@]}" <<'PYTHON'
 import sys
 from pathlib import Path
 
 repo, private, manifests, hidden_manifests = (Path(p).resolve() for p in sys.argv[1:5])
-protected = [Path(p).resolve() for p in sys.argv[5:14] if p]
+protected = [Path(p).resolve() for p in sys.argv[5:15] if p]
 protected.extend(manifests / name for name in ("train.txt", "val.txt", "all.txt"))
 protected.append(hidden_manifests / "hidden_val.txt")
 protected.append(private / "msa_row_filters/official_heldout_target_homology_filter.json")
@@ -420,7 +457,7 @@ protected.extend(repo / "leaderboard" / name for name in (
 ))
 protected_roots = [repo / "leaderboard", repo / "tracks", repo / "data/manifests"]
 protected.extend(path for root in protected_roots for path in root.rglob("*") if path.is_file())
-outputs = [Path(p).resolve() for p in sys.argv[14:]]
+outputs = [Path(p).resolve() for p in sys.argv[15:]]
 
 def aliases(left, right):
     return left == right or (left.exists() and right.exists() and left.samefile(right))
@@ -432,6 +469,32 @@ for index, output in enumerate(outputs):
         raise SystemExit("Refusing to overwrite a frozen dataset contract; use a candidate output path.")
     if any(aliases(output, previous) for previous in outputs[:index]):
         raise SystemExit("Candidate output paths must be distinct.")
+PYTHON
+
+# Search checkpoints and generated policy/filter files must stay outside asset
+# roots, and checkpoint jobs must never write through a protected input path.
+python - "$MSA_FILTER_CHECKPOINT_DIR" \
+  "$MANIFESTS_DIR" "$HIDDEN_MANIFESTS_DIR" "$REPO_ROOT/leaderboard" "$REPO_ROOT/tracks" \
+  "$TRAIN_MSA_ROW_FILTER" "$VAL_MSA_ROW_FILTER" "$CHAIN_DATA_CACHE" \
+  "${#CANDIDATE_OUTPUTS[@]}" "${CANDIDATE_OUTPUTS[@]}" "${ASSET_DIRS[@]}" <<'PYTHON'
+import sys
+from pathlib import Path
+
+checkpoint = Path(sys.argv[1]).resolve()
+protected = [Path(p).resolve() for p in sys.argv[2:9]]
+count = int(sys.argv[9])
+outputs = [Path(p).resolve() for p in sys.argv[10:10 + count]]
+assets = [Path(p).resolve() for p in sys.argv[10 + count:]]
+
+def overlaps(left, right):
+    return left.is_relative_to(right) or right.is_relative_to(left)
+
+if any(overlaps(output, asset) for output in outputs for asset in assets):
+    raise SystemExit("Candidate output files must be separate from raw and processed asset roots.")
+if any(overlaps(checkpoint, path) for path in [*protected, *outputs, *assets]):
+    raise SystemExit("MSA filter checkpoints must be separate from inputs, outputs and asset roots.")
+if checkpoint.exists() and not checkpoint.is_dir():
+    raise SystemExit("MSA filter checkpoint path must be a directory.")
 PYTHON
 
 if [[ "$DRY_RUN" -eq 1 ]]; then
@@ -521,32 +584,41 @@ else
   echo "Skipping hidden split raw asset download (--skip-hidden or --skip-setup)."
 fi
 
-echo "[3c/5] Build held-out-target MSA row filter"
-if [[ "$SKIP_SETUP" -eq 0 && "$USER_MSA_ROW_FILTER" -eq 0 && "$SKIP_MSA_ROW_FILTER_BUILD" -eq 0 ]]; then
-  MSA_FILTER_CMD=(
-    python "$SCRIPT_DIR/build_msa_row_filter.py"
-    --source-manifest "$MANIFESTS_DIR/train.txt"
-    --source-manifest "$MANIFESTS_DIR/val.txt"
-    --heldout-manifest "$MANIFESTS_DIR/val.txt"
-    --chain-data-cache "$CHAIN_DATA_CACHE"
-    --raw-root "$DATA_ROOT"
-    --threads "$DOWNLOAD_WORKERS"
-    --output "$MSA_ROW_FILTER"
-  )
-  if [[ "$SKIP_HIDDEN" -eq 0 ]]; then
-    MSA_FILTER_CMD+=(
-      --source-manifest "$HIDDEN_MANIFESTS_DIR/hidden_val.txt"
-      --heldout-manifest "$HIDDEN_MANIFESTS_DIR/hidden_val.txt"
+echo "[3c/5] Build directed MSA row filters and public split policy"
+if [[ "$SKIP_SETUP" -eq 0 ]]; then
+  if [[ "$USER_MSA_ROW_FILTERS" -eq 0 ]]; then
+    MSA_FILTER_COMMON=(
+      python "$SCRIPT_DIR/build_msa_row_filter.py"
+      --chain-data-cache "$CHAIN_DATA_CACHE"
+      --raw-root "$DATA_ROOT"
+      --threads "$DOWNLOAD_WORKERS"
+      --exhaustive
+      --min-seq-id "$MSA_MIN_SEQ_ID" --coverage "$MSA_COVERAGE"
     )
+    if [[ -n "$MSA_NAMES" ]]; then
+      MSA_FILTER_COMMON+=(--msa-names "$MSA_NAMES")
+    fi
+    run_cmd "${MSA_FILTER_COMMON[@]}" \
+      --source-manifest "$MANIFESTS_DIR/train.txt" \
+      --heldout-manifest "$MANIFESTS_DIR/val.txt" \
+      --heldout-manifest "$HIDDEN_MANIFESTS_DIR/hidden_val.txt" \
+      --checkpoint-dir "$MSA_FILTER_CHECKPOINT_DIR/train" \
+      --output "$TRAIN_MSA_ROW_FILTER"
+    run_cmd "${MSA_FILTER_COMMON[@]}" \
+      --source-manifest "$MANIFESTS_DIR/val.txt" \
+      --heldout-manifest "$HIDDEN_MANIFESTS_DIR/hidden_val.txt" \
+      --checkpoint-dir "$MSA_FILTER_CHECKPOINT_DIR/val" \
+      --output "$VAL_MSA_ROW_FILTER"
   fi
-  if [[ -n "$MSA_NAMES" ]]; then
-    MSA_FILTER_CMD+=(--msa-names "$MSA_NAMES")
-  fi
-  run_cmd "${MSA_FILTER_CMD[@]}"
-elif [[ -n "$MSA_ROW_FILTER" ]]; then
-  echo "Using existing MSA row filter: $MSA_ROW_FILTER"
+  run_cmd python "$SCRIPT_DIR/build_msa_filter_policy.py" \
+    --train-manifest "$MANIFESTS_DIR/train.txt" \
+    --val-manifest "$MANIFESTS_DIR/val.txt" \
+    --hidden-manifest "$HIDDEN_MANIFESTS_DIR/hidden_val.txt" \
+    --train-msa-row-filter "$TRAIN_MSA_ROW_FILTER" \
+    --val-msa-row-filter "$VAL_MSA_ROW_FILTER" \
+    --output "$MSA_FILTER_POLICY_OUT"
 else
-  echo "MSA row-filter build skipped and no --msa-row-filter was supplied; outputs will not be held-out sanitized."
+  echo "Skipping MSA filter construction (--skip-setup)."
 fi
 
 echo "[3d/5] Preprocess public split NPZ data"
@@ -562,9 +634,7 @@ if [[ "$SKIP_SETUP" -eq 0 ]]; then
   if [[ -n "$MSA_NAMES" ]]; then
     PUBLIC_PREPROCESS_COMMON+=(--msa-names "$MSA_NAMES")
   fi
-  if [[ -n "$MSA_ROW_FILTER" ]]; then
-    PUBLIC_PREPROCESS_COMMON+=(--msa-row-filter "$MSA_ROW_FILTER")
-  fi
+  PUBLIC_PREPROCESS_COMMON+=(--msa-filter-policy "$MSA_FILTER_POLICY_OUT")
   if [[ "$USE_TEMPLATES" -eq 1 ]]; then
     PUBLIC_PREPROCESS_COMMON+=(--template-hhr-name "pdb70_hits.hhr")
   else
@@ -596,9 +666,6 @@ if [[ "$SKIP_HIDDEN" -eq 0 && "$SKIP_SETUP" -eq 0 ]]; then
   if [[ -n "$MSA_NAMES" ]]; then
     HIDDEN_PREPROCESS_CMD+=(--msa-names "$MSA_NAMES")
   fi
-  if [[ -n "$MSA_ROW_FILTER" ]]; then
-    HIDDEN_PREPROCESS_CMD+=(--msa-row-filter "$MSA_ROW_FILTER")
-  fi
   if [[ "$USE_TEMPLATES" -eq 1 ]]; then
     HIDDEN_PREPROCESS_CMD+=(--template-hhr-name "pdb70_hits.hhr")
   else
@@ -624,7 +691,9 @@ PUBLIC_AUDIT_CMD=(
   --features-dir "$PROCESSED_FEATURES_DIR"
   --feature-exclusion-list "$FEATURE_EXCLUSION_LIST"
   --out-dir "$PRIVATE_ROOT/audits/public_msa_split"
-  --strict --run-mmseqs --skip-plot
+  --strict --run-mmseqs --exhaustive --skip-plot
+  --min-seq-id "$MSA_MIN_SEQ_ID" --coverage "$MSA_COVERAGE"
+  --checkpoint-dir "$MSA_FILTER_CHECKPOINT_DIR/residual_train_val"
   --threads "$DOWNLOAD_WORKERS"
 )
 run_cmd "${PUBLIC_AUDIT_CMD[@]}"
@@ -637,7 +706,9 @@ if [[ "$SKIP_HIDDEN" -eq 0 ]]; then
     --val-features-dir "$HIDDEN_FEATURES_DIR"
     --feature-exclusion-list "$FEATURE_EXCLUSION_LIST"
     --out-dir "$PRIVATE_ROOT/audits/hidden_msa_split"
-    --strict --run-mmseqs --skip-plot
+    --strict --run-mmseqs --exhaustive --skip-plot
+    --min-seq-id "$MSA_MIN_SEQ_ID" --coverage "$MSA_COVERAGE"
+    --checkpoint-dir "$MSA_FILTER_CHECKPOINT_DIR/residual_public_hidden"
     --threads "$DOWNLOAD_WORKERS"
   )
   run_cmd "${HIDDEN_AUDIT_CMD[@]}"
@@ -784,8 +855,8 @@ echo "Manifests: $MANIFESTS_DIR"
 echo "Processed features: $PROCESSED_FEATURES_DIR"
 echo "Processed labels: $PROCESSED_LABELS_DIR"
 echo "Fingerprint: $FINGERPRINT_OUT"
-if [[ -n "$MSA_ROW_FILTER" ]]; then
-  echo "MSA row filter: $MSA_ROW_FILTER"
+if [[ "$SKIP_SETUP" -eq 0 ]]; then
+  echo "Directed public MSA filter policy: $MSA_FILTER_POLICY_OUT"
 fi
 echo "Structure metadata: $STRUCTURE_METADATA"
 echo "Metadata sources: $METADATA_SOURCES_DIR"

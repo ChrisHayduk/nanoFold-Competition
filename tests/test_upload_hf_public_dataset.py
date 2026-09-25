@@ -8,9 +8,11 @@ from typing import Any
 import numpy as np
 import pytest
 import yaml
+from msa_filter_policy_helpers import write_valid_policy_case
 
 from nanofold.chain_paths import chain_npz_path
-from nanofold.dataset_integrity import build_dataset_fingerprint
+from nanofold.dataset_integrity import build_dataset_fingerprint, preprocess_config_sha256
+from nanofold.msa_filter_policy import load_msa_filter_policy
 from nanofold.utils import sha256_file
 from scripts import upload_hf_public_dataset as exporter
 from scripts.upload_hf_public_dataset import generate_rows, render_dataset_card
@@ -643,5 +645,99 @@ def test_batched_filter_summary_rejects_private_or_inconsistent_metadata_before_
     path.write_text(json.dumps(summary))
     monkeypatch.setattr(exporter, "parse_args", lambda: public_inputs)
     monkeypatch.setattr(exporter, "_require_hf_modules", lambda: pytest.fail("Unsafe batch metadata reached HF"))
+    with pytest.raises(ValueError):
+        exporter.main()
+
+
+def _attach_directed_filter_summaries(args: Namespace, tmp_path: Path) -> dict[str, Path]:
+    paths = write_valid_policy_case(tmp_path / ".nanofold_private", chains={"train": "1abc_A", "val": "3ghi_C", "hidden": "5mno_E"})
+    policy = load_msa_filter_policy(paths["policy_path"])
+    meta = {"schema_version": 3, "cli_args": {}, "msa_filter_policy": policy.provenance}
+    config_hash = preprocess_config_sha256(meta)
+    (args.processed_features_dir / "preprocess_meta.json").write_text(json.dumps(meta))
+    for split in ("train", "val"):
+        manifest = getattr(args, f"{split}_manifest")
+        manifest.write_bytes(paths[f"{split}_manifest"].read_bytes())
+        for chain in exporter.read_manifest(manifest):
+            for root in (args.processed_features_dir, args.processed_labels_dir):
+                updates = {"preprocess_config_sha256": np.asarray(config_hash), "source_inputs_sha256": np.asarray("e" * 64)}
+                if root == args.processed_features_dir:
+                    updates["msa_row_filter_sha256"] = np.asarray(policy.filters[split].sha256)
+                _edit_npz(chain_npz_path(root, chain), **updates)
+        summary = build_source_lock(row_filter_path=paths[f"{split}_filter"], processed_filter_audit_paths=[],
+                                    msa_filter_policy_path=paths["policy_path"], split=split)
+        output = args.manifest_lock.parent / f"msa_summary_{split}.json"
+        output.write_text(json.dumps(summary))
+        setattr(args, f"{split}_msa_row_filter_source_lock", output)
+    args.all_manifest.write_bytes(args.train_manifest.read_bytes() + args.val_manifest.read_bytes())
+    _write_contract(args)
+    return paths
+
+
+def test_directed_public_export_checks_each_split_and_packages_both_summaries(public_inputs: Namespace, tmp_path: Path) -> None:
+    paths = _attach_directed_filter_summaries(public_inputs, tmp_path)
+    validated = exporter._validate_public_inputs(public_inputs)
+    for split in ("train", "val"):
+        name = f"metadata/msa_row_filter_source_lock_{split}_public_safe.json"
+        assert validated.auxiliary_files[name] == getattr(public_inputs, f"{split}_msa_row_filter_source_lock").read_bytes()
+        rows = list(generate_rows(str(getattr(public_inputs, f"{split}_manifest")), split, str(public_inputs.processed_features_dir),
+                                  str(public_inputs.processed_labels_dir)))
+        assert {row["msa_row_filter_sha256"] for row in rows} == {sha256_file(paths[f"{split}_filter"])}
+    card = render_dataset_card(validated.summary)
+    assert "Training MSAs exclude homologs of validation and hidden targets" in card
+    assert "Validation MSAs exclude homologs of hidden targets" in card
+    assert "| Train |" in card and "| Validation |" in card
+    public_bytes = b"\n".join(validated.auxiliary_files.values())
+    assert b".nanofold_private" not in public_bytes
+    assert paths["hidden_manifest"].read_bytes().strip() not in public_bytes
+    assert sha256_file(paths["hidden_manifest"]).encode() not in public_bytes
+
+
+@pytest.mark.parametrize("corruption", [
+    "missing_val", "mixed_shared", "swapped", "missing_scope", "wrong_role", "different_policy", "wrong_manifest",
+    "wrong_count", "wrong_filter", "private_policy_path", "hidden_policy_split", "missing_root_policy",
+    "unscoped_directed_root", "shared_scoped_lock", "wrong_npz_filter",
+])
+def test_directed_export_rejects_scope_and_provenance_corruption_before_hf(
+    public_inputs: Namespace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, corruption: str,
+) -> None:
+    _attach_directed_filter_summaries(public_inputs, tmp_path)
+    train_path = public_inputs.train_msa_row_filter_source_lock
+    summary = json.loads(train_path.read_text())
+    if corruption == "missing_val":
+        public_inputs.val_msa_row_filter_source_lock = None
+    elif corruption == "mixed_shared":
+        public_inputs.msa_row_filter_source_lock = train_path
+    elif corruption == "swapped":
+        public_inputs.train_msa_row_filter_source_lock, public_inputs.val_msa_row_filter_source_lock = (
+            public_inputs.val_msa_row_filter_source_lock, train_path,
+        )
+    elif corruption == "missing_scope":
+        del summary["filter_scope"]
+    elif corruption == "wrong_role":
+        summary["filter_scope"]["split"] = "val"
+    elif corruption == "different_policy":
+        summary["filter_scope"]["policy"]["policy_sha256"] = "a" * 64
+    elif corruption == "wrong_manifest":
+        summary["filter_scope"]["policy"]["splits"]["train"]["manifest_sha256"] = "b" * 64
+    elif corruption == "wrong_count":
+        summary["filter_scope"]["policy"]["splits"]["train"]["chain_count"] = True
+    elif corruption == "wrong_filter":
+        summary["filter_scope"]["policy"]["splits"]["train"]["filter_sha256"] = "c" * 64
+    elif corruption == "private_policy_path":
+        summary["filter_scope"]["policy"]["path"] = "leaderboard/unreviewed_policy.json"
+    elif corruption == "hidden_policy_split":
+        summary["filter_scope"]["policy"]["splits"]["hidden"] = dict(summary["filter_scope"]["policy"]["splits"]["val"])
+    elif corruption == "missing_root_policy":
+        (public_inputs.processed_features_dir / "preprocess_meta.json").unlink()
+    elif corruption in {"unscoped_directed_root", "shared_scoped_lock"}:
+        public_inputs.train_msa_row_filter_source_lock = public_inputs.val_msa_row_filter_source_lock = None
+        if corruption == "shared_scoped_lock":
+            public_inputs.msa_row_filter_source_lock = train_path
+    else:
+        _edit_npz(chain_npz_path(public_inputs.processed_features_dir, "1abc_A"), msa_row_filter_sha256=np.asarray("d" * 64))
+    train_path.write_text(json.dumps(summary))
+    monkeypatch.setattr(exporter, "parse_args", lambda: public_inputs)
+    monkeypatch.setattr(exporter, "_require_hf_modules", lambda: pytest.fail("Invalid directed policy reached HF"))
     with pytest.raises(ValueError):
         exporter.main()

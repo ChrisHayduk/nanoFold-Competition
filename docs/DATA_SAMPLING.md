@@ -150,12 +150,12 @@ The secret environment variable is `NANOFOLD_HIDDEN_SPLIT_SALT`; alternatively p
 
 `build_hidden_manifest.py --sampling-policy cath-v4` is available for a fixed candidate public contract; pass its `--lock-file` and public manifest paths, metadata/cluster/group-map and receipt overrides plus the bound eligibility receipt and exclusion catalog if relocated, a fresh hidden output directory/private lock, and the secret. The requested hidden size and seed must match the source lock. Published-manifest regeneration wrappers refuse writes; `full_official_data_refresh.sh --skip-manifest-regen` rebuilds/audits frozen assets only.
 
-Prepare CATH v4 assets from the **same validated raw-query and historical-structure bytes** after building the complete held-out MSA filter. The following assumes the verified historical members are available under one root; use the paths bound by the eligibility receipt and recheck hashes if constructing a consolidated source view. Process public `all.txt` once, then process the hidden manifest into separate feature/label roots with the same predicate and filter.
+Prepare CATH v4 assets from the **same validated raw-query and historical-structure bytes** after building the two directed MSA filters and their public split policy. The following assumes the verified historical members are available under one root; use the paths bound by the eligibility receipt and recheck hashes if constructing a consolidated source view. Process public `all.txt` once with training and public-validation filter assignments, then process hidden targets into separate feature/label roots with the same structure predicate and no row filter. Preserve query row 0 in every split.
 
 ```bash
 stage=.nanofold_private/cath-v4-candidate-01
 historical_mmcif=.nanofold_private/pinned-structures/pdb_data/mmcif_files
-msa_filter=.nanofold_private/cath-v4-heldout-filter.json
+msa_policy="$stage/public-msa-policy.json"
 python scripts/preprocess.py \
   --manifest "$stage/public/all.txt" \
   --chain-data-cache "$cache" \
@@ -163,7 +163,7 @@ python scripts/preprocess.py \
   --mmcif-root "$historical_mmcif" \
   --processed-features-dir "$stage/features" \
   --processed-labels-dir "$stage/labels" \
-  --msa-row-filter "$msa_filter" \
+  --msa-filter-policy "$msa_policy" \
   --disable-templates \
   --min-projection-seq-identity 0.90 \
   --min-projection-coverage 0.70 \
@@ -171,7 +171,7 @@ python scripts/preprocess.py \
   --min-projection-valid-ca 32
 ```
 
-These fixed projection thresholds are the eligibility predicate; `preprocess.py --strict` is a different option requiring exact coordinate-sequence agreement and is not interchangeable with this policy. Keep `--allow-failures` off. The acquired MSA query must equal the pinned cache target exactly. Cache bytes, selected target identity, raw assets, filter and preprocessing configuration are bound into output provenance. `--skip-existing` permits only matching validated outputs; changed inputs require fresh roots. Complete target identity, label geometry, residual homology audits and fingerprints remain required before adoption.
+These fixed projection thresholds are the eligibility predicate; `preprocess.py --strict` is a different option requiring exact coordinate-sequence agreement and is not interchangeable with this policy. Keep `--allow-failures` off. The acquired MSA query must equal the pinned cache target exactly. Cache bytes, selected target identity, raw assets, split policy, effective filter and preprocessing configuration are bound into output provenance. `--skip-existing` permits only matching validated outputs; changed inputs require fresh roots. Complete target identity, label geometry, residual homology audits and fingerprints remain required before adoption.
 
 `scripts/setup_custom_data.sh` remains a convenience for other staged datasets with explicit custom paths; it downloads the current RCSB mmCIF subset and does not select the CATH v4 historical source policy. Do not substitute its current-source preprocessing for the bound historical inputs. Neither asset command generates or adopts splits.
 
@@ -222,9 +222,9 @@ establish processability. Check every selected target's query and structure unde
 the same projection predicate; failed members cannot be silently removed after
 group allocation, because that can violate required group coverage.
 
-Run strict MSA audits for train→public validation and public-all→hidden, using separate held-out feature roots where needed. `--strict --run-mmseqs` searches held-out targets against both source targets and non-query MSA rows of at least 20 residues, and fails on either kind of hit. Both searches request actual alignment identity and validate numeric fields, known IDs, coverage and expected output; missing output cannot count as zero hits. Target pairs use all-pair local alignment with prefiltering, masking and composition correction disabled and E-value limit `1e308`. Large MSA-row searches use explicitly recorded heuristic settings by default. A zero-hit result is limited to those alignment/search contracts. A filter digest proves filter identity, not absence of residual homology. Audit after filtering and before fingerprinting. Keep identifier-bearing reports private.
+Use directional MSA exclusions: train removes public-plus-hidden target homologs, public validation removes hidden target homologs, and hidden remains unfiltered. No filter uses its source split's own targets or an earlier split as the exclusion set. Run strict MSA audits for train→public validation and public-all→hidden, using separate held-out feature roots where needed. `--strict --run-mmseqs` searches held-out targets against both source targets and non-query MSA rows of at least 20 residues, and fails on either kind of hit. Both searches request actual alignment identity and validate numeric fields, known IDs, coverage and expected output; missing output cannot count as zero hits. Target pairs use all-pair local alignment with prefiltering, masking and composition correction disabled and E-value limit `1e308`. Standalone MSA-row searches use explicitly recorded heuristic settings unless `--exhaustive` is supplied. A zero-hit result is limited to those alignment/search contracts. A filter digest proves filter identity, not absence of residual homology. Audit after filtering and before fingerprinting. Keep identifier-bearing reports private.
 
-For all-pair MSA comparisons, add `--exhaustive` to `build_msa_row_filter.py` and use `audit_msa_split.py --strict --run-mmseqs --exhaustive`. The mode uses protein local alignments with actual alignment identity, bidirectional coverage, `--prefilter-mode 2`, masking/composition correction disabled and E-value limit `1e308`. Without checkpointed batching, `--max-seqs` must cover the whole searched source population: unique MSA sequences for filtering/MSA auditing, and source target records for the target audit. With checkpointed batching, it must cover every record in each source batch. A cap too small fails; it cannot silently truncate an exhaustive search. The default refresh wrapper retains its heuristic MSA search, so an exhaustive filter does not by itself make the later default audit exhaustive.
+For all-pair MSA comparisons, add `--exhaustive` to `build_msa_row_filter.py` and use `audit_msa_split.py --strict --run-mmseqs --exhaustive`. The mode uses protein local alignments with actual alignment identity, bidirectional coverage, `--prefilter-mode 2`, masking/composition correction disabled and E-value limit `1e308`. Without checkpointed batching, `--max-seqs` must cover the whole searched source population: unique MSA sequences for filtering/MSA auditing, and source target records for the target audit. With checkpointed batching, it must cover every record in each source batch. A cap too small fails; it cannot silently truncate an exhaustive search. The full-refresh wrapper uses exhaustive checkpointed searches for both directed filters and both residual audits. Standalone commands must specify `--exhaustive` on every search.
 
 Before allocating that search, run the filter builder with the same source/held-out inputs plus `--exhaustive --inventory-only --output <private-inventory.json>`. This scans and hashes source rows without invoking MMseqs or requiring its executable. The inventory reports `source_unique_sequence_count`, `heldout_unique_sequence_count`, their product `all_pair_comparisons`, `required_exhaustive_max_seqs`, and `source_complete`. It is an estimate of search size, not a wall-time estimate or a completed filter; preprocessing rejects it as a filter. Runtime and output size can be much larger than heuristic search. Missing sources remain failures for release preparation, and non-query rows shorter than 20 residues are outside this search scope. All-pair here means every collected query/source pair under the MMseqs local-alignment contract, not enumeration of all possible alignments or proof against every evolutionary relationship.
 
@@ -232,23 +232,44 @@ Before allocating that search, run the filter builder with the same source/held-
 
 Use `--exhaustive --checkpoint-dir <private-search-directory>` with the filter builder, or `--strict --run-mmseqs --exhaustive --checkpoint-dir <private-search-directory>` with the split auditor. Rerun the same command to resume; no separate resume flag is needed. Each distinct search needs its own checkpoint directory. The auditor requires anonymous headers, so `--include-identifiers-in-mmseqs` cannot be combined with checkpointed batching. It keeps target and MSA searches under separate `train_targets` and `train_msa` subdirectories.
 
-Build the complete trio filter before preprocessing; repeat the same command after interruption:
+Build the two directed filters before preprocessing. Keep their checkpoint directories separate and repeat the corresponding command after interruption:
 
 ```bash
+train_filter="$stage/train-msa-filter.json"
+val_filter="$stage/val-msa-filter.json"
 python scripts/build_msa_row_filter.py \
   --chain-data-cache "$cache" \
-  --source-manifest "$stage/public/all.txt" \
-  --source-manifest "$stage/hidden/hidden_val.txt" \
+  --source-manifest "$stage/public/train.txt" \
   --heldout-manifest "$stage/public/val.txt" \
   --heldout-manifest "$stage/hidden/hidden_val.txt" \
   --raw-root "$raw" \
   --exhaustive \
-  --checkpoint-dir "$stage/exhaustive-msa-filter" \
-  --source-batch-size 1000000 --query-batch-size 256 \
-  --max-seqs 1000000 \
-  --search-disk-reserve-gib 100 --search-max-rss-gib 48 \
-  --output "$msa_filter"
+  --checkpoint-dir "$stage/exhaustive-train-msa" \
+  --output "$train_filter"
+
+python scripts/build_msa_row_filter.py \
+  --chain-data-cache "$cache" \
+  --source-manifest "$stage/public/val.txt" \
+  --heldout-manifest "$stage/hidden/hidden_val.txt" \
+  --raw-root "$raw" \
+  --exhaustive \
+  --checkpoint-dir "$stage/exhaustive-val-msa" \
+  --output "$val_filter"
 ```
+
+Neither filter scans hidden source MSAs or is applied to hidden preprocessing. Bind the two completed artifacts and all three manifests into a private public-preprocessing policy. The manifests must be duplicate-free and disjoint; both filters must cover their complete raw source MSAs with the same cache, 30% identity and 80% bidirectional coverage. Retain both complete checkpoint directories. The policy loader verifies the source partitions and every job, then rederives the excluded sequence set from alignment hits and exact query/source intersections. An unbatched exploratory filter cannot satisfy this policy:
+
+```bash
+python scripts/build_msa_filter_policy.py \
+  --train-manifest "$stage/public/train.txt" \
+  --val-manifest "$stage/public/val.txt" \
+  --hidden-manifest "$stage/hidden/hidden_val.txt" \
+  --train-msa-row-filter "$train_filter" \
+  --val-msa-row-filter "$val_filter" \
+  --output "$stage/public-msa-policy.json"
+```
+
+Pass this file through `preprocess.py --msa-filter-policy` with the same `--chain-data-cache` for the exact public train/validation union in `all.txt`. Do not combine it with `--msa-row-filter`. Preprocessing validates the configured MSA names and each consumed raw-file path/hash against the filter evidence. Process hidden targets in a separate output root without either filter option; hidden MSAs retain their permitted rows, subject to ordinary validation, deduplication and depth limits. The two residual audit directions remain train→public validation and public-all→hidden.
 
 | Option | Default | Contract |
 |---|---:|---|
@@ -262,7 +283,7 @@ The immutable plan binds complete query/source FASTAs, deterministic partitions,
 
 The supported sequence lengths are 1–256 residues, with the existing 20-residue minimum for non-query MSA rows. Native numeric limits must be valid; batching is not a reason to truncate returned hits. Disk/RSS monitoring fails closed but is sampled, not an operating-system memory cap. Local process inspection must work before search starts; on systems with sandbox restrictions, run with the required local process permissions. Inventory mode can use the same batch flags and checkpoint-directory option to report the per-batch hit-capacity requirement without launching MMseqs or creating a checkpoint. In that mode `required_exhaustive_max_seqs` uses the smaller of the source population and source-batch size; the unbatched inventory uses the whole source population.
 
-Batching bounds individual jobs and enables reuse of completed work; it does not reduce the total query-by-source comparison count. Run an exhaustive filter, preprocess from raw inputs, then rerun both residual split audits in exhaustive mode. `extend_msa_row_filter_from_audit.py` accepts a single-alignment audit only; batched reports are rejected and cannot be used as if one shard represented the full search.
+Batching bounds individual jobs and enables reuse of completed work; it does not reduce the total query-by-source comparison count. Build both directed exhaustive filters, preprocess public chains with their explicit split policy and hidden chains without a filter, then rerun both residual split audits in exhaustive mode. `extend_msa_row_filter_from_audit.py` accepts a single-alignment audit only; batched reports are rejected and cannot be used as if one shard represented the full search.
 
 The row filter also removes canonical exact matches independently of MMseqs, so
 low-complexity masking cannot retain an identical held-out target. All supplied

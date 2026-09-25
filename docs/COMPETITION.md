@@ -245,23 +245,31 @@ The setup script expects `aws`, `unzip`, and `python` on `PATH`; it keeps hidden
 
 Maintainer asset rebuilding against the frozen manifests requires
 `scripts/full_official_data_refresh.sh --skip-manifest-regen`. The workflow
-builds a private held-out-target MSA filter from train, public-validation, and
-hidden-validation source rows against both held-out target sets. Detected
-non-query homologs are removed before the depth cap, and the query is preserved.
-Filters derived from hidden targets remain private. An explicit
-`--msa-row-filter <json>` may also be supplied to preprocessing.
+builds two private filters: training source MSAs against public-plus-hidden
+validation targets, and public-validation source MSAs against hidden targets.
+Public `all.txt` is preprocessed once with explicit split assignments so each
+chain receives its intended filter through `preprocess.py --msa-filter-policy`.
+The policy binds both filters and all three split manifests, fixes 30% identity
+and 80% bidirectional coverage, and requires both complete verified search
+checkpoints. Hidden preprocessing omits both `--msa-filter-policy` and
+`--msa-row-filter`.
+Detected non-query homologs are removed before the depth cap; query row 0 is
+always preserved. Ordinary MSA normalization and depth limits remain in place.
+Policy and effective-filter provenance bind the resulting tensors. Keep all
+artifacts derived from hidden targets private.
 
-The workflow runs `scripts/audit_msa_split.py --strict --run-mmseqs` on public
+The workflow runs `scripts/audit_msa_split.py --strict --run-mmseqs --exhaustive` on public
 training versus public validation and on all public targets versus hidden
-validation before fingerprinting. Strict mode rejects missing features,
+validation before fingerprinting. These are directed boundaries; there is no
+reverse or within-split homology exclusion. Strict mode rejects missing features,
 duplicate targets, chain/PDB overlap, exact target-sequence leakage, and detected
 residual MMseqs hits. Cluster checks require a complete `--cluster-tsv`; absent
 cluster assignments are not interpreted as proof of separation. Target searches
 align all source/held-out pairs with prefiltering and masking disabled and a
-permissive E-value limit. Searches over non-query MSA rows of at least 20 residues
-remain heuristic by default. Standalone filter generation supports `--exhaustive`,
-and `audit_msa_split.py --strict --run-mmseqs --exhaustive` uses all-pair local
-alignments for MSA rows as well. Exhaustive mode requires enough `--max-seqs`
+permissive E-value limit. Both filter construction and residual audits use
+exhaustive checkpointed searches over non-query MSA rows of at least 20 residues.
+Standalone tools use heuristic MSA search unless `--exhaustive` is supplied.
+Exhaustive mode requires enough `--max-seqs`
 capacity for the whole source population, or each complete source batch when
 checkpointed batching is enabled. The filter builder's `--inventory-only`
 reports unique sequence counts and pair workload without searching or producing
@@ -269,8 +277,8 @@ a usable filter. `--checkpoint-dir` with exhaustive mode adds bounded jobs and
 verified resume; the final result requires the complete query/source job grid,
 not a subset of finished shards. Resource monitoring is sampled, not an OS hard
 limit. See [the search contract](DATA_SAMPLING.md#bounded-resumable-exhaustive-msa-searches).
-Reports record these modes separately. Neither constitutes
-proof of absence under every possible alignment or of all biological homology.
+Reports record the search mode. A completed search does not prove absence under
+every possible alignment or of all biological homology.
 Exact held-out sequence matches are also removed independently of MMseqs,
 including low-complexity sequences that its masking can suppress.
 
@@ -338,8 +346,10 @@ new audit; the resulting zero-hit claim remains specific to that search.
 normalized search settings, public manifest hashes, counts, and aggregate
 filtering results. By default it redacts unrecognized/private paths and private
 manifest hashes, validates final filter-digest correspondence and row counts,
-and omits per-chain records and excluded sequence hashes. It summarizes filtering
-provenance; it does not independently establish zero residual homology.
+and omits per-chain records and excluded sequence hashes. Directed preprocessing
+uses one summary per split, with `--msa-filter-policy`, `--split train` or
+`--split val`, and the corresponding filter and split audit. It summarizes
+filtering provenance; it does not independently establish zero residual homology.
 
 Official mode requirements:
 - pinned manifest SHA checks
@@ -469,8 +479,9 @@ rejected. Direct local Python execution assumes trusted maintainer code and is
 not an isolation boundary.
 
 Mounted processed roots are limited to manifest-selected NPZs and known feature
-sidecars (`preprocess_meta.json`, `msa_row_filter_audit.json`). Extra files,
-subdirectories and links fail before execution. The image includes its required
+sidecars (`preprocess_meta.json`, `msa_row_filter_audit.json`, plus
+`msa_row_filter_audit.train.json` and `msa_row_filter_audit.val.json` for public
+features only). Extra files, subdirectories and links fail before execution. The image includes its required
 public source lock and excludes vendor example structures and research assets.
 
 Official orchestration entrypoints:
