@@ -168,7 +168,7 @@ def test_eval_yaml_declares_public_foldscore_task() -> None:
     assert "FoldScore" in config["description"]
     assert config["tasks"] == [
         {
-            "id": "public_validation_foldscore",
+            "id": "nanofold",
             "config": "default",
             "split": "validation",
         }

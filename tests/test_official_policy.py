@@ -68,6 +68,7 @@ def test_public_tracks_do_not_enforce_model_param_limit() -> None:
 
 def test_model_param_limit_helper_is_enforced_when_track_sets_cap() -> None:
     track = replace(load_track_spec("limited"), max_params=100_000_000)
+    assert track.max_params is not None
     enforce_model_param_limit(track_spec=track, n_params=int(track.max_params))
     with pytest.raises(ValueError):
         enforce_model_param_limit(track_spec=track, n_params=int(track.max_params) + 1)

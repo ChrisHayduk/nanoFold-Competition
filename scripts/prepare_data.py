@@ -108,6 +108,12 @@ def parse_args() -> argparse.Namespace:
         help="Base delay for download retries in seconds (default: 2.0).",
     )
     ap.add_argument(
+        "--download-url-timeout-seconds",
+        type=float,
+        default=60.0,
+        help="Timeout for each direct URL download attempt in seconds. Use <=0 to disable.",
+    )
+    ap.add_argument(
         "--download-workers",
         type=int,
         default=32,
@@ -256,6 +262,7 @@ def _download_url(
     retries: int,
     retry_delay_seconds: float,
     allow_fail: bool,
+    timeout_seconds: float = 60.0,
     verbose: bool = False,
 ) -> bool:
     if verbose or dry_run:
@@ -267,7 +274,11 @@ def _download_url(
     attempt = 0
     while True:
         try:
-            with urlopen(url) as response:
+            if timeout_seconds <= 0:
+                response_cm = urlopen(url)
+            else:
+                response_cm = urlopen(url, timeout=timeout_seconds)
+            with response_cm as response:
                 with tempfile.NamedTemporaryFile(
                     dir=str(destination.parent),
                     prefix=f".{destination.name}.",
@@ -297,6 +308,7 @@ def _download_mmcif_subset(
     dry_run: bool,
     retries: int,
     retry_delay_seconds: float,
+    download_url_timeout_seconds: float = 60.0,
     workers: int,
     strict: bool = False,
     verbose: bool = False,
@@ -321,6 +333,7 @@ def _download_mmcif_subset(
             dry_run=dry_run,
             retries=retries,
             retry_delay_seconds=retry_delay_seconds,
+            timeout_seconds=download_url_timeout_seconds,
             allow_fail=not strict,
             verbose=verbose,
         )
@@ -635,6 +648,7 @@ def main() -> None:
             dry_run=args.dry_run,
             retries=max(0, int(args.download_retries)),
             retry_delay_seconds=max(0.0, float(args.download_retry_delay_seconds)),
+            download_url_timeout_seconds=float(args.download_url_timeout_seconds),
             workers=max(1, int(args.download_workers)),
             strict=bool(args.strict_downloads),
             verbose=bool(args.verbose_downloads),
@@ -671,6 +685,7 @@ def main() -> None:
             dry_run=args.dry_run,
             retries=max(0, int(args.download_retries)),
             retry_delay_seconds=max(0.0, float(args.download_retry_delay_seconds)),
+            download_url_timeout_seconds=float(args.download_url_timeout_seconds),
             workers=max(1, int(args.download_workers)),
             strict=bool(args.strict_downloads),
             verbose=bool(args.verbose_downloads),

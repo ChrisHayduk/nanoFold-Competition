@@ -32,6 +32,11 @@ Useful deep links:
 - [Dataset split methodology](docs/DATA.md#3-how-dataset-splits-are-determined)
 - [Example model input sample](docs/DATA.md#5-example-model-input-sample)
 
+Training can also run across CUDA GPUs using `torchrun`; the runner preserves
+the global sample budget. See [training sampling and multiple GPUs](docs/API.md#training-sampling-and-multiple-gpus)
+for rank and accumulation requirements. The [data guide](docs/DATA.md#2-how-data-is-downloaded)
+covers download timeouts and reports for incomplete preprocessing.
+
 ## What Counts As Progress
 
 nanoFold is not meant to be a pretrained-weight contest, a web-retrieval contest, or a race to find near-duplicate templates. The official tracks are deliberately strict:

@@ -76,9 +76,9 @@ processed feature/label NPZ fields into typed Hugging Face columns, pushes the
 result as Parquet shards, and uploads a dataset README plus public manifest and
 fingerprint metadata. If `eval.yaml` is present, the uploader also publishes it
 at the dataset repo root so the Hub can treat the public validation split as the
-`public_validation_foldscore` benchmark task. That task reports mean FoldScore
-over the fixed public validation chains; official hidden ranking remains sealed
-and track-specific.
+`nanofold` benchmark task. That task reports mean FoldScore over the fixed
+public validation chains; official hidden ranking remains sealed and
+track-specific.
 
 Run `--dry-run --readme-out hf_dataset_export/README.md` first to validate the
 public inputs and inspect the generated dataset card without contacting Hugging
@@ -86,9 +86,10 @@ Face.
 
 Hugging Face benchmark aggregation is still a beta feature. The root
 `eval.yaml` declares NanoFold's intended `nanofold` evaluation framework and
-the `public_validation_foldscore` task. If the Hub requires allow-listing for
-the dataset to display the Benchmark tag, request HF registration rather than
-changing the metric semantics to fit an unrelated evaluation framework.
+the `nanofold` task. If the Hub requires allow-listing for the dataset to
+display the Benchmark tag, request HF registration rather than changing the
+metric semantics to fit an unrelated evaluation framework. Model-side
+evaluation-result pull requests should use `dataset.task_id: nanofold`.
 
 Maintainer-only hidden outputs:
 
@@ -131,6 +132,31 @@ That script does five things:
    - Template hits are skipped when `--disable-templates` is set.
 4. Downloads the manifest mmCIF subset from RCSB when `--mmcif-mode subset` is used.
 5. Runs `scripts/preprocess.py` separately for train and public validation manifests.
+
+Direct URL downloads in `scripts/prepare_data.py` time out after 60 seconds per
+attempt. Set `--download-url-timeout-seconds <seconds>` to adjust this limit;
+values at or below zero disable it. Retry count and retry delay still apply.
+This option covers direct metadata and mmCIF URLs, not AWS CLI transfers.
+
+For an exploratory preprocessing audit, write a separate manifest containing
+only chains with both feature and label NPZ files:
+
+```bash
+python scripts/write_processed_manifest_report.py \
+  --source-manifest data/manifests/val.txt \
+  --processed-features-dir data/processed_features \
+  --processed-labels-dir data/processed_labels \
+  --output-manifest .nanofold_private/audits/processed_val.txt \
+  --report .nanofold_private/audits/processed_val_report.json \
+  --require-complete
+```
+
+The report counts missing, feature-only, and label-only chains and groups
+preprocessing error messages. `--max-examples` limits example lists (default
+50). Both files are written before an incomplete-data failure; no available
+examples always causes failure. These are local audit outputs. Keep the
+official manifests fixed: official execution requires every requested chain
+and still verifies the NPZ schema and fingerprint.
 
 Maintainer full refreshes sanitize MSAs by default. After the
 train/public-validation/hidden-validation manifests are known,

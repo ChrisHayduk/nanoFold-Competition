@@ -9,6 +9,6 @@ description: >
 evaluation_framework: nanofold
 
 tasks:
-  - id: public_validation_foldscore
+  - id: nanofold
     config: default
     split: validation

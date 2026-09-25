@@ -278,6 +278,14 @@ Official budget definitions:
 - sample budget: `B_sample = max_steps * effective_batch_size`
 - residue budget: `B_res = max_steps * effective_batch_size * crop_size`
 
+Multi-GPU training preserves the configured global effective batch and sample
+budget by dividing local gradient accumulation across ranks. Rank count must
+divide the configured accumulation count exactly; otherwise training fails.
+Per-step sample and residue counters sum all ranks. Weighted sampling is an
+explicitly enabled training study and must be identified as such; it still
+uses only the fixed training manifest and the same sample budget. See the
+[training API](API.md#training-sampling-and-multiple-gpus) for configuration.
+
 Track budget constants:
 
 | Track | Seed | Crop size | MSA depth | Effective batch | Max steps | Sample budget | Residue budget | Parameter cap |

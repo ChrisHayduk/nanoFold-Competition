@@ -9,9 +9,12 @@ import torch
 from eval import _load_feature_crop, _load_label_crop
 from nanofold.chain_paths import chain_npz_path
 from train import (
+    WeightedDistributedSampler,
     _cfg_with_runtime,
+    _epoch_aware_sampler,
     _scalar_output_metrics,
     _summarize_eval_metrics,
+    _validate_train_sample_weights_opt_in,
     masked_kabsch_rmsd,
 )
 
@@ -160,3 +163,26 @@ def test_cfg_with_runtime_does_not_mutate_base_config() -> None:
         "max_steps": 10000,
         "sample_budget": 20000,
     }
+
+
+def test_weighted_distributed_sampler_is_epoch_aware() -> None:
+    weights = torch.arange(1, 21, dtype=torch.float32)
+    sampler = WeightedDistributedSampler(weights, num_replicas=2, rank=0, seed=17)
+
+    epoch0 = list(iter(sampler))
+    sampler.set_epoch(1)
+    epoch1 = list(iter(sampler))
+
+    assert len(epoch0) == 10
+    assert len(epoch1) == 10
+    assert epoch0 != epoch1
+    assert _epoch_aware_sampler(sampler) is sampler
+
+
+def test_train_sample_weights_require_explicit_opt_in() -> None:
+    with pytest.raises(ValueError, match="replacement-based weighted sampling"):
+        _validate_train_sample_weights_opt_in({"train_sample_weights": "weights.json"})
+
+    _validate_train_sample_weights_opt_in(
+        {"train_sample_weights": "weights.json", "allow_train_sample_weights": True}
+    )

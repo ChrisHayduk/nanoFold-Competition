@@ -46,6 +46,24 @@ Competition submissions should use `submission.path` under `submissions/<name>/`
 - `data.msa_depth`
 - `data.batch_size`
 
+### Training sampling and multiple GPUs
+
+`train.py` supports `torchrun` with one CUDA device per rank and the NCCL
+backend. `data.batch_size` is per rank; the configured effective batch remains
+`data.batch_size * train.grad_accum_steps` across all ranks. The runner divides
+accumulation by `WORLD_SIZE` and rejects combinations that cannot preserve that
+batch exactly. Only rank zero writes checkpoints and runs public validation.
+`NANOFOLD_DDP_TIMEOUT_SECONDS`, when set, must be a positive integer.
+
+Training normally shuffles the manifest each epoch. For an explicitly labeled
+weighted-sampling study, set `data.train_sample_weights` to a JSON mapping from
+chain ID to weight, or a text file with `chain_id weight` or `chain_id,weight`
+rows, and set `data.allow_train_sample_weights: true`. Every training chain must
+have a finite, nonnegative weight, and the total must be positive. Sampling is
+with replacement; zero-weight chains are not drawn. The same seed and epoch
+produce the same global weighted draw before partitioning it across ranks.
+Weights do not add data or change the configured sample budget.
+
 ## Batch Contract by Mode
 
 Training batches include labels because submissions need supervision to learn. Inference batches do not. The runtime strips supervision keys itself when `training=False`, which protects hidden evaluation even if a caller accidentally passes a labeled batch.
