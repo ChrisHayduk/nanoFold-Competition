@@ -138,6 +138,12 @@ binding require fresh output directories. These checks add no model inputs. Main
 Coordinate projection requires all optimal deposited-polymer alignments to agree
 on every observed residue's query position; ambiguous observed mappings fail.
 
+`scripts/fetch_openproteinset_mmcif.py` requires a manifest, fresh private output
+root, archive byte size, exact quoted ETag and explicit version ID. Its
+`retrieval-receipt.json` binds the inputs and retrieved members and reports
+`retrieved_unvalidated_structures`; it is not a biological identity or dataset
+acceptance receipt. Pass its `pdb_data/mmcif_files` directory to `--mmcif-root`.
+
 Maintainers can run `scripts/audit_label_geometry.py --chain-data-cache CACHE --split NAME MANIFEST FEATURES LABELS COUNT --out-dir PRIVATE_AUDIT`, repeating `--split` for train, public validation and hidden validation. It requires complete selected manifests, exact cache/feature/label identities, valid feature and label schemas, and atom14 masks supported by each actual residue type. Nonexistent observed atoms fail. The receipt binds source and asset hashes and reports masked CA and peptide C–N distances, skipping explicit segment breaks, nonconsecutive residue indices and missing atoms. Distance outliers are diagnostics only; they do not reject experimental structures. An optional verified `--split-group-tsv` adds group summaries. Keep all reports private.
 
 Feature archives must not contain supervision arrays. A features-only loader

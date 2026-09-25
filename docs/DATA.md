@@ -19,6 +19,7 @@ Official nanoFold data is built from public structure and alignment sources, the
 | OpenFold/OpenProteinSet RODA bucket, `s3://openfold` | Chain cache metadata, duplicate-chain map, per-chain MSA assets | Provides a public, reproducible AlphaFold-style training-data foundation without asking competitors to run external retrieval. |
 | OpenFold `chain_data_cache.json` | Candidate universe, sequence, length, resolution, source lock hashing | Gives a single official chain metadata table for deterministic split generation. |
 | OpenFold `duplicate_pdb_chains.txt` | Duplicate-chain fallback during per-chain asset download | Lets the downloader reuse equivalent chain assets when OpenProteinSet stores a duplicate under a representative chain. |
+| OpenProteinSet `s3://openfold/pdb_mmcif.zip` | Pinned historical structure members for maintainer regeneration | Selective retrieval binds archive identity and verifies member bytes without downloading the whole archive. |
 | OpenFold per-chain `uniref90_hits.a3m` | Official MSA input feature | Gives every model the same evolutionary input while keeping external MSA retrieval out of official runs. |
 | RCSB mmCIF files, `https://files.rcsb.org/download/<PDB>.cif` | Atomic labels for C-alpha and atom14 supervision/scoring | mmCIF is the authoritative coordinate source used to build geometry labels. |
 | Original cluster TSV and full-group TSV/receipt | Separate selectable original units from indivisible split groups for CATH v3 | Bind the complete eligible universe, graph search provenance, group coverage and deterministic replay. |
@@ -159,6 +160,32 @@ Direct URL downloads in `scripts/prepare_data.py` time out after 60 seconds per
 attempt. Set `--download-url-timeout-seconds <seconds>` to adjust this limit;
 values at or below zero disable it. Retry count and retry delay still apply.
 This option covers direct metadata and mmCIF URLs, not AWS CLI transfers.
+
+Maintainers can retrieve a manifest's historical structures from the OpenProteinSet
+archive with explicit archive pins. Set `ARCHIVE_BYTES`, `ARCHIVE_ETAG` (including
+the ETag's quotes), and `ARCHIVE_VERSION_ID` from verified source metadata:
+
+```bash
+python scripts/fetch_openproteinset_mmcif.py \
+  --manifest "$PRIVATE_MANIFEST" \
+  --out-dir .nanofold_private/pinned-structures \
+  --archive-size "$ARCHIVE_BYTES" \
+  --archive-etag "$ARCHIVE_ETAG" \
+  --archive-version-id "$ARCHIVE_VERSION_ID"
+```
+
+The parent directory must exist and the output root must be fresh. Version ID
+`null` requests the S3 null version; `absent` requires the version header to be
+absent. Every range must match the pinned object, bounds and length. The retriever
+checks ZIP64 metadata, member headers, decompressed sizes and CRCs, and records
+archive, manifest, implementation, range and member hashes in a private receipt.
+It limits ranges to 2 MiB, the directory and compressed members to 64 MiB each,
+and decompressed members to 256 MiB. Changed sources or invalid members fail.
+Use the resulting `pdb_data/mmcif_files` directory as preprocessing's
+`--mmcif-root`. Retrieval does not validate chain sequences, coordinate coverage
+or group coverage; those gates remain required. Archive modification time does
+not establish the structures' revision cutoff. Current RCSB files can differ from
+the archived members, so record the exact source bytes used for each rebuild.
 
 For an exploratory preprocessing audit, write a separate manifest containing
 only chains with both feature and label NPZ files:

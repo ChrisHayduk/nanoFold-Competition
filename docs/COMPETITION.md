@@ -233,6 +233,9 @@ coordinate projection. Cache bytes and target identity are bound into each
 processed pair's provenance; changed cache bytes require fresh outputs.
 Coordinate labels require a unique observed-residue mapping across all optimal
 deposited-polymer alignments; unresolved positions may have equivalent placements.
+Maintainer rebuilds can retrieve pinned historical structures with
+`scripts/fetch_openproteinset_mmcif.py`. Successful retrieval establishes source
+integrity only; complete target, structure, split and tensor gates still apply.
 
 The setup script expects `aws`, `unzip`, and `python` on `PATH`; it keeps hidden validation assets out of the public setup path.
 

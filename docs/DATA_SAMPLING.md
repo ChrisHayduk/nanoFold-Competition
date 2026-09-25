@@ -186,6 +186,13 @@ residue indices. The default broad reporting ranges are 2.5–4.5 Å for CA and
 change those diagnostic ranges. Outliers remain in the corpus and the private
 report: these ranges are not exclusion rules or proof of experimental quality.
 
+For historical source acquisition, `scripts/fetch_openproteinset_mmcif.py`
+retrieves only manifest structures from an explicitly pinned OpenProteinSet ZIP
+and retains private range/member provenance. Its source-only receipt does not
+establish processability. Check every selected target's query and structure under
+the same projection predicate; failed members cannot be silently removed after
+group allocation, because that can violate required group coverage.
+
 Run strict MSA audits for train→public validation and public-all→hidden, using separate held-out feature roots where needed. `--strict --run-mmseqs` searches held-out targets against both source targets and non-query MSA rows of at least 20 residues, and fails on either kind of hit. Both searches request actual alignment identity and validate numeric fields, known IDs, coverage and expected output; missing output cannot count as zero hits. Target pairs use all-pair local alignment with prefiltering, masking and composition correction disabled and E-value limit `1e308`. Large MSA-row searches use explicitly recorded heuristic settings by default. A zero-hit result is limited to those alignment/search contracts. A filter digest proves filter identity, not absence of residual homology. Audit after filtering and before fingerprinting. Keep identifier-bearing reports private.
 
 For all-pair MSA comparisons, add `--exhaustive` to `build_msa_row_filter.py` and use `audit_msa_split.py --strict --run-mmseqs --exhaustive`. The mode uses protein local alignments with actual alignment identity, bidirectional coverage, `--prefilter-mode 2`, masking/composition correction disabled and E-value limit `1e308`. `--max-seqs` must cover every searched source record: unique source MSA sequences for filtering/MSA auditing, and source target records for the target audit. A cap too small fails; it cannot silently truncate an exhaustive search. The default refresh wrapper retains its heuristic MSA search, so an exhaustive filter does not by itself make the later default audit exhaustive.

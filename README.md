@@ -231,6 +231,8 @@ Official scoring requires atom14 labels, and submissions must return `pred_atom1
 Preprocessing maps observed coordinates through the deposited polymer sequence
 and residue indices, preserving unresolved positions in repeated sequences.
 Every optimal alignment must agree on the placement of observed coordinates.
+Maintainers can use `scripts/fetch_openproteinset_mmcif.py` to retrieve structures
+from a pinned OpenProteinSet archive; see [the source contract](docs/DATA.md).
 Feature archives containing supervision are rejected, and feature/label output
 directories must be separate. Collated batches include `msa_mask` to distinguish
 real MSA gaps from padding; maintained submissions use it for MSA statistics.
