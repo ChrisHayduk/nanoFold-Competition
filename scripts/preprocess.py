@@ -37,6 +37,7 @@ import json
 import re
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple, cast
@@ -51,7 +52,13 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from nanofold.a3m import GAP_ID, MASK_ID, RESTYPES, read_a3m, sequence_to_ids, ungap_query_columns
-from nanofold.chain_paths import chain_data_dir, chain_error_path, chain_npz_path
+from nanofold.chain_paths import chain_data_dir, chain_error_path, chain_id_from_stem, chain_npz_path
+from nanofold.dataset_integrity import (
+    preprocess_config_sha256,
+    validate_feature_label_pair,
+    validate_feature_npz_schema,
+    validate_label_npz_schema,
+)
 from nanofold.mmcif import extract_chain_atoms
 from nanofold.residue_constants import ATOM14_NUM_SLOTS, CA_ATOM14_SLOT
 
@@ -100,7 +107,10 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     ap.add_argument("--template-hhr-name", type=str, default="pdb70_hits.hhr", help="Template hits file name under chain dir")
-    ap.add_argument("--max-templates", type=int, default=1, help="Maximum number of template hits to include per chain")
+    ap.add_argument(
+        "--max-templates", type=int, default=1,
+        help="Maximum template hits per chain; all hits from the target PDB entry are excluded.",
+    )
     ap.add_argument("--disable-templates", action="store_true", help="Do not attempt to include template features")
     ap.add_argument(
         "--strict",
@@ -110,7 +120,10 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--min-projection-seq-identity", type=float, default=0.90)
     ap.add_argument("--min-projection-coverage", type=float, default=0.70)
     ap.add_argument("--min-projection-aligned-fraction", type=float, default=0.70)
-    ap.add_argument("--min-projection-valid-ca", type=int, default=32)
+    ap.add_argument(
+        "--min-projection-valid-ca", type=int, default=32,
+        help="Minimum usable C-alpha labels in both strict and projected preprocessing.",
+    )
     ap.add_argument("--fail-fast", action="store_true")
     ap.add_argument(
         "--allow-failures",
@@ -120,7 +133,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument(
         "--skip-existing",
         action="store_true",
-        help="Skip chains whose feature and label NPZs already exist with the required schema.",
+        help="Skip validated feature/label pairs from the same preprocessing configuration and implementation.",
     )
     return ap.parse_args()
 
@@ -147,6 +160,7 @@ class HHRHit:
     query_aligned: str
     template_aligned: str
     aligned_pairs: Tuple[Tuple[int, int], ...]
+    aligned_residue_pairs: Tuple[Tuple[int, int, str, str], ...]
 
 
 @dataclass(frozen=True)
@@ -180,23 +194,22 @@ def _parse_hhr_token(token: str) -> Optional[Tuple[str, str]]:
     return None
 
 
-def _alignment_pairs_with_offsets(
+def _alignment_residue_pairs_with_offsets(
     query_start: int,
     query_aligned: str,
     template_start: int,
     template_aligned: str,
-) -> List[Tuple[int, int]]:
+) -> List[Tuple[int, int, str, str]]:
     if len(query_aligned) != len(template_aligned):
         raise ValueError("Aligned query/template strings must have the same length.")
-
-    pairs: List[Tuple[int, int]] = []
+    pairs: List[Tuple[int, int, str, str]] = []
     query_index = query_start - 1
     template_index = template_start - 1
     for query_char, template_char in zip(query_aligned, template_aligned, strict=True):
         query_has = query_char != "-"
         template_has = template_char != "-"
         if query_has and template_has:
-            pairs.append((query_index, template_index))
+            pairs.append((query_index, template_index, query_char.upper(), template_char.upper()))
         if query_has:
             query_index += 1
         if template_has:
@@ -219,15 +232,16 @@ def _parse_hhr_hits(hhr_path: Path) -> List[HHRHit]:
         query_aligned = "".join(query_fragments)
         template_aligned = "".join(template_fragments)
         aligned_pairs: List[Tuple[int, int]] = []
+        aligned_residue_pairs: List[Tuple[int, int, str, str]] = []
         for query_start, query_chunk, template_start, template_chunk in chunk_pairs:
-            aligned_pairs.extend(
-                _alignment_pairs_with_offsets(
-                    query_start=query_start,
-                    query_aligned=query_chunk,
-                    template_start=template_start,
-                    template_aligned=template_chunk,
-                )
+            residue_pairs = _alignment_residue_pairs_with_offsets(
+                query_start=query_start,
+                query_aligned=query_chunk,
+                template_start=template_start,
+                template_aligned=template_chunk,
             )
+            aligned_pairs.extend((qi, ti) for qi, ti, _, _ in residue_pairs)
+            aligned_residue_pairs.extend(residue_pairs)
         if query_aligned and template_aligned and aligned_pairs:
             hits.append(
                 HHRHit(
@@ -236,6 +250,7 @@ def _parse_hhr_hits(hhr_path: Path) -> List[HHRHit]:
                     query_aligned=query_aligned,
                     template_aligned=template_aligned,
                     aligned_pairs=tuple(aligned_pairs),
+                    aligned_residue_pairs=tuple(aligned_residue_pairs),
                 )
             )
         current_template = None
@@ -356,7 +371,7 @@ def _find_msa_path(chain_dir: Path, msa_name: str) -> Path | None:
     for candidate in direct_candidates:
         if candidate.exists():
             return candidate
-    for path in chain_dir.rglob(msa_name):
+    for path in sorted(chain_dir.rglob(msa_name)):
         return path
     return None
 
@@ -366,7 +381,11 @@ MSA_TOKEN_TO_AA[20] = "X"
 
 
 def _sha256_file(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    hasher = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
 
 
 def _sequence_sha256(sequence: str) -> str:
@@ -508,8 +527,8 @@ def _project_atom14_to_query(
 ) -> Tuple[np.ndarray, np.ndarray, Dict[str, float]]:
     """Map structure atom14 coordinates onto query positions via global sequence alignment.
 
-    Projects the full atom14 stack (not just CA) so downstream consumers can
-    use side-chain atoms where the structure provides them. Returns
+    Projects labels only at identical residues. Mismatches remain fully masked
+    because atom14 slots and side-chain geometry depend on residue identity. Returns
     ``(atom14_positions, atom14_mask, stats)`` where stats are computed on
     the Cα slot for projection identity, coverage, aligned fraction, and
     valid-Cα count diagnostics.
@@ -528,6 +547,8 @@ def _project_atom14_to_query(
         if qi < 0 or qi >= qL:
             continue
         if si < 0 or si >= structure_atom14_positions.shape[0]:
+            continue
+        if query_seq[qi].upper() != structure_seq[si].upper():
             continue
         row_mask = structure_mask_bool[si]
         if not row_mask.any():
@@ -563,7 +584,7 @@ def _extract_template_features(
         return _empty_template_features(target_L)
 
     hhr_path = None
-    for p in chain_dir.rglob(template_hhr_name):
+    for p in sorted(chain_dir.rglob(template_hhr_name)):
         hhr_path = p
         break
     if hhr_path is None:
@@ -578,7 +599,8 @@ def _extract_template_features(
     template_mask_list: List[np.ndarray] = []
 
     for hit in hits:
-        if hit.pdb_id == target_pdb_id and hit.chain_id == target_chain_id:
+        # Same-entry templates can expose target coordinates through aliases or homomers.
+        if hit.pdb_id == target_pdb_id.lower():
             continue
         mmcif_path = mmcif_root / f"{hit.pdb_id}.cif"
         if not mmcif_path.exists():
@@ -595,9 +617,19 @@ def _extract_template_features(
         except Exception:
             continue
 
-        pairs = list(hit.aligned_pairs)
+        pairs = list(hit.aligned_residue_pairs)
         if not pairs:
             continue
+        # HHR indices address the complete polymer sequence. Missing coordinate
+        # residues must remain gaps instead of shifting every later template atom.
+        known_indices = [int(index) for index in tpl.polymer_residue_index if index >= 0]
+        if len(known_indices) != len(set(known_indices)):
+            continue
+        observed_index_by_polymer = {
+            int(polymer_index): observed_index
+            for observed_index, polymer_index in enumerate(tpl.polymer_residue_index)
+            if polymer_index >= 0
+        }
 
         t_aatype = np.full((target_L,), fill_value=20, dtype=np.int32)
         t_ca = np.zeros((target_L, 3), dtype=np.float32)
@@ -605,10 +637,13 @@ def _extract_template_features(
 
         template_ca_mask = tpl.atom14_mask[:, CA_ATOM14_SLOT] > 0.5
         template_ca_coords = tpl.atom14_positions[:, CA_ATOM14_SLOT, :]
-        for qi, ti in pairs:
+        for qi, polymer_index, query_residue, template_residue in pairs:
             if qi < 0 or qi >= target_L:
                 continue
-            if ti < 0 or ti >= len(tpl.sequence):
+            ti = observed_index_by_polymer.get(polymer_index)
+            if ti is None:
+                continue
+            if target_seq[qi].upper() != query_residue or tpl.sequence[ti].upper() != template_residue:
                 continue
             t_aatype[qi] = tpl.aatype[ti]
             if bool(template_ca_mask[ti]):
@@ -676,11 +711,61 @@ def _save_npz(path: Path, arrays: Dict[str, np.ndarray]) -> None:
     np.savez_compressed(path, **arrays)  # type: ignore[arg-type]
 
 
+def _source_inputs_sha256(
+    chain_dir: Path, mmcif_path: Path, mmcif_root: Path, args: argparse.Namespace, *, requested_chain_id: str,
+) -> str:
+    """Bind a processed pair to all inputs that can influence this invocation."""
+    sources: Dict[str, str | None] = {
+        "requested_chain_id": requested_chain_id,
+        "target_mmcif": _sha256_file(mmcif_path),
+    }
+    for name in _resolve_msa_names(args.msa_name, args.msa_names):
+        path = _find_msa_path(chain_dir, name)
+        sources[f"msa:{name}"] = _sha256_file(path) if path is not None else None
+    if not args.disable_templates and args.max_templates > 0:
+        hhr_path = next(iter(sorted(chain_dir.rglob(args.template_hhr_name))), None)
+        sources["template_hhr"] = _sha256_file(hhr_path) if hhr_path is not None else None
+        if hhr_path is not None:
+            for pdb_id in sorted({hit.pdb_id for hit in _parse_hhr_hits(hhr_path)}):
+                path = mmcif_root / f"{pdb_id}.cif"
+                sources[f"template_mmcif:{pdb_id}"] = _sha256_file(path) if path.exists() else None
+    payload = json.dumps(sources, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _save_validated_outputs(
+    feature_path: Path, features: Dict[str, np.ndarray], label_path: Path, labels: Dict[str, np.ndarray],
+) -> None:
+    temporary_paths: List[Path] = []
+    try:
+        for destination, arrays in ((feature_path, features), (label_path, labels)):
+            with tempfile.NamedTemporaryFile(dir=destination.parent, suffix=".npz", delete=False) as handle:
+                temporary_path = Path(handle.name)
+            temporary_paths.append(temporary_path)
+            _save_npz(temporary_path, arrays)
+        feature_temp, label_temp = temporary_paths
+        errors = validate_feature_npz_schema(feature_temp) + validate_label_npz_schema(label_temp)
+        if not errors:
+            errors.extend(validate_feature_label_pair(
+                feature_temp, label_temp,
+                expected_chain_id=chain_id_from_stem(feature_path.stem), require_chain_id=True,
+            ))
+        if errors:
+            raise ValueError("Invalid processed arrays: " + "; ".join(errors))
+        feature_temp.replace(feature_path)
+        label_temp.replace(label_path)
+    finally:
+        for path in temporary_paths:
+            path.unlink(missing_ok=True)
+
+
 def _existing_outputs_are_valid(
     feature_path: Path,
     label_path: Path,
     *,
     expected_msa_row_filter_sha256: str | None,
+    expected_preprocess_config_sha256: str,
+    expected_source_inputs_sha256: str,
 ) -> bool:
     if not feature_path.exists() or not label_path.exists():
         return False
@@ -704,11 +789,29 @@ def _existing_outputs_are_valid(
         "resolution",
     }
     try:
+        if (
+            validate_feature_npz_schema(feature_path)
+            or validate_label_npz_schema(label_path)
+            or validate_feature_label_pair(
+                feature_path, label_path,
+                expected_chain_id=chain_id_from_stem(feature_path.stem), require_chain_id=True,
+            )
+        ):
+            return False
         with np.load(feature_path) as features, np.load(label_path) as labels:
             if not required_feature_keys.issubset(set(features.files)):
                 return False
             if not required_label_keys.issubset(set(labels.files)):
                 return False
+            for data in (features, labels):
+                if "preprocess_config_sha256" not in data.files:
+                    return False
+                if str(data["preprocess_config_sha256"].item()) != expected_preprocess_config_sha256:
+                    return False
+                if "source_inputs_sha256" not in data.files:
+                    return False
+                if str(data["source_inputs_sha256"].item()) != expected_source_inputs_sha256:
+                    return False
             feature_keys = set(features.files)
             if expected_msa_row_filter_sha256 is None:
                 if "msa_row_filter_sha256" in feature_keys:
@@ -719,37 +822,31 @@ def _existing_outputs_are_valid(
                 if str(features["msa_row_filter_sha256"].item()) != expected_msa_row_filter_sha256:
                     return False
 
-            aatype = features["aatype"]
-            msa = features["msa"]
-            atom14_positions = labels["atom14_positions"]
-            atom14_mask = labels["atom14_mask"]
-            ca_coords = labels["ca_coords"]
-            ca_mask = labels["ca_mask"]
-            if aatype.ndim != 1 or msa.ndim != 2:
-                return False
-            length = int(aatype.shape[0])
-            return (
-                int(msa.shape[1]) == length
-                and atom14_positions.shape == (length, ATOM14_NUM_SLOTS, 3)
-                and atom14_mask.shape == (length, ATOM14_NUM_SLOTS)
-                and ca_coords.shape == (length, 3)
-                and ca_mask.shape == (length,)
-            )
+            return True
     except Exception:
         return False
 
 
-def _write_preprocess_meta(args: argparse.Namespace, out_dir: Path, msa_row_filter: MSARowFilter | None) -> None:
+def _write_preprocess_meta(args: argparse.Namespace, out_dir: Path, msa_row_filter: MSARowFilter | None) -> str:
     stable_args = {
         k: (str(v) if isinstance(v, Path) else v)
         for k, v in vars(args).items()
-        if k not in {"manifest", "skip_existing", "msa_row_filter"}
+        if k not in {"manifest", "skip_existing", "msa_row_filter", "fail_fast", "allow_failures"}
     }
     if msa_row_filter is not None:
         stable_args["msa_row_filter_sha256"] = msa_row_filter.sha256
     meta = {
-        "schema_version": 2,
+        "schema_version": 3,
         "cli_args": stable_args,
+        "implementation_sha256": {
+            name: _sha256_file(REPO_ROOT / name)
+            for name in (
+                "scripts/preprocess.py",
+                "nanofold/a3m.py",
+                "nanofold/mmcif.py",
+                "nanofold/residue_constants.py",
+            )
+        },
         "split_manifest": None,
         "dependency_metadata": _dependency_metadata(),
         "git_sha": _git_sha_short(),
@@ -764,7 +861,26 @@ def _write_preprocess_meta(args: argparse.Namespace, out_dir: Path, msa_row_filt
         "ca_atom14_slot": CA_ATOM14_SLOT,
     }
     out_path = out_dir / "preprocess_meta.json"
+    config_sha256 = preprocess_config_sha256(meta)
+    populated = any(out_dir.glob("*.npz")) or any(Path(args.processed_labels_dir).glob("*.npz"))
+    if populated:
+        if not out_path.exists():
+            raise ValueError("Existing processed outputs have no preprocessing metadata; use fresh output directories.")
+        try:
+            recorded = json.loads(out_path.read_text())
+        except json.JSONDecodeError as exc:
+            raise ValueError("Invalid preprocessing metadata; use fresh output directories.") from exc
+        if not isinstance(recorded, dict):
+            raise ValueError("Invalid preprocessing metadata; use fresh output directories.")
+        # Source/output roots and dependencies must also match when resuming locally.
+        # Keep the original metadata bytes so a resumed manifest cannot relabel the run.
+        comparable = {key: value for key, value in meta.items() if key != "git_sha"}
+        prior = {key: value for key, value in recorded.items() if key != "git_sha"}
+        if prior != comparable:
+            raise ValueError("Existing processed outputs have different preprocessing provenance; use fresh output directories.")
+        return config_sha256
     out_path.write_text(json.dumps(meta, indent=2, sort_keys=True) + "\n")
+    return config_sha256
 
 
 def _write_msa_row_filter_audit(
@@ -812,6 +928,14 @@ def _read_existing_msa_row_filter_audit_row(feature_path: Path, chain_id: str) -
 
 def main() -> None:
     args = parse_args()
+    for name in ("min_projection_seq_identity", "min_projection_coverage", "min_projection_aligned_fraction"):
+        value = float(getattr(args, name))
+        if not np.isfinite(value) or not 0.0 <= value <= 1.0:
+            raise ValueError(f"--{name.replace('_', '-')} must be finite and in [0, 1]")
+    if args.min_projection_valid_ca < 1:
+        raise ValueError("--min-projection-valid-ca must be at least 1")
+    if args.max_msa_seqs < 0 or args.max_templates < 0:
+        raise ValueError("--max-msa-seqs and --max-templates must be nonnegative")
 
     raw_root = Path(args.raw_root)
     alignments_root = Path(args.alignments_root) if args.alignments_root else None
@@ -822,7 +946,7 @@ def main() -> None:
     processed_labels_dir.mkdir(parents=True, exist_ok=True)
     msa_row_filter = _load_msa_row_filter(args.msa_row_filter)
 
-    _write_preprocess_meta(args, processed_features_dir, msa_row_filter)
+    config_sha256 = _write_preprocess_meta(args, processed_features_dir, msa_row_filter)
 
     manifest = Path(args.manifest)
     chain_ids = [ln.strip() for ln in manifest.read_text().splitlines() if ln.strip() and not ln.startswith("#")]
@@ -839,20 +963,6 @@ def main() -> None:
             label_path = chain_npz_path(processed_labels_dir, cid)
             err_marker = chain_error_path(processed_features_dir, cid)
 
-            if args.skip_existing and _existing_outputs_are_valid(
-                feature_path,
-                label_path,
-                expected_msa_row_filter_sha256=msa_row_filter.sha256 if msa_row_filter is not None else None,
-            ):
-                if err_marker.exists():
-                    err_marker.unlink()
-                if msa_row_filter is not None:
-                    audit_row = _read_existing_msa_row_filter_audit_row(feature_path, cid)
-                    if audit_row is not None:
-                        msa_filter_audit_rows.append(audit_row)
-                n_ok += 1
-                continue
-
             # Resolve alignment path:
             # Local chain directories use an encoded stem so case-sensitive PDB chain IDs
             # remain distinct on case-insensitive filesystems.
@@ -866,6 +976,26 @@ def main() -> None:
             mmcif_path = mmcif_root / f"{pdb_id}.cif"
             if not mmcif_path.exists():
                 raise FileNotFoundError(f"Missing mmCIF: {mmcif_path}")
+
+            source_sha256 = _source_inputs_sha256(
+                chain_dir, mmcif_path, mmcif_root, args, requested_chain_id=cid,
+            )
+
+            if args.skip_existing and _existing_outputs_are_valid(
+                feature_path,
+                label_path,
+                expected_msa_row_filter_sha256=msa_row_filter.sha256 if msa_row_filter is not None else None,
+                expected_preprocess_config_sha256=config_sha256,
+                expected_source_inputs_sha256=source_sha256,
+            ):
+                if err_marker.exists():
+                    err_marker.unlink()
+                if msa_row_filter is not None:
+                    audit_row = _read_existing_msa_row_filter_audit_row(feature_path, cid)
+                    if audit_row is not None:
+                        msa_filter_audit_rows.append(audit_row)
+                n_ok += 1
+                continue
 
             msa, deletions, query_sequence, msa_filter_stats = _read_merged_msa(
                 chain_dir,
@@ -914,13 +1044,17 @@ def main() -> None:
                     raise ValueError(f"Projection coverage below threshold for {cid}: {projection_stats}")
                 if projection_stats["projection_aligned_fraction"] < float(args.min_projection_aligned_fraction):
                     raise ValueError(f"Projection aligned fraction below threshold for {cid}: {projection_stats}")
-                if int(projection_stats["projection_valid_ca_count"]) < int(args.min_projection_valid_ca):
-                    raise ValueError(f"Projection valid C-alpha count below threshold for {cid}: {projection_stats}")
+            if int(projection_stats["projection_valid_ca_count"]) < int(args.min_projection_valid_ca):
+                raise ValueError(f"Projection valid C-alpha count below threshold for {cid}: {projection_stats}")
 
             target_L = len(target_seq)
 
             features_out = {
                 "chain_id": np.asarray(cid),
+                "preprocess_config_sha256": np.asarray(config_sha256),
+                "source_inputs_sha256": np.asarray(source_sha256),
+                "resolved_author_chain_id": np.asarray(chain_struct.resolved_author_chain_id),
+                "chain_mapping_method": np.asarray(chain_struct.chain_mapping_method),
                 "aatype": sequence_to_ids(target_seq),
                 "msa": msa.astype(np.int32),
                 "deletions": deletions.astype(np.int32),
@@ -955,6 +1089,10 @@ def main() -> None:
                 )
             labels_out = {
                 "chain_id": np.asarray(cid),
+                "preprocess_config_sha256": np.asarray(config_sha256),
+                "source_inputs_sha256": np.asarray(source_sha256),
+                "resolved_author_chain_id": np.asarray(chain_struct.resolved_author_chain_id),
+                "chain_mapping_method": np.asarray(chain_struct.chain_mapping_method),
                 "ca_coords": target_ca_coords.astype(np.float32),
                 "ca_mask": target_ca_mask.astype(bool),
                 "atom14_positions": target_atom14_positions.astype(np.float32),
@@ -984,8 +1122,7 @@ def main() -> None:
                 )
                 features_out.update(tpl)
 
-            _save_npz(feature_path, features_out)
-            _save_npz(label_path, labels_out)
+            _save_validated_outputs(feature_path, features_out, label_path, labels_out)
             if err_marker.exists():
                 err_marker.unlink()
             n_ok += 1

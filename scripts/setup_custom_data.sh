@@ -1,169 +1,151 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# End-to-end setup for custom/research subsets.
-# This script can regenerate manifests and should not be used for strict
-# official runs. For official runs use scripts/setup_official_data.sh.
-#
-# What this script does:
-#  1) downloads OpenFold data caches (chain_data_cache + mmcif_cache)
-#  2) builds train/val manifests (maintainer/research path)
-#  3) downloads per-chain MSA + template hits for manifest chains only
-#  4) downloads + unzips pdb_mmcif.zip (targets + template structures)
-#  5) preprocesses train/val into data/processed/*.npz
-#
-# Usage:
-#   bash scripts/setup_custom_data.sh
-#   bash scripts/setup_custom_data.sh --train-size 1000 --val-size 100
-#   bash scripts/setup_custom_data.sh --disable-templates
-
 usage() {
-  cat <<'EOF'
+  cat <<'HELP'
 Usage: bash scripts/setup_custom_data.sh [options]
 
-Options:
-  --data-root <path>          Root for downloaded OpenProteinSet files (default: data/openproteinset)
-  --manifests-dir <path>      Output dir for train/val manifests (default: data/manifests)
-  --processed-features-dir <path>
-                              Output dir for feature .npz files (default: data/processed_features)
-  --processed-labels-dir <path>
-                              Output dir for label .npz files (default: data/processed_labels)
-  --train-size <int>          Number of training chains (default: 10000)
-  --val-size <int>            Number of validation chains (default: 1000)
-  --seed <int>                Manifest sampling seed (default: 0)
-  --expected-chain-cache-sha256 <hex>
-                              Optional expected SHA256 for chain_data_cache.json
-                              (fails generation if cache hash differs)
-  --manifest-lock-file <path> Optional lock metadata output path from build_manifests.py
-  --min-len <int>             Minimum chain length filter (default: 40)
-  --max-len <int>             Maximum chain length filter (default: 256)
-  --max-resolution <float>    Maximum resolution filter (default: 3.0)
-  --msa-name <filename>       MSA filename to download/use (default: uniref90_hits.a3m)
-  --template-hhr-name <name>  Template hits filename (default: pdb70_hits.hhr)
-  --download-retries <int>    Retries per failed aws chain download (default: 2)
+Download and preprocess the public train/val assets of an already-staged custom
+candidate. Generate and verify manifests first with stage_dataset_candidate.py.
+This command verifies the supplied source lock and never regenerates manifests,
+rewrites all.txt, or updates a published dataset contract. It downloads only the
+manifest mmCIF subset and preprocesses without templates.
+
+Required options:
+  --manifests-dir <path>          Existing staged public train.txt, val.txt and all.txt
+  --manifest-lock-file <path>     Existing candidate public source lock (read-only)
+  --data-root <path>              Custom raw asset directory
+  --processed-features-dir <path> Custom feature NPZ directory
+  --processed-labels-dir <path>   Custom label NPZ directory
+
+Optional:
+  --msa-name <filename>          MSA filename (default: uniref90_hits.a3m)
+  --msa-row-filter <path>        Existing private held-out-target MSA filter
+  --download-retries <int>       AWS download retries (default: 2)
   --download-retry-delay-seconds <float>
-                              Base delay for retries in seconds (default: 2.0)
-  --disable-templates         Skip template-hit download and template preprocessing
-  --skip-preprocess           Do not run preprocess.py
-  --dry-run                   Print commands without executing
-  -h, --help                  Show this message
-EOF
+                                 Retry delay (default: 2.0)
+  --disable-templates            Explicitly select the default no-template policy
+  --resume-preprocess            Reuse pairs with matching schema-3 provenance
+  --skip-preprocess              Download assets only
+  --dry-run                     Validate inputs and print commands without writes
+  -h, --help                    Show this message
+
+All asset paths must be distinct custom directories, separate from the manifests
+and published asset paths. Strict homology audits and fingerprints remain required
+before a candidate can be adopted as a dataset release.
+HELP
 }
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-BUILD_MANIFESTS_SCRIPT="$SCRIPT_DIR/build_manifests.py"
-PREPARE_DATA_SCRIPT="$SCRIPT_DIR/prepare_data.py"
-PREPROCESS_SCRIPT="$SCRIPT_DIR/preprocess.py"
-
-DATA_ROOT="data/openproteinset"
-MANIFESTS_DIR="data/manifests"
-PROCESSED_FEATURES_DIR="data/processed_features"
-PROCESSED_LABELS_DIR="data/processed_labels"
-TRAIN_SIZE=10000
-VAL_SIZE=1000
-SEED=0
-EXPECTED_CHAIN_CACHE_SHA256=""
+REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+DATA_ROOT=""
+MANIFESTS_DIR=""
 MANIFEST_LOCK_FILE=""
-MIN_LEN=40
-MAX_LEN=256
-MAX_RESOLUTION=3.0
+PROCESSED_FEATURES_DIR=""
+PROCESSED_LABELS_DIR=""
 MSA_NAME="uniref90_hits.a3m"
-TEMPLATE_HHR_NAME="pdb70_hits.hhr"
+MSA_ROW_FILTER=""
 DOWNLOAD_RETRIES=2
 DOWNLOAD_RETRY_DELAY_SECONDS=2.0
-USE_TEMPLATES=1
 SKIP_PREPROCESS=0
+RESUME_PREPROCESS=0
 DRY_RUN=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --data-root)
-      DATA_ROOT="$2"
-      shift 2
-      ;;
-    --manifests-dir)
-      MANIFESTS_DIR="$2"
-      shift 2
-      ;;
-    --processed-features-dir)
-      PROCESSED_FEATURES_DIR="$2"
-      shift 2
-      ;;
-    --processed-labels-dir)
-      PROCESSED_LABELS_DIR="$2"
-      shift 2
-      ;;
-    --train-size)
-      TRAIN_SIZE="$2"
-      shift 2
-      ;;
-    --val-size)
-      VAL_SIZE="$2"
-      shift 2
-      ;;
-    --seed)
-      SEED="$2"
-      shift 2
-      ;;
-    --expected-chain-cache-sha256)
-      EXPECTED_CHAIN_CACHE_SHA256="$2"
-      shift 2
-      ;;
-    --manifest-lock-file)
-      MANIFEST_LOCK_FILE="$2"
-      shift 2
-      ;;
-    --min-len)
-      MIN_LEN="$2"
-      shift 2
-      ;;
-    --max-len)
-      MAX_LEN="$2"
-      shift 2
-      ;;
-    --max-resolution)
-      MAX_RESOLUTION="$2"
-      shift 2
-      ;;
-    --msa-name)
-      MSA_NAME="$2"
-      shift 2
-      ;;
-    --template-hhr-name)
-      TEMPLATE_HHR_NAME="$2"
-      shift 2
-      ;;
-    --download-retries)
-      DOWNLOAD_RETRIES="$2"
-      shift 2
-      ;;
-    --download-retry-delay-seconds)
-      DOWNLOAD_RETRY_DELAY_SECONDS="$2"
-      shift 2
-      ;;
-    --disable-templates)
-      USE_TEMPLATES=0
-      shift 1
-      ;;
-    --skip-preprocess)
-      SKIP_PREPROCESS=1
-      shift 1
-      ;;
-    --dry-run)
-      DRY_RUN=1
-      shift 1
-      ;;
-    -h|--help)
-      usage
-      exit 0
-      ;;
-    *)
-      echo "Unknown option: $1"
-      usage
-      exit 1
-      ;;
+    --data-root) DATA_ROOT="${2:?Missing --data-root value}"; shift 2 ;;
+    --manifests-dir) MANIFESTS_DIR="${2:?Missing --manifests-dir value}"; shift 2 ;;
+    --manifest-lock-file) MANIFEST_LOCK_FILE="${2:?Missing --manifest-lock-file value}"; shift 2 ;;
+    --processed-features-dir) PROCESSED_FEATURES_DIR="${2:?Missing --processed-features-dir value}"; shift 2 ;;
+    --processed-labels-dir) PROCESSED_LABELS_DIR="${2:?Missing --processed-labels-dir value}"; shift 2 ;;
+    --msa-name) MSA_NAME="${2:?Missing --msa-name value}"; shift 2 ;;
+    --msa-row-filter) MSA_ROW_FILTER="${2:?Missing --msa-row-filter value}"; shift 2 ;;
+    --download-retries) DOWNLOAD_RETRIES="${2:?Missing --download-retries value}"; shift 2 ;;
+    --download-retry-delay-seconds) DOWNLOAD_RETRY_DELAY_SECONDS="${2:?Missing retry delay}"; shift 2 ;;
+    --disable-templates) shift ;;
+    --resume-preprocess) RESUME_PREPROCESS=1; shift ;;
+    --skip-preprocess) SKIP_PREPROCESS=1; shift ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    --train-size|--val-size|--seed|--min-len|--max-len|--max-resolution|--expected-chain-cache-sha256)
+      echo "Manifest generation flags are not accepted. Use scripts/stage_dataset_candidate.py first." >&2
+      exit 1 ;;
+    *) echo "Unknown option: $1" >&2; usage >&2; exit 1 ;;
   esac
 done
+
+if [[ -z "$DATA_ROOT" || -z "$MANIFESTS_DIR" || -z "$MANIFEST_LOCK_FILE" || -z "$PROCESSED_FEATURES_DIR" || -z "$PROCESSED_LABELS_DIR" ]]; then
+  echo "Explicit custom data, manifest, source-lock, feature and label paths are required; see --help." >&2
+  exit 1
+fi
+if ! command -v python >/dev/null 2>&1; then
+  echo "python not found. Activate your environment first." >&2
+  exit 1
+fi
+
+# All validation is read-only and precedes even output directory creation.
+python - "$REPO_ROOT" "$MANIFESTS_DIR" "$MANIFEST_LOCK_FILE" "$MSA_ROW_FILTER" \
+  "$DATA_ROOT" "$PROCESSED_FEATURES_DIR" "$PROCESSED_LABELS_DIR" <<'PYTHON'
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+repo, manifests, lock_path = (Path(p).resolve() for p in sys.argv[1:4])
+filter_path = Path(sys.argv[4]).resolve() if sys.argv[4] else None
+outputs = [Path(p).resolve() for p in sys.argv[5:8]]
+protected = [repo / name for name in (
+    "data/manifests", "data/openproteinset", "data/processed_features", "data/processed_labels",
+    "data/hidden_processed_features", "data/hidden_processed_labels", ".nanofold_private/hidden_processed_features",
+    ".nanofold_private/hidden_processed_labels", "leaderboard", "tracks",
+)]
+
+def overlaps(left, right):
+    return left.is_relative_to(right) or right.is_relative_to(left)
+
+if manifests.is_relative_to(repo / "data/manifests"):
+    raise SystemExit("Use staged custom manifests; official assets use setup_official_data.sh.")
+for index, output in enumerate(outputs):
+    if any(overlaps(output, path.resolve()) for path in [*protected, manifests, *outputs[:index]]):
+        raise SystemExit("Custom asset paths must be separate from published paths, manifests and each other.")
+    if lock_path.is_relative_to(output) or (filter_path and filter_path.is_relative_to(output)):
+        raise SystemExit("Custom asset output paths must not contain source inputs.")
+    if output.exists() and not output.is_dir():
+        raise SystemExit("Custom asset output paths must be directories.")
+if not lock_path.is_file() or (filter_path and not filter_path.is_file()):
+    raise SystemExit("The source lock and optional MSA filter must already exist.")
+lock = json.loads(lock_path.read_text())
+records = lock.get("outputs", {})
+if not isinstance(records, dict):
+    raise SystemExit("Candidate source lock outputs must be an object.")
+ids = {}
+for split, count_key in (("train", "train_count"), ("val", "val_count"), ("all", "unique_count")):
+    path = manifests / f"{split}.txt"
+    if not path.is_file():
+        raise SystemExit(f"Missing staged {split} manifest; all.txt is never generated here.")
+    if path.resolve().is_relative_to(repo / "data/manifests"):
+        raise SystemExit("Staged manifests must not alias published manifests.")
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    if records.get(f"{split}_manifest_sha256") != digest:
+        raise SystemExit(f"Candidate {split} manifest does not match its source lock.")
+    ids[split] = [line.strip() for line in path.read_text().splitlines() if line.strip() and not line.startswith("#")]
+    if not ids[split] or len(set(ids[split])) != len(ids[split]) or records.get(count_key) != len(ids[split]):
+        raise SystemExit(f"Candidate {split} manifest has invalid counts or duplicate IDs.")
+if set(ids["train"]) & set(ids["val"]) or set(ids["all"]) != set(ids["train"]) | set(ids["val"]):
+    raise SystemExit("Candidate manifests must be disjoint with an exact train/val union.")
+print("Verified staged public manifests against their source lock.")
+PYTHON
+
+if [[ "$DRY_RUN" -eq 0 ]]; then
+  if ! command -v aws >/dev/null 2>&1; then
+    echo "aws CLI not found. Install awscli first." >&2
+    exit 1
+  fi
+  if ! python -c "import tqdm" >/dev/null 2>&1; then
+    echo "python package 'tqdm' not found. Run: pip install -r requirements.txt" >&2
+    exit 1
+  fi
+fi
 
 run_cmd() {
   echo "+ $*"
@@ -172,132 +154,32 @@ run_cmd() {
   fi
 }
 
-if ! command -v aws >/dev/null 2>&1; then
-  echo "aws CLI not found. Install awscli first."
-  exit 1
-fi
-
-if ! command -v unzip >/dev/null 2>&1; then
-  echo "unzip not found. Install unzip first."
-  exit 1
-fi
-
-if ! command -v python >/dev/null 2>&1; then
-  echo "python not found. Activate your environment first."
-  exit 1
-fi
-
-if [[ "$DRY_RUN" -eq 0 ]] && ! python -c "import tqdm" >/dev/null 2>&1; then
-  echo "python package 'tqdm' not found. Run: pip install -r requirements.txt"
-  exit 1
-fi
-
 PDB_DIR="$DATA_ROOT/pdb_data"
-DATA_CACHES_DIR="$PDB_DIR/data_caches"
-MMCIF_ROOT="$PDB_DIR/mmcif_files"
-
-mkdir -p "$DATA_ROOT" "$PDB_DIR" "$DATA_CACHES_DIR" "$MANIFESTS_DIR" "$PROCESSED_FEATURES_DIR" "$PROCESSED_LABELS_DIR"
-
-echo "NOTE: This script regenerates manifests for custom/research runs."
-echo "For strict official runs, use scripts/setup_official_data.sh."
-
-echo "[1/6] Downloading OpenFold data caches from RODA..."
-run_cmd aws s3 cp s3://openfold/data_caches/ "$DATA_CACHES_DIR/" --recursive --no-sign-request
-run_cmd aws s3 cp s3://openfold/duplicate_pdb_chains.txt "$PDB_DIR/" --no-sign-request
-
-CHAIN_DATA_CACHE_PATH="$DATA_CACHES_DIR/chain_data_cache.json"
-if [[ ! -f "$CHAIN_DATA_CACHE_PATH" && -f "$PDB_DIR/chain_data_cache.json" ]]; then
-  CHAIN_DATA_CACHE_PATH="$PDB_DIR/chain_data_cache.json"
-fi
-
-if [[ "$DRY_RUN" -eq 0 ]] && [[ ! -f "$CHAIN_DATA_CACHE_PATH" ]]; then
-  echo "Could not find chain_data_cache.json in either:"
-  echo "  - $DATA_CACHES_DIR"
-  echo "  - $PDB_DIR"
-  exit 1
-fi
-
-echo "[2/6] Building fixed manifests..."
-BUILD_MANIFESTS_CMD=(
-  python "$BUILD_MANIFESTS_SCRIPT"
-  --chain-data-cache "$CHAIN_DATA_CACHE_PATH"
-  --out-dir "$MANIFESTS_DIR"
-  --train-size "$TRAIN_SIZE"
-  --val-size "$VAL_SIZE"
-  --min-len "$MIN_LEN"
-  --max-len "$MAX_LEN"
-  --max-resolution "$MAX_RESOLUTION"
-  --seed "$SEED"
-)
-if [[ -n "$EXPECTED_CHAIN_CACHE_SHA256" ]]; then
-  BUILD_MANIFESTS_CMD+=(--expected-chain-cache-sha256 "$EXPECTED_CHAIN_CACHE_SHA256")
-fi
-if [[ -n "$MANIFEST_LOCK_FILE" ]]; then
-  BUILD_MANIFESTS_CMD+=(--lock-file "$MANIFEST_LOCK_FILE")
-fi
-run_cmd "${BUILD_MANIFESTS_CMD[@]}"
-
-ALL_MANIFEST="$MANIFESTS_DIR/all.txt"
-echo "[3/6] Building union manifest at $ALL_MANIFEST..."
-if [[ "$DRY_RUN" -eq 0 ]]; then
-  cat "$MANIFESTS_DIR/train.txt" "$MANIFESTS_DIR/val.txt" | awk 'NF {print $0}' | sort -u > "$ALL_MANIFEST"
-else
-  echo "+ cat $MANIFESTS_DIR/train.txt $MANIFESTS_DIR/val.txt | awk 'NF {print \$0}' | sort -u > $ALL_MANIFEST"
-fi
-
-echo "[4/6] Downloading per-chain MSA + template hits for manifest chains..."
+run_cmd mkdir -p "$PDB_DIR" "$PROCESSED_FEATURES_DIR" "$PROCESSED_LABELS_DIR"
+run_cmd aws s3 cp s3://openfold/duplicate_pdb_chains.txt "$PDB_DIR/" --only-show-errors --no-sign-request
 PREPARE_CMD=(
-  python "$PREPARE_DATA_SCRIPT"
-  --data-root "$DATA_ROOT"
-  --manifest "$ALL_MANIFEST"
+  python "$SCRIPT_DIR/prepare_data.py"
+  --data-root "$DATA_ROOT" --manifest "$MANIFESTS_DIR/all.txt"
   --duplicate-chains-file "$PDB_DIR/duplicate_pdb_chains.txt"
-  --msa-name "$MSA_NAME"
-  --download-retries "$DOWNLOAD_RETRIES"
-  --download-retry-delay-seconds "$DOWNLOAD_RETRY_DELAY_SECONDS"
+  --msa-name "$MSA_NAME" --no-template-hits --download-mmcif-subset --strict-downloads
+  --download-retries "$DOWNLOAD_RETRIES" --download-retry-delay-seconds "$DOWNLOAD_RETRY_DELAY_SECONDS"
 )
-if [[ "$USE_TEMPLATES" -eq 1 ]]; then
-  PREPARE_CMD+=(--template-hits-name "$TEMPLATE_HHR_NAME")
-else
-  PREPARE_CMD+=(--no-template-hits)
-fi
-if [[ "$DRY_RUN" -eq 1 ]]; then
-  PREPARE_CMD+=(--dry-run)
-fi
 run_cmd "${PREPARE_CMD[@]}"
-
-echo "[5/6] Downloading + unpacking mmCIF archive (targets + templates)..."
-run_cmd aws s3 cp s3://openfold/pdb_mmcif.zip "$PDB_DIR/" --no-sign-request
-run_cmd unzip -o "$PDB_DIR/pdb_mmcif.zip" -d "$PDB_DIR"
-
-if [[ "$SKIP_PREPROCESS" -eq 1 ]]; then
-  echo "[6/6] Skipping preprocess (--skip-preprocess set)."
-else
-  echo "[6/6] Preprocessing train/val to .npz..."
+if [[ "$SKIP_PREPROCESS" -eq 0 ]]; then
   PREPROCESS_COMMON=(
-    python "$PREPROCESS_SCRIPT"
-    --raw-root "$DATA_ROOT"
-    --mmcif-root "$MMCIF_ROOT"
-    --processed-features-dir "$PROCESSED_FEATURES_DIR"
-    --processed-labels-dir "$PROCESSED_LABELS_DIR"
-    --msa-name "$MSA_NAME"
+    python "$SCRIPT_DIR/preprocess.py" --raw-root "$DATA_ROOT" --mmcif-root "$PDB_DIR/mmcif_files"
+    --processed-features-dir "$PROCESSED_FEATURES_DIR" --processed-labels-dir "$PROCESSED_LABELS_DIR"
+    --msa-name "$MSA_NAME" --disable-templates
   )
-  if [[ "$USE_TEMPLATES" -eq 1 ]]; then
-    PREPROCESS_COMMON+=(--template-hhr-name "$TEMPLATE_HHR_NAME")
-  else
-    PREPROCESS_COMMON+=(--disable-templates)
+  if [[ -n "$MSA_ROW_FILTER" ]]; then
+    PREPROCESS_COMMON+=(--msa-row-filter "$MSA_ROW_FILTER")
   fi
-
+  if [[ "$RESUME_PREPROCESS" -eq 1 ]]; then
+    PREPROCESS_COMMON+=(--skip-existing)
+  fi
   run_cmd "${PREPROCESS_COMMON[@]}" --manifest "$MANIFESTS_DIR/train.txt"
   run_cmd "${PREPROCESS_COMMON[@]}" --manifest "$MANIFESTS_DIR/val.txt"
 fi
 
-echo ""
-echo "Subset setup complete."
-echo "Data root: $DATA_ROOT"
-echo "Manifests: $MANIFESTS_DIR"
-echo "Processed features: $PROCESSED_FEATURES_DIR"
-echo "Processed labels: $PROCESSED_LABELS_DIR"
-echo ""
-echo "Next:"
-echo "  git submodule update --init --recursive"
-echo "  python train.py --config submissions/minalphafold2/config.yaml"
+echo "Custom public asset setup complete. Manifests and source lock are unchanged."
+echo "Run strict split/homology audits and fingerprint the candidate before any release."

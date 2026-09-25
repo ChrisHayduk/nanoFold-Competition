@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
-import contextlib
 import hashlib
 import json
+import shutil
+import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,12 +13,17 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
 
-STANDARD_AAS = set("ARNDCQEGHILKMFPSTWYV")
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from build_structure_metadata import _candidate_rows
 
 BULK_SOURCES = {
     "cath_domain_list": {
-        "url": "https://download.cathdb.info/cath/releases/latest-release/cath-classification-data/cath-domain-list.txt",
+        "url": "https://download.cathdb.info/cath/releases/all-releases/v4_4_0/cath-classification-data/cath-domain-list-v4_4_0.txt",
         "path": "cath-domain-list.txt",
+        "version": "4.4.0",
     },
     "scope_classification": {
         "url": "http://scop.berkeley.edu/downloads/parse/dir.cla.scope.2.08-stable.txt",
@@ -31,7 +38,11 @@ BULK_SOURCES = {
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Download and pin structural metadata sources for official split curation.",
+        description=(
+            "Download and pin structural metadata sources for official split curation. "
+            "Existing locks are verified without repinning; use a fresh output directory and lock for new sources. "
+            "CATH is required; optional source failures are recorded in the lock."
+        ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--chain-data-cache", type=Path, required=True)
@@ -45,6 +56,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-len", type=int, default=256)
     parser.add_argument("--max-resolution", type=float, default=3.0)
     parser.add_argument("--max-unknown-aa-fraction", type=float, default=0.0)
+    parser.add_argument(
+        "--require-monomer", action="store_true", help="Require an explicitly documented biological monomer."
+    )
     parser.add_argument("--download-retries", type=int, default=2)
     parser.add_argument("--download-retry-delay-seconds", type=float, default=2.0)
     parser.add_argument("--include-rcsb-rest", action="store_true")
@@ -89,18 +103,20 @@ def _download_url(
     if dry_run:
         return True
     if destination.exists():
-        print(f"  exists: {destination}", flush=True)
-        return True
+        raise ValueError(f"Refusing to reuse an unverified source file: {destination}")
     destination.parent.mkdir(parents=True, exist_ok=True)
     attempt = 0
     while True:
         try:
             with urlopen(url, timeout=60) as response:
                 tmp = destination.with_suffix(destination.suffix + ".tmp")
-                tmp.write_bytes(response.read())
+                contents = response.read()
+                if not contents:
+                    raise ValueError(f"Empty source response: {url}")
+                tmp.write_bytes(contents)
                 tmp.replace(destination)
             return True
-        except (HTTPError, URLError, TimeoutError, OSError) as exc:
+        except (HTTPError, URLError, TimeoutError, OSError, ValueError) as exc:
             attempt += 1
             if attempt <= retries:
                 wait_s = max(0.0, retry_delay_seconds) * attempt
@@ -111,29 +127,6 @@ def _download_url(
             return False
 
 
-def _extract_sequence(meta: dict[str, Any]) -> str | None:
-    for key in ("sequence", "seq", "seqres", "aatype_sequence"):
-        value = meta.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip().upper()
-    return None
-
-
-def _numeric(value: object, default: float) -> float:
-    if not isinstance(value, (str, bytes, bytearray, int, float)):
-        return default
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def _unknown_fraction(sequence: str) -> float:
-    if not sequence:
-        return 1.0
-    return sum(1 for ch in sequence if ch not in STANDARD_AAS) / float(len(sequence))
-
-
 def _candidate_chain_ids(
     chain_data_cache: Path,
     *,
@@ -141,30 +134,20 @@ def _candidate_chain_ids(
     max_len: int,
     max_resolution: float,
     max_unknown_aa_fraction: float,
+    require_monomer: bool = False,
 ) -> list[str]:
     raw = json.loads(chain_data_cache.read_text())
     if not isinstance(raw, dict):
         raise ValueError(f"chain_data_cache must be a JSON object: {chain_data_cache}")
-    chain_ids: list[str] = []
-    for chain_id, meta_raw in sorted(raw.items()):
-        if not isinstance(meta_raw, dict):
-            continue
-        seq = _extract_sequence(meta_raw)
-        if not seq:
-            continue
-        length = int(_numeric(meta_raw.get("seq_length", meta_raw.get("sequence_length", len(seq))), len(seq)))
-        resolution = _numeric(meta_raw.get("resolution", 999.0), 999.0)
-        oligomeric_count = int(_numeric(meta_raw.get("oligomeric_count", meta_raw.get("num_chains", 1)), 1.0))
-        if not (min_len <= length <= max_len):
-            continue
-        if resolution != 999.0 and resolution > max_resolution:
-            continue
-        if oligomeric_count != 1:
-            continue
-        if _unknown_fraction(seq) > max_unknown_aa_fraction:
-            continue
-        chain_ids.append(str(chain_id))
-    return chain_ids
+    rows, _ = _candidate_rows(
+        raw,
+        min_len=min_len,
+        max_len=max_len,
+        max_resolution=max_resolution,
+        max_unknown_aa_fraction=max_unknown_aa_fraction,
+        require_monomer=require_monomer,
+    )
+    return [str(row["chain_id"]) for row in rows]
 
 
 def _pdb_id(chain_id: str) -> str:
@@ -181,8 +164,10 @@ def _read_json_url(url: str, *, retries: int, retry_delay_seconds: float) -> tup
         try:
             with urlopen(url, timeout=30) as response:
                 payload = json.loads(response.read().decode("utf-8"))
-            return payload if isinstance(payload, dict) else None, None
-        except (HTTPError, URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+            if not isinstance(payload, dict):
+                raise ValueError(f"Expected JSON object from {url}")
+            return payload, None
+        except (HTTPError, URLError, TimeoutError, OSError, ValueError, UnicodeError) as exc:
             attempt += 1
             if attempt <= retries:
                 time.sleep(max(0.0, retry_delay_seconds) * attempt)
@@ -200,12 +185,12 @@ def _download_rcsb_jsonl(
 ) -> dict[str, Any]:
     print("+ RCSB REST metadata ->", destination, flush=True)
     if dry_run:
-        return {"path": str(destination), "chain_count": len(chain_ids), "sha256": None, "errors": 0}
+        return {"path": destination.name, "chain_count": len(chain_ids), "sha256": None, "errors": 0}
     if destination.exists():
-        return {"path": str(destination), "chain_count": len(chain_ids), "sha256": _sha256(destination), "errors": 0}
+        raise ValueError(f"Refusing to reuse unverified RCSB metadata: {destination}")
     destination.parent.mkdir(parents=True, exist_ok=True)
     errors = 0
-    entry_cache: dict[str, dict[str, Any] | None] = {}
+    entry_cache: dict[str, tuple[dict[str, Any] | None, str | None]] = {}
     tmp = destination.with_suffix(destination.suffix + ".tmp")
     with tmp.open("w") as handle:
         for idx, chain_id in enumerate(chain_ids, start=1):
@@ -215,12 +200,12 @@ def _download_rcsb_jsonl(
             chain_name = _chain_name(chain_id)
             entry_url = f"https://data.rcsb.org/rest/v1/core/entry/{pdb_id}"
             instance_url = f"https://data.rcsb.org/rest/v1/core/polymer_entity_instance/{pdb_id}/{chain_name}"
-            entry = entry_cache.get(pdb_id)
             if pdb_id not in entry_cache:
                 entry, error = _read_json_url(entry_url, retries=retries, retry_delay_seconds=retry_delay_seconds)
-                entry_cache[pdb_id] = entry
+                entry_cache[pdb_id] = (entry, error)
                 if error:
                     errors += 1
+            entry, entry_error = entry_cache[pdb_id]
             instance, instance_error = _read_json_url(
                 instance_url,
                 retries=retries,
@@ -231,7 +216,14 @@ def _download_rcsb_jsonl(
             entity_id = None
             if isinstance(instance, dict):
                 identifiers = instance.get("rcsb_polymer_entity_instance_container_identifiers")
-                if isinstance(identifiers, dict):
+                author_chain = identifiers.get("auth_asym_id") if isinstance(identifiers, dict) else None
+                # The REST endpoint uses label asym IDs; our candidate IDs use author asym IDs.
+                if author_chain != chain_name:
+                    instance_error = (
+                        f"Unverified author-chain mapping for {chain_id}: RCSB instance auth_asym_id={author_chain!r}"
+                    )
+                    instance = None
+                elif isinstance(identifiers, dict):
                     entity_id = identifiers.get("entity_id")
             if entity_id is not None:
                 entity_url = f"https://data.rcsb.org/rest/v1/core/polymer_entity/{pdb_id}/{entity_id}"
@@ -253,7 +245,7 @@ def _download_rcsb_jsonl(
                         "entry": entry or {},
                         "instance": instance or {},
                         "entity": entity or {},
-                        "errors": [err for err in (instance_error, entity_error) if err],
+                        "errors": [err for err in (entry_error, instance_error, entity_error) if err],
                     },
                     sort_keys=True,
                 )
@@ -261,7 +253,7 @@ def _download_rcsb_jsonl(
             )
     tmp.replace(destination)
     return {
-        "path": str(destination),
+        "path": destination.name,
         "chain_count": len(chain_ids),
         "sha256": _sha256(destination),
         "errors": errors,
@@ -283,8 +275,6 @@ def _download_dssp_mmcifs(
             print(f"  DSSP mmCIF {idx}/{len(pdb_ids)}", flush=True)
         url = f"https://pdb-redo.eu/dssp/db/{pdb_id}/mmcif"
         destination = destination_dir / f"{pdb_id}.cif"
-        if destination.exists():
-            continue
         ok = _download_url(
             url,
             destination,
@@ -295,33 +285,67 @@ def _download_dssp_mmcifs(
         if not ok:
             failures += 1
     return {
-        "path": str(destination_dir),
+        "path": destination_dir.name,
         "pdb_count": len(pdb_ids),
         "failed_pdb_count": failures,
         "tree_sha256": None if dry_run else _tree_sha256(destination_dir),
     }
 
 
-def main(argv: list[str] | None = None) -> None:
-    args = parse_args(argv)
-    chain_ids = _candidate_chain_ids(
-        args.chain_data_cache,
-        min_len=int(args.min_len),
-        max_len=int(args.max_len),
-        max_resolution=float(args.max_resolution),
-        max_unknown_aa_fraction=float(args.max_unknown_aa_fraction),
-    )
-    args.out_dir.mkdir(parents=True, exist_ok=True)
-    sources: dict[str, Any] = {}
-    failures: list[str] = []
-    print(
-        f"Metadata source candidate scope: {len(chain_ids)} chains, "
-        f"{len({_pdb_id(chain_id) for chain_id in chain_ids})} PDB entries",
-        flush=True,
-    )
+def _source_paths() -> dict[str, str]:
+    return {
+        **{name: spec["path"] for name, spec in BULK_SOURCES.items()},
+        "rcsb_chain_metadata": "rcsb_chain_metadata.jsonl",
+        "dssp_mmcif": "dssp_mmcif",
+    }
 
+
+def _verify_existing_lock(args: argparse.Namespace, candidate_filters: dict[str, Any], chain_count: int) -> None:
+    lock = json.loads(args.source_lock.read_text())
+    if not isinstance(lock, dict) or lock.get("schema_version") != 2:
+        raise ValueError("Expected structural metadata source lock schema_version=2; use a fresh directory and lock.")
+    cache = lock.get("chain_data_cache")
+    if not isinstance(cache, dict) or cache.get("sha256") != _sha256(args.chain_data_cache):
+        raise ValueError("chain_data_cache hash mismatch; refusing to repin changed input.")
+    if lock.get("candidate_filters") != candidate_filters or lock.get("candidate_chain_count") != chain_count:
+        raise ValueError("Candidate selection differs from the source lock; use a fresh directory and lock.")
+    options = {"include_rcsb_rest": args.include_rcsb_rest, "include_dssp_mmcif": args.include_dssp_mmcif}
+    if lock.get("download_options") != options:
+        raise ValueError("Download options differ from the source lock; use a fresh directory and lock.")
+    sources = lock.get("sources")
+    if not isinstance(sources, dict) or set(sources) - _source_paths().keys():
+        raise ValueError("Invalid sources in structural metadata lock.")
+    cath = sources.get("cath_domain_list")
+    if not isinstance(cath, dict) or cath.get("skipped"):
+        raise ValueError("Source lock must include the required CATH domain list.")
+    for name, source in sources.items():
+        if not isinstance(source, dict) or source.get("path") != _source_paths()[name]:
+            raise ValueError(f"Invalid source path in lock: {name}")
+        if source.get("skipped"):
+            continue
+        path = args.out_dir / source["path"]
+        digest_key = "tree_sha256" if name == "dssp_mmcif" else "sha256"
+        digest = source.get(digest_key)
+        if not isinstance(digest, str) or len(digest) != 64:
+            raise ValueError(f"Missing source checksum: {name}")
+        if not path.exists() or path.is_symlink():
+            raise ValueError(f"Missing or invalid source: {name}")
+        if name == "dssp_mmcif":
+            if not path.is_dir():
+                raise ValueError(f"Expected a source directory: {name}")
+            actual = _tree_sha256(path)
+        else:
+            if not path.is_file():
+                raise ValueError(f"Expected a source file: {name}")
+            actual = _sha256(path)
+        if actual != digest:
+            raise ValueError(f"Source hash mismatch: {name}; refusing to repin changed bytes.")
+
+
+def _collect_sources(args: argparse.Namespace, chain_ids: list[str], destination_dir: Path) -> dict[str, Any]:
+    sources: dict[str, Any] = {}
     for name, spec in BULK_SOURCES.items():
-        destination = args.out_dir / str(spec["path"])
+        destination = destination_dir / spec["path"]
         ok = _download_url(
             str(spec["url"]),
             destination,
@@ -329,28 +353,26 @@ def main(argv: list[str] | None = None) -> None:
             retries=max(0, int(args.download_retries)),
             retry_delay_seconds=max(0.0, float(args.download_retry_delay_seconds)),
         )
-        if not ok:
-            failures.append(name)
         sources[name] = {
-            "url": spec["url"],
-            "path": str(destination),
+            **spec,
             "sha256": None if args.dry_run or not destination.exists() else _sha256(destination),
         }
+        if not ok:
+            if name == "cath_domain_list":
+                raise SystemExit("Required metadata source download failed: cath_domain_list; no lock was published.")
+            sources[name].update({"skipped": True, "errors": 1, "reason": "optional source download failed"})
 
     if args.include_rcsb_rest:
         sources["rcsb_chain_metadata"] = _download_rcsb_jsonl(
             chain_ids,
-            args.out_dir / "rcsb_chain_metadata.jsonl",
+            destination_dir / "rcsb_chain_metadata.jsonl",
             dry_run=bool(args.dry_run),
             retries=max(0, int(args.download_retries)),
             retry_delay_seconds=max(0.0, float(args.download_retry_delay_seconds)),
         )
     else:
-        rcsb_path = args.out_dir / "rcsb_chain_metadata.jsonl"
-        with contextlib.suppress(FileNotFoundError):
-            rcsb_path.unlink()
         sources["rcsb_chain_metadata"] = {
-            "path": str(rcsb_path),
+            "path": "rcsb_chain_metadata.jsonl",
             "chain_count": len(chain_ids),
             "sha256": None,
             "skipped": True,
@@ -359,38 +381,91 @@ def main(argv: list[str] | None = None) -> None:
     if args.include_dssp_mmcif:
         sources["dssp_mmcif"] = _download_dssp_mmcifs(
             chain_ids,
-            args.out_dir / "dssp_mmcif",
+            destination_dir / "dssp_mmcif",
             dry_run=bool(args.dry_run),
             retries=max(0, int(args.download_retries)),
             retry_delay_seconds=max(0.0, float(args.download_retry_delay_seconds)),
         )
+        if not args.dry_run and not sources["dssp_mmcif"]["tree_sha256"]:
+            sources["dssp_mmcif"].update({"skipped": True, "reason": "no DSSP source downloads succeeded"})
     else:
         sources["dssp_mmcif"] = {
-            "path": str(args.out_dir / "dssp_mmcif"),
+            "path": "dssp_mmcif",
             "pdb_count": len({_pdb_id(chain_id) for chain_id in chain_ids}),
             "failed_pdb_count": None,
             "tree_sha256": None,
             "skipped": True,
             "reason": "selected-chain mmCIF annotations are derived during preprocessing",
         }
+    return sources
 
-    lock = {
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "chain_data_cache": {
-            "path": str(args.chain_data_cache),
-            "sha256": None if args.dry_run else _sha256(args.chain_data_cache),
-        },
-        "candidate_chain_count": len(chain_ids),
-        "sources": sources,
+
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
+    cache_digest = _sha256(args.chain_data_cache)
+    candidate_filters = {
+        "min_len": args.min_len,
+        "max_len": args.max_len,
+        "max_resolution": args.max_resolution,
+        "max_unknown_aa_fraction": args.max_unknown_aa_fraction,
+        "require_monomer": args.require_monomer,
     }
+    chain_ids = _candidate_chain_ids(args.chain_data_cache, **candidate_filters)
+    if _sha256(args.chain_data_cache) != cache_digest:
+        raise ValueError("Chain data cache changed during candidate selection.")
+    print(
+        f"Metadata source candidate scope: {len(chain_ids)} chains, "
+        f"{len({_pdb_id(chain_id) for chain_id in chain_ids})} PDB entries",
+        flush=True,
+    )
+    if not chain_ids:
+        raise ValueError("No eligible chains for structural metadata download.")
+    if args.source_lock.exists():
+        _verify_existing_lock(args, candidate_filters, len(chain_ids))
+        print(f"Verified existing metadata source lock: {args.source_lock}")
+        return
+    source_paths = [args.out_dir / path for path in _source_paths().values()]
+    if args.source_lock.resolve() in {args.chain_data_cache.resolve(), *(path.resolve() for path in source_paths)}:
+        raise ValueError("Source lock must not overwrite a source or chain data cache.")
     if args.dry_run:
+        _collect_sources(args, chain_ids, args.out_dir)
         print("+ write source lock", args.source_lock)
-    else:
+        return
+    for path in source_paths:
+        if path.exists() or path.is_symlink():
+            raise ValueError(f"Unpinned source already exists: {path}; use a fresh directory and lock.")
+
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".structure-metadata-", dir=args.out_dir) as staging_dir:
+        staging = Path(staging_dir)
+        sources = _collect_sources(args, chain_ids, staging)
+        if _sha256(args.chain_data_cache) != cache_digest:
+            raise ValueError("Chain data cache changed during source download; no lock was published.")
+        lock = {
+            "schema_version": 2,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "chain_data_cache": {"path": args.chain_data_cache.name, "sha256": cache_digest},
+            "candidate_chain_count": len(chain_ids),
+            "candidate_filters": candidate_filters,
+            "download_options": {
+                "include_rcsb_rest": args.include_rcsb_rest,
+                "include_dssp_mmcif": args.include_dssp_mmcif,
+            },
+            "sources": sources,
+        }
+        for source in sources.values():
+            if not source.get("skipped"):
+                shutil.move(str(staging / source["path"]), str(args.out_dir / source["path"]))
         args.source_lock.parent.mkdir(parents=True, exist_ok=True)
-        args.source_lock.write_text(json.dumps(lock, indent=2, sort_keys=True) + "\n")
+        with tempfile.NamedTemporaryFile(mode="w", dir=args.source_lock.parent, delete=False) as handle:
+            temp_lock = Path(handle.name)
+            try:
+                handle.write(json.dumps(lock, indent=2, sort_keys=True) + "\n")
+                handle.close()
+                temp_lock.replace(args.source_lock)
+            finally:
+                temp_lock.unlink(missing_ok=True)
         print(f"Wrote metadata source lock: {args.source_lock}")
-    if failures:
-        raise SystemExit(f"Required metadata source downloads failed: {', '.join(failures)}")
 
 
 if __name__ == "__main__":

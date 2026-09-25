@@ -5,11 +5,12 @@ import hashlib
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import tempfile
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -23,21 +24,22 @@ Expected input:
 - chain_data_cache.json (available from RODA as described in OpenFold docs)
 
 We filter by:
-- monomer chains
+- single-chain prediction targets (biological monomers only with --require-monomer)
 - length range
 - resolution cutoff
 and then sample fixed-size split chain sets with leakage-aware grouping:
 - no sequence cluster is allowed to appear in multiple splits
 - no PDB entry is allowed to appear in multiple splits
-- required secondary-structure metadata is used to stratify by
-  secondary structure, domain architecture, length, and resolution bins
+- CATH architecture compositions, then length and resolution, receive proportional quotas
 
 The chain_data_cache parser accepts the field names present in OpenFold's
-published cache metadata and fails closed when required structure metadata is absent.
+published cache metadata and requires source-bound versioned structural metadata.
 """
 
 STANDARD_AAS = set("ARNDCQEGHILKMFPSTWYV")
-DEFAULT_STRATIFY_FIELDS = (
+SAMPLING_POLICY = "cath-v2"
+DEFAULT_STRATIFY_FIELDS = ("cath_architecture_ids", "length_bin", "resolution_bin")
+LEGACY_STRATIFY_FIELDS = (
     "secondary_structure_class",
     "domain_architecture_class",
     "length_bin",
@@ -63,6 +65,11 @@ class Candidate:
     domain_architecture_class: str
     domain_architecture_source: str
     metadata_source_count: int
+    cath_architecture_ids: tuple[str, ...] = ()
+    cath_topology_ids: tuple[str, ...] = ()
+    cath_homologous_superfamily_ids: tuple[str, ...] = ()
+    cath_annotation_status: str = "unknown"
+    cath_domain_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -83,6 +90,8 @@ class SplitResult:
 
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser()
+    ap.add_argument("--sampling-policy", choices=[SAMPLING_POLICY], required=True,
+                    help="Explicit opt-in to versioned CATH sampling; requires metadata schema 2 and new output paths.")
     ap.add_argument("--chain-data-cache", type=str, required=True, help="Path to chain_data_cache.json")
     ap.add_argument("--out-dir", type=str, required=True, help="Where to write public train.txt, val.txt, and all.txt")
     ap.add_argument(
@@ -108,6 +117,8 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--min-len", type=int, default=40)
     ap.add_argument("--max-len", type=int, default=256)
     ap.add_argument("--max-resolution", type=float, default=3.0)
+    ap.add_argument("--require-monomer", action="store_true",
+                    help="Require explicit biological oligomeric_count=1; absent state is unknown.")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument(
         "--hidden-split-salt-env",
@@ -145,7 +156,7 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help=(
             "Canonical structure metadata JSON from scripts/build_structure_metadata.py or "
-            "scripts/filter_openproteinset.py. Accepted chains must include secondary-structure metadata."
+            "scripts/filter_openproteinset.py. Schema 2 preserves CATH domains and measured secondary-structure missingness."
         ),
     )
     ap.add_argument(
@@ -160,14 +171,14 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument(
         "--lock-file",
         type=str,
-        default="",
-        help="Optional public JSON path capturing non-hidden generation inputs/hashes.",
+        required=True,
+        help="Required public JSON path capturing non-hidden generation inputs/hashes.",
     )
     ap.add_argument(
         "--private-lock-file",
         type=str,
-        default="",
-        help="Optional maintainer-only JSON path capturing hidden split metadata and salt digest.",
+        required=True,
+        help="Required maintainer-only JSON path capturing hidden split metadata and salt digest.",
     )
     return ap.parse_args()
 
@@ -240,6 +251,8 @@ def _candidate_field(candidate: Candidate, field_name: str) -> str:
         if candidate.metadata_source_count >= 2:
             return "sources_2_3"
         return "sources_0_1"
+    if field_name.startswith("cath_") and field_name.endswith("_ids"):
+        return "+".join(getattr(candidate, field_name)) or "unknown"
     value = getattr(candidate, field_name, None)
     if value is None:
         return "unknown"
@@ -357,42 +370,89 @@ def _to_optional_float(value: object) -> float | None:
         out = float(value)
     except (TypeError, ValueError):
         return None
-    if out < 0.0:
+    if not math.isfinite(out) or out < 0.0 or isinstance(value, bool):
         return None
     return out
 
 
-def _load_structure_metadata(path: str | Path) -> tuple[set[str], dict[str, dict[str, Any]]]:
+def _load_structure_metadata(
+    path: str | Path, *, require_schema_version: int | None = None,
+) -> tuple[set[str], dict[str, dict[str, Any]]]:
     metadata_path = Path(path)
     raw = json.loads(metadata_path.read_text())
     if not isinstance(raw, dict) or not isinstance(raw.get("chains"), list):
         raise ValueError(f"Structure metadata must contain a `chains` list: {metadata_path}")
+    version = raw.get("schema_version", 1)
+    if version not in (1, 2) or (require_schema_version is not None and version != require_schema_version):
+        raise ValueError(f"Structure metadata requires schema {require_schema_version or '1 or 2'}: {metadata_path}")
     accepted: set[str] = set()
     metadata: dict[str, dict[str, Any]] = {}
     for item in raw["chains"]:
-        if not isinstance(item, dict):
-            continue
-        chain_id = str(item.get("chain_id") or "").strip()
-        if not chain_id:
-            continue
+        if not isinstance(item, dict) or not isinstance(item.get("chain_id"), str):
+            raise ValueError("Structure metadata rows must contain a chain_id string.")
+        chain_id = item["chain_id"].strip()
+        if not chain_id or chain_id in metadata:
+            raise ValueError(f"Missing or duplicate structure metadata chain: {chain_id}")
+        if not isinstance(item.get("accepted"), bool):
+            raise ValueError(f"Structure metadata accepted must be boolean: {chain_id}")
         metadata[chain_id] = item
-        if bool(item.get("accepted", False)):
-            cls, helix_f, beta_f, coil_f = _parse_secondary_payload(item)
-            if cls == "unknown" or helix_f is None or beta_f is None or coil_f is None:
-                raise ValueError(
-                    "Accepted structure metadata rows must include secondary-structure class and "
-                    f"helix/beta/coil fractions. Bad chain: {chain_id}"
-                )
-            domain_class, _domain_source, _source_count = _parse_domain_payload(item)
-            if domain_class == "unknown":
-                raise ValueError(
-                    "Accepted structure metadata rows must include a domain_architecture_class. "
-                    f"Bad chain: {chain_id}"
-                )
-            accepted.add(chain_id)
+        if not item["accepted"]:
+            continue
+        cls, helix_f, beta_f, coil_f = _parse_secondary_payload(item)
+        fractions = (helix_f, beta_f, coil_f)
+        if version == 1:
+            if cls == "unknown" or any(value is None for value in fractions):
+                raise ValueError(f"Accepted schema 1 metadata requires secondary structure: {chain_id}")
+        else:
+            raw_fractions = [item.get(f"secondary_{name}_fraction") for name in ("helix", "beta", "coil")]
+            if any(value is not None for value in raw_fractions):
+                if any(value is None or value > 1 for value in fractions):
+                    raise ValueError(f"Invalid secondary structure fractions: {chain_id}")
+                if not math.isclose(sum(value for value in fractions if value is not None), 1.0, abs_tol=0.02):
+                    raise ValueError(f"Secondary structure fractions must sum to one: {chain_id}")
+            elif cls != "unknown":
+                raise ValueError(f"Secondary structure class requires measured fractions: {chain_id}")
+            _parse_cath_payload(item)
+        accepted.add(chain_id)
     if not accepted:
         raise ValueError(f"Structure metadata has no accepted chains: {metadata_path}")
     return accepted, metadata
+
+
+def _parse_cath_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    values: dict[str, Any] = {}
+    for field, levels in (("cath_architecture_ids", 2), ("cath_topology_ids", 3),
+                          ("cath_homologous_superfamily_ids", 4)):
+        codes = payload.get(field, [])
+        if not isinstance(codes, list) or any(
+            not isinstance(code, str) or len(code.split(".")) != levels
+            or any(not part.isdigit() or int(part) <= 0 for part in code.split("."))
+            for code in codes
+        ):
+            raise ValueError(f"Invalid {field} for {payload.get('chain_id')}")
+        values[field] = tuple(sorted(set(codes)))
+    status = payload.get("cath_annotation_status", "unknown")
+    if status not in ("annotated", "unknown"):
+        raise ValueError("Invalid cath_annotation_status")
+    if (status == "annotated") != bool(values["cath_architecture_ids"]):
+        raise ValueError("CATH annotation status disagrees with architecture IDs")
+    if {".".join(code.split(".")[:2]) for code in values["cath_topology_ids"]} != set(values["cath_architecture_ids"]):
+        raise ValueError("CATH topology IDs disagree with architecture IDs")
+    if {".".join(code.split(".")[:3]) for code in values["cath_homologous_superfamily_ids"]} != set(values["cath_topology_ids"]):
+        raise ValueError("CATH superfamily IDs disagree with topology IDs")
+    domains = payload.get("cath_domains", [])
+    if not isinstance(domains, list) or any(not isinstance(domain, dict) for domain in domains):
+        raise ValueError("Invalid cath_domains")
+    for field, domain_field in (("cath_architecture_ids", "architecture_id"), ("cath_topology_ids", "topology_id"),
+                                ("cath_homologous_superfamily_ids", "homologous_superfamily_id")):
+        if {domain.get(domain_field) for domain in domains} != set(values[field]):
+            raise ValueError(f"CATH domains disagree with {field}")
+    domain_ids = [domain.get("domain_id") for domain in domains]
+    if any(not isinstance(domain_id, str) or not domain_id for domain_id in domain_ids) or len(set(domain_ids)) != len(domain_ids):
+        raise ValueError("Invalid or duplicate CATH domain IDs")
+    values["cath_annotation_status"] = status
+    values["cath_domain_count"] = len(domains)
+    return values
 
 
 def _structure_metadata_source_record(path: str | Path) -> dict[str, Any]:
@@ -416,13 +476,20 @@ def _load_cluster_tsv(path: str | Path, candidates: set[str]) -> Dict[str, str]:
     cluster_path = Path(path)
     cluster_map: Dict[str, str] = {}
     with cluster_path.open() as handle:
-        for line in handle:
-            parts = line.strip().split("\t")
-            if len(parts) < 2:
+        for line_number, line in enumerate(handle, 1):
+            if not line.strip():
                 continue
-            representative, member = parts[0].strip(), parts[1].strip()
-            if member in candidates:
-                cluster_map[member] = representative
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) != 2 or any(not part.strip() for part in parts):
+                raise ValueError(f"Malformed cluster TSV row {line_number}")
+            representative, member = (part.strip() for part in parts)
+            if member in cluster_map and cluster_map[member] != representative:
+                raise ValueError(f"Conflicting cluster assignments for {member}")
+            cluster_map[member] = representative
+    for representative in set(cluster_map.values()):
+        if representative in cluster_map and cluster_map[representative] != representative:
+            raise ValueError(f"Cluster representative is assigned to a different cluster: {representative}")
+    cluster_map = {member: representative for member, representative in cluster_map.items() if member in candidates}
     missing = sorted(candidates - set(cluster_map))
     if missing:
         sample = ", ".join(missing[:8])
@@ -438,6 +505,7 @@ def _cluster_sequences_mmseqs(
     mmseqs_bin: str,
     min_seq_id: float,
     coverage: float,
+    alignment_mode: int | None = 3,
 ) -> tuple[Dict[str, str] | None, List[str] | None]:
     mmseqs_path = shutil.which(mmseqs_bin)
     if mmseqs_path is None:
@@ -466,6 +534,7 @@ def _cluster_sequences_mmseqs(
             str(coverage),
             "--cov-mode",
             "0",
+            *([] if alignment_mode is None else ["--alignment-mode", str(alignment_mode)]),
             "--threads",
             "1",
         ]
@@ -481,6 +550,7 @@ def _cluster_sequences_mmseqs(
             str(coverage),
             "--cov-mode",
             "0",
+            *([] if alignment_mode is None else ["--alignment-mode", str(alignment_mode)]),
             "--threads",
             "1",
         ]
@@ -492,16 +562,7 @@ def _cluster_sequences_mmseqs(
         if not cluster_tsv.exists():
             return None, lock_cmd
 
-        cluster_map: Dict[str, str] = {}
-        for line in cluster_tsv.read_text().splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            rep, member = line.split("\t")
-            cluster_map[member] = rep
-        if set(cluster_map.keys()) != set(sequences.keys()):
-            return None, lock_cmd
-        return cluster_map, lock_cmd
+        return _load_cluster_tsv(cluster_tsv, set(sequences)), lock_cmd
 
 
 def _mmseqs_version(mmseqs_bin: str) -> str | None:
@@ -529,12 +590,17 @@ def _build_candidates(
     max_resolution: float,
     structure_metadata: dict[str, dict[str, Any]],
     structure_metadata_accepted: set[str],
+    sampling_policy: str = SAMPLING_POLICY,
+    require_monomer: bool = False,
 ) -> tuple[list[Candidate], Counter[str], str]:
     candidates: list[Candidate] = []
     reject_reasons: Counter[str] = Counter()
     secondary_source = "structure_metadata"
 
-    for chain_id, meta_raw in data.items():
+    for chain_id, meta_raw in sorted(data.items()):
+        if not re.fullmatch(r"[0-9A-Za-z]{4}_[^\s_]+", chain_id):
+            reject_reasons["invalid_chain_id"] += 1
+            continue
         if chain_id not in structure_metadata_accepted:
             reject_reasons["not_accepted_in_structure_metadata"] += 1
             continue
@@ -547,43 +613,50 @@ def _build_candidates(
             reject_reasons["missing_sequence"] += 1
             continue
         seq = seq.upper()
+        if sampling_policy == SAMPLING_POLICY and _unknown_aa_fraction(seq) != 0:
+            reject_reasons["nonstandard_amino_acids"] += 1
+            continue
 
         raw_length = meta.get("seq_length", meta.get("sequence_length", len(seq)))
-        try:
-            L = int(raw_length) if isinstance(raw_length, (str, bytes, bytearray, int, float)) else len(seq)
-        except Exception:
-            L = len(seq)
-        raw_resolution = meta.get("resolution", 999.0)
-        try:
-            res = float(raw_resolution) if isinstance(raw_resolution, (str, bytes, bytearray, int, float)) else 999.0
-        except Exception:
-            res = 999.0
-
-        olig = meta.get("oligomeric_count", meta.get("num_chains", 1))
-        try:
-            olig = int(olig) if isinstance(olig, (str, bytes, bytearray, int, float)) else 1
-        except Exception:
-            olig = 1
-
+        raw_resolution = meta.get("resolution")
+        oligomer_count = meta.get("oligomeric_count")
+        if sampling_policy == SAMPLING_POLICY:
+            length_value = _to_optional_float(raw_length)
+            res_value = _to_optional_float(raw_resolution)
+            olig_value = _to_optional_float(oligomer_count)
+            if length_value is None or not length_value.is_integer() or length_value != len(seq):
+                reject_reasons["invalid_or_mismatched_sequence_length"] += 1
+                continue
+            if res_value is None or res_value <= 0:
+                res_value = 999.0
+            if require_monomer and (olig_value is None or not olig_value.is_integer()):
+                reject_reasons["missing_or_invalid_oligomeric_count"] += 1
+                continue
+            L, res, olig = int(length_value), res_value, olig_value
+        else:
+            L = int(_to_optional_float(raw_length) or len(seq))
+            res = _to_optional_float(raw_resolution) or 999.0
+            olig = int(_to_optional_float(oligomer_count) or 1)
         if not (min_len <= L <= max_len):
             reject_reasons["length"] += 1
             continue
         if res != 999.0 and res > max_resolution:
             reject_reasons["resolution"] += 1
             continue
-        if olig != 1:
+        if (require_monomer or sampling_policy != SAMPLING_POLICY) and olig != 1:
             reject_reasons["oligomeric_count"] += 1
             continue
 
         metadata_entry = structure_metadata[chain_id]
         ss_class, helix_fraction, beta_fraction, coil_fraction = _parse_secondary_payload(metadata_entry)
-        if ss_class == "unknown" or helix_fraction is None or beta_fraction is None or coil_fraction is None:
-            reject_reasons["missing_secondary_structure_metadata"] += 1
-            continue
         domain_class, domain_source, metadata_source_count = _parse_domain_payload(metadata_entry)
-        if domain_class == "unknown":
-            reject_reasons["missing_domain_architecture_metadata"] += 1
+        if sampling_policy != SAMPLING_POLICY and (
+            ss_class == "unknown" or any(value is None for value in (helix_fraction, beta_fraction, coil_fraction))
+            or domain_class == "unknown"
+        ):
+            reject_reasons["missing_structure_metadata"] += 1
             continue
+        cath = _parse_cath_payload(metadata_entry) if sampling_policy == SAMPLING_POLICY else {}
 
         candidates.append(
             Candidate(
@@ -601,6 +674,7 @@ def _build_candidates(
                 domain_architecture_class=domain_class,
                 domain_architecture_source=domain_source,
                 metadata_source_count=metadata_source_count,
+                **cath,
             )
         )
     return candidates, reject_reasons, secondary_source
@@ -610,7 +684,6 @@ def _choose_representative(candidates: list[Candidate], seed: int) -> Candidate:
     return min(
         candidates,
         key=lambda item: (
-            1 if item.secondary_structure_class == "unknown" else 0,
             item.resolution if item.resolution and item.resolution < 999.0 else 999.0,
             -item.length,
             item.release_date or "",
@@ -644,10 +717,12 @@ def _disjoint_units(
 
     by_cluster: defaultdict[str, list[str]] = defaultdict(list)
     by_pdb: defaultdict[str, list[str]] = defaultdict(list)
+    by_sequence: defaultdict[str, list[str]] = defaultdict(list)
     for candidate in candidates:
         by_cluster[cluster_map[candidate.chain_id]].append(candidate.chain_id)
         by_pdb[candidate.pdb_id].append(candidate.chain_id)
-    for cluster_members in by_cluster.values():
+        by_sequence[candidate.sequence].append(candidate.chain_id)
+    for cluster_members in list(by_cluster.values()) + list(by_sequence.values()):
         first = cluster_members[0]
         for member in cluster_members[1:]:
             union(first, member)
@@ -668,50 +743,84 @@ def _disjoint_units(
     return units
 
 
-def _allocate_counts_by_stratum(
-    units: list[Candidate],
-    *,
-    size: int,
-    stratify_fields: tuple[str, ...],
-) -> dict[tuple[str, ...], int]:
-    if size <= 0:
-        return {}
-    by_stratum: defaultdict[tuple[str, ...], list[Candidate]] = defaultdict(list)
-    for unit in units:
-        by_stratum[_stratum(unit, stratify_fields)].append(unit)
-    if size > len(units):
-        raise ValueError(f"Requested {size} chains but only {len(units)} disjoint candidate units are available.")
+def _apportion_counts(
+    capacities: dict[str, int], weights: dict[str, int], *, size: int, seed: int, salt: str,
+) -> dict[str, int]:
+    """Capped proportional quotas with seeded largest-remainder rounding.
 
-    total = len(units)
-    allocation: dict[tuple[str, ...], int] = {}
-    remainders: list[tuple[float, int, tuple[str, ...]]] = []
-    allocated = 0
-    for key, members in sorted(by_stratum.items()):
-        exact = size * len(members) / float(total)
-        count = min(len(members), int(exact))
-        allocation[key] = count
-        allocated += count
-        remainders.append((exact - count, len(members), key))
-
-    remaining = size - allocated
-    for _, _, key in sorted(remainders, key=lambda item: (-item[0], -item[1], item[2])):
-        if remaining <= 0:
-            break
-        capacity = len(by_stratum[key]) - allocation[key]
-        if capacity <= 0:
+    Saturated groups are removed and their quota redistributed proportionally.
+    If no reference-supported group remains, residual capacity supplies the weights.
+    """
+    if size < 0 or size > sum(capacities.values()):
+        raise ValueError("Requested sample size exceeds available capacity or is negative.")
+    allocation = dict.fromkeys(capacities, 0)
+    available = {key: value for key, value in capacities.items() if value > 0}
+    remaining = size
+    while remaining and available:
+        active_weights = {key: weights.get(key, 0) for key in available}
+        if not sum(active_weights.values()):
+            active_weights = dict(available)
+        total_weight = sum(active_weights.values())
+        exact = {key: remaining * active_weights[key] / total_weight for key in available}
+        saturated = [key for key in available if exact[key] >= available[key]]
+        if saturated:
+            for key in saturated:
+                allocation[key] += available[key]
+                remaining -= available.pop(key)
             continue
-        allocation[key] += 1
-        remaining -= 1
-
-    if remaining > 0:
-        for key, members in sorted(by_stratum.items(), key=lambda item: (-len(item[1]), item[0])):
-            if remaining <= 0:
-                break
-            capacity = len(members) - allocation[key]
-            take = min(capacity, remaining)
-            allocation[key] += take
-            remaining -= take
+        floors = {key: int(value) for key, value in exact.items()}
+        for key, count in floors.items():
+            allocation[key] += count
+            remaining -= count
+        ranked = sorted(available, key=lambda key: (
+            -(exact[key] - floors[key]), _stable_random_score(seed, salt, key), key,
+        ))
+        for key in ranked[:remaining]:
+            allocation[key] += 1
+        remaining = 0
     return allocation
+
+
+def _allocate_hierarchical(
+    pool: list[Candidate], reference: list[Candidate], *, size: int,
+    stratify_fields: tuple[str, ...], seed: int, salt: str,
+) -> dict[tuple[str, ...], int]:
+    """Apportion biological axes first, then length/resolution within each quota."""
+    if size < 0 or size > len(pool):
+        raise ValueError(f"Requested {size} chains but only {len(pool)} disjoint candidate units are available.")
+    if not reference and size:
+        raise ValueError("Cannot apportion a nonempty sample without a reference population.")
+    allocation: dict[tuple[str, ...], int] = {}
+
+    def visit(members: list[Candidate], targets: list[Candidate], quota: int, prefix: tuple[str, ...]) -> None:
+        if len(prefix) == len(stratify_fields):
+            allocation[prefix or ("all",)] = quota
+            return
+        field = stratify_fields[len(prefix)]
+        groups: defaultdict[str, list[Candidate]] = defaultdict(list)
+        target_groups: defaultdict[str, list[Candidate]] = defaultdict(list)
+        for member in members:
+            groups[_candidate_field(member, field)].append(member)
+        for target in targets:
+            target_groups[_candidate_field(target, field)].append(target)
+        counts = _apportion_counts(
+            {key: len(value) for key, value in groups.items()},
+            {key: len(value) for key, value in target_groups.items()},
+            size=quota, seed=seed, salt=f"{salt}:{json.dumps(prefix)}",
+        )
+        for key in sorted(groups):
+            visit(groups[key], target_groups.get(key, []), counts[key], (*prefix, key))
+
+    visit(pool, reference, size, ())
+    return allocation
+
+
+def _allocate_counts_by_stratum(
+    units: list[Candidate], *, size: int, stratify_fields: tuple[str, ...], seed: int = 0, salt: str = "allocation",
+) -> dict[tuple[str, ...], int]:
+    return _allocate_hierarchical(
+        units, units, size=size, stratify_fields=stratify_fields, seed=seed, salt=salt,
+    )
 
 
 def _select_stratified(
@@ -727,7 +836,9 @@ def _select_stratified(
     by_stratum: defaultdict[tuple[str, ...], list[Candidate]] = defaultdict(list)
     for unit in units:
         by_stratum[_stratum(unit, stratify_fields)].append(unit)
-    allocation = _allocate_counts_by_stratum(units, size=size, stratify_fields=stratify_fields)
+    allocation = _allocate_counts_by_stratum(
+        units, size=size, stratify_fields=stratify_fields, seed=seed, salt=salt,
+    )
     selected: list[Candidate] = []
     for key, count in sorted(allocation.items()):
         members = sorted(
@@ -756,25 +867,7 @@ def _split_candidates(
     structural_metadata_source: str,
 ) -> SplitResult:
     candidate_by_id = {candidate.chain_id: candidate for candidate in candidates}
-    candidates_with_clusters = [
-        Candidate(
-            chain_id=candidate.chain_id,
-            sequence=candidate.sequence,
-            length=candidate.length,
-            resolution=candidate.resolution,
-            release_date=candidate.release_date,
-            cluster_id=cluster_map[candidate.chain_id],
-            pdb_id=candidate.pdb_id,
-            secondary_structure_class=candidate.secondary_structure_class,
-            secondary_helix_fraction=candidate.secondary_helix_fraction,
-            secondary_beta_fraction=candidate.secondary_beta_fraction,
-            secondary_coil_fraction=candidate.secondary_coil_fraction,
-            domain_architecture_class=candidate.domain_architecture_class,
-            domain_architecture_source=candidate.domain_architecture_source,
-            metadata_source_count=candidate.metadata_source_count,
-        )
-        for candidate in candidates
-    ]
+    candidates_with_clusters = [replace(candidate, cluster_id=cluster_map[candidate.chain_id]) for candidate in candidates]
     units = _disjoint_units(
         candidates_with_clusters,
         cluster_map,
@@ -788,26 +881,22 @@ def _split_candidates(
             "The candidate source set is too small for the official split contract."
         )
 
+    # Public choices must not reveal holes left by privately selected hidden chains.
+    val = _select_stratified(units, size=int(val_size), seed=seed, salt="val", stratify_fields=stratify_fields)
+    val_ids = {candidate.chain_id for candidate in val}
+    train_pool = [candidate for candidate in units if candidate.chain_id not in val_ids]
+    train = _select_stratified(train_pool, size=int(train_size), seed=seed, salt="train", stratify_fields=stratify_fields)
+    public_ids = val_ids | {candidate.chain_id for candidate in train}
+    hidden_pool = [candidate for candidate in units if candidate.chain_id not in public_ids]
     if hidden_val_size > 0:
         if not hidden_split_salt_digest:
             raise RuntimeError("Hidden split salt digest is required when hidden_val_size is positive.")
         hidden = _select_stratified(
-            units,
-            size=int(hidden_val_size),
-            seed=seed,
-            salt=f"hidden_val:{hidden_split_salt_digest}",
-            stratify_fields=stratify_fields,
+            hidden_pool, size=int(hidden_val_size), seed=seed,
+            salt=f"hidden_val:{hidden_split_salt_digest}", stratify_fields=stratify_fields,
         )
-        hidden_ids = {candidate.chain_id for candidate in hidden}
     else:
         hidden = []
-        hidden_ids = set()
-
-    public_pool = [candidate for candidate in units if candidate.chain_id not in hidden_ids]
-    val = _select_stratified(public_pool, size=int(val_size), seed=seed, salt="val", stratify_fields=stratify_fields)
-    val_ids = {candidate.chain_id for candidate in val}
-    train_pool = [candidate for candidate in public_pool if candidate.chain_id not in val_ids]
-    train = _select_stratified(train_pool, size=int(train_size), seed=seed, salt="train", stratify_fields=stratify_fields)
 
     selected = {candidate.chain_id: candidate for candidate in train + val + hidden}
     quality_report = _build_quality_report(
@@ -818,6 +907,7 @@ def _split_candidates(
             "hidden_val": [candidate.chain_id for candidate in hidden],
         },
         stratify_fields=stratify_fields,
+        reference_candidates=units,
     )
     _assert_quality_report(quality_report)
     return SplitResult(
@@ -831,7 +921,7 @@ def _split_candidates(
         cluster_method=cluster_method,
         cluster_command=cluster_command,
         structural_metadata_source=structural_metadata_source,
-        group_policy={"cluster_disjoint": True, "pdb_disjoint": disallow_pdb_overlap},
+        group_policy={"cluster_disjoint": True, "pdb_disjoint": disallow_pdb_overlap, "exact_sequence_disjoint": True},
         quality_report=quality_report,
     )
 
@@ -850,7 +940,7 @@ def _assert_split_disjointness(result: SplitResult) -> None:
             if overlap:
                 raise RuntimeError(f"Split chain overlap between {left_name} and {right_name}: {sorted(overlap)[:8]}")
 
-    checks = [("cluster_id", "cluster")]
+    checks = [("cluster_id", "cluster"), ("sequence", "exact sequence")]
     if result.group_policy.get("pdb_disjoint", False):
         checks.append(("pdb_id", "PDB entry"))
     for attr_name, label in checks:
@@ -873,6 +963,7 @@ def _split_distribution(result: SplitResult, ids: list[str]) -> dict[str, Any]:
     lengths = Counter(_length_bin(result.selected_candidates[chain_id].length) for chain_id in ids)
     resolutions = Counter(_resolution_bin(result.selected_candidates[chain_id].resolution) for chain_id in ids)
     return {
+        "cath_architecture_ids": _distribution_for_field([result.selected_candidates[chain_id] for chain_id in ids], "cath_architecture_ids"),
         "secondary_structure_class": dict(sorted(classes.items())),
         "domain_architecture_class": dict(sorted(domains.items())),
         "length_bin": dict(sorted(lengths.items())),
@@ -886,7 +977,7 @@ def _distribution_for_field(candidates: list[Candidate], field_name: str) -> dic
 
 
 def _js_divergence(left: dict[str, int], right: dict[str, int]) -> float:
-    keys = set(left) | set(right)
+    keys = sorted(set(left) | set(right))
     left_total = float(sum(left.values()))
     right_total = float(sum(right.values()))
     if left_total <= 0.0 or right_total <= 0.0:
@@ -904,47 +995,96 @@ def _js_divergence(left: dict[str, int], right: dict[str, int]) -> float:
 
 
 def _build_quality_report(
-    *,
-    selected_candidates: dict[str, Candidate],
-    split_ids: dict[str, list[str]],
-    stratify_fields: tuple[str, ...],
+    *, selected_candidates: dict[str, Candidate], split_ids: dict[str, list[str]],
+    stratify_fields: tuple[str, ...], reference_candidates: list[Candidate] | None = None,
 ) -> dict[str, Any]:
     selected = [selected_candidates[chain_id] for ids in split_ids.values() for chain_id in ids]
-    all_distribution = {
-        field_name: _distribution_for_field(selected, field_name)
-        for field_name in stratify_fields
-    }
-    split_distribution: dict[str, dict[str, dict[str, int]]] = {}
-    js_by_split: dict[str, dict[str, float]] = {}
+    reference = reference_candidates if reference_candidates is not None else selected
+    all_distribution = {field: _distribution_for_field(selected, field) for field in stratify_fields}
+    reference_distribution = {field: _distribution_for_field(reference, field) for field in stratify_fields}
+    split_distribution = {}
+    js_by_split = {}
+    coverage = {}
     for split_name, ids in split_ids.items():
         members = [selected_candidates[chain_id] for chain_id in ids]
-        split_distribution[split_name] = {
-            field_name: _distribution_for_field(members, field_name)
-            for field_name in stratify_fields
-        }
+        split_distribution[split_name] = {field: _distribution_for_field(members, field) for field in stratify_fields}
         js_by_split[split_name] = {
-            field_name: _js_divergence(split_distribution[split_name][field_name], all_distribution[field_name])
-            for field_name in stratify_fields
+            field: _js_divergence(split_distribution[split_name][field], reference_distribution[field])
+            for field in stratify_fields
         }
-    domain_counts = all_distribution.get("domain_architecture_class", {})
-    unknown_domain_fraction = domain_counts.get("unknown", 0) / float(max(1, sum(domain_counts.values())))
-    max_js = max(
-        (value for fields in js_by_split.values() for value in fields.values()),
-        default=0.0,
-    )
+        coverage[split_name] = _annotation_coverage(members)
+    domain_counts = _distribution_for_field(selected, "domain_architecture_class")
+    cath_policy = "cath_architecture_ids" in stratify_fields
+    unknown_fraction = sum(not candidate.cath_architecture_ids for candidate in selected) / max(1, len(selected))
+    max_js = max((value for fields in js_by_split.values() for value in fields.values()), default=0.0)
     return {
         "stratify_fields": list(stratify_fields),
         "selected_distribution": all_distribution,
+        "reference_distribution": reference_distribution,
+        "reference_population": "eligible_disjoint_units" if reference_candidates is not None else "selected_chains",
+        "reference_annotation_coverage": _annotation_coverage(reference),
         "split_distribution": split_distribution,
+        "annotation_coverage": coverage,
+        "training_familiarity": _training_familiarity(selected_candidates, split_ids),
         "jensen_shannon_divergence": js_by_split,
+        "split_sizes": {name: len(ids) for name, ids in split_ids.items()},
         "gates": {
             "max_split_js_divergence": MAX_SPLIT_JS_DIVERGENCE,
             "max_unknown_domain_architecture_fraction": MAX_UNKNOWN_DOMAIN_ARCHITECTURE_FRACTION,
         },
         "observed": {
             "max_split_js_divergence": max_js,
-            "unknown_domain_architecture_fraction": unknown_domain_fraction,
+            "unknown_domain_architecture_fraction": unknown_fraction if cath_policy else (
+                domain_counts.get("unknown", 0) / max(1, len(selected))
+            ),
             "min_split_size": min((len(ids) for ids in split_ids.values() if ids), default=0),
+        },
+    }
+
+
+def _training_familiarity(
+    candidates: dict[str, Candidate], split_ids: dict[str, list[str]],
+) -> dict[str, dict[str, dict[str, int]]]:
+    result = {}
+    train = [candidates[chain_id] for chain_id in split_ids.get("train", [])]
+    for name, ids in split_ids.items():
+        if name == "train":
+            continue
+        fields = {}
+        for field in ("cath_topology_ids", "cath_homologous_superfamily_ids"):
+            known = {code for candidate in train for code in getattr(candidate, field)}
+            counts = dict.fromkeys(("UNANNOTATED", "NONE_SEEN", "SOME_SEEN", "ALL_SEEN"), 0)
+            for chain_id in ids:
+                codes = set(getattr(candidates[chain_id], field))
+                overlap = codes & known
+                category = ("UNANNOTATED" if not codes else "NONE_SEEN" if not overlap
+                            else "ALL_SEEN" if overlap == codes else "SOME_SEEN")
+                counts[category] += 1
+            fields[field] = counts
+        result[name] = fields
+    return result
+
+
+def _annotation_coverage(candidates: list[Candidate]) -> dict[str, Any]:
+    count = len(candidates)
+    return {
+        "chain_count": count,
+        "residue_count": sum(candidate.length for candidate in candidates),
+        "cath_domain_count": sum(candidate.cath_domain_count for candidate in candidates),
+        "cath_multidomain_chain_count": sum(candidate.cath_domain_count > 1 for candidate in candidates),
+        "cath_class_count": len({code.split(".")[0] for candidate in candidates for code in candidate.cath_architecture_ids}),
+        "cath_annotated_count": sum(bool(candidate.cath_architecture_ids) for candidate in candidates),
+        "cath_unknown_fraction": sum(not candidate.cath_architecture_ids for candidate in candidates) / max(1, count),
+        "measured_secondary_structure_count": sum(
+            candidate.secondary_helix_fraction is not None and candidate.secondary_beta_fraction is not None
+            and candidate.secondary_coil_fraction is not None for candidate in candidates
+        ),
+        "cath_architecture_count": len({code for candidate in candidates for code in candidate.cath_architecture_ids}),
+        "cath_topology_count": len({code for candidate in candidates for code in candidate.cath_topology_ids}),
+        "cath_superfamily_count": len({code for candidate in candidates for code in candidate.cath_homologous_superfamily_ids}),
+        "label_chain_counts": {
+            field: dict(sorted(Counter(code for candidate in candidates for code in getattr(candidate, field)).items()))
+            for field in ("cath_architecture_ids", "cath_topology_ids", "cath_homologous_superfamily_ids")
         },
     }
 
@@ -954,11 +1094,18 @@ def _assert_quality_report(report: dict[str, Any]) -> None:
     max_js = float(observed.get("max_split_js_divergence", 0.0))
     unknown_domain = float(observed.get("unknown_domain_architecture_fraction", 0.0))
     min_split_size = int(observed.get("min_split_size", 0))
-    if min_split_size >= 100 and max_js > MAX_SPLIT_JS_DIVERGENCE:
+    split_sizes = report.get("split_sizes", {})
+    if split_sizes:
+        max_js = max((value for name, fields in report.get("jensen_shannon_divergence", {}).items()
+                      if split_sizes.get(name, 0) >= 100 for value in fields.values()), default=0.0)
+    if (split_sizes or min_split_size >= 100) and max_js > MAX_SPLIT_JS_DIVERGENCE:
         raise ValueError(
             "Split stratification quality gate failed: "
             f"max JS divergence {max_js:.4f} exceeds {MAX_SPLIT_JS_DIVERGENCE:.4f}."
         )
+    if "cath_architecture_ids" in report.get("stratify_fields", []):
+        unknown_domain = max((coverage["cath_unknown_fraction"] for coverage in report.get("annotation_coverage", {}).values()
+                              if coverage["chain_count"] >= 100), default=unknown_domain)
     if unknown_domain > MAX_UNKNOWN_DOMAIN_ARCHITECTURE_FRACTION:
         raise ValueError(
             "Split metadata quality gate failed: "
@@ -967,12 +1114,76 @@ def _assert_quality_report(report: dict[str, Any]) -> None:
         )
 
 
+def _validate_metadata_identity(path: str | Path, cache_sha256: str, args: argparse.Namespace) -> None:
+    metadata = json.loads(Path(path).read_text())
+    if not isinstance(metadata, dict) or not isinstance(metadata.get("source"), dict) or not isinstance(metadata.get("config"), dict):
+        raise ValueError("Structure metadata requires source and config provenance objects.")
+    if metadata.get("source", {}).get("chain_data_cache_sha256") != cache_sha256:
+        raise ValueError("Structure metadata chain_data_cache SHA256 mismatch.")
+    if metadata.get("source", {}).get("chain_id_namespace") != "author_asym_id":
+        raise ValueError("Structure metadata must use the author_asym_id chain namespace.")
+    config = metadata["config"]
+    for field in ("min_len", "max_len", "max_resolution", "require_monomer"):
+        expected_type = (int, float) if field == "max_resolution" else (bool,) if field == "require_monomer" else (int,)
+        if type(config.get(field)) not in expected_type or config.get(field) != getattr(args, field):
+            raise ValueError(f"Structure metadata filter mismatch for {field}.")
+    sample_limit = config.get("sample_limit")
+    if type(sample_limit) is not int or sample_limit != 0:
+        raise ValueError("CATH sampling requires complete metadata with config.sample_limit=0; rebuild without debug sampling.")
+    unknown_fraction = config.get("max_unknown_aa_fraction")
+    if type(unknown_fraction) not in (int, float) or unknown_fraction != 0:
+        raise ValueError("CATH sampling requires metadata with max_unknown_aa_fraction=0 (standard amino acids only).")
+    summary = metadata.get("summary", {})
+    if not isinstance(summary, dict) or not isinstance(metadata.get("chains"), list):
+        raise ValueError("Structure metadata requires full-universe provenance and a chains list.")
+    for field in ("eligible_candidate_count", "candidate_count"):
+        value = summary.get(field)
+        if type(value) is not int or value < 0 or value != len(metadata["chains"]):
+            raise ValueError(f"Structure metadata full-universe provenance mismatch for summary.{field}.")
+
+
+def _validate_generation_args(args: argparse.Namespace) -> None:
+    for name in ("train_size", "val_size", "hidden_val_size"):
+        value = getattr(args, name, 1)
+        if type(value) is not int or value <= 0:
+            raise ValueError(f"--{name.replace('_', '-')} must be positive.")
+    if type(args.min_len) is not int or type(args.max_len) is not int or args.min_len <= 0 or args.max_len < args.min_len:
+        raise ValueError("Length limits must be positive and ordered.")
+    if type(args.seed) is not int:
+        raise ValueError("Sampling seed must be an integer.")
+    if type(args.require_monomer) is not bool:
+        raise ValueError("require_monomer must be boolean.")
+    if type(args.max_resolution) not in (int, float) or not math.isfinite(args.max_resolution) or args.max_resolution <= 0:
+        raise ValueError("Resolution cutoff must be positive and finite.")
+    if any(type(value) not in (int, float) or not math.isfinite(value) or not 0 < value <= 1
+           for value in (args.min_seq_id, args.coverage)):
+        raise ValueError("Sequence identity and coverage must be in (0, 1].")
+
+
+def _atomic_write(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, prefix=f".{path.name}.", delete=False) as handle:
+            temporary = Path(handle.name)
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
 def _write_manifest(path: Path, chain_ids: list[str]) -> None:
-    path.write_text("\n".join(chain_ids) + ("\n" if chain_ids else ""))
+    _atomic_write(path, "\n".join(chain_ids) + ("\n" if chain_ids else ""))
 
 
 def main() -> None:
     args = parse_args()
+    _validate_generation_args(args)
+    if not args.lock_file.strip() or not args.private_lock_file.strip():
+        raise ValueError("CATH sampling requires nonempty --lock-file and --private-lock-file paths.")
 
     cache_path = Path(args.chain_data_cache)
     cache_sha = _sha256(cache_path)
@@ -995,7 +1206,8 @@ def main() -> None:
             f"Got {type(data).__name__}."
         )
 
-    structure_metadata_accepted, structure_metadata = _load_structure_metadata(args.structure_metadata)
+    _validate_metadata_identity(args.structure_metadata, cache_sha, args)
+    structure_metadata_accepted, structure_metadata = _load_structure_metadata(args.structure_metadata, require_schema_version=2)
 
     candidates, reject_reasons, structural_metadata_source = _build_candidates(
         data,
@@ -1004,6 +1216,7 @@ def main() -> None:
         max_resolution=float(args.max_resolution),
         structure_metadata=structure_metadata,
         structure_metadata_accepted=structure_metadata_accepted,
+        require_monomer=args.require_monomer,
     )
     required_count = int(args.train_size) + int(args.val_size) + int(args.hidden_val_size)
     if int(args.hidden_val_size) <= 0:
@@ -1070,12 +1283,20 @@ def main() -> None:
     hidden_val_path = hidden_out_dir / "hidden_val.txt"
     all_path = out_dir / "all.txt"
     quality_report_path = hidden_out_dir / "split_quality_report.json"
+    output_paths = [train_path, val_path, hidden_val_path, all_path, quality_report_path]
+    output_paths.extend(Path(value) for value in (args.lock_file, args.private_lock_file) if value)
+    resolved_paths = [path.resolve() for path in output_paths]
+    if len(set(resolved_paths)) != len(resolved_paths):
+        raise ValueError("Sampling output paths must be distinct.")
+    for path in output_paths:
+        if path.exists():
+            raise ValueError(f"Refusing to overwrite existing sampling output; use a new version directory: {path}")
     _write_manifest(train_path, result.train_ids)
     _write_manifest(val_path, result.val_ids)
     _write_manifest(hidden_val_path, result.hidden_val_ids)
     all_ids = sorted(set(result.train_ids + result.val_ids))
     _write_manifest(all_path, all_ids)
-    quality_report_path.write_text(json.dumps(result.quality_report, indent=2, sort_keys=True) + "\n")
+    _atomic_write(quality_report_path, json.dumps(result.quality_report, indent=2, sort_keys=True) + "\n")
 
     print(
         f"Wrote {len(result.train_ids)} train + {len(result.val_ids)} val chains to {out_dir} "
@@ -1101,15 +1322,18 @@ def main() -> None:
             stratify_fields=stratify_fields,
         )
         lock = {
+            "sampling_policy": SAMPLING_POLICY,
             "chain_data_cache_path": str(cache_path),
             "chain_data_cache_sha256": cache_sha,
             "args": {
+                "sampling_policy": SAMPLING_POLICY,
                 "train_size": int(args.train_size),
                 "val_size": int(args.val_size),
                 "hidden_val_size": int(args.hidden_val_size),
                 "min_len": int(args.min_len),
                 "max_len": int(args.max_len),
                 "max_resolution": float(args.max_resolution),
+                "require_monomer": args.require_monomer,
                 "seed": int(args.seed),
                 "min_seq_id": float(args.min_seq_id),
                 "coverage": float(args.coverage),
@@ -1122,11 +1346,16 @@ def main() -> None:
             "filtering": {
                 "candidate_count": result.candidate_count,
                 "disjoint_unit_count": result.unit_count,
+                "target_policy": "known_monomer" if args.require_monomer else "single_chain",
+                "candidate_annotation_coverage": _annotation_coverage(candidates),
+                "representative_policy": "best_resolution_then_longest_then_release_date_seeded_tie",
                 "reject_reasons": dict(sorted(reject_reasons.items())),
             },
             "structure_metadata": _structure_metadata_source_record(args.structure_metadata),
             "clustering": {
                 "method": cluster_method,
+                "cluster_tsv_sha256": _sha256(Path(args.cluster_tsv)) if args.cluster_tsv else None,
+                "guarantee": "assigned_cluster_disjointness; not an all-pairs sequence identity bound",
                 "cluster_count": len(set(result.cluster_map.values())),
                 "command": cluster_command,
                 "mmseqs": _mmseqs_version(str(args.mmseqs_bin)) if cluster_method == "mmseqs2" else None,
@@ -1153,11 +1382,12 @@ def main() -> None:
         }
         lock_path = Path(args.lock_file)
         lock_path.parent.mkdir(parents=True, exist_ok=True)
-        lock_path.write_text(json.dumps(lock, indent=2) + "\n")
+        _atomic_write(lock_path, json.dumps(lock, indent=2) + "\n")
         print(f"Wrote manifest lock file: {lock_path.resolve()}")
 
     if args.private_lock_file:
         private_lock = {
+            "sampling_policy": SAMPLING_POLICY,
             "notes": "Maintainer-only hidden manifest lock. Do not commit this file.",
             "chain_data_cache_sha256": cache_sha,
             "hidden_split_salt_sha256": hidden_split_salt_digest,
@@ -1167,11 +1397,20 @@ def main() -> None:
             "split_quality_report": str(quality_report_path),
             "split_quality_report_sha256": _sha256(quality_report_path),
             "hidden_split_distribution": _split_distribution(result, result.hidden_val_ids),
+            "source_lock_sha256": _sha256(Path(args.lock_file)),
+            "public_contract": {
+                "train_manifest_sha256": _sha256(train_path), "train_count": len(result.train_ids),
+                "val_manifest_sha256": _sha256(val_path), "val_count": len(result.val_ids),
+                "all_manifest_sha256": _sha256(all_path), "all_count": len(all_ids),
+            },
+            "structure_metadata": _structure_metadata_source_record(args.structure_metadata),
+            "clustering": {"cluster_assignments_sha256": _cluster_assignments_sha256(result.cluster_map)},
+            "stratification": {"reference": "eligible_disjoint_units", "fields": list(stratify_fields)},
             "quality_report": result.quality_report,
         }
         private_lock_path = Path(args.private_lock_file)
         private_lock_path.parent.mkdir(parents=True, exist_ok=True)
-        private_lock_path.write_text(json.dumps(private_lock, indent=2) + "\n")
+        _atomic_write(private_lock_path, json.dumps(private_lock, indent=2) + "\n")
         print(f"Wrote private hidden manifest lock file: {private_lock_path.resolve()}")
 
 

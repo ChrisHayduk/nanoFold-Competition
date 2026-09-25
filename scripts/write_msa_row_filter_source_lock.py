@@ -15,7 +15,12 @@ import json
 from pathlib import Path
 from typing import Any, Sequence
 
-PRIVATE_MARKERS = (".nanofold_private", "results_private")
+PUBLIC_PATHS = frozenset({
+    "data/manifests/train.txt", "data/manifests/val.txt", "data/manifests/all.txt",
+    "data/openproteinset", "data/openproteinset/pdb_data/data_caches/chain_data_cache.json",
+    "data/processed_features",
+})
+SOURCE_STAT_KEYS = ("chains", "missing_features", "missing_msa_files", "rows", "non_query_rows", "unique_non_query_rows")
 
 
 def parse_args() -> argparse.Namespace:
@@ -51,7 +56,7 @@ def _load_json(path: Path) -> dict[str, Any]:
 def _is_private_path(value: str | None) -> bool:
     if not value:
         return False
-    return any(marker in value for marker in PRIVATE_MARKERS)
+    return value.replace("\\", "/") not in PUBLIC_PATHS
 
 
 def _safe_path(value: str | None, *, include_private_paths: bool) -> str | None:
@@ -59,9 +64,7 @@ def _safe_path(value: str | None, *, include_private_paths: bool) -> str | None:
         return None
     if include_private_paths or not _is_private_path(value):
         return value
-    if ".nanofold_private" in value:
-        return "<private>"
-    return "<private-artifact>"
+    return "<private>"
 
 
 def _manifest_role(path: str | None) -> str:
@@ -111,13 +114,24 @@ def _normalize_mmseqs_command(command: Any) -> list[str]:
     try:
         search_index = normalized.index("easy-search")
     except ValueError:
-        return normalized
+        return []
+    # Only retain the search contract, never executable paths or arbitrary arguments.
+    safe = ["mmseqs", "easy-search"]
     replacements = ["<heldout_targets.fasta>", "<source_msa_rows.fasta>", "<output.m8>", "<tmp_dir>"]
-    for offset, replacement in enumerate(replacements, start=1):
-        index = search_index + offset
-        if index < len(normalized):
-            normalized[index] = replacement
-    return normalized
+    safe.extend(replacements)
+    numeric_flags = {
+        "--min-seq-id", "-c", "--cov-mode", "--alignment-mode", "--seq-id-mode",
+        "--threads", "--max-seqs", "-e", "-s",
+    }
+    for index in range(search_index + 5, len(normalized) - 1):
+        flag = normalized[index]
+        if flag in numeric_flags:
+            try:
+                float(normalized[index + 1])
+            except ValueError:
+                continue
+            safe.extend([flag, normalized[index + 1]])
+    return safe
 
 
 def _summarize_row_filter(filter_path: Path, *, include_private_paths: bool) -> dict[str, Any]:
@@ -133,6 +147,9 @@ def _summarize_row_filter(filter_path: Path, *, include_private_paths: bool) -> 
         raise ValueError("Row filter is missing mmseqs object.")
     if not isinstance(chain_data_cache, dict):
         raise ValueError("Row filter has invalid chain_data_cache object.")
+    source_stats = source.get("stats", {})
+    if not isinstance(source_stats, dict):
+        raise ValueError("Row filter source stats must be an object.")
 
     return {
         "path": _safe_path(str(filter_path), include_private_paths=include_private_paths),
@@ -142,7 +159,7 @@ def _summarize_row_filter(filter_path: Path, *, include_private_paths: bool) -> 
         "excluded_sequence_count": payload.get("excluded_sequence_count"),
         "excluded_sequence_sha256_included": False,
         "mmseqs": {
-            "binary": mmseqs.get("binary"),
+            "binary": mmseqs.get("binary") if include_private_paths else "mmseqs",
             "version": mmseqs.get("version"),
             "command": _normalize_mmseqs_command(mmseqs.get("command")),
             "max_seqs": mmseqs.get("max_seqs"),
@@ -157,7 +174,10 @@ def _summarize_row_filter(filter_path: Path, *, include_private_paths: bool) -> 
                 for path in source.get("processed_features_dirs", [])
             ],
             "msa_names": source.get("msa_names"),
-            "stats": source.get("stats"),
+            "stats": {
+                key: value for key, value in source_stats.items()
+                if key in SOURCE_STAT_KEYS and isinstance(value, int) and not isinstance(value, bool)
+            },
         },
         "heldout": {
             "manifests": _safe_manifests(heldout.get("manifests"), include_private_paths=include_private_paths),
@@ -215,10 +235,26 @@ def build_source_lock(
         _summarize_processed_audit(path, include_private_paths=include_private_paths)
         for path in processed_filter_audit_paths
     ]
+    if audit_summaries and audit_summaries[-1]["msa_row_filter_sha256"] != filter_summary["sha256"]:
+        raise ValueError("Final processed-filter audit does not reference the supplied row-filter bytes")
+    for audit in audit_summaries:
+        before, after, removed = (audit[key] for key in (
+            "total_msa_rows_before_filter", "total_msa_rows_after_filter", "total_msa_rows_removed"
+        ))
+        if not all(isinstance(value, int) and not isinstance(value, bool) and value >= 0 for value in (before, after, removed)):
+            raise ValueError("Processed-filter audit must contain nonnegative integer row counts")
+        if before - after != removed:
+            raise ValueError("Processed-filter audit row counts are inconsistent")
     return {
         "schema_version": 1,
         "artifact_type": "msa_row_filter_source_lock",
         "public_safe": not include_private_paths,
+        "validation": {
+            "final_audit_filter_hash_checked": bool(audit_summaries),
+            "residual_homology_audited": False,
+            "scope": "Filtering counts and source provenance only; use audit_msa_split.py --strict "
+            "--run-mmseqs on the final features to check residual held-out target homology.",
+        },
         "safety": {
             "raw_sequences_included": False,
             "excluded_sequence_sha256_included": False,

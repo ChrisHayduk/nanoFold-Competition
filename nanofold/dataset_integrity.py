@@ -7,8 +7,10 @@ from typing import Any, Dict, List, Mapping
 
 import numpy as np
 
+from .a3m import GAP_ID, UNK_ID
 from .chain_paths import chain_npz_path
 from .data import read_manifest
+from .residue_constants import CA_ATOM14_SLOT
 from .utils import sha256_file
 
 FINGERPRINT_COMPARISON_KEYS = (
@@ -101,11 +103,26 @@ def validate_feature_npz_schema(npz_path: str | Path) -> List[str]:
             errors.append(f"`aatype` must have shape (L,), got {aatype.shape}")
             return errors
         L = int(aatype.shape[0])
+        if L == 0:
+            errors.append("`aatype` must contain at least one residue")
+        token_arrays = (("aatype", aatype, UNK_ID), ("msa", msa, GAP_ID), ("template_aatype", template_aatype, UNK_ID))
+        for key, value, maximum in token_arrays:
+            if np.issubdtype(value.dtype, np.number):
+                if not np.isfinite(value).all() or np.any(value < 0) or np.any(value > maximum):
+                    errors.append(f"`{key}` tokens must be in [0,{maximum}]")
+        if np.issubdtype(deletions.dtype, np.number) and (not np.isfinite(deletions).all() or np.any(deletions < 0)):
+            errors.append("`deletions` must contain nonnegative finite counts")
+        if np.issubdtype(template_ca_coords.dtype, np.number) and not np.isfinite(template_ca_coords).all():
+            errors.append("`template_ca_coords` must contain only finite coordinates")
 
         if msa.ndim != 2:
             errors.append(f"`msa` must have shape (N, L), got {msa.shape}")
         elif msa.shape[1] != L:
             errors.append(f"`msa` second dimension must equal len(aatype)={L}, got {msa.shape[1]}")
+        elif msa.shape[0] == 0:
+            errors.append("`msa` must include a query row")
+        elif not np.array_equal(msa[0], aatype):
+            errors.append("`msa` query row must equal `aatype`")
 
         if deletions.ndim != 2:
             errors.append(f"`deletions` must have shape (N, L), got {deletions.shape}")
@@ -128,7 +145,7 @@ def validate_feature_npz_schema(npz_path: str | Path) -> List[str]:
                     "`template_ca_coords` second dimension must equal len(aatype)="
                     f"{L}, got {template_ca_coords.shape[1]}"
                 )
-            if template_ca_coords.shape[0] != template_aatype.shape[0]:
+            if template_aatype.ndim == 2 and template_ca_coords.shape[0] != template_aatype.shape[0]:
                 errors.append(
                     "`template_ca_coords` first dimension must match `template_aatype` "
                     f"({template_ca_coords.shape[0]} vs {template_aatype.shape[0]})"
@@ -142,7 +159,7 @@ def validate_feature_npz_schema(npz_path: str | Path) -> List[str]:
                     "`template_ca_mask` second dimension must equal len(aatype)="
                     f"{L}, got {template_ca_mask.shape[1]}"
                 )
-            if template_ca_mask.shape[0] != template_aatype.shape[0]:
+            if template_aatype.ndim == 2 and template_ca_mask.shape[0] != template_aatype.shape[0]:
                 errors.append(
                     "`template_ca_mask` first dimension must match `template_aatype` "
                     f"({template_ca_mask.shape[0]} vs {template_aatype.shape[0]})"
@@ -174,6 +191,11 @@ def validate_label_npz_schema(npz_path: str | Path) -> List[str]:
 
         ca_coords = data["ca_coords"]
         ca_mask = data["ca_mask"]
+        for key in ("ca_coords", "atom14_positions", "resolution"):
+            if key in keys:
+                value = data[key]
+                if np.issubdtype(value.dtype, np.number) and not np.isfinite(value).all():
+                    errors.append(f"`{key}` must contain only finite values")
 
         if _dtype_name(ca_coords.dtype) not in {"float32", "float64"}:
             errors.append(f"`ca_coords` dtype must be float32/float64 (got {_dtype_name(ca_coords.dtype)})")
@@ -220,6 +242,15 @@ def validate_label_npz_schema(npz_path: str | Path) -> List[str]:
                     f"({atom14_mask.shape[0]} vs {residue_count})"
                 )
 
+        if ca_mask.ndim == 1 and ca_mask.shape[0] == 0:
+            errors.append("Labels must contain at least one residue")
+        if atom14_mask.ndim == 2 and atom14_mask.shape[1] == 14:
+            if not np.array_equal(ca_mask, atom14_mask[:, CA_ATOM14_SLOT]):
+                errors.append("`ca_mask` must equal the CA slot of `atom14_mask`")
+        if atom14_positions.ndim == 3 and atom14_positions.shape[1:] == (14, 3):
+            if not np.array_equal(ca_coords, atom14_positions[:, CA_ATOM14_SLOT, :]):
+                errors.append("`ca_coords` must equal the CA slot of `atom14_positions`")
+
         if "residue_index" in keys:
             residue_index = data["residue_index"]
             if _dtype_name(residue_index.dtype) not in {"int32", "int64"}:
@@ -240,10 +271,48 @@ def validate_label_npz_schema(npz_path: str | Path) -> List[str]:
                 errors.append(
                     f"`resolution` dtype must be float32/float64 (got {_dtype_name(resolution.dtype)})"
                 )
+            if np.issubdtype(resolution.dtype, np.number) and np.any(resolution < 0):
+                errors.append("`resolution` must be nonnegative")
             if resolution.ndim not in (0, 1):
                 errors.append(f"`resolution` must be a scalar, got shape {resolution.shape}")
             elif resolution.ndim == 1 and resolution.shape[0] != 1:
                 errors.append(f"`resolution` rank-1 form must be length 1, got {resolution.shape}")
+    return errors
+
+
+def _chain_identity_errors(value: np.ndarray | None, expected_chain_id: str, *, required: bool) -> List[str]:
+    if value is None:
+        return [f"Missing `chain_id` for requested chain {expected_chain_id}"] if required else []
+    if value.shape != () or str(value.item()) != expected_chain_id:
+        return [f"`chain_id` must match requested chain {expected_chain_id}"]
+    return []
+
+
+def validate_feature_label_pair(
+    feature_path: str | Path,
+    label_path: str | Path,
+    *,
+    expected_chain_id: str | None = None,
+    require_chain_id: bool = False,
+) -> List[str]:
+    """Check that individually valid arrays describe the same example and projection."""
+    errors: List[str] = []
+    with np.load(feature_path) as features, np.load(label_path) as labels:
+        if expected_chain_id is not None:
+            for data in (features, labels):
+                value = data["chain_id"] if "chain_id" in data.files else None
+                errors.extend(_chain_identity_errors(value, expected_chain_id, required=require_chain_id))
+        if features["aatype"].shape != labels["ca_mask"].shape:
+            errors.append("Feature and label residue counts must match")
+        for key in (
+            "chain_id", "residue_index", "preprocess_config_sha256", "source_inputs_sha256",
+            "resolved_author_chain_id", "chain_mapping_method",
+        ):
+            if key in features.files and key in labels.files:
+                if not np.array_equal(features[key], labels[key]):
+                    errors.append(f"Feature and label `{key}` must match")
+            elif key in {"preprocess_config_sha256", "source_inputs_sha256"} and (key in features.files or key in labels.files):
+                errors.append(f"Both features and labels must record `{key}`")
     return errors
 
 
@@ -258,6 +327,7 @@ def _files_sha256(
     missing_chain_ids: List[str],
     validate_schema: bool,
     schema_validator,
+    expected_preprocess_config_sha256: str | None = None,
 ) -> str | None:
     if base_dir is None:
         return None
@@ -273,6 +343,33 @@ def _files_sha256(
             if schema_errors:
                 joined = "; ".join(schema_errors[:8])
                 raise ValueError(f"Invalid schema for {npz_path}: {joined}")
+
+        if validate_schema:
+            with np.load(npz_path) as data:
+                if expected_preprocess_config_sha256 is None and any(
+                    key in data.files for key in ("preprocess_config_sha256", "source_inputs_sha256")
+                ):
+                    raise ValueError(
+                        "Provenance-bearing outputs require schema-version 3 preprocessing metadata: "
+                        f"{npz_path}"
+                    )
+                value = data["chain_id"] if "chain_id" in data.files else None
+                identity_errors = _chain_identity_errors(
+                    value, chain_id, required=expected_preprocess_config_sha256 is not None,
+                )
+                if identity_errors:
+                    raise ValueError(f"Invalid identity for {npz_path}: {'; '.join(identity_errors)}")
+
+        if expected_preprocess_config_sha256 is not None:
+            with np.load(npz_path) as data:
+                for key in ("preprocess_config_sha256", "source_inputs_sha256"):
+                    if key not in data.files or data[key].shape != ():
+                        raise ValueError(f"Missing scalar `{key}` in {npz_path}")
+                    value = str(data[key].item())
+                    if len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
+                        raise ValueError(f"Invalid `{key}` in {npz_path}")
+                if str(data["preprocess_config_sha256"].item()) != expected_preprocess_config_sha256:
+                    raise ValueError(f"Preprocessing provenance mismatch in {npz_path}")
 
         file_hash = sha256_file(npz_path)
         hasher.update(chain_id.encode("utf-8"))
@@ -312,6 +409,11 @@ def _stable_preprocess_meta_sha256(path: Path) -> str | None:
     if not isinstance(raw, dict):
         return sha256_file(path)
 
+    return preprocess_config_sha256(raw)
+
+
+def preprocess_config_sha256(raw: Mapping[str, Any]) -> str:
+    """Hash data-producing settings independently of machine-local paths."""
     raw_cli_args = raw.get("cli_args")
     cli_args: Mapping[str, Any] = raw_cli_args if isinstance(raw_cli_args, dict) else {}
     stable_cli_keys = (
@@ -337,6 +439,8 @@ def _stable_preprocess_meta_sha256(path: Path) -> str | None:
         "cli_args": {key: cli_args.get(key) for key in stable_cli_keys if key in cli_args},
         "schema_version": raw.get("schema_version"),
     }
+    if "implementation_sha256" in raw:
+        stable["implementation_sha256"] = raw["implementation_sha256"]
     payload = json.dumps(stable, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
 
@@ -355,6 +459,13 @@ def build_split_fingerprint(
     processed_features_dir = Path(processed_features_dir).resolve()
     processed_labels_dir_path = Path(processed_labels_dir).resolve() if processed_labels_dir else None
     manifest_map = _normalize_manifest_map(manifest_paths)
+    preprocess_meta_path = processed_features_dir / PREPROCESS_META_FILENAME
+    preprocess_config_hash = _stable_preprocess_meta_sha256(preprocess_meta_path)
+    expected_preprocess_config_hash = None
+    if validate_schema and preprocess_meta_path.exists():
+        raw_meta = json.loads(preprocess_meta_path.read_text())
+        if isinstance(raw_meta, dict) and raw_meta.get("schema_version") == 3:
+            expected_preprocess_config_hash = preprocess_config_hash
 
     manifest_meta: Dict[str, Dict[str, Any]] = {}
     all_chain_ids_unsorted: List[str] = []
@@ -376,6 +487,7 @@ def build_split_fingerprint(
         missing_chain_ids=missing_feature_chain_ids,
         validate_schema=validate_schema,
         schema_validator=validate_feature_npz_schema,
+        expected_preprocess_config_sha256=expected_preprocess_config_hash,
     )
     label_hash = _files_sha256(
         base_dir=processed_labels_dir_path if require_labels else None,
@@ -383,6 +495,7 @@ def build_split_fingerprint(
         missing_chain_ids=missing_label_chain_ids,
         validate_schema=validate_schema,
         schema_validator=validate_label_npz_schema,
+        expected_preprocess_config_sha256=expected_preprocess_config_hash,
     )
 
     if require_no_missing and missing_feature_chain_ids:
@@ -398,8 +511,17 @@ def build_split_fingerprint(
             f"Examples: {sample}"
         )
 
-    preprocess_meta_path = processed_features_dir / PREPROCESS_META_FILENAME
-    preprocess_config_sha256 = _stable_preprocess_meta_sha256(preprocess_meta_path)
+    if validate_schema and require_labels and processed_labels_dir_path is not None:
+        for chain_id in all_chain_ids:
+            feature_path = chain_npz_path(processed_features_dir, chain_id)
+            label_path = chain_npz_path(processed_labels_dir_path, chain_id)
+            if feature_path.exists() and label_path.exists():
+                pair_errors = validate_feature_label_pair(
+                    feature_path, label_path, expected_chain_id=chain_id,
+                    require_chain_id=expected_preprocess_config_hash is not None,
+                )
+                if pair_errors:
+                    raise ValueError(f"Invalid feature/label pair for {chain_id}: {'; '.join(pair_errors)}")
 
     result: Dict[str, Any] = {
         "track_id": track_id,
@@ -418,7 +540,7 @@ def build_split_fingerprint(
         "require_labels": bool(require_labels),
         "source_lock_path": _display_path(source_lock_path) if source_lock_path else None,
         "source_lock_sha256": sha256_file(source_lock_path) if source_lock_path else None,
-        "preprocess_config_sha256": preprocess_config_sha256,
+        "preprocess_config_sha256": preprocess_config_hash,
     }
     if list(manifest_map.keys()) == ["train", "val"]:
         result["train_manifest_chain_count"] = manifest_meta["train"]["chain_count"]

@@ -175,3 +175,17 @@ def test_project_atom14_to_query_reports_alignment_provenance() -> None:
     # Check CA coordinates copied through for aligned residues.
     assert float(out_positions[0, CA_ATOM14_SLOT, 0]) == 0.0
     assert float(out_positions[2, CA_ATOM14_SLOT, 0]) == 2.0
+
+
+def test_projection_masks_mismatched_residue_including_sidechain_slots() -> None:
+    module = _load_preprocess_module()
+    positions = np.arange(4 * 14 * 3, dtype=np.float32).reshape(4, 14, 3)
+    mask = np.ones((4, 14), dtype=bool)
+    projected, projected_mask, stats = module._project_atom14_to_query("ACDE", "ACDF", positions, mask)
+
+    # A phenylalanine ring must never supervise a glutamate carboxylate slot.
+    assert not projected_mask[3].any()
+    assert not projected[3].any()
+    np.testing.assert_array_equal(projected[:3], positions[:3])
+    assert stats["projection_seq_identity"] == 0.75
+    assert stats["projection_valid_ca_count"] == 3

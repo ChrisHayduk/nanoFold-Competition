@@ -1,9 +1,9 @@
-"""Audit MSA availability and cross-split MSA-row leakage.
+"""Audit MSA availability, target separation and cross-split MSA-row leakage.
 
 This script is intended for maintainer/rebuttal analysis. It can summarize MSA
 depths for two split manifests, verify target chain/cluster disjointness, check
-exact MSA-row sequence overlap, and optionally run MMseqs2 from held-out target
-sequences to source non-query MSA rows at the same split threshold.
+exact MSA-row sequence overlap, and optionally run separate MMseqs2 searches
+from held-out targets to source targets and source non-query MSA rows.
 """
 
 from __future__ import annotations
@@ -29,6 +29,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from nanofold.a3m import GAP_ID, MASK_ID, RESTYPES
 from nanofold.chain_paths import chain_data_dir, chain_npz_path
+from nanofold.mmseqs import iter_mmseqs_hits, validate_search_parameters
 
 MSA_TOKEN_TO_AA = {idx: aa for idx, aa in enumerate(RESTYPES)}
 MSA_TOKEN_TO_AA[20] = "X"
@@ -40,6 +41,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--train-manifest", type=Path, default=Path("data/manifests/train.txt"))
     ap.add_argument("--val-manifest", type=Path, default=Path("data/manifests/val.txt"))
     ap.add_argument("--features-dir", type=Path, default=Path("data/processed_features"))
+    ap.add_argument("--val-features-dir", type=Path, default=None, help="Held-out features root; defaults to --features-dir.")
     ap.add_argument(
         "--feature-exclusion-list",
         type=Path,
@@ -64,7 +66,10 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Comma-separated raw A3M names to scan for identifier overlap. Defaults to --raw-msa-name.",
     )
-    ap.add_argument("--run-mmseqs", action="store_true")
+    ap.add_argument(
+        "--run-mmseqs", action="store_true",
+        help="Search held-out targets against both source targets and non-query MSA rows; gate both with --strict.",
+    )
     ap.add_argument("--mmseqs-bin", default="mmseqs")
     ap.add_argument("--min-seq-id", type=float, default=0.30)
     ap.add_argument("--coverage", type=float, default=0.80)
@@ -82,11 +87,22 @@ def parse_args() -> argparse.Namespace:
         help="Write chain/row identifiers into MMseqs FASTA headers. Do not use for hidden reports.",
     )
     ap.add_argument("--skip-plot", action="store_true")
+    ap.add_argument(
+        "--include-depth-identifiers",
+        action="store_true",
+        help="Include chain IDs in the depth CSV. Use only for public or sealed private reports.",
+    )
+    ap.add_argument(
+        "--strict",
+        action="store_true",
+        help="Fail on missing/empty features, duplicate targets, target chain/PDB/cluster overlap, "
+        "or held-out target leakage. MMseqs homology is gated only with --run-mmseqs.",
+    )
     return ap.parse_args()
 
 
 def read_manifest(path: Path) -> list[str]:
-    return [line.strip() for line in path.read_text().splitlines() if line.strip() and not line.startswith("#")]
+    return [line.strip() for line in path.read_text().splitlines() if line.strip() and not line.lstrip().startswith("#")]
 
 
 def _read_optional_set(path: Path | None) -> set[str]:
@@ -208,14 +224,28 @@ def _load_feature_msa(features_dir: Path, chain_id: str) -> tuple[np.ndarray, in
     path = chain_npz_path(features_dir, chain_id)
     if not path.exists():
         return None
-    with np.load(path) as data:
+    with np.load(path, allow_pickle=False) as data:
         if "msa" not in data.files:
             return None
-        msa = np.asarray(data["msa"], dtype=np.int32)
+        raw_msa = np.asarray(data["msa"])
+        if not np.issubdtype(raw_msa.dtype, np.integer):
+            raise ValueError("Processed MSA tokens must be integers")
+        if np.any(raw_msa < 0) or np.any(raw_msa > MASK_ID):
+            raise ValueError("Processed MSA contains invalid residue tokens")
+        msa = raw_msa.astype(np.int32)
+        if msa.ndim != 2 or msa.shape[0] == 0 or msa.shape[1] == 0:
+            raise ValueError("Processed MSA must be a nonempty two-dimensional array")
         if "aatype" in data.files:
-            length = int(np.asarray(data["aatype"]).shape[0])
+            aatype = np.asarray(data["aatype"])
+            if aatype.ndim != 1 or not np.issubdtype(aatype.dtype, np.integer):
+                raise ValueError("Processed query must be a one-dimensional integer array")
+            length = int(aatype.shape[0])
+            if not np.array_equal(msa[0], aatype):
+                raise ValueError("Processed MSA query row does not match aatype")
         else:
             length = int(msa.shape[1])
+        if length != msa.shape[1]:
+            raise ValueError("Processed MSA width does not match query length")
     return msa, length
 
 
@@ -282,11 +312,13 @@ def _load_cluster_map(path: Path | None) -> dict[str, str]:
         if not line.strip():
             continue
         parts = line.split()
-        if len(parts) < 2:
-            continue
+        if len(parts) != 2:
+            raise ValueError("Cluster TSV must contain exactly representative and member columns")
         rep, member = parts[0], parts[1]
-        cluster_map[rep] = rep
-        cluster_map[member] = rep
+        for chain_id in (rep, member):
+            if chain_id in cluster_map and cluster_map[chain_id] != rep:
+                raise ValueError("Cluster TSV assigns a chain to conflicting clusters")
+            cluster_map[chain_id] = rep
     return cluster_map
 
 
@@ -299,16 +331,26 @@ def target_disjointness(
     train_set = set(train_ids)
     val_set = set(val_ids)
     cluster_map = _load_cluster_map(cluster_tsv)
-    train_clusters = {cluster_map.get(chain_id, chain_id) for chain_id in train_ids}
-    val_clusters = {cluster_map.get(chain_id, chain_id) for chain_id in val_ids}
+    train_clusters = {cluster_map[chain_id] for chain_id in train_ids if chain_id in cluster_map}
+    val_clusters = {cluster_map[chain_id] for chain_id in val_ids if chain_id in cluster_map}
+    missing_cluster_count = len((train_set | val_set) - cluster_map.keys())
+    cluster_complete = cluster_tsv is not None and missing_cluster_count == 0
     return {
         "train_chains": len(train_ids),
         "val_chains": len(val_ids),
-        "train_clusters": len(train_clusters),
-        "val_clusters": len(val_clusters),
+        "train_duplicate_chain_count": len(train_ids) - len(train_set),
+        "val_duplicate_chain_count": len(val_ids) - len(val_set),
+        "train_clusters": len(train_clusters) if cluster_tsv is not None else None,
+        "val_clusters": len(val_clusters) if cluster_tsv is not None else None,
         "train_val_chain_overlap": len(train_set & val_set),
-        "train_val_cluster_overlap": len(train_clusters & val_clusters),
-        "cluster_tsv": str(cluster_tsv) if cluster_tsv is not None else None,
+        "train_val_pdb_overlap": len(
+            {chain_id.split("_", 1)[0].lower() for chain_id in train_ids}
+            & {chain_id.split("_", 1)[0].lower() for chain_id in val_ids}
+        ),
+        "train_val_cluster_overlap": len(train_clusters & val_clusters) if cluster_tsv is not None else None,
+        "cluster_map_complete": cluster_complete,
+        "missing_cluster_assignments": missing_cluster_count if cluster_tsv is not None else None,
+        "cluster_tsv_supplied": cluster_tsv is not None,
     }
 
 
@@ -383,6 +425,7 @@ def audit_processed_msa_exact(
     val_ids: Sequence[str],
     features_dir: Path,
     include_examples: bool = False,
+    val_features_dir: Path | None = None,
 ) -> dict[str, Any]:
     train = _scan_msa_rows(
         manifest_ids=train_ids,
@@ -392,7 +435,7 @@ def audit_processed_msa_exact(
     )
     val = _scan_msa_rows(
         manifest_ids=val_ids,
-        features_dir=features_dir,
+        features_dir=val_features_dir or features_dir,
         split_name="val",
         include_examples=include_examples,
     )
@@ -404,6 +447,7 @@ def audit_processed_msa_exact(
         "train": train["summary"],
         "val": val["summary"],
         "val_target_sequences_seen_in_train_non_query_msa": len(val_targets_in_train_non_query),
+        "train_val_target_sequence_overlap": len(train["target_hashes"] & val["target_hashes"]),
         "train_val_non_query_msa_unique_sequence_overlap": len(exact_non_query_overlap),
         "train_val_all_msa_unique_sequence_overlap": len(exact_all_overlap),
     }
@@ -424,9 +468,12 @@ def audit_processed_msa_exact(
     return payload
 
 
-def _write_depth_csv(path: Path, rows: Iterable[dict[str, Any]]) -> None:
+def _write_depth_csv(path: Path, rows: Iterable[dict[str, Any]], *, include_identifiers: bool = False) -> None:
+    fields = ["split", "length", "msa_depth", "msa_depth_bin"]
+    if include_identifiers:
+        fields.insert(1, "chain_id")
     with path.open("w", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=["split", "chain_id", "length", "msa_depth", "msa_depth_bin"])
+        writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
         for row in rows:
             writer.writerow(row)
@@ -615,11 +662,13 @@ def _collect_mmseqs_records(
     val_ids: Sequence[str],
     features_dir: Path,
     include_identifiers: bool,
+    val_features_dir: Path | None = None,
+    source_targets_only: bool = False,
 ) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
     target_records: list[tuple[str, str]] = []
     seen_targets: set[str] = set()
     for target_index, chain_id in enumerate(val_ids):
-        loaded = _load_feature_msa(features_dir, chain_id)
+        loaded = _load_feature_msa(val_features_dir or features_dir, chain_id)
         if loaded is None:
             continue
         sequence = _msa_row_to_ungapped_sequence(loaded[0][0])
@@ -639,15 +688,17 @@ def _collect_mmseqs_records(
         if loaded is None:
             continue
         msa = loaded[0]
-        for row_index, row in enumerate(msa[1:], start=1):
+        rows = enumerate(msa[:1]) if source_targets_only else enumerate(msa[1:], start=1)
+        for row_index, row in rows:
             sequence = _msa_row_to_ungapped_sequence(row)
-            if len(sequence) < 20:
+            if not source_targets_only and len(sequence) < 20:
                 continue
             digest = _sequence_sha256(sequence)
             if digest in seen_sources:
                 continue
             seen_sources.add(digest)
-            header = f"trainmsa_{len(source_records)}"
+            prefix = "traintarget" if source_targets_only else "trainmsa"
+            header = f"{prefix}_{len(source_records)}"
             if include_identifiers:
                 header += f"|origin={chain_id}|row={row_index}"
             source_records.append((header, sequence))
@@ -667,7 +718,10 @@ def run_mmseqs_homology(
     max_seqs: int,
     tmp_dir: Path | None,
     include_identifiers: bool,
+    val_features_dir: Path | None = None,
+    source_targets_only: bool = False,
 ) -> dict[str, Any]:
+    validate_search_parameters(min_seq_id=min_seq_id, coverage=coverage, threads=threads, max_seqs=max_seqs)
     if shutil.which(mmseqs_bin) is None:
         raise SystemExit(f"MMseqs binary not found: {mmseqs_bin}")
     target_records, source_records = _collect_mmseqs_records(
@@ -675,15 +729,37 @@ def run_mmseqs_homology(
         val_ids=val_ids,
         features_dir=features_dir,
         include_identifiers=include_identifiers,
+        val_features_dir=val_features_dir,
+        source_targets_only=source_targets_only,
     )
-    if not target_records or not source_records:
-        raise SystemExit("Could not collect target/source records for MMseqs audit.")
+    if not target_records:
+        raise SystemExit("Could not collect held-out target records for MMseqs audit.")
+    source_count_key = "source_target_records" if source_targets_only else "source_non_query_records"
+    hit_count_key = (
+        "val_targets_with_train_target_homolog_hits" if source_targets_only
+        else "val_targets_with_train_msa_homolog_hits"
+    )
+    threshold = {
+        "min_seq_id": min_seq_id, "coverage": coverage, "cov_mode": 0, "alignment_mode": 3, "seq_id_mode": 0,
+    }
+    if not source_records:
+        return {
+            "threshold": threshold,
+            "target_records": len(target_records),
+            source_count_key: 0,
+            "hit_count": 0,
+            hit_count_key: 0,
+            "search_executed": False,
+            "reason": "No source targets" if source_targets_only else "No non-query source rows of at least 20 residues",
+        }
 
-    m8_out = out_dir / "val_targets_vs_train_msa.mmseqs_m8"
+    source_name = "train_targets" if source_targets_only else "train_msa"
+    m8_out = out_dir / f"val_targets_vs_{source_name}.mmseqs_m8"
+    m8_out.unlink(missing_ok=True)
     with tempfile.TemporaryDirectory(prefix="nanofold_msa_split_audit_", dir=str(tmp_dir) if tmp_dir else None) as tmp:
         tmp_path = Path(tmp)
         target_fasta = tmp_path / "val_targets.fasta"
-        source_fasta = tmp_path / "train_non_query_msa_rows.fasta"
+        source_fasta = tmp_path / f"{source_name}.fasta"
         mmseqs_tmp = tmp_path / "mmseqs_tmp"
         _write_fasta(target_fasta, target_records)
         _write_fasta(source_fasta, source_records)
@@ -700,6 +776,10 @@ def run_mmseqs_homology(
             str(coverage),
             "--cov-mode",
             "0",
+            "--alignment-mode",
+            "3",
+            "--seq-id-mode",
+            "0",
             "--threads",
             str(threads),
             "--max-seqs",
@@ -713,26 +793,59 @@ def run_mmseqs_homology(
 
     unique_target_hits: set[str] = set()
     hit_count = 0
-    if m8_out.exists():
-        for line in m8_out.read_text().splitlines():
-            if not line.strip():
-                continue
-            hit_count += 1
-            unique_target_hits.add(line.split("\t", 1)[0])
+    for query, _target in iter_mmseqs_hits(
+        m8_out, query_ids={header for header, _ in target_records},
+        target_ids={header for header, _ in source_records}, min_seq_id=min_seq_id, coverage=coverage,
+    ):
+        hit_count += 1
+        unique_target_hits.add(query)
     return {
-        "threshold": {"min_seq_id": min_seq_id, "coverage": coverage, "cov_mode": 0},
+        "threshold": threshold,
         "mmseqs": {"binary": mmseqs_bin, "version": _mmseqs_version(mmseqs_bin), "command": cmd},
         "target_records": len(target_records),
-        "source_non_query_records": len(source_records),
+        source_count_key: len(source_records),
         "hit_count": hit_count,
-        "val_targets_with_train_msa_homolog_hits": len(unique_target_hits),
+        hit_count_key: len(unique_target_hits),
         "m8_path": str(m8_out),
         "identifiers_in_m8": include_identifiers,
+        "search_executed": True,
     }
+
+
+def strict_failures(summary: dict[str, Any]) -> list[str]:
+    """Evaluate target leakage and completeness; shared background MSA rows remain descriptive."""
+    failures: list[str] = []
+    for split, stats in summary["splits"].items():
+        if stats["manifest_chains"] == 0:
+            failures.append(f"{split}: empty manifest")
+        for key in ("missing_feature_files", "missing_msa_key", "feature_exclusion_intersection_count"):
+            if stats[key]:
+                failures.append(f"{split}: {key}={stats[key]}")
+    disjointness = summary["target_manifest_disjointness"]
+    for key in (
+        "train_duplicate_chain_count", "val_duplicate_chain_count", "train_val_chain_overlap",
+        "train_val_pdb_overlap", "train_val_cluster_overlap", "missing_cluster_assignments",
+    ):
+        if disjointness[key]:
+            failures.append(f"{key}={disjointness[key]}")
+    exact = summary["processed_msa_exact"]
+    for key in ("val_target_sequences_seen_in_train_non_query_msa", "train_val_target_sequence_overlap"):
+        if exact[key]:
+            failures.append(f"{key}={exact[key]}")
+    for report, key in (
+        ("mmseqs_homology", "val_targets_with_train_msa_homolog_hits"),
+        ("mmseqs_target_homology", "val_targets_with_train_target_homolog_hits"),
+    ):
+        if report in summary and summary[report][key]:
+            failures.append(f"{key}={summary[report][key]}")
+    return failures
 
 
 def main() -> None:
     args = parse_args()
+    validate_search_parameters(
+        min_seq_id=args.min_seq_id, coverage=args.coverage, threads=args.threads, max_seqs=args.max_seqs,
+    )
     train_ids = read_manifest(args.train_manifest)
     val_ids = read_manifest(args.val_manifest)
     args.out_dir.mkdir(parents=True, exist_ok=True)
@@ -750,12 +863,12 @@ def main() -> None:
     val_summary, val_depth_rows = summarize_split_features(
         split_name="val",
         manifest_ids=val_ids,
-        features_dir=args.features_dir,
+        features_dir=args.val_features_dir or args.features_dir,
         feature_exclusions=feature_exclusions,
         depth_bin_edges=depth_bin_edges,
     )
     depth_csv = args.out_dir / "msa_split_audit_depths.csv"
-    _write_depth_csv(depth_csv, [*train_depth_rows, *val_depth_rows])
+    _write_depth_csv(depth_csv, [*train_depth_rows, *val_depth_rows], include_identifiers=args.include_depth_identifiers)
     if not args.skip_plot:
         _plot_depths(depth_csv, args.out_dir)
 
@@ -776,6 +889,7 @@ def main() -> None:
             val_ids=val_ids,
             features_dir=args.features_dir,
             include_examples=args.include_examples,
+            val_features_dir=args.val_features_dir,
         ),
     }
     if args.audit_raw_identifiers:
@@ -787,6 +901,21 @@ def main() -> None:
             include_examples=args.include_examples,
         )
     if args.run_mmseqs:
+        summary["mmseqs_target_homology"] = run_mmseqs_homology(
+            train_ids=train_ids,
+            val_ids=val_ids,
+            features_dir=args.features_dir,
+            out_dir=args.out_dir,
+            mmseqs_bin=args.mmseqs_bin,
+            min_seq_id=float(args.min_seq_id),
+            coverage=float(args.coverage),
+            threads=int(args.threads),
+            max_seqs=int(args.max_seqs),
+            tmp_dir=args.tmp_dir,
+            include_identifiers=bool(args.include_identifiers_in_mmseqs),
+            val_features_dir=args.val_features_dir,
+            source_targets_only=True,
+        )
         summary["mmseqs_homology"] = run_mmseqs_homology(
             train_ids=train_ids,
             val_ids=val_ids,
@@ -799,9 +928,25 @@ def main() -> None:
             max_seqs=int(args.max_seqs),
             tmp_dir=args.tmp_dir,
             include_identifiers=bool(args.include_identifiers_in_mmseqs),
+            val_features_dir=args.val_features_dir,
         )
+    failures = strict_failures(summary)
+    summary["validation"] = {
+        "strict": bool(args.strict),
+        "passed": not failures,
+        "failures": failures,
+        "cluster_disjointness_checked": summary["target_manifest_disjointness"]["cluster_map_complete"],
+        "mmseqs_homology_checked": bool(args.run_mmseqs),
+        "target_target_homology_checked": bool(args.run_mmseqs),
+        "homology_scope": "Separate held-out query searches versus source targets and source non-query "
+        "rows of at least 20 residues, "
+        "using the configured heuristic MMseqs search; zero hits do not prove absence of all homology.",
+        "depth_identifiers_included": bool(args.include_depth_identifiers),
+    }
     (args.out_dir / "msa_split_audit_summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
     print(f"Wrote MSA split audit to {args.out_dir}")
+    if args.strict and failures:
+        raise SystemExit("MSA split audit failed: " + "; ".join(failures))
 
 
 if __name__ == "__main__":

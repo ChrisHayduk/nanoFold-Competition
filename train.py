@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
+import random
 import sys
+import tempfile
 import time
 from datetime import timedelta
 from functools import partial
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, Mapping, Protocol, runtime_checkable
+from typing import Any, Dict, Iterable, Iterator, Mapping, Protocol, cast, runtime_checkable
 
+import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -20,6 +24,7 @@ from torch.utils.data import DataLoader, Sampler, WeightedRandomSampler
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
+from nanofold.chain_paths import chain_npz_path
 from nanofold.competition_policy import (
     DEFAULT_TRACK_ID,
     OFFICIAL_DATASET_FINGERPRINT_PATH,
@@ -173,6 +178,276 @@ def _validate_train_sample_weights_opt_in(data_cfg: Mapping[str, Any]) -> None:
     )
 
 
+def _loader_generator(loader: DataLoader) -> torch.Generator:
+    generator = loader.generator
+    if not isinstance(generator, torch.Generator):
+        raise ValueError("Resumable training requires an explicit DataLoader generator.")
+    return generator
+
+
+def _training_sampling_contract(
+    train_loader: DataLoader, *, world_size: int, local_grad_accum_steps: int,
+    data_sha256: str | None = None,
+) -> Dict[str, Any]:
+    chain_ids = list(getattr(train_loader.dataset, "chain_ids"))
+    sampler = train_loader.sampler
+    weights = sampler.weights if isinstance(sampler, (WeightedRandomSampler, WeightedDistributedSampler)) else None
+    # Bind the values actually used by the sampler, independent of file formatting.
+    population = {
+        "chain_ids": chain_ids,
+        "weights": None if weights is None else [float(value).hex() for value in weights.tolist()],
+    }
+    population_sha256 = hashlib.sha256(
+        json.dumps(population, separators=(",", ":"), ensure_ascii=True).encode()
+    ).hexdigest()
+    if len(train_loader) < 1:
+        raise ValueError("Training needs at least one complete batch per rank.")
+    return {
+        "population_sha256": population_sha256,
+        "data_sha256": data_sha256,
+        "sampler": type(sampler).__name__,
+        "seed": getattr(sampler, "seed", _loader_generator(train_loader).initial_seed()),
+        "world_size": world_size,
+        "local_grad_accum_steps": local_grad_accum_steps,
+        "batch_size": train_loader.batch_size,
+        "num_workers": train_loader.num_workers,
+        "batches_per_epoch": len(train_loader),
+        "drop_last": train_loader.drop_last,
+        "collate_options": dict(train_loader.collate_fn.keywords) if isinstance(train_loader.collate_fn, partial) else {},
+    }
+
+
+def _training_data_sha256(train_loader: DataLoader, val_loader: DataLoader) -> str:
+    """Bind unfingerprinted runs to the processed inputs once at startup/resume."""
+    hasher = hashlib.sha256()
+    for split, loader in (("train", train_loader), ("val", val_loader)):
+        dataset = cast(ProcessedNPZDataset, loader.dataset)
+        for chain_id in dataset.chain_ids:
+            feature_hash = _sha256_file(chain_npz_path(dataset.processed_features_dir, chain_id))
+            label_hash = None
+            if dataset.include_labels:
+                if dataset.processed_labels_dir is None:
+                    raise ValueError("Training labels require a processed label directory.")
+                label_hash = _sha256_file(chain_npz_path(dataset.processed_labels_dir, chain_id))
+            hasher.update(json.dumps([split, chain_id, feature_hash, label_hash], separators=(",", ":")).encode())
+            hasher.update(b"\n")
+    return hasher.hexdigest()
+
+
+def _capture_rng_state(device: torch.device) -> Dict[str, Any]:
+    state: Dict[str, Any] = {
+        "python": random.getstate(),
+        "numpy": serialize_numpy_rng_state(cast(tuple[Any, ...], np.random.get_state())),
+        "torch": torch.get_rng_state(),
+        "device_type": device.type,
+    }
+    if device.type == "cuda":
+        state["device_rng"] = torch.cuda.get_rng_state(device)
+    elif device.type == "mps":
+        state["device_rng"] = torch.mps.get_rng_state()
+    return state
+
+
+def _validate_generator_state(value: Any, field: str) -> None:
+    if not isinstance(value, torch.Tensor) or value.dtype != torch.uint8 or value.ndim != 1:
+        raise ValueError(f"Checkpoint has invalid {field}.")
+    try:
+        torch.Generator().set_state(value)
+    except (TypeError, ValueError, RuntimeError) as exc:
+        raise ValueError(f"Checkpoint has invalid {field}.") from exc
+
+
+def _validate_rng_state(state: Mapping[str, Any], device: torch.device | None = None) -> None:
+    device_type = state.get("device_type")
+    if device_type not in {"cpu", "cuda", "mps"} or (device is not None and device_type != device.type):
+        raise ValueError("Resume requires the checkpoint's training device type.")
+    try:
+        # Validate independent RNG instances so rejected state cannot alter a run.
+        random.Random().setstate(state["python"])
+        np.random.RandomState().set_state(state["numpy"])
+        _validate_generator_state(state["torch"], "rank RNG state")
+        if device_type != "cpu":
+            value = state["device_rng"]
+            if (
+                not isinstance(value, torch.Tensor) or value.device.type != "cpu"
+                or value.dtype != torch.uint8 or value.ndim != 1 or value.numel() == 0
+            ):
+                raise ValueError("Invalid device RNG state")
+            if device is not None:
+                current = torch.cuda.get_rng_state(device) if device.type == "cuda" else torch.mps.get_rng_state()
+                if value.numel() != current.numel():
+                    raise ValueError("Invalid device RNG state size")
+    except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+        raise ValueError("Checkpoint contains invalid rank RNG state; cannot resume sampling.") from exc
+
+
+def _restore_rng_state(state: Mapping[str, Any], device: torch.device) -> None:
+    _validate_rng_state(state, device)
+    try:
+        random.setstate(state["python"])
+        np.random.set_state(state["numpy"])
+        torch.set_rng_state(state["torch"])
+        if device.type == "cuda":
+            torch.cuda.set_rng_state(state["device_rng"], device)
+        elif device.type == "mps":
+            torch.mps.set_rng_state(state["device_rng"])
+    except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+        raise ValueError("Checkpoint contains invalid rank RNG state; cannot resume sampling.") from exc
+
+
+def _start_train_epoch(train_loader: DataLoader, epoch: int) -> tuple[Iterator[Any], torch.Tensor]:
+    sampler = _epoch_aware_sampler(train_loader.sampler)
+    if sampler is not None:
+        sampler.set_epoch(epoch)
+    epoch_start = _loader_generator(train_loader).get_state()
+    return iter(train_loader), epoch_start
+
+
+def _capture_training_rank_state(
+    *, train_loader: DataLoader, val_loader: DataLoader, epoch: int, batches_consumed: int,
+    epoch_start_generator_state: torch.Tensor, rank: int, device: torch.device,
+) -> Dict[str, Any]:
+    return {
+        "rank": rank,
+        "epoch": epoch,
+        "batches_consumed": batches_consumed,
+        "epoch_start_generator_state": epoch_start_generator_state.clone(),
+        "loader_generator_state": _loader_generator(train_loader).get_state(),
+        "val_loader_generator_state": _loader_generator(val_loader).get_state(),
+        "rng_state": _capture_rng_state(device),
+    }
+
+
+def _collect_training_sampling_state(
+    local_state: Dict[str, Any], contract: Dict[str, Any], *, distributed: bool,
+) -> Dict[str, Any]:
+    gathered: list[Any] = [{"contract": contract, "state": local_state}]
+    if distributed:
+        gathered = [None] * dist.get_world_size()
+        dist.all_gather_object(gathered, {"contract": contract, "state": local_state})
+    if any(item["contract"] != contract for item in gathered):
+        raise ValueError("Training ranks have different sampling populations or loader configuration.")
+    return {"schema_version": 1, "contract": contract, "rank_states": [item["state"] for item in gathered]}
+
+
+def _resume_rank_sampling_state(
+    checkpoint: Mapping[str, Any], contract: Dict[str, Any], *, rank: int, device: torch.device | None = None,
+) -> Dict[str, Any]:
+    sampling = checkpoint.get("sampling_state")
+    if not isinstance(sampling, dict) or sampling.get("schema_version") != 1:
+        raise ValueError(
+            "Checkpoint lacks supported sampling state. Resume would repeat training examples; start a fresh run."
+        )
+    if sampling.get("contract") != contract:
+        raise ValueError(
+            "Checkpoint sampling contract differs: training chains/weights, world size, batch accumulation, "
+            "processed inputs, and DataLoader settings must match."
+        )
+    states = sampling.get("rank_states")
+    if not isinstance(states, list) or len(states) != contract["world_size"] or not 0 <= rank < len(states):
+        raise ValueError("Checkpoint does not contain sampling state for every rank.")
+    for expected_rank, state in enumerate(states):
+        if not isinstance(state, dict) or type(state.get("rank")) is not int or state["rank"] != expected_rank:
+            raise ValueError("Checkpoint sampling states do not match rank order.")
+        epoch, cursor, step = state.get("epoch"), state.get("batches_consumed"), checkpoint.get("step")
+        if any(type(value) is not int or value < 0 for value in (epoch, cursor, step)):
+            raise ValueError("Checkpoint has an invalid sampling epoch, cursor, or step.")
+        if cursor > contract["batches_per_epoch"] or (
+            epoch * contract["batches_per_epoch"] + cursor != step * contract["local_grad_accum_steps"]
+        ):
+            raise ValueError("Checkpoint sampling cursor does not match its optimizer step.")
+        for field in ("epoch_start_generator_state", "loader_generator_state", "val_loader_generator_state"):
+            _validate_generator_state(state.get(field), field)
+        if not isinstance(state.get("rng_state"), dict):
+            raise ValueError("Checkpoint has no rank RNG state.")
+        # Every rank checks every saved state before restoring its own model/loader.
+        # Otherwise one corrupt rank can fail while its peers wait in a collective.
+        _validate_rng_state(state["rng_state"], device)
+    return states[rank]
+
+
+def _restore_training_iterator(
+    train_loader: DataLoader, val_loader: DataLoader, state: Mapping[str, Any], *, device: torch.device,
+) -> Iterator[Any]:
+    _validate_rng_state(state["rng_state"], device)
+    for field in ("epoch_start_generator_state", "loader_generator_state", "val_loader_generator_state"):
+        _validate_generator_state(state[field], field)
+    _loader_generator(train_loader).set_state(state["epoch_start_generator_state"])
+    iterator, _ = _start_train_epoch(train_loader, state["epoch"])
+    # Replay ordered worker assignments from their original seeds. With no workers,
+    # discard temporary augmentation RNG consumption before restoring the model RNG.
+    for _ in range(state["batches_consumed"]):
+        next(iterator)
+    if not torch.equal(_loader_generator(train_loader).get_state(), state["loader_generator_state"]):
+        raise ValueError("Replayed DataLoader state differs from the checkpoint; cannot resume sampling.")
+    _loader_generator(val_loader).set_state(state["val_loader_generator_state"])
+    _restore_rng_state(state["rng_state"], device)
+    return iterator
+
+
+def _atomic_torch_save(payload: Dict[str, Any], path: Path) -> None:
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False) as handle:
+            temporary_path = Path(handle.name)
+            torch.save(payload, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary_path.replace(path)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+def _checkpoint_write_error(error: str | None, *, distributed: bool) -> None:
+    errors = [error]
+    if distributed:
+        dist.broadcast_object_list(errors, src=0)
+    if errors[0] is not None:
+        raise RuntimeError(f"Checkpoint write failed on rank zero: {errors[0]}")
+
+
+def _restore_scaler_state(scaler: Any, checkpoint: Mapping[str, Any], *, enabled: bool) -> None:
+    if not enabled:
+        return
+    state = checkpoint.get("scaler")
+    if not isinstance(state, dict) or not state:
+        raise ValueError("AMP resume requires the checkpoint's gradient-scaler state.")
+    for field in ("scale", "growth_factor", "backoff_factor"):
+        value = state.get(field)
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value) or value <= 0:
+            raise ValueError(f"Checkpoint contains invalid gradient-scaler {field}.")
+    if state["growth_factor"] <= 1 or state["backoff_factor"] >= 1:
+        raise ValueError("Checkpoint contains invalid gradient-scaler growth/backoff factors.")
+    if type(state.get("growth_interval")) is not int or state["growth_interval"] <= 0:
+        raise ValueError("Checkpoint contains invalid gradient-scaler growth_interval.")
+    if type(state.get("_growth_tracker")) is not int or not 0 <= state["_growth_tracker"] < state["growth_interval"]:
+        raise ValueError("Checkpoint contains invalid gradient-scaler growth tracker.")
+    try:
+        scaler.load_state_dict(state)
+    except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+        raise ValueError("Checkpoint contains invalid gradient-scaler state; cannot resume AMP training.") from exc
+
+
+def _restore_scheduler_state(scheduler: Any, checkpoint: Mapping[str, Any]) -> None:
+    if scheduler is None or not callable(getattr(scheduler, "load_state_dict", None)):
+        return
+    state = checkpoint.get("scheduler")
+    if not isinstance(state, dict):
+        raise ValueError("Resume requires the configured scheduler's checkpoint state.")
+    if isinstance(scheduler, torch.optim.lr_scheduler.LRScheduler):
+        expected = scheduler.state_dict()
+        if not expected.keys() <= state.keys():
+            raise ValueError("Checkpoint scheduler state is incompatible with the configured scheduler.")
+        for field, minimum in (("last_epoch", -1), ("_step_count", 0)):
+            if field in state and (type(state[field]) is not int or state[field] < minimum):
+                raise ValueError(f"Checkpoint contains invalid scheduler {field}.")
+    try:
+        scheduler.load_state_dict(state)
+    except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+        raise ValueError("Checkpoint contains invalid scheduler state; cannot resume training.") from exc
+
+
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(
         description=(
@@ -214,7 +489,7 @@ def parse_args() -> argparse.Namespace:
         "--resume",
         type=str,
         default="",
-        help="Optional checkpoint path to resume from.",
+        help="Resume a checkpoint with sampling state; processed data bytes, training weights, world size and loader settings must match.",
     )
     ap.add_argument(
         "--reset-run",
@@ -229,7 +504,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument(
         "--allow-resume-mismatch",
         action="store_true",
-        help="Allow resume metadata mismatches (maintainer-only override).",
+        help="Allow resume metadata mismatches (maintainer-only); sampling-state compatibility remains required.",
     )
     return ap.parse_args()
 
@@ -425,7 +700,10 @@ def make_loader(
         msa_sample_mode=msa_sample_mode,
     )
     num_workers = normalize_num_workers(int(data_cfg.get("num_workers", 0)))
-    generator = make_dataloader_generator(generator_seed)
+    # Distributed ranks share the sampling plan, but their workers need distinct
+    # augmentation streams. Single-device sampling keeps its own loader generator.
+    worker_seed = generator_seed + (distributed_rank or 0) if distributed_world_size > 1 else generator_seed
+    generator = make_dataloader_generator(worker_seed)
     sampler: Sampler[Any] | None = None
     train_sample_weights = str(data_cfg.get("train_sample_weights", "")).strip()
     if split == "train" and train_sample_weights:
@@ -997,6 +1275,10 @@ def main() -> None:
     fingerprint_sha256 = (
         _sha256_file(fingerprint_path) if (args.official or args.verify_fingerprint) and Path(fingerprint_path).exists() else None
     )
+    sampling_contract = _training_sampling_contract(
+        train_loader, world_size=world_size, local_grad_accum_steps=grad_accum_steps,
+        data_sha256=fingerprint_sha256 or _training_data_sha256(train_loader, val_loader),
+    )
 
     metrics: Dict[str, Any] = {
         "run_name": run_name,
@@ -1014,6 +1296,7 @@ def main() -> None:
         "effective_batch_size": effective_batch_size,
         "configured_grad_accum_steps": configured_grad_accum_steps,
         "local_grad_accum_steps": grad_accum_steps,
+        "sampling_contract": sampling_contract,
         "distributed": {
             "enabled": distributed,
             "world_size": world_size,
@@ -1044,8 +1327,12 @@ def main() -> None:
     cumulative_samples_seen = 0
     cumulative_cropped_residues_seen = 0
     cumulative_nonpad_residues_seen = 0
+    train_sampler_epoch = 0
+    train_batches_consumed = 0
+    train_epoch_start_generator_state = _loader_generator(train_loader).get_state()
+    train_iter: Iterator[Any]
 
-    def _checkpoint_payload(*, step_value: int) -> Dict[str, Any]:
+    def _checkpoint_payload(*, step_value: int, sampling_state: Dict[str, Any]) -> Dict[str, Any]:
         payload: Dict[str, Any] = {
             "step": step_value,
             "model": model.state_dict(),
@@ -1067,22 +1354,29 @@ def main() -> None:
             "cumulative_cropped_residues_seen": cumulative_cropped_residues_seen,
             "cumulative_nonpad_residues_seen": cumulative_nonpad_residues_seen,
             "cumulative_residues_seen": cumulative_nonpad_residues_seen,
-            "rng_state": {
-                "python": __import__("random").getstate(),
-                "numpy": serialize_numpy_rng_state(__import__("numpy").random.get_state()),
-                "torch": torch.get_rng_state(),
-                "torch_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
-            },
+            "sampling_state": sampling_state,
         }
         if scheduler is not None and callable(getattr(scheduler, "state_dict", None)):
             payload["scheduler"] = scheduler.state_dict()
         return payload
 
     def _save_checkpoint_files(*, step_value: int) -> None:
-        ckpt = _checkpoint_payload(step_value=step_value)
-        ckpt_path = paths.ckpt_dir / f"ckpt_step_{step_value}.pt"
-        torch.save(ckpt, ckpt_path)
-        torch.save(ckpt, paths.ckpt_dir / "ckpt_last.pt")
+        local_state = _capture_training_rank_state(
+            train_loader=train_loader, val_loader=val_loader, epoch=train_sampler_epoch,
+            batches_consumed=train_batches_consumed,
+            epoch_start_generator_state=train_epoch_start_generator_state,
+            rank=rank, device=device,
+        )
+        sampling_state = _collect_training_sampling_state(local_state, sampling_contract, distributed=distributed)
+        write_error = None
+        if is_main:
+            try:
+                ckpt = _checkpoint_payload(step_value=step_value, sampling_state=sampling_state)
+                _atomic_torch_save(ckpt, paths.ckpt_dir / f"ckpt_step_{step_value}.pt")
+                _atomic_torch_save(ckpt, paths.ckpt_dir / "ckpt_last.pt")
+            except Exception as exc:
+                write_error = f"{type(exc).__name__}: {exc}"
+        _checkpoint_write_error(write_error, distributed=distributed)
     if args.resume:
         resume_path = Path(args.resume)
         if not resume_path.exists():
@@ -1103,15 +1397,11 @@ def main() -> None:
                 "Pass --allow-resume-mismatch to override.\n"
                 f"{joined}"
             )
+        rank_sampling_state = _resume_rank_sampling_state(ckpt, sampling_contract, rank=rank, device=device)
+        _restore_scaler_state(scaler, ckpt, enabled=use_amp)
+        _restore_scheduler_state(scheduler, ckpt)
         model.load_state_dict(ckpt["model"], strict=True)
         opt.load_state_dict(ckpt["opt"])
-        if scheduler is not None and "scheduler" in ckpt and callable(getattr(scheduler, "load_state_dict", None)):
-            scheduler.load_state_dict(ckpt["scheduler"])
-        if use_amp and "scaler" in ckpt:
-            try:
-                scaler.load_state_dict(ckpt["scaler"])
-            except Exception:
-                pass
         start_step = int(ckpt.get("step", 0))
         cumulative_samples_seen = int(ckpt.get("cumulative_samples_seen", start_step * effective_batch_size))
         cumulative_cropped_residues_seen = int(
@@ -1123,19 +1413,11 @@ def main() -> None:
                 ckpt.get("cumulative_residues_seen", cumulative_cropped_residues_seen),
             )
         )
-        if "rng_state" in ckpt:
-            rng_state = ckpt["rng_state"]
-            try:
-                import random as _random
-                _random.setstate(rng_state["python"])
-                import numpy as _np
-                _np.random.set_state(rng_state["numpy"])
-                torch.set_rng_state(rng_state["torch"])
-                cuda_state = rng_state.get("torch_cuda")
-                if cuda_state is not None and torch.cuda.is_available():
-                    torch.cuda.set_rng_state_all(cuda_state)
-            except Exception:
-                pass
+        train_sampler_epoch = rank_sampling_state["epoch"]
+        train_batches_consumed = rank_sampling_state["batches_consumed"]
+        train_epoch_start_generator_state = rank_sampling_state["epoch_start_generator_state"]
+        train_iter = _restore_training_iterator(train_loader, val_loader, rank_sampling_state, device=device)
+        _distributed_barrier(distributed)
         if is_main:
             print(f"Resumed from {resume_path} at step {start_step}")
             removed_step_metrics = _truncate_step_metrics(step_metrics_path, max_step=start_step)
@@ -1171,8 +1453,8 @@ def main() -> None:
         if is_main:
             Path(paths.metrics_path).write_text(json.dumps(metrics, indent=2))
     else:
-        if is_main:
-            _save_checkpoint_files(step_value=0)
+        train_iter, train_epoch_start_generator_state = _start_train_epoch(train_loader, train_sampler_epoch)
+        _save_checkpoint_files(step_value=0)
     _distributed_barrier(distributed)
 
     step = start_step
@@ -1220,11 +1502,6 @@ def main() -> None:
         disable=not show_progress,
     )
 
-    train_sampler = _epoch_aware_sampler(train_loader.sampler)
-    train_sampler_epoch = 0
-    if train_sampler is not None:
-        train_sampler.set_epoch(train_sampler_epoch)
-    train_iter = iter(train_loader)
     step_start = time.perf_counter()
     run_start = time.perf_counter()
 
@@ -1308,11 +1585,11 @@ def main() -> None:
             try:
                 batch = next(train_iter)
             except StopIteration:
-                if train_sampler is not None:
-                    train_sampler_epoch += 1
-                    train_sampler.set_epoch(train_sampler_epoch)
-                train_iter = iter(train_loader)
+                train_sampler_epoch += 1
+                train_batches_consumed = 0
+                train_iter, train_epoch_start_generator_state = _start_train_epoch(train_loader, train_sampler_epoch)
                 batch = next(train_iter)
+            train_batches_consumed += 1
 
             batch = to_device(batch, device)
             samples_this_step += int(batch["aatype"].shape[0])
@@ -1509,8 +1786,8 @@ def main() -> None:
 
         if step % save_every == 0 or step == max_steps:
             _distributed_barrier(distributed)
+            _save_checkpoint_files(step_value=step)
             if is_main:
-                _save_checkpoint_files(step_value=step)
                 log_line(f"[checkpoint] step {step}: wrote {paths.ckpt_dir / 'ckpt_last.pt'}")
                 sys.stdout.flush()
             _distributed_barrier(distributed)

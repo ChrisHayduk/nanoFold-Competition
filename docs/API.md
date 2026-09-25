@@ -64,6 +64,12 @@ with replacement; zero-weight chains are not drawn. The same seed and epoch
 produce the same global weighted draw before partitioning it across ranks.
 Weights do not add data or change the configured sample budget.
 
+Training checkpoints include a versioned `sampling_state`: the manifest-aligned sampling-weight digest, loader/sampler configuration, epoch and consumed-batch cursor, epoch-start generator state, and RNG state for every rank. Resume reconstructs the ordered loader, replays consumed batches, then restores that rank's model RNG. Worker seeds differ across ranks while the distributed sampling plan uses a shared seed. Replaying the current epoch prefix adds startup I/O but does not count as new training exposure.
+
+Resume requires the same effective sampling population and weights, dataset contents, world size, device type, worker count, batch/accumulation settings and crop/MSA configuration. Changing weights or feature/label bytes at the same file path is detected. Verified runs bind their checked fingerprint; other runs stream-hash train and validation files once at startup. Checkpoints without supported sampling state cannot resume training safely and produce an explicit error; they remain usable for prediction/scoring. `--allow-resume-mismatch` does not bypass sampling-state checks. Deterministic sample/augmentation replay does not promise bitwise numerical agreement across different hardware or library versions.
+
+Checkpoint writes use staged, flushed files followed by atomic replacement. A failed write preserves the previous checkpoint, and rank-zero save failures propagate to every rank. Resume validates RNG states for all ranks and requires valid AMP scaler state when AMP is enabled, plus the configured scheduler's saved state, before changing run history.
+
 ## Batch Contract by Mode
 
 Training batches include labels because submissions need supervision to learn. Inference batches do not. The runtime strips supervision keys itself when `training=False`, which protects hidden evaluation even if a caller accidentally passes a labeled batch.
@@ -94,6 +100,8 @@ Typical use:
 ca_from_atom14 = batch["atom14_positions"][..., 1, :]  # slot 1 == Cα
 backbone_valid = batch["atom14_mask"][..., :4].all(dim=-1)
 ```
+
+Processed NPZ validation checks token ranges, nonnegative deletions, query/MSA agreement, finite coordinates, and matching feature/label lengths and residue indices. CA coordinates and masks must agree with atom14 slot 1. Query/structure sequence mismatches have all atom labels masked. Schema-3 preprocessing adds matching `preprocess_config_sha256` and `source_inputs_sha256` provenance to each pair; these are storage/audit metadata, not model inputs. Fingerprinting rejects mixed configurations and stored chain IDs that disagree with the manifest. Schema 3 requires the chain ID in both files.
 
 ### Inference mode (`training=False`)
 

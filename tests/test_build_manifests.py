@@ -7,6 +7,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 TEST_HIDDEN_SPLIT_SALT = "test-hidden-split-salt-with-enough-length-000000"
 
 
@@ -32,20 +34,36 @@ def _write_structure_metadata(path: Path, chain_ids: list[str], class_by_chain: 
     chains = []
     for chain_id in chain_ids:
         cls = (class_by_chain or {}).get(chain_id, "alpha_beta")
+        cath_code = {"alpha": "1.10.1.1", "beta": "2.20.1.1", "alpha_beta": "3.30.1.1"}[cls]
         chains.append(
             {
                 "chain_id": chain_id,
                 "accepted": True,
                 "secondary_structure_class": cls,
-                "secondary_helix_fraction": 0.7 if cls == "alpha" else 0.2,
-                "secondary_beta_fraction": 0.7 if cls == "beta" else 0.2,
+                "secondary_helix_fraction": 0.7 if cls == "alpha" else (0.2 if cls == "beta" else 0.45),
+                "secondary_beta_fraction": 0.7 if cls == "beta" else (0.2 if cls == "alpha" else 0.45),
                 "secondary_coil_fraction": 0.1,
                 "domain_architecture_class": cls,
                 "domain_architecture_source": "test",
                 "metadata_source_count": 2,
+                "cath_domains": [{"domain_id": chain_id + "01", "class_id": cath_code.split(".")[0],
+                                  "architecture_id": ".".join(cath_code.split(".")[:2]),
+                                  "topology_id": ".".join(cath_code.split(".")[:3]),
+                                  "homologous_superfamily_id": cath_code}],
+                "cath_annotation_status": "annotated",
+                "cath_architecture_ids": [{"alpha": "1.10", "beta": "2.20", "alpha_beta": "3.30"}[cls]],
+                "cath_topology_ids": [{"alpha": "1.10.1", "beta": "2.20.1", "alpha_beta": "3.30.1"}[cls]],
+                "cath_homologous_superfamily_ids": [{"alpha": "1.10.1.1", "beta": "2.20.1.1", "alpha_beta": "3.30.1.1"}[cls]],
             }
         )
-    path.write_text(json.dumps({"schema_version": 1, "chains": chains}))
+    path.write_text(json.dumps({
+        "schema_version": 2, "chains": chains,
+        "source": {"chain_data_cache_sha256": _cache_sha(path.parent / "chain_data_cache.json"),
+                   "chain_id_namespace": "author_asym_id"},
+        "config": {"min_len": 40, "max_len": 256, "max_resolution": 3.0, "require_monomer": False,
+                   "max_unknown_aa_fraction": 0, "sample_limit": 0},
+        "summary": {"eligible_candidate_count": len(chains), "candidate_count": len(chains)},
+    }))
 
 
 def _write_cluster_tsv(path: Path, chain_ids: list[str]) -> None:
@@ -66,10 +84,16 @@ def _run_build(cache_path: Path, out_dir: Path, expected_sha: str) -> subprocess
         [
             sys.executable,
             "scripts/build_manifests.py",
+            "--sampling-policy",
+            "cath-v2",
             "--chain-data-cache",
             str(cache_path),
             "--out-dir",
             str(out_dir),
+            "--lock-file",
+            str(out_dir / "source.lock.json"),
+            "--private-lock-file",
+            str(out_dir / "private" / "private.lock.json"),
             "--hidden-out-dir",
             str(out_dir / "private"),
             "--train-size",
@@ -102,12 +126,18 @@ def _run_build_without_cluster_tsv(cache_path: Path, out_dir: Path, expected_sha
         [
             sys.executable,
             "scripts/build_manifests.py",
+            "--sampling-policy",
+            "cath-v2",
             "--chain-data-cache",
             str(cache_path),
             "--out-dir",
             str(out_dir),
             "--hidden-out-dir",
             str(out_dir / "private"),
+            "--lock-file",
+            str(out_dir / "source.lock.json"),
+            "--private-lock-file",
+            str(out_dir / "private" / "source.lock.json"),
             "--train-size",
             "3",
             "--val-size",
@@ -157,6 +187,27 @@ def test_build_manifests_rejects_wrong_cache_sha(tmp_path: Path) -> None:
     assert "SHA256 mismatch" in (proc.stderr + proc.stdout)
 
 
+@pytest.mark.parametrize("omitted", [("--lock-file",), ("--private-lock-file",), ("--lock-file", "--private-lock-file")])
+def test_generation_requires_both_audit_locks_before_writing_outputs(tmp_path: Path, omitted: tuple[str, ...]) -> None:
+    cache = tmp_path / "chain_data_cache.json"
+    _make_chain_cache(cache)
+    metadata = tmp_path / "structure_metadata.json"
+    _write_structure_metadata(metadata, list(json.loads(cache.read_text())))
+    out = tmp_path / "out"
+    command = [sys.executable, "scripts/build_manifests.py", "--sampling-policy", "cath-v2",
+               "--chain-data-cache", str(cache), "--structure-metadata", str(metadata),
+               "--out-dir", str(out), "--hidden-out-dir", str(out / "private")]
+    for option, path in (("--lock-file", out / "public.lock.json"),
+                         ("--private-lock-file", out / "private" / "source.lock.json")):
+        if option not in omitted:
+            command.extend((option, str(path)))
+    proc = subprocess.run(command, text=True, capture_output=True, check=False)
+    assert proc.returncode != 0
+    assert "required" in proc.stderr
+    assert all(option in proc.stderr for option in omitted)
+    assert not out.exists()
+
+
 def test_build_manifests_deterministic_with_expected_cache_sha(tmp_path: Path) -> None:
     cache_path = tmp_path / "chain_data_cache.json"
     _make_chain_cache(cache_path)
@@ -198,12 +249,18 @@ def test_build_manifests_requires_private_hidden_split_salt(tmp_path: Path) -> N
         [
             sys.executable,
             "scripts/build_manifests.py",
+            "--sampling-policy",
+            "cath-v2",
             "--chain-data-cache",
             str(cache_path),
             "--out-dir",
             str(tmp_path / "out_no_salt"),
             "--hidden-out-dir",
             str(tmp_path / "private_no_salt"),
+            "--lock-file",
+            str(tmp_path / "source.lock.json"),
+            "--private-lock-file",
+            str(tmp_path / "private_no_salt" / "source.lock.json"),
             "--train-size",
             "3",
             "--val-size",
@@ -264,6 +321,8 @@ def test_build_manifests_writes_hidden_split_and_stratifies_secondary_classes(tm
         [
             sys.executable,
             "scripts/build_manifests.py",
+            "--sampling-policy",
+            "cath-v2",
             "--chain-data-cache",
             str(cache_path),
             "--out-dir",
@@ -286,6 +345,8 @@ def test_build_manifests_writes_hidden_split_and_stratifies_secondary_classes(tm
             str(cluster_tsv),
             "--lock-file",
             str(lock_file),
+            "--private-lock-file",
+            str(hidden_out_dir / "source.lock.json"),
         ],
         text=True,
         capture_output=True,
@@ -304,7 +365,7 @@ def test_build_manifests_writes_hidden_split_and_stratifies_secondary_classes(tm
     for split_name in ("train", "val"):
         classes = distributions[split_name]["secondary_structure_class"]
         assert classes == {"alpha": 1, "alpha_beta": 1, "beta": 1}
-    assert lock["grouping"] == {"cluster_disjoint": True, "pdb_disjoint": True}
+    assert lock["grouping"] == {"cluster_disjoint": True, "pdb_disjoint": True, "exact_sequence_disjoint": True}
     assert "hidden_val_count" not in lock["outputs"]
     assert "hidden_val" not in lock["stratification"]["split_distributions"]
     assert not (out_dir / "split_quality_report.json").exists()
@@ -368,7 +429,15 @@ def test_build_hidden_manifest_preserves_public_manifests_and_excludes_public_co
     lock_file.write_text(
         json.dumps(
             {
+                "sampling_policy": "cath-v2",
                 "chain_data_cache_sha256": expected_sha,
+                "structure_metadata": {"sha256": _cache_sha(structure_metadata)},
+                "clustering": {"cluster_assignments_sha256": hashlib.sha256("".join(f"{chain}\t{'1aaa_A' if chain in {'1aaa_A', '1aaa_B'} else chain}\n" for chain in sorted(chain_ids)).encode()).hexdigest()},
+                "outputs": {
+                    "train_manifest_sha256": _cache_sha(train), "train_count": 3,
+                    "val_manifest_sha256": _cache_sha(val), "val_count": 2,
+                    "all_manifest_sha256": _cache_sha(all_manifest), "unique_count": 5,
+                },
                 "args": {
                     "hidden_val_size": 2,
                     "min_len": 40,
@@ -393,6 +462,8 @@ def test_build_hidden_manifest_preserves_public_manifests_and_excludes_public_co
         [
             sys.executable,
             "scripts/build_hidden_manifest.py",
+            "--sampling-policy",
+            "cath-v2",
             "--chain-data-cache",
             str(cache_path),
             "--lock-file",
@@ -430,6 +501,7 @@ def test_build_hidden_manifest_preserves_public_manifests_and_excludes_public_co
         "cluster_disjoint": True,
         "pdb_disjoint": True,
         "public_components_excluded": True,
+        "exact_sequence_disjoint": True,
     }
 
     verify_proc = subprocess.run(
@@ -495,6 +567,8 @@ def test_build_hidden_manifest_preserves_public_manifests_and_excludes_public_co
         [
             sys.executable,
             "scripts/build_hidden_manifest.py",
+            "--sampling-policy",
+            "cath-v2",
             "--chain-data-cache",
             str(cache_path),
             "--lock-file",
@@ -524,3 +598,109 @@ def test_build_hidden_manifest_preserves_public_manifests_and_excludes_public_co
     assert "6fff_A" not in excluded_hidden_ids
     excluded_lock = json.loads(excluded_private_lock.read_text())
     assert excluded_lock["filtering"]["private_processability_exclusion_count"] == 1
+    assert excluded_lock["filtering"]["private_processability_exclusions"]["sha256"] == _cache_sha(private_exclusions)
+    assert excluded_lock["filtering"]["private_processability_exclusions"]["canonical_ids_sha256"] == _cache_sha(private_exclusions)
+
+
+def test_joint_generation_and_verification_bind_private_and_public_contract(tmp_path: Path) -> None:
+    cache_path = tmp_path / "chain_data_cache.json"
+    _make_chain_cache(cache_path)
+    out_dir = tmp_path / "staged"
+    generated = _run_build(cache_path, out_dir, _cache_sha(cache_path))
+    assert generated.returncode == 0, generated.stderr
+    result = subprocess.run([
+        sys.executable, "scripts/verify_hidden_manifest.py",
+        "--chain-data-cache", str(cache_path),
+        "--lock-file", str(out_dir / "source.lock.json"),
+        "--public-train-manifest", str(out_dir / "train.txt"),
+        "--public-val-manifest", str(out_dir / "val.txt"),
+        "--public-all-manifest", str(out_dir / "all.txt"),
+        "--hidden-manifest", str(out_dir / "private" / "hidden_val.txt"),
+        "--private-lock-file", str(out_dir / "private" / "private.lock.json"),
+    ], text=True, capture_output=True, check=False)
+    assert result.returncode == 0, result.stderr + result.stdout
+    before = {path: path.read_bytes() for path in out_dir.rglob("*") if path.is_file()}
+    repeated = _run_build(cache_path, out_dir, _cache_sha(cache_path))
+    assert repeated.returncode != 0
+    assert "Refusing to overwrite" in repeated.stderr
+    assert {path: path.read_bytes() for path in before} == before
+
+
+@pytest.mark.parametrize("metadata_mode", ["complete", "limited", "permissive"])
+def test_cath_metadata_builder_output_feeds_real_manifest_generation(tmp_path: Path, metadata_mode: str) -> None:
+    from scripts.build_structure_metadata import build_metadata
+
+    cache = tmp_path / "chain_data_cache.json"
+    _make_chain_cache(cache)
+    chain_ids = list(json.loads(cache.read_text()))
+    sources = tmp_path / "sources"
+    sources.mkdir()
+    cath = sources / "cath-domain-list.txt"
+    cath.write_text("".join(f"{chain.replace('_', '')}01 1 10 20 30 1 1 1 1 1 100 2.0\n" for chain in chain_ids))
+    source_lock = sources / "sources.lock.json"
+    source_lock.write_text(json.dumps({
+        "schema_version": 2, "chain_data_cache": {"sha256": _cache_sha(cache)},
+        "sources": {"cath_domain_list": {"path": cath.name, "sha256": _cache_sha(cath)}},
+    }))
+    exclusions = tmp_path / "empty_exclusions.txt"
+    exclusions.touch()
+    metadata = build_metadata(
+        chain_data_cache=cache, metadata_sources_dir=sources, metadata_source_lock=source_lock,
+        feature_exclusion_list=exclusions, processability_exclusion_list=exclusions,
+        min_len=40, max_len=256, max_resolution=3.0,
+        max_unknown_aa_fraction=0.1 if metadata_mode == "permissive" else 0,
+        sample_limit=6 if metadata_mode == "limited" else 0,
+    )
+    metadata_path = tmp_path / "structure_metadata.json"
+    metadata_path.write_text(json.dumps(metadata))
+    clusters = tmp_path / "clusters.tsv"
+    _write_cluster_tsv(clusters, chain_ids)
+    out = tmp_path / "generated"
+    proc = subprocess.run([
+        sys.executable, "scripts/build_manifests.py", "--sampling-policy", "cath-v2",
+        "--chain-data-cache", str(cache), "--structure-metadata", str(metadata_path),
+        "--cluster-tsv", str(clusters), "--train-size", "2", "--val-size", "1", "--hidden-val-size", "1",
+        "--out-dir", str(out), "--hidden-out-dir", str(out / "private"),
+        "--lock-file", str(out / "source.lock.json"),
+        "--private-lock-file", str(out / "private" / "source.lock.json"),
+    ], text=True, capture_output=True, check=False,
+       env={**os.environ, "NANOFOLD_HIDDEN_SPLIT_SALT": TEST_HIDDEN_SPLIT_SALT})
+    if metadata_mode != "complete":
+        assert proc.returncode != 0
+        assert ("sample_limit" if metadata_mode == "limited" else "max_unknown_aa_fraction") in proc.stderr
+        assert not out.exists()
+        return
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    lock = json.loads((out / "source.lock.json").read_text())
+    assert lock["sampling_policy"] == "cath-v2"
+    assert lock["stratification"]["fields"] == ["cath_architecture_ids", "length_bin", "resolution_bin"]
+    assert lock["filtering"]["candidate_annotation_coverage"]["cath_annotated_count"] == 7
+    assert lock["filtering"]["candidate_annotation_coverage"]["measured_secondary_structure_count"] == 0
+
+
+def test_source_lock_binds_cluster_tsv_bytes_not_only_canonical_assignments(tmp_path: Path) -> None:
+    from scripts.build_hidden_manifest import _validate_source_lock
+    from scripts.build_manifests import _load_cluster_tsv
+
+    cache = tmp_path / "chain_data_cache.json"
+    _make_chain_cache(cache)
+    out = tmp_path / "out"
+    proc = _run_build(cache, out, _cache_sha(cache))
+    assert proc.returncode == 0, proc.stderr
+    tsv = tmp_path / "clusters.tsv"
+    candidates = set(json.loads(cache.read_text()))
+    assignments = _load_cluster_tsv(tsv, candidates)
+    def validate(path: Path | None) -> None:
+        _validate_source_lock(
+            out / "source.lock.json", train_path=out / "train.txt", val_path=out / "val.txt",
+            all_path=out / "all.txt", structure_metadata_path=tmp_path / "structure_metadata.json",
+            cluster_map=assignments, cluster_tsv_path=path,
+        )
+
+    validate(tsv)
+    with pytest.raises(ValueError, match="Cluster TSV SHA256"):
+        validate(None)
+    tsv.write_text(tsv.read_text() + "\n")
+    assert _load_cluster_tsv(tsv, candidates) == assignments
+    with pytest.raises(ValueError, match="Cluster TSV SHA256"):
+        validate(tsv)

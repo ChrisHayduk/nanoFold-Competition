@@ -5,7 +5,7 @@ This document is the official data contract for nanoFold. It explains what data 
 The short version:
 
 - Public participants get train and public validation data through `scripts/setup_official_data.sh`.
-- Maintainers build hidden validation privately through `scripts/build_hidden_manifest.py` after the public manifests are fixed.
+- Maintainers keep the published manifests fixed. New sampling candidates use the explicitly versioned `cath-v2` workflow in [Dataset sampling](DATA_SAMPLING.md).
 - Public train/validation manifests are committed.
 - Hidden manifests, hidden features, hidden labels, hidden fingerprints, and hidden locks live under `.nanofold_private/` and must never be committed.
 - Models receive processed feature tensors and must return `pred_atom14` with shape `(B, L, 14, 3)`.
@@ -17,17 +17,17 @@ Official nanoFold data is built from public structure and alignment sources, the
 | Source | Used for | Why it is used |
 |---|---|---|
 | OpenFold/OpenProteinSet RODA bucket, `s3://openfold` | Chain cache metadata, duplicate-chain map, per-chain MSA assets | Provides a public, reproducible AlphaFold-style training-data foundation without asking competitors to run external retrieval. |
-| OpenFold `chain_data_cache.json` | Candidate universe, sequence, length, resolution, monomer filtering, source lock hashing | Gives a single official chain metadata table for deterministic split generation. |
+| OpenFold `chain_data_cache.json` | Candidate universe, sequence, length, resolution, source lock hashing | Gives a single official chain metadata table for deterministic split generation. |
 | OpenFold `duplicate_pdb_chains.txt` | Duplicate-chain fallback during per-chain asset download | Lets the downloader reuse equivalent chain assets when OpenProteinSet stores a duplicate under a representative chain. |
 | OpenFold per-chain `uniref90_hits.a3m` | Official MSA input feature | Gives every model the same evolutionary input while keeping external MSA retrieval out of official runs. |
 | RCSB mmCIF files, `https://files.rcsb.org/download/<PDB>.cif` | Atomic labels for C-alpha and atom14 supervision/scoring | mmCIF is the authoritative coordinate source used to build geometry labels. |
-| CATH domain list | Split stratification metadata | Helps balance broad structural classes so the benchmark does not overrepresent a single fold family. |
-| SCOPe classification file | Split stratification metadata | Adds an independent structural-classification signal for split balancing. |
-| ECOD domain file | Split stratification metadata | Adds another domain-architecture source, improving coverage and reducing classification blind spots. |
+| Pinned CATH 4.4.0 domain list | CATH hierarchy for new sampling candidates | Preserves Class, Architecture, Topology, Homologous superfamily and all domains; unannotated chains remain unknown. |
+| SCOPe classification file | Optional annotation audit | Retains source classifications without treating them as CATH assignments. |
+| ECOD domain file | Optional annotation audit | Retains source classifications without imputing missing CATH labels. |
 | Optional RCSB REST metadata | Extra split audit metadata when explicitly enabled | Can enrich structural metadata, but the default bulk split path does not require per-chain REST calls. |
 | Pinned feature/processability exclusion lists | Split eligibility | Prevents known missing-assets or unprocessable-label chains from entering official manifests. |
 
-Official templates are disabled. The schema still carries template feature tensors, but official preprocessing uses `T=0`, so template lookup cannot decide the leaderboard.
+Official templates are disabled. The schema still carries template feature tensors, but official preprocessing uses `T=0`, so template lookup cannot decide the leaderboard. Template-enabled research preprocessing excludes every hit from the target PDB entry, including aliases and other chains. It requires auditable polymer residue indices and matching sequence identities; missing coordinates preserve their sequence gaps, and ambiguous mappings are omitted.
 
 Default source locations after download:
 
@@ -158,7 +158,7 @@ examples always causes failure. These are local audit outputs. Keep the
 official manifests fixed: official execution requires every requested chain
 and still verifies the NPZ schema and fingerprint.
 
-Maintainer full refreshes sanitize MSAs by default. After the
+Maintainer asset refreshes require `--skip-manifest-regen` and sanitize MSAs by default. The published manifests remain fixed. After the
 train/public-validation/hidden-validation manifests are known,
 `scripts/full_official_data_refresh.sh` downloads raw public and hidden
 OpenProteinSet assets, builds a private held-out-target MSA row filter with
@@ -166,7 +166,9 @@ OpenProteinSet assets, builds a private held-out-target MSA row filter with
 NPZs with that filter. The generated filter scans source MSAs from train, public
 validation, and hidden validation, then removes non-query rows homologous to
 public or hidden validation targets before the MSA depth cap. Hidden-validation
-filters are private artifacts and must not be published.
+filters are private artifacts and must not be published. Automatically rebuilt
+filters default to `.nanofold_private/asset_rebuild/msa_row_filters/`, alongside
+the candidate asset rebuild rather than the existing filter reference.
 
 Ad hoc maintainer/research refreshes can still pass an explicit
 `--msa-row-filter <json>` to `scripts/setup_official_data.sh` or
@@ -179,9 +181,9 @@ feature roots are scanned together.
 MSA split audits live in `scripts/audit_msa_split.py`. The script reports
 processed feature availability, MSA-depth quantiles and binned Jensen-Shannon
 divergence, target chain/cluster overlap, exact processed MSA-row overlap,
-optional MMseqs target-to-train-MSA homology, and optional raw A3M hit-identifier
+optional MMseqs target-to-target and target-to-MSA homology, and optional raw A3M hit-identifier
 overlap. Its default JSON output avoids raw sequences and hidden identifiers;
-only use example/identifier flags for public or private sealed reports.
+depth CSVs also omit identifiers by default. Use identifier flags only when the output may contain those identities. `--strict` fails incomplete coverage, split overlap and exact held-out target leakage; `--run-mmseqs` adds separate thresholded searches against source targets and non-query MSA rows of at least 20 residues. Either kind of hit fails a strict audit. Missing or malformed MMseqs output is an error. Use `--val-features-dir` when held-out features have a separate root. Shared background MSA rows alone are descriptive overlap, not evidence of target leakage.
 
 If preprocessing is interrupted, rerun the same command with:
 
@@ -189,362 +191,33 @@ If preprocessing is interrupted, rerun the same command with:
 bash scripts/setup_official_data.sh ... --resume-preprocess
 ```
 
-Maintainers generate hidden validation against the fixed public manifests:
-
-```bash
-mkdir -p .nanofold_private/secrets
-python -c "import pathlib,secrets; pathlib.Path('.nanofold_private/secrets/hidden_split_salt.txt').write_text(secrets.token_urlsafe(48) + '\n')"
-chmod 600 .nanofold_private/secrets/hidden_split_salt.txt
-
-python scripts/build_hidden_manifest.py \
-  --hidden-split-salt-file .nanofold_private/secrets/hidden_split_salt.txt
-
-python scripts/verify_hidden_manifest.py
-```
-
-The hidden builder preserves `data/manifests/train.txt`, `data/manifests/val.txt`, and `data/manifests/all.txt`. Hidden features, labels, fingerprints, and locks are then built under `.nanofold_private/` with `scripts/prepare_data.py`, `scripts/preprocess.py`, `scripts/build_fingerprint.py`, and `scripts/pin_hidden_assets.py`.
-
-If hidden preprocessing finds chains that cannot produce valid atom14 labels, maintainers record those chain IDs only in `.nanofold_private/manifests/hidden_processability_exclusions.txt`. The hidden builder excludes those private failures from future hidden selection without changing public train or public validation.
+Resume requires the same raw inputs, preprocessing implementation and configuration. New outputs contain source-content and configuration hashes; a changed or missing provenance record requires a fresh output directory. Existing files are validated before they can be skipped.
 
 ## 3. How Dataset Splits Are Determined
 
-Official public splits are generated by `scripts/build_manifests.py`, usually through `scripts/regenerate_official_manifests.sh` or `scripts/full_official_data_refresh.sh`. Maintainer-only hidden validation for the committed public contract is generated by `scripts/build_hidden_manifest.py`.
+The committed train and public-validation manifests, fingerprints and source lock define the published benchmark. They have not been resampled. Changing structural annotations or preprocessing does not update that contract automatically. The regeneration wrapper refuses to overwrite it; the full-refresh wrapper can rebuild and audit its assets with `--skip-manifest-regen`. Rebuilt fingerprints and raw/hidden asset locks default to `.nanofold_private/asset_rebuild/leaderboard/`. Published and sealed reference paths, including symlink/hardlink aliases, cannot be used as candidate outputs.
 
-The split is designed to answer one scientific question:
+New candidate datasets use `--sampling-policy cath-v2` and metadata schema 2. `scripts/stage_dataset_candidate.py` builds metadata, generates both locks and independently verifies the candidate in a fresh private directory. Metadata must describe the complete eligible universe; debug sample limits and permissive nonstandard-amino-acid filters cannot enter release sampling. See [Dataset sampling](DATA_SAMPLING.md) for reproducible commands, the CATH schema, selection policy, release gates and scientific limitations.
 
-> When every participant has the same small, fixed experimental structure set, which models learn general protein geometry rather than memorizing families, exploiting retrieval, or overfitting a narrow structural distribution?
+`scripts/setup_custom_data.sh` consumes a staged public manifest directory and
+its source lock, with explicit custom raw/features/labels directories. It checks
+the locked public manifests before downloading and never regenerates them.
+This public-asset step does not replace hidden preparation or the strict audits.
 
-That goal makes the split policy part of the benchmark, not just bookkeeping. Protein structures are not independent examples in the same way as shuffled text lines. The PDB contains many near-duplicates, homologous families, same-entry chains, overrepresented folds, overrepresented experimental regimes, and distributional biases from what structural biology has historically found easiest or most important to solve. A random row split would make the public/hidden score easier, noisier, and less biologically meaningful.
+The generation path:
 
-### Split design goals
+1. Verifies the chain cache and downloaded annotation bytes against their source locks. Metadata and sampling filters must agree.
+2. Filters standard amino-acid chains by length, resolution and pinned asset exclusions. Targets are individual chains; biological monomer status is required only with `--require-monomer` and cannot be inferred from missing metadata.
+3. Retains every CATH domain's C.A.T.H hierarchy. Multi-domain chains retain their complete unique label sets. Missing annotations are an explicit stratum. Secondary fractions remain unknown unless supported by pinned structural annotations.
+4. Forms connected groups using assigned sequence clusters, identical sequences and PDB entries, then chooses one representative per group.
+5. Samples public validation and train first, independent of the private hidden salt. It samples hidden validation from the remaining groups. Hierarchical proportional allocation uses CATH architecture-label sets, then length, then resolution; seeded ties avoid systematic lexical preference.
+6. Reports annotation coverage and distribution shifts against the eligible group representatives, plus topology/superfamily familiarity relative to train. Public artifacts contain public split details; hidden split details remain private.
 
-The official split is built to satisfy five goals:
+The standard requested sizes are 10,000 train, 1,000 public validation and 1,000 hidden validation chains. Generation fails when the eligible independent pool cannot support those counts. Both public and private locks are required; hashes and counts bind train, validation and their public union separately. Hidden verification reconstructs complete chain/cluster/exact-sequence/PDB components, including unselected bridges, and enforces one representative per component. Private processability exclusions are bound to their locked bytes and canonical IDs and exclude every touching hidden component.
 
-1. Prevent train/eval homology leakage.
-2. Keep train, public validation, and hidden validation scientifically comparable.
-3. Avoid secondary-structure and fold-family skew.
-4. Ensure every chain can actually be downloaded and converted into official tensors.
-5. Make the public data contract reproducible without revealing hidden chain IDs.
+Assigned-cluster disjointness is not a global all-pairs sequence-identity guarantee. Residual target/MSA homology needs a separate search audit. Likewise, balanced CATH Architecture does not establish unseen-fold or unseen-superfamily generalization: those require separate held-out protocols. Source annotations are incomplete, and annotation presence does not establish residue-level domain coverage.
 
-Those goals pull in different directions. Strong leakage controls reduce candidate count. Stratification improves comparability but can overconstrain small candidate pools. Processability gates reduce broken examples but can bias toward easier structures. The official policy tries to be strict enough for a serious leaderboard while staying simple enough to audit.
-
-### Data used by the split builder
-
-The split builder uses metadata only. It does not inspect hidden labels to select high-scoring or low-scoring examples.
-
-| Data | File or source | Role in splitting | Scientific purpose |
-|---|---|---|---|
-| Chain sequence | `chain_data_cache.json` | Defines the chain sequence used for filtering and MMseqs2 clustering. | Lets the split block close sequence homologs across train/validation/hidden. |
-| Chain length | `chain_data_cache.json` | Filters to `40 <= L <= 256`; forms `length_bin`. | Keeps the benchmark inside the official crop regime and balances short/medium/long proteins. |
-| Resolution | `chain_data_cache.json` | Filters structures above `3.0A` when known; forms `resolution_bin`. | Reduces label noise and prevents one split from receiving systematically lower-quality coordinates. |
-| Oligomeric count | `chain_data_cache.json` | Filters to monomer chains. | Keeps official evaluation focused on single-chain folding rather than missing biological assembly context. |
-| Standard amino-acid content | `chain_data_cache.json` | Excludes chains with non-standard sequence tokens. | Keeps input/output semantics clean for the fixed amino-acid vocabulary. |
-| PDB ID | Chain ID prefix | Prevents chains from the same PDB entry crossing split boundaries. | Blocks same-experiment or same-complex leakage that sequence clustering alone may miss. |
-| OpenFold feature availability | `openfold_required_feature_exclusions.txt` plus download checks | Excludes chains without required official MSA assets. | Ensures every selected chain can produce the same feature schema for every participant. |
-| Label processability | `official_processability_exclusions.txt` plus preprocessing gates | Excludes chains that fail atom14 projection quality. | Ensures selected chains can produce reliable atom14 labels for scoring. |
-| Sequence clusters | MMseqs2 cluster TSV or live MMseqs2 run | Groups chains at `30%` identity and `80%` coverage. | Makes evaluation closer to generalization across protein families rather than interpolation among close homologs. |
-| CATH annotations | `cath-domain-list.txt` | Provides domain architecture and secondary-structure class signals. | Adds structural-class coverage so the benchmark is not dominated by the easiest or most common domain types. |
-| SCOPe annotations | `dir.cla.scope.txt` | Provides independent structural/evolutionary class signals. | Cross-checks CATH-style structural classes with a manually curated/evolution-oriented resource. |
-| ECOD annotations | `ecod.latest.domains.txt` | Provides evolutionary domain architecture signals. | Improves coverage of remote homology and broad domain categories. |
-| Optional RCSB REST metadata | `rcsb_chain_metadata.jsonl` when enabled | Adds extra audit metadata such as method/source organism. | Useful for future balancing and diagnostics, but not required for the official bulk split path. |
-| Hidden split salt | `NANOFOLD_HIDDEN_SPLIT_SALT` | Selects hidden validation deterministically but privately. | Lets maintainers reproduce the hidden split without publishing enough information to infer it. |
-
-### Why these sources are used
-
-OpenProteinSet/OpenFold provides the practical foundation. It packages AlphaFold-style MSA assets at scale, and OpenFold/OpenProteinSet exist specifically to make AlphaFold-like training data reproducible for the research community. nanoFold uses this instead of asking participants to run their own MSA pipelines because MSA generation is expensive, non-deterministic across database snapshots, and a major leakage surface if participants can retrieve extra information.
-
-RCSB mmCIF files provide the coordinate truth. mmCIF is used because it is the modern PDB archival format and can represent large structures, rich metadata, exact chain identifiers, and atom-level records more robustly than legacy PDB format. nanoFold turns those coordinates into atom14 labels so scoring can evaluate backbone and side-chain geometry, not only C-alpha traces.
-
-CATH, SCOPe, and ECOD provide structural context that sequence metadata alone cannot. Sequence clustering controls close homology, but it does not guarantee balanced structural coverage. A dataset can be sequence-disjoint and still be dominated by all-alpha proteins, beta sandwiches, small enzyme domains, or one region of fold space. The structural classification sources provide broad domain/secondary-structure signals that let the split allocator preserve a similar biological mix across train, public validation, and hidden validation.
-
-MMseqs2 provides the scalable sequence clustering step. The official policy uses a deliberately coarse `30%` sequence-identity threshold with `80%` coverage so that obvious family-level leakage is blocked without collapsing the entire structure universe into very broad remote-homology groups.
-
-The exclusion lists are included because a scientifically elegant split is useless if selected chains cannot be downloaded or scored. They make the split operationally reproducible: all selected chains must have official input features and reliable atom14 labels.
-
-### Candidate filtering
-
-A chain is eligible only if it passes the official gates:
-
-- sequence exists in `chain_data_cache.json`
-- length is between `40` and `256`
-- resolution is at most `3.0` Angstrom when known
-- chain is monomeric according to the cache metadata
-- sequence contains only the 20 standard amino acids
-- required OpenFold feature assets are available
-- atom14 label projection is processable under the official thresholds
-
-The feature and processability exclusion lists are public, pinned, and hashed through lock metadata.
-
-Each filter has a scientific or operational reason:
-
-- Length `40-256` keeps examples within the intended single-domain/small-chain regime and matches the official crop size. This makes sample-budget comparisons cleaner because one sample is not allowed to secretly mean a very different sequence-length problem.
-- Resolution `<=3.0A` reduces coordinate noise. Noisy labels can reward models that learn broad coarse structure while hiding atom-level errors, which is the opposite of why nanoFold uses atom14 scoring.
-- Monomer-only selection removes ambiguity about missing partners. A chain from an obligate multimer can have a PDB conformation stabilized by partner chains that are absent from the model input.
-- Standard amino-acid-only selection keeps the official vocabulary stable and avoids special-case chemistry in the first competition track.
-- Feature availability ensures no participant has a different input distribution because some chains silently lack MSA assets.
-- Label processability ensures that the official atom14 target corresponds to the MSA query sequence with enough identity, coverage, and resolved C-alpha atoms.
-
-### Structural metadata used for balancing
-
-The split builder requires a chain-level metadata file from `scripts/build_structure_metadata.py`. That metadata combines:
-
-- OpenFold chain metadata: chain ID, sequence, length, resolution
-- CATH domain classifications
-- SCOPe classifications
-- ECOD domain classifications
-- optional RCSB REST fields when that source is explicitly enabled
-- pinned missing-feature exclusions
-- pinned label-processability exclusions
-
-The metadata builder converts structural/domain annotations into broad balancing fields:
-
-- `secondary_structure_class`
-- `domain_architecture_class`
-- `length_bin`
-- `resolution_bin`
-
-Secondary-structure class is a deterministic broad class used for split balancing, not a model input and not a scoring label.
-
-The current metadata builder maps domain architecture to broad secondary-structure fractions/classes:
-
-- `alpha`
-- `beta`
-- `alpha_beta`
-- `coil_or_sparse`
-- `mixed_low_confidence`
-
-This is intentionally broad. nanoFold is not trying to make a benchmark of CATH-vs-SCOP-vs-ECOD taxonomy labels. It is using those taxonomies to avoid obvious structural composition errors. For example, if hidden validation accidentally had many more beta-rich structures than training, the leaderboard could punish models for distribution shift rather than reward better data-efficient learning. If training were much more alpha-rich than validation, a model with an alpha-helix-biased inductive prior could look strong during training but fail to learn the harder sheet topology patterns needed for general folding.
-
-The scientific purpose is to measure whether architectures learn transferable geometric rules across the main regimes of protein structure:
-
-- local helical packing
-- beta-strand pairing and sheet topology
-- mixed alpha/beta motifs
-- longer-range contacts across nonlocal sequence positions
-- domain-scale geometry under a fixed sample budget
-
-Balancing secondary structure, broad domain architecture, length, and resolution makes the hidden score a better estimate of general fixed-data learning and a less noisy measurement of quirks in one split.
-
-### Homology and grouping
-
-Splits are not sampled as independent rows. They are sampled as grouped biological units.
-
-The official grouping policy is:
-
-- build sequence clusters with MMseqs2 at `30%` sequence identity and `80%` coverage, or use a locked TSV generated with those same settings
-- choose one representative unit per disjoint group
-- prevent any sequence cluster from crossing train, public validation, and hidden validation
-- prevent different chains from the same PDB entry from crossing split boundaries
-
-This reduces leakage where a model could see a close homolog, duplicate, or same-structure sibling during training and be scored on it later.
-
-The PDB is full of biologically related entries: mutants, orthologs, paralogs, constructs, alternate crystal forms, ligand-bound variants, different chains in one biological assembly, and repeated domains. If those relatives cross splits, validation stops measuring whether a model has learned folding principles and starts measuring how well it interpolates from near-neighbor structures.
-
-The cluster/PDB grouping therefore serves two related purposes:
-
-- Sequence-cluster disjointness blocks close family leakage.
-- PDB-entry disjointness blocks same-experiment and same-complex leakage.
-
-The representative chosen for a disjoint unit is selected before splitting, so the allocator operates on one biological unit at a time. This also prevents large duplicate families from gaining extra influence simply because they have many deposited variants.
-
-### Stratified allocation
-
-The official split sizes are:
-
-- train: `10,000` chains
-- public validation: `1,000` chains
-- hidden validation: `1,000` chains
-
-The split allocator stratifies by:
-
-```text
-secondary_structure_class
-domain_architecture_class
-length_bin
-resolution_bin
-```
-
-It allocates each split proportionally across those strata, then checks split quality with Jensen-Shannon divergence gates and unknown-domain coverage gates. Split-comparability analysis uses the same fields to compare train, public validation, hidden validation, and the eligible source pool.
-
-The public allocator works in three stages:
-
-1. Build disjoint units from eligible chains after sequence clustering and PDB grouping.
-2. Select public validation with deterministic stratified sampling.
-3. Select train from the remaining public pool with deterministic stratified sampling.
-
-The hidden allocator uses the fixed public manifests as reference data:
-
-1. Build the same disjoint units from eligible chains after sequence clustering and PDB grouping.
-2. Remove every unit whose component contains any train or public-validation chain.
-3. Allocate hidden counts by stratum to match the public train+validation distribution.
-4. Select hidden validation from the remaining units with a deterministic salted hash.
-
-Within each split, target counts are allocated proportionally by stratum. A stratum is the tuple:
-
-```text
-(secondary_structure_class, domain_architecture_class, length_bin, resolution_bin)
-```
-
-The sampler is deterministic for a given seed, source metadata, cluster map, public manifests, and hidden salt. This matters because maintainers need to rebuild the same official hidden data, but public contributors should not be able to infer the hidden chain IDs from public files.
-
-The committed public lock records public generation metadata. Hidden chain IDs, the hidden split salt digest, hidden split quality details, hidden fingerprints, and private locks live only under `.nanofold_private/`.
-
-Maintainers verify the hidden split with `scripts/verify_hidden_manifest.py`. The verifier recomputes the MMseqs2 grouping, checks zero chain overlap, zero cluster overlap, and zero PDB-entry overlap against the public manifests, then recomputes the Jensen-Shannon quality report for the balancing fields above.
-
-The public `all.txt` manifest is the union of train and public validation only.
-
-### Targeted public distributions
-
-The split does not target hand-written ideal biological proportions. It targets proportional matching to the eligible, grouped, processable chain universe after all official filters have been applied. That matters because the target should reflect what can actually be downloaded, clustered, and scored under the official rules.
-
-For public documentation, the target below is the public train + public validation union recorded by `leaderboard/official_manifest_source.lock.json`. Hidden validation is shown only as aggregate bucket counts and quality scalars; hidden chain IDs, salts, fingerprints, labels, and private locks are not published.
-
-The allocator tries to equalize four metadata views:
-
-- `secondary_structure_class`: broad alpha, beta, mixed, sparse, or low-confidence secondary-structure regime
-- `domain_architecture_class`: broad structural/domain architecture after CATH, SCOPe, ECOD, and derived metadata normalization
-- `length_bin`: sequence-length regime within the official `40-256` residue range
-- `resolution_bin`: coordinate-quality regime, including an `unknown` bucket when resolution is unavailable
-
-#### Secondary-structure class
-
-| Bucket | Public target count (%) | Train count (%) | Public val count (%) | Hidden val count (%) |
-|---|---:|---:|---:|---:|
-| alpha | `3,090` (28.09%) | `2,815` (28.15%) | `275` (27.50%) | `282` (28.20%) |
-| alpha/beta | `4,380` (39.82%) | `3,983` (39.83%) | `397` (39.70%) | `399` (39.90%) |
-| beta | `2,291` (20.83%) | `2,083` (20.83%) | `208` (20.80%) | `210` (21.00%) |
-| coil/sparse | `153` (1.39%) | `137` (1.37%) | `16` (1.60%) | `12` (1.20%) |
-| mixed low-confidence | `1,086` (9.87%) | `982` (9.82%) | `104` (10.40%) | `97` (9.70%) |
-
-#### Domain-architecture class
-
-Most domain-architecture buckets correspond directly to broad CATH/SCOPe/ECOD-style classes. Rare source-specific residual labels are preserved as their own buckets so they can be balanced rather than silently folded into a larger class.
-
-| Bucket | Public target count (%) | Train count (%) | Public val count (%) | Hidden val count (%) |
-|---|---:|---:|---:|---:|
-| `6` source bucket | `220` (2.00%) | `196` (1.96%) | `24` (2.40%) | `18` (1.80%) |
-| alpha | `3,090` (28.09%) | `2,815` (28.15%) | `275` (27.50%) | `282` (28.20%) |
-| alpha/beta | `4,380` (39.82%) | `3,983` (39.83%) | `397` (39.70%) | `399` (39.90%) |
-| beta | `2,291` (20.83%) | `2,083` (20.83%) | `208` (20.80%) | `210` (21.00%) |
-| coil/sparse | `153` (1.39%) | `137` (1.37%) | `16` (1.60%) | `12` (1.20%) |
-| mixed low-confidence | `856` (7.78%) | `776` (7.76%) | `80` (8.00%) | `79` (7.90%) |
-| other | `10` (0.09%) | `10` (0.10%) | `0` (0.00%) | `0` (0.00%) |
-
-#### Length bin
-
-| Bucket | Public target count (%) | Train count (%) | Public val count (%) | Hidden val count (%) |
-|---|---:|---:|---:|---:|
-| 40-63 aa | `746` (6.78%) | `676` (6.76%) | `70` (7.00%) | `70` (7.00%) |
-| 64-95 aa | `1,708` (15.53%) | `1,548` (15.48%) | `160` (16.00%) | `157` (15.70%) |
-| 96-127 aa | `2,226` (20.24%) | `2,027` (20.27%) | `199` (19.90%) | `201` (20.10%) |
-| 128-191 aa | `3,611` (32.83%) | `3,285` (32.85%) | `326` (32.60%) | `326` (32.60%) |
-| 192-256 aa | `2,709` (24.63%) | `2,464` (24.64%) | `245` (24.50%) | `246` (24.60%) |
-
-#### Resolution bin
-
-| Bucket | Public target count (%) | Train count (%) | Public val count (%) | Hidden val count (%) |
-|---|---:|---:|---:|---:|
-| <=1.5 A | `2,082` (18.93%) | `1,892` (18.92%) | `190` (19.00%) | `190` (19.00%) |
-| 1.5-2.0 A | `3,760` (34.18%) | `3,419` (34.19%) | `341` (34.10%) | `345` (34.50%) |
-| 2.0-2.5 A | `2,056` (18.69%) | `1,869` (18.69%) | `187` (18.70%) | `186` (18.60%) |
-| 2.5-3.0 A | `863` (7.85%) | `783` (7.83%) | `80` (8.00%) | `76` (7.60%) |
-| unknown | `2,239` (20.35%) | `2,037` (20.37%) | `202` (20.20%) | `203` (20.30%) |
-
-The resulting train, public validation, and hidden validation distributions are very close to the target. Jensen-Shannon divergence is the enforced split-quality metric used for each balancing field:
-
-| Field | Train JS divergence | Public val JS divergence | Hidden val JS divergence |
-|---|---:|---:|---:|
-| `secondary_structure_class` | `6.7834414e-07` | `0.00016998018` | `5.0607920e-05` |
-| `domain_architecture_class` | `6.1796866e-06` | `0.00070301452` | `0.00049740386` |
-| `length_bin` | `1.1833676e-07` | `6.0099717e-05` | `1.7185505e-05` |
-| `resolution_bin` | `8.0612644e-08` | `1.1483855e-05` | `1.7619565e-05` |
-
-The official quality gate is `max_split_js_divergence <= 0.35`; the largest value shown is `0.00070301452`. The unknown-domain-architecture fraction is `0.0`, below the `0.75` gate.
-
-The split-comparability run also reports two descriptive distance metrics for each split and each balancing field:
-
-- `total_variation_distance`: half the sum of absolute bin-frequency differences between a split and the selected reference distribution. This gives one aggregate distribution-shift value per metadata field.
-- `max_bin_deviation`: the largest absolute bin-frequency difference between a split and the selected reference distribution. This highlights the single bucket with the strongest skew, even when aggregate shift is small.
-
-The source-pool comparison is unit-weighted after MMseqs2 sequence clustering and PDB-entry grouping, because those `13,037` disjoint units are what the splitter samples. Raw chain-pool diagnostics were also computed, but raw PDB chain rows overweight duplicate families and are not the headline balance target. Max bin deviation is reported as a fraction of the split; for example, `0.0068133006` means `0.68133006` percentage points.
-
-| Split vs eligible disjoint-unit source pool | Field | JS divergence | Total variation distance | Max bin deviation |
-|---|---|---:|---:|---:|
-| Train | `secondary_structure_class` | `1.1124689e-06` | `0.00067809312` | `0.00047813147` |
-| Train | `domain_architecture_class` | `1.1964903e-05` | `0.00067809312` | `0.00033695636` |
-| Train | `length_bin` | `1.6082197e-07` | `0.00042614098` | `0.00035702232` |
-| Train | `resolution_bin` | `1.2029919e-07` | `0.00039483010` | `0.00033368873` |
-| Public val | `secondary_structure_class` | `0.00017820814` | `0.0087780931` | `0.0068133006` |
-| Public val | `domain_architecture_class` | `0.00067542980` | `0.0095451408` | `0.0068133006` |
-| Public val | `length_bin` | `6.0198881e-05` | `0.0074027767` | `0.0049796732` |
-| Public val | `resolution_bin` | `1.0596222e-05` | `0.0024537854` | `0.0018045563` |
-| Hidden val | `secondary_structure_class` | `3.4636641e-05` | `0.0022219069` | `0.0015000384` |
-| Hidden val | `domain_architecture_class` | `0.00044374653` | `0.0037500959` | `0.0015281890` |
-| Hidden val | `length_bin` | `2.5168859e-05` | `0.0044027767` | `0.0024231035` |
-| Hidden val | `resolution_bin` | `2.0079247e-05` | `0.0041263327` | `0.0034336887` |
-
-The same run checks pairwise split comparability. The table below reports the worst field for each pair:
-
-| Pairwise comparison | Max JS divergence | Max total variation distance | Max bin deviation |
-|---|---:|---:|---:|
-| Train vs public val | `0.00076614113` | `0.0091` | `0.0065` |
-| Train vs hidden val | `0.00057253960` | `0.0046` | `0.0031` |
-| Public val vs hidden val | `0.00055627728` | `0.0110` | `0.0070` |
-
-Only aggregate hidden bucket counts and comparability scalars are shown here. Hidden chain IDs, salts, fingerprints, labels, and private locks remain sealed.
-
-### Split quality checks
-
-The split builder records and checks:
-
-- candidate counts
-- disjoint unit counts
-- reject-reason counts
-- clustering method and command
-- cluster-assignment hash
-- grouping policy
-- stratification fields
-- per-split structural distributions
-- Jensen-Shannon divergence between each split and the selected overall distribution
-- unknown-domain-architecture fraction
-- train/val/hidden chain counts and manifest hashes
-
-The comparability diagnostics include total variation distance and max bin deviation, but the enforced public gate remains Jensen-Shannon divergence unless a future official lock promotes those diagnostics to gates.
-
-The public lock is sanitized so it contains the public contract and public split metadata. The private hidden locks contain hidden manifest hashes, hidden distribution details, and hidden fingerprint hashes.
-
-### Why hidden and public validation both exist
-
-Public validation is for debugging. Participants need a visible split to check that their model trains, predicts, and produces sane geometry under the official API.
-
-Hidden validation is for ranking. It exists because repeated iteration on public validation can become leaderboard overfitting even when participants act in good faith. Hidden scoring keeps the public validation set from becoming the real training target.
-
-The hidden split is not intended to be adversarial. It is intended to be compositionally comparable to train and public validation while remaining sealed.
-
-### What the split is not trying to measure
-
-The official tracks intentionally do not measure:
-
-- template lookup ability
-- external MSA/database retrieval skill
-- pretrained protein language model knowledge
-- multimer assembly inference
-- ligand/cofactor-dependent folding
-- very long protein domain packing
-- non-standard amino-acid chemistry
-
-Those are important scientific problems, but mixing them into the first track would make it harder to interpret the core result: data-efficient learning of single-chain atom14 geometry from a fixed, scarce supervised structure set.
-
-### References for split methodology
-
-The split policy follows the same broad lessons that show up repeatedly in protein-structure prediction literature: control sequence redundancy, control template/homology leakage, preserve structural diversity, and treat PDB-derived data as clustered biological observations rather than IID rows.
-
-- [OpenProteinSet](https://pmc.ncbi.nlm.nih.gov/articles/PMC10441447/) motivates using a public precomputed MSA/structure corpus because MSA generation is expensive and central to structure learning.
-- [OpenFold](https://www.nature.com/articles/s41592-024-02272-z) motivates fixed-data retraining as a way to study learning behavior, generalization, and the effect of training-set composition.
-- [AlphaFold](https://www.nature.com/articles/s41586-021-03819-2) illustrates the importance of sequence clustering, recent-PDB evaluation, template controls, MSA features, and structural generalization in protein folding benchmarks.
-- [MMseqs2](https://www.nature.com/articles/nbt.3988) provides the scalable sequence clustering/search machinery used for homology grouping.
-- [CATH-Gene3D](https://pmc.ncbi.nlm.nih.gov/articles/PMC5210570/), [SCOPe](https://pmc.ncbi.nlm.nih.gov/articles/PMC6323910/), and [ECOD](https://journals.plos.org/ploscompbiol/article?id=10.1371/journal.pcbi.1003926) motivate using structural/evolutionary domain classifications as broad coverage signals.
-- [PDBx/mmCIF](https://pmc.ncbi.nlm.nih.gov/articles/PMC10292674/) motivates mmCIF as the structural biology data standard for atom-level coordinate extraction.
+The published source lock's broad-class distributions describe its frozen selection. They must not be interpreted as measurements of full CATH Architecture balance or measured secondary-structure fractions. New CATH reports apply only to newly generated candidates until a dataset release is independently audited and adopted.
 
 ## 4. How Input Data Is Prepped
 
@@ -562,10 +235,10 @@ For each chain ID, preprocessing:
 7. Loads the matching mmCIF file.
 8. Extracts chain atom coordinates into the canonical atom14 layout.
 9. Aligns the mmCIF structure sequence to the MSA query sequence.
-10. Projects atom14 coordinates onto query positions.
-11. Rejects chains that fail projection quality thresholds.
-12. Writes one feature NPZ and one label NPZ per chain.
-13. Writes `preprocess_meta.json` into the feature directory.
+10. Projects atom14 coordinates onto query positions, masking every label at a sequence mismatch.
+11. Rejects chains that fail projection quality thresholds, including the valid-CA minimum in strict alignment mode.
+12. Validates and writes one feature NPZ and one label NPZ per chain, with matching configuration and source-content hashes.
+13. Records schema-3 run provenance in `preprocess_meta.json`. This run metadata is required for fingerprinting provenance-bearing pairs; removing or downgrading it is an error. Resume verifies raw inputs and existing files before skipping work. Chain resolution prefers author IDs, then explicit polymer label IDs, then a unique sequence match; ambiguous matches fail. Alternate atom locations are selected by occupancy; invalid nonfinite coordinates fail.
 
 The MSA row filter is meant to sanitize evolutionary input features against
 held-out target homologs. The recommended split-aligned threshold is `30%`
@@ -642,6 +315,8 @@ Feature NPZ keys:
 | `template_ca_mask` | `(T, L)` | `bool` | Template coordinate mask. Official track uses `T=0`. |
 | `projection_*` | scalar | numeric | Projection diagnostics used for audit/debugging. |
 | `msa_row_filter_*` | scalar | mixed | Present only when `--msa-row-filter` is used; records the filter hash and row-removal counts. |
+| `preprocess_config_sha256`, `source_inputs_sha256` | scalar | string | Schema-3 provenance shared with the label NPZ; used for resume and fingerprint validation, not passed to models. |
+| `resolved_author_chain_id`, `chain_mapping_method` | scalar | string | Resolved coordinate chain and mapping evidence (`author_id`, `label_id`, or unique `sequence` match), shared with labels. |
 
 Label NPZ keys:
 
@@ -653,6 +328,8 @@ Label NPZ keys:
 | `atom14_mask` | `(L, 14)` | `bool` | True where the atom exists and was present in mmCIF. |
 | `residue_index` | `(L,)` | `int32` | Contiguous `0..L-1` positions. |
 | `resolution` | scalar | `float32` | Structure resolution, or `0.0` when unknown. |
+
+Integrity checks enforce amino-acid token ranges, nonnegative deletion counts, query/MSA consistency, finite coordinates, CA/atom14 consistency, and feature/label length, index, identity and provenance agreement. Schema-3 files must contain a scalar `chain_id` matching the requested manifest chain; a matching pair under the wrong filename is rejected. An interrupted pair replacement is detected on validation; the two files are not a single filesystem transaction.
 
 The data loader then:
 

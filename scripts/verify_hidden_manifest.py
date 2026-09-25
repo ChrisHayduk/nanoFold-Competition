@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -12,19 +13,26 @@ if str(SCRIPT_DIR) not in sys.path:
 
 from build_hidden_manifest import (  # noqa: E402
     _assert_public_manifests,
+    _componentize,
     _load_lock_args,
     _read_manifest,
+    _read_optional_chain_list,
+    _validate_source_lock,
     _with_cluster_ids,
 )
 from build_manifests import (  # noqa: E402
     DEFAULT_STRATIFY_FIELDS,
+    LEGACY_STRATIFY_FIELDS,
+    SAMPLING_POLICY,
     _assert_quality_report,
     _build_candidates,
     _build_quality_report,
+    _cluster_assignments_sha256,
     _cluster_sequences_mmseqs,
     _load_cluster_tsv,
     _load_structure_metadata,
     _sha256,
+    _validate_metadata_identity,
 )
 
 
@@ -53,17 +61,66 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--structure-metadata", type=Path, default=None)
     parser.add_argument("--cluster-tsv", type=Path, default=None)
     parser.add_argument("--mmseqs-bin", type=str, default=None)
+    parser.add_argument(
+        "--private-processability-exclusion-list", type=Path, default=None,
+        help="Relocated private exclusion input; its bytes and canonical IDs must match the private lock.",
+    )
     parser.add_argument("--json-out", type=Path, default=None)
     return parser.parse_args()
 
 
-def _load_private_lock(path: Path) -> dict[str, Any] | None:
+def _load_private_lock(path: Path) -> dict[str, Any]:
     if not path.exists():
-        return None
+        raise FileNotFoundError("A private hidden manifest source lock is required for verification.")
     raw = json.loads(path.read_text())
     if not isinstance(raw, dict):
         raise ValueError(f"Private hidden manifest lock must be a JSON object: {path}")
     return raw
+
+
+def _validate_private_lock(
+    private_lock: dict[str, Any], *, args: argparse.Namespace, sampling_policy: str,
+    cache_sha: str, structure_metadata_path: Path, cluster_map: dict[str, str], hidden_count: int,
+) -> str:
+    """Bind the private selection to the same inputs and public release being audited."""
+    required = sampling_policy == SAMPLING_POLICY
+
+    def check(container: dict[str, Any], key: str, actual: object, *, mandatory: bool = True) -> None:
+        if (mandatory or key in container) and container.get(key) != actual:
+            raise ValueError(f"Private hidden manifest lock {key} is missing or does not match.")
+
+    check(private_lock, "hidden_val_manifest_sha256", _sha256(args.hidden_manifest))
+    check(private_lock, "hidden_val_count", hidden_count)
+    check(private_lock, "chain_data_cache_sha256", cache_sha)
+    check(private_lock, "sampling_policy", sampling_policy, mandatory=required)
+    check(private_lock, "source_lock_sha256", _sha256(args.lock_file), mandatory=required)
+    contract = private_lock.get("public_contract", {})
+    if not isinstance(contract, dict):
+        raise ValueError("Private hidden manifest lock public_contract must be an object.")
+    for name, path in (("train", args.public_train_manifest), ("val", args.public_val_manifest),
+                       ("all", args.public_all_manifest)):
+        check(contract, f"{name}_manifest_sha256", _sha256(path), mandatory=required)
+        check(contract, f"{name}_count", len(_read_manifest(path)), mandatory=required)
+    for section, key, actual in (
+        ("structure_metadata", "sha256", _sha256(structure_metadata_path)),
+        ("clustering", "cluster_assignments_sha256", _cluster_assignments_sha256(cluster_map)),
+    ):
+        record = private_lock.get(section, {})
+        if not isinstance(record, dict):
+            raise ValueError(f"Private hidden manifest lock {section} must be an object.")
+        check(record, key, actual, mandatory=required)
+    stratification = private_lock.get("stratification", {})
+    if not isinstance(stratification, dict):
+        raise ValueError("Private hidden manifest lock stratification must be an object.")
+    reference = stratification.get("reference", "selected_chains" if not required else None)
+    permitted = {"eligible_disjoint_units", "public_train_plus_public_val"} if required else {
+        "selected_chains", "public_train_plus_public_val",
+    }
+    if reference not in permitted:
+        raise ValueError("Private hidden manifest lock has an unsupported stratification reference.")
+    # Frozen hidden-only locks describe their allocation reference, but their
+    # quality gate was evaluated against pooled selected chains.
+    return str(reference) if required else "selected_chains"
 
 
 def _fail_if_nonempty(label: str, values: set[str]) -> None:
@@ -71,8 +128,39 @@ def _fail_if_nonempty(label: str, values: set[str]) -> None:
         raise RuntimeError(f"{label} overlap is non-zero: {len(values)}")
 
 
+def _validate_private_exclusions(
+    private_lock: dict[str, Any], *, override_path: Path | None, required: bool,
+) -> set[str]:
+    filtering = private_lock.get("filtering", {})
+    if not isinstance(filtering, dict):
+        raise ValueError("Private hidden manifest lock filtering must be an object.")
+    record = filtering.get("private_processability_exclusions")
+    if record is None and not required and override_path is None:
+        return set()
+    if not isinstance(record, dict):
+        raise ValueError("Private hidden manifest lock private exclusions are missing or invalid.")
+    recorded_path = record.get("path")
+    if not isinstance(recorded_path, str) or not recorded_path:
+        raise ValueError("Private hidden manifest lock private exclusion path is missing or invalid.")
+    path = override_path if override_path is not None else Path(recorded_path)
+    if path.exists() and not path.is_file():
+        raise ValueError("Private processability exclusions must be a file.")
+    actual_sha = _sha256(path) if path.is_file() else None
+    if "sha256" not in record or record["sha256"] != actual_sha:
+        raise ValueError("Private processability exclusion SHA256 is missing or does not match.")
+    exclusions = set(_read_optional_chain_list(path))
+    canonical_sha = hashlib.sha256("".join(f"{chain}\n" for chain in sorted(exclusions)).encode()).hexdigest()
+    if record.get("canonical_ids_sha256") != canonical_sha:
+        raise ValueError("Private processability exclusion canonical IDs SHA256 does not match.")
+    if filtering.get("private_processability_exclusion_count") != len(exclusions):
+        raise ValueError("Private processability exclusion count does not match.")
+    return exclusions
+
+
 def verify(args: argparse.Namespace) -> dict[str, Any]:
     lock_args = _load_lock_args(args.lock_file)
+    if lock_args.sampling_policy not in {SAMPLING_POLICY, "legacy-v1"}:
+        raise ValueError("Unsupported sampling policy in source lock.")
     structure_metadata_path = args.structure_metadata or Path(lock_args.structure_metadata)
     cluster_tsv = str(args.cluster_tsv if args.cluster_tsv is not None else lock_args.cluster_tsv)
     mmseqs_bin = str(args.mmseqs_bin if args.mmseqs_bin is not None else lock_args.mmseqs_bin)
@@ -90,7 +178,7 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
 
     cache_sha = _sha256(args.chain_data_cache)
     expected_sha = lock_args.expected_chain_cache_sha256.strip().lower()
-    if expected_sha and cache_sha != expected_sha:
+    if not expected_sha or cache_sha != expected_sha:
         raise ValueError(
             "chain_data_cache SHA256 mismatch.\n"
             f"expected: {expected_sha}\n"
@@ -102,7 +190,11 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise ValueError(f"chain_data_cache.json must be a JSON object: {args.chain_data_cache}")
 
-    structure_metadata_accepted, structure_metadata = _load_structure_metadata(structure_metadata_path)
+    structure_metadata_accepted, structure_metadata = _load_structure_metadata(
+        structure_metadata_path, require_schema_version=2 if lock_args.sampling_policy == SAMPLING_POLICY else None,
+    )
+    if lock_args.sampling_policy == SAMPLING_POLICY:
+        _validate_metadata_identity(structure_metadata_path, cache_sha256=cache_sha, args=argparse.Namespace(**vars(lock_args)))
     candidates, _reject_reasons, _structural_metadata_source = _build_candidates(
         data,
         min_len=lock_args.min_len,
@@ -110,12 +202,14 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
         max_resolution=lock_args.max_resolution,
         structure_metadata=structure_metadata,
         structure_metadata_accepted=structure_metadata_accepted,
+        sampling_policy=lock_args.sampling_policy,
+        require_monomer=lock_args.require_monomer,
     )
     candidate_ids = {candidate.chain_id for candidate in candidates}
     required_ids = set(all_ids) | set(hidden_ids)
     missing = sorted(required_ids - candidate_ids)
     if missing:
-        raise ValueError(f"{len(missing)} manifest chains are not eligible candidates. Examples: {missing[:8]}")
+        raise ValueError(f"{len(missing)} manifest chains are not eligible candidates.")
 
     candidate_sequences = {candidate.chain_id: candidate.sequence for candidate in candidates}
     if cluster_tsv:
@@ -128,6 +222,7 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
             mmseqs_bin=mmseqs_bin,
             min_seq_id=lock_args.min_seq_id,
             coverage=lock_args.coverage,
+            alignment_mode=3 if lock_args.sampling_policy == SAMPLING_POLICY else None,
         )
         if cluster_map_or_none is None:
             raise RuntimeError(
@@ -136,6 +231,12 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
                 f"{lock_args.min_seq_id} and coverage {lock_args.coverage}."
             )
         cluster_map = cluster_map_or_none
+
+    _validate_source_lock(
+        args.lock_file, train_path=args.public_train_manifest, val_path=args.public_val_manifest,
+        all_path=args.public_all_manifest, structure_metadata_path=structure_metadata_path, cluster_map=cluster_map,
+        cluster_tsv_path=Path(cluster_tsv) if cluster_tsv else None,
+    )
 
     clustered_candidates = _with_cluster_ids(candidates, cluster_map)
     candidate_by_id = {candidate.chain_id: candidate for candidate in clustered_candidates}
@@ -154,35 +255,65 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
     _fail_if_nonempty("Public/hidden MMseqs2 cluster", cluster_overlap)
     _fail_if_nonempty("Public/hidden PDB entry", pdb_overlap)
 
+    splits = {"train": train_ids, "val": val_ids, "hidden_val": hidden_ids}
+    for left, right in (("train", "val"), ("train", "hidden_val"), ("val", "hidden_val")):
+        for label, attribute in (("MMseqs2 cluster", "cluster_id"), ("PDB entry", "pdb_id"),
+                                 ("exact sequence", "sequence")):
+            left_values = {getattr(candidate_by_id[chain_id], attribute) for chain_id in splits[left]}
+            right_values = {getattr(candidate_by_id[chain_id], attribute) for chain_id in splits[right]}
+            _fail_if_nonempty(f"{left}/{right} {label}", left_values & right_values)
+
+    private_lock = _load_private_lock(args.private_lock_file)
+    reference_population = _validate_private_lock(
+        private_lock, args=args, sampling_policy=lock_args.sampling_policy, cache_sha=cache_sha,
+        structure_metadata_path=structure_metadata_path, cluster_map=cluster_map, hidden_count=len(hidden_ids),
+    )
+    private_exclusions = _validate_private_exclusions(
+        private_lock, override_path=getattr(args, "private_processability_exclusion_list", None),
+        required=lock_args.sampling_policy == SAMPLING_POLICY and reference_population == "public_train_plus_public_val",
+    )
+    _fail_if_nonempty("Public/private processability exclusion", public_ids & private_exclusions)
+    components = _componentize(clustered_candidates, cluster_map, seed=lock_args.seed)
+    split_by_id = {chain_id: name for name, ids in splits.items() for chain_id in ids}
+    shared_components = 0
+    repeated_units = 0
+    excluded_hidden_components = 0
+    for component in components:
+        member_ids = {member.chain_id for member in component.members}
+        selected_ids = member_ids & split_by_id.keys()
+        shared_components += len({split_by_id[chain_id] for chain_id in selected_ids}) > 1
+        repeated_units += len(selected_ids) > 1
+        excluded_hidden_components += bool(member_ids & hidden_set) and bool(member_ids & private_exclusions)
+    if shared_components:
+        raise RuntimeError(f"Selected splits share {shared_components} transitive cluster/PDB/exact-sequence components.")
+    if lock_args.sampling_policy == SAMPLING_POLICY and repeated_units:
+        raise RuntimeError(f"Selected manifests contain multiple representatives of {repeated_units} connected components.")
+    if excluded_hidden_components:
+        raise RuntimeError(f"Hidden split touches {excluded_hidden_components} privately excluded connected components.")
+    reference_candidates = None
+    if reference_population == "eligible_disjoint_units":
+        reference_candidates = [component.representative for component in components]
+    elif reference_population == "public_train_plus_public_val":
+        reference_candidates = [candidate_by_id[chain_id] for chain_id in train_ids + val_ids]
+    stratify_fields = DEFAULT_STRATIFY_FIELDS if lock_args.sampling_policy == SAMPLING_POLICY else LEGACY_STRATIFY_FIELDS
+
     selected_candidates = {
         chain_id: candidate_by_id[chain_id]
         for chain_id in train_ids + val_ids + hidden_ids
     }
     quality_report = _build_quality_report(
         selected_candidates=selected_candidates,
-        split_ids={"train": train_ids, "val": val_ids, "hidden_val": hidden_ids},
-        stratify_fields=DEFAULT_STRATIFY_FIELDS,
+        split_ids=splits,
+        stratify_fields=stratify_fields,
+        reference_candidates=reference_candidates,
     )
     _assert_quality_report(quality_report)
-
-    private_lock = _load_private_lock(args.private_lock_file)
-    if private_lock is not None:
-        expected_hidden_sha = str(private_lock.get("hidden_val_manifest_sha256") or "")
-        if expected_hidden_sha and expected_hidden_sha != _sha256(args.hidden_manifest):
-            raise ValueError("Private hidden manifest lock hash does not match hidden manifest.")
-        expected_count = int(private_lock.get("hidden_val_count", len(hidden_ids)))
-        if expected_count != len(hidden_ids):
-            raise ValueError("Private hidden manifest lock count does not match hidden manifest.")
-        public_contract = private_lock.get("public_contract", {})
-        if isinstance(public_contract, dict):
-            expected_all_sha = str(public_contract.get("all_manifest_sha256") or "")
-            if expected_all_sha and expected_all_sha != _sha256(args.public_all_manifest):
-                raise ValueError("Private hidden manifest lock public all.txt hash does not match.")
 
     js = quality_report["jensen_shannon_divergence"]
     max_js = float(quality_report["observed"]["max_split_js_divergence"])
     return {
         "status": "ok",
+        "sampling_policy": lock_args.sampling_policy,
         "counts": {
             "train": len(train_ids),
             "val": len(val_ids),
@@ -192,13 +323,17 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
             "chains": 0,
             "mmseqs2_clusters": 0,
             "pdb_entries": 0,
+            "exact_sequences": 0,
+            "connected_components": 0,
+            "private_exclusion_components": 0,
         },
         "clustering": {
             "method": cluster_method,
             "cluster_count": len(set(cluster_map.values())),
         },
         "stratification": {
-            "fields": list(DEFAULT_STRATIFY_FIELDS),
+            "fields": list(stratify_fields),
+            "reference_population": reference_population,
             "max_split_js_divergence": max_js,
             "jensen_shannon_divergence": js,
         },

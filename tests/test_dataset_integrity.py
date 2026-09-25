@@ -427,3 +427,94 @@ def test_preprocess_meta_hash_captures_msa_row_filter_sha256(tmp_path: Path) -> 
         require_labels=True,
     )
     assert fp_a["preprocess_config_sha256"] != fp_b["preprocess_config_sha256"]
+
+
+def _replace_npz_array(path: Path, key: str, value: np.ndarray) -> None:
+    with np.load(path) as data:
+        arrays = dict(data)
+    arrays[key] = value
+    np.savez_compressed(path, **arrays)
+
+
+@pytest.mark.parametrize(
+    "key,value,error",
+    [
+        ("aatype", np.full(6, 21, dtype=np.int32), "tokens"),
+        ("msa", np.full((4, 6), 22, dtype=np.int32), "tokens"),
+        ("deletions", np.full((4, 6), -1, dtype=np.int32), "nonnegative"),
+        ("template_aatype", np.full((1, 6), 21, dtype=np.int32), "tokens"),
+        ("template_ca_coords", np.full((1, 6, 3), np.nan, dtype=np.float32), "finite"),
+        ("msa", np.zeros((0, 6), dtype=np.int32), "query row"),
+        ("msa", np.ones((4, 6), dtype=np.int32), "query row"),
+        ("template_aatype", np.asarray(0, dtype=np.int32), "shape"),
+    ],
+)
+def test_feature_validation_rejects_invalid_model_inputs(
+    tmp_path: Path, key: str, value: np.ndarray, error: str,
+) -> None:
+    path = tmp_path / "features.npz"
+    _write_feature_npz(path)
+    _replace_npz_array(path, key, value)
+    assert any(error in message for message in validate_npz_schema(path))
+
+
+@pytest.mark.parametrize(
+    "key,value,error",
+    [
+        ("ca_coords", np.full((6, 3), np.inf, dtype=np.float32), "finite"),
+        ("atom14_positions", np.full((6, 14, 3), np.nan, dtype=np.float32), "finite"),
+        ("resolution", np.asarray(np.nan, dtype=np.float32), "finite"),
+        ("resolution", np.asarray(-1, dtype=np.float32), "nonnegative"),
+        ("ca_coords", np.ones((6, 3), dtype=np.float32), "CA slot"),
+        ("ca_mask", np.zeros(6, dtype=bool), "CA slot"),
+    ],
+)
+def test_label_validation_rejects_nonfinite_or_inconsistent_supervision(
+    tmp_path: Path, key: str, value: np.ndarray, error: str,
+) -> None:
+    path = tmp_path / "labels.npz"
+    _write_label_npz(path)
+    _replace_npz_array(path, key, value)
+    assert any(error in message for message in validate_label_npz_schema(path))
+
+
+def test_fingerprint_rejects_feature_label_identity_mismatch(tmp_path: Path) -> None:
+    features = tmp_path / "features"
+    labels = tmp_path / "labels"
+    features.mkdir()
+    labels.mkdir()
+    manifest = tmp_path / "train.txt"
+    manifest.write_text("1abc_A\n")
+    feature_path = chain_npz_path(features, "1abc_A")
+    label_path = chain_npz_path(labels, "1abc_A")
+    _write_feature_npz(feature_path)
+    _write_label_npz(label_path)
+    _replace_npz_array(feature_path, "chain_id", np.asarray("1abc_A"))
+    _replace_npz_array(label_path, "chain_id", np.asarray("2xyz_A"))
+    with pytest.raises(ValueError, match="chain_id.*must match"):
+        build_split_fingerprint(
+            processed_features_dir=features,
+            processed_labels_dir=labels,
+            manifest_paths={"train": manifest},
+            require_no_missing=True,
+            require_labels=True,
+        )
+
+
+@pytest.mark.parametrize("schema_version", [1, 2])
+def test_frozen_schema_optional_chain_ids_are_checked_when_present(tmp_path: Path, schema_version: int) -> None:
+    features = tmp_path / "features"
+    features.mkdir()
+    manifest = tmp_path / "train.txt"
+    manifest.write_text("1abc_A\n")
+    path = chain_npz_path(features, "1abc_A")
+    _write_feature_npz(path)
+    (features / PREPROCESS_META_FILENAME).write_text(json.dumps({"schema_version": schema_version}))
+    args = {
+        "processed_features_dir": features, "manifest_paths": {"train": manifest},
+        "require_no_missing": True, "require_labels": False,
+    }
+    build_split_fingerprint(**args)
+    _replace_npz_array(path, "chain_id", np.asarray("1abc_B"))
+    with pytest.raises(ValueError, match="chain_id.*requested chain 1abc_A"):
+        build_split_fingerprint(**args)

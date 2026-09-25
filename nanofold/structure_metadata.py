@@ -5,7 +5,7 @@ from typing import Any
 import gemmi
 import numpy as np
 
-STRUCTURE_METADATA_SCHEMA_VERSION = 1
+STRUCTURE_METADATA_SCHEMA_VERSION = 2
 
 
 def dihedral_degrees(a: Any, b: Any, c: Any, d: Any) -> float | None:
@@ -13,6 +13,8 @@ def dihedral_degrees(a: Any, b: Any, c: Any, d: Any) -> float | None:
     p1 = np.asarray(b, dtype=np.float64)
     p2 = np.asarray(c, dtype=np.float64)
     p3 = np.asarray(d, dtype=np.float64)
+    if any(point.shape != (3,) or not np.isfinite(point).all() for point in (p0, p1, p2, p3)):
+        return None
     b0 = -(p1 - p0)
     b1 = p2 - p1
     b2 = p3 - p2
@@ -38,6 +40,9 @@ def secondary_class_from_fractions(
         return "unknown"
     helix = float(helix_fraction)
     beta = float(beta_fraction)
+    fractions = [helix, beta] + ([] if coil_fraction is None else [float(coil_fraction)])
+    if any(not np.isfinite(value) or not 0 <= value <= 1 for value in fractions) or sum(fractions) > 1.000001:
+        return "unknown"
     if helix >= 0.40 and beta < 0.20:
         return "alpha"
     if beta >= 0.30 and helix < 0.20:
@@ -134,15 +139,6 @@ def domain_architecture_from_scop_sccs(value: object) -> str:
     return "other"
 
 
-def _range_len(start: object, end: object) -> int:
-    try:
-        start_i = int(str(start).strip())
-        end_i = int(str(end).strip())
-    except (TypeError, ValueError):
-        return 0
-    return max(0, end_i - start_i + 1)
-
-
 def _row_value(row: Any, *keys: str) -> str:
     for key in keys:
         try:
@@ -164,7 +160,8 @@ def secondary_fractions_from_mmcif_annotations(
 
     This supports DSSP-annotated mmCIF files and depositor/MAXIT annotations.
     It intentionally collapses detailed states into helix, beta, and coil
-    buckets for split stratification.
+    buckets for split stratification. Complete first-model CA coverage is
+    required so unresolved residues are never counted as coil.
     """
     if length <= 0:
         return "unknown", None, None, None, None
@@ -175,49 +172,86 @@ def secondary_fractions_from_mmcif_annotations(
 
     helix_residues: set[int] = set()
     beta_residues: set[int] = set()
+    author_to_label: dict[str, set[str]] = {}
+    for category, author_key, label_key in (
+        ("_atom_site.", "auth_asym_id", "label_asym_id"),
+        ("_pdbx_poly_seq_scheme.", "pdb_strand_id", "asym_id"),
+    ):
+        table = block.find_mmcif_category(category)
+        if table:
+            for row in table:
+                author = _row_value(row, category + author_key)
+                label = _row_value(row, category + label_key)
+                if author and label:
+                    author_to_label.setdefault(author, set()).add(label)
 
-    conf = block.find_mmcif_category("_struct_conf.")
-    if conf:
-        for row in conf:
-            beg_chain = _row_value(row, "_struct_conf.beg_label_asym_id", "_struct_conf.beg_auth_asym_id")
-            end_chain = _row_value(row, "_struct_conf.end_label_asym_id", "_struct_conf.end_auth_asym_id")
-            if chain_id not in {beg_chain, end_chain}:
+    observed_residues: set[int] = set()
+    atoms = block.find_mmcif_category("_atom_site.")
+    first_model: str | None = None
+    if atoms:
+        for row in atoms:
+            model = _row_value(row, "_atom_site.pdbx_PDB_model_num") or "1"
+            if first_model is None:
+                first_model = model
+            if model != first_model:
                 continue
-            beg = _row_value(row, "_struct_conf.beg_label_seq_id", "_struct_conf.beg_auth_seq_id")
-            end = _row_value(row, "_struct_conf.end_label_seq_id", "_struct_conf.end_auth_seq_id")
-            count = _range_len(beg, end)
-            if count <= 0:
+            author = _row_value(row, "_atom_site.auth_asym_id")
+            label = _row_value(row, "_atom_site.label_asym_id")
+            matches_author = author == chain_id if author else label in author_to_label.get(chain_id, set())
+            if not matches_author:
                 continue
-            conf_type = _row_value(row, "_struct_conf.conf_type_id").upper()
-            target = beta_residues if conf_type.startswith("STRN") or "SHEET" in conf_type else helix_residues
-            start = max(1, int(str(beg).strip()) if str(beg).strip().isdigit() else 1)
-            for idx in range(start, min(length, start + count - 1) + 1):
-                target.add(idx)
+            if _row_value(row, "_atom_site.label_atom_id", "_atom_site.auth_atom_id") != "CA":
+                continue
+            seq_id = _row_value(row, "_atom_site.label_seq_id")
+            if not seq_id.isdigit() or not 1 <= int(seq_id) <= length:
+                continue
+            try:
+                coordinates = [float(_row_value(row, f"_atom_site.Cartn_{axis}")) for axis in ("x", "y", "z")]
+                occupancy = float(_row_value(row, "_atom_site.occupancy") or "1")
+            except ValueError:
+                continue
+            if np.isfinite(coordinates).all() and np.isfinite(occupancy) and occupancy > 0:
+                observed_residues.add(int(seq_id))
+    if observed_residues != set(range(1, length + 1)):
+        return "unknown", None, None, None, None
 
-    sheet = block.find_mmcif_category("_struct_sheet_range.")
-    if sheet:
-        for row in sheet:
-            beg_chain = _row_value(
-                row,
-                "_struct_sheet_range.beg_label_asym_id",
-                "_struct_sheet_range.beg_auth_asym_id",
-            )
-            end_chain = _row_value(
-                row,
-                "_struct_sheet_range.end_label_asym_id",
-                "_struct_sheet_range.end_auth_asym_id",
-            )
-            if chain_id not in {beg_chain, end_chain}:
-                continue
-            beg = _row_value(row, "_struct_sheet_range.beg_label_seq_id", "_struct_sheet_range.beg_auth_seq_id")
-            end = _row_value(row, "_struct_sheet_range.end_label_seq_id", "_struct_sheet_range.end_auth_seq_id")
-            count = _range_len(beg, end)
-            if count <= 0:
-                continue
-            start = max(1, int(str(beg).strip()) if str(beg).strip().isdigit() else 1)
-            for idx in range(start, min(length, start + count - 1) + 1):
-                beta_residues.add(idx)
+    def matches_chain(row: Any, category: str, end: str) -> bool:
+        author = _row_value(row, f"{category}{end}_auth_asym_id")
+        if author:
+            return author == chain_id
+        label = _row_value(row, f"{category}{end}_label_asym_id")
+        return bool(label and label in author_to_label.get(chain_id, set()))
 
+    for category in ("_struct_conf.", "_struct_sheet_range."):
+        table = block.find_mmcif_category(category)
+        if not table:
+            continue
+        for row in table:
+            if not (matches_chain(row, category, "beg") and matches_chain(row, category, "end")):
+                continue
+            # Label sequence IDs index the polymer sequence. Author residue numbers
+            # can include offsets/insertion codes and must not be treated as indices.
+            beg = _row_value(row, category + "beg_label_seq_id")
+            end = _row_value(row, category + "end_label_seq_id")
+            if not beg.isdigit() or not end.isdigit():
+                continue
+            start, stop = int(beg), int(end)
+            if not 1 <= start <= stop <= length:
+                continue
+            if category == "_struct_sheet_range.":
+                target = beta_residues
+            else:
+                conf_type = _row_value(row, "_struct_conf.conf_type_id").upper()
+                if conf_type.startswith("HELX"):
+                    target = helix_residues
+                elif conf_type.startswith("STRN"):
+                    target = beta_residues
+                else:
+                    continue
+            target.update(range(start, stop + 1))
+
+    if helix_residues & beta_residues:
+        return "unknown", None, None, None, None
     beta_residues -= helix_residues
     annotated = len(helix_residues) + len(beta_residues)
     if annotated == 0:
@@ -247,7 +281,7 @@ def secondary_fractions_from_atom14(
     """
     pos = np.asarray(atom14_positions)
     mask = np.asarray(atom14_mask).astype(bool)
-    if pos.ndim != 3 or pos.shape[1:] != (14, 3) or mask.shape[:2] != pos.shape[:2]:
+    if pos.ndim != 3 or pos.shape[1:] != (14, 3) or mask.shape != pos.shape[:2]:
         return "unknown", None, None, None
 
     n_slot, ca_slot, c_slot = 0, 1, 2
@@ -271,9 +305,7 @@ def secondary_fractions_from_atom14(
         assigned += 1
         if -120.0 <= phi <= -25.0 and -100.0 <= psi <= 45.0:
             helix += 1
-        elif (-180.0 <= phi <= -60.0 and 45.0 <= psi <= 180.0) or (
-            45.0 <= phi <= 180.0 and -180.0 <= psi <= -120.0
-        ):
+        elif (-180.0 <= phi <= -60.0 and 45.0 <= psi <= 180.0) or (45.0 <= phi <= 180.0 and -180.0 <= psi <= -120.0):
             beta += 1
     if assigned == 0:
         return "unknown", None, None, None

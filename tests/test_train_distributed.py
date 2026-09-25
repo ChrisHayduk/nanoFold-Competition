@@ -201,9 +201,29 @@ def _gloo_metric_worker(rank: int, rendezvous: str, result_dir: str) -> None:
         )
         any_rank = train._distributed_any(rank == 1, device=torch.device("cpu"), enabled=True)
         no_rank = train._distributed_any(False, device=torch.device("cpu"), enabled=True)
+        train.set_seed(100 + rank)
+        sampling = train._collect_training_sampling_state(
+            {"rank": rank, "rng_state": train._capture_rng_state(torch.device("cpu"))},
+            {"world_size": 2}, distributed=True,
+        )
+        expected_random = torch.rand(5)
+        train.set_seed(999)
+        train._restore_rng_state(sampling["rank_states"][rank]["rng_state"], torch.device("cpu"))
+        rank_rng_restored = torch.equal(torch.rand(5), expected_random)
+        separate_rank_states = not torch.equal(
+            sampling["rank_states"][0]["rng_state"]["torch"],
+            sampling["rank_states"][1]["rng_state"]["torch"],
+        )
+        write_failed_on_all_ranks = False
+        try:
+            train._checkpoint_write_error("disk full" if rank == 0 else None, distributed=True)
+        except RuntimeError as exc:
+            write_failed_on_all_ranks = "disk full" in str(exc)
         train._distributed_barrier(True)
         Path(result_dir, f"rank{rank}.json").write_text(json.dumps({
             "names": names, "totals": totals.tolist(), "any": any_rank, "none": no_rank,
+            "rank_rng_restored": rank_rng_restored, "separate_rank_states": separate_rank_states,
+            "write_failed_on_all_ranks": write_failed_on_all_ranks,
         }))
     finally:
         train._destroy_distributed(True)
@@ -216,6 +236,10 @@ def test_distributed_helpers_reduce_unequal_metric_sets_across_processes(monkeyp
         monkeypatch.setenv("GLOO_SOCKET_IFNAME", loopback)
     rendezvous = (tmp_path / "rendezvous").as_uri()
     mp.spawn(_gloo_metric_worker, args=(rendezvous, str(tmp_path)), nprocs=2, join=True)
-    expected = {"names": ["first", "second"], "totals": [3.0, 2.0, 6.0], "any": True, "none": False}
+    expected = {
+        "names": ["first", "second"], "totals": [3.0, 2.0, 6.0], "any": True, "none": False,
+        "rank_rng_restored": True, "separate_rank_states": True,
+        "write_failed_on_all_ranks": True,
+    }
     assert json.loads((tmp_path / "rank0.json").read_text()) == expected
     assert json.loads((tmp_path / "rank1.json").read_text()) == expected

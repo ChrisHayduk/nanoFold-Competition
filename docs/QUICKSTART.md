@@ -66,6 +66,8 @@ If preprocessing is interrupted, rerun the same command with:
 --resume-preprocess
 ```
 
+Resume checks the raw source files and existing outputs. Keep those sources available. If preprocessing flags, implementation or source content changed, use fresh feature/label directories and build a new fingerprint; do not mix outputs from different runs.
+
 ## 3) Start Training
 
 Train the minAlphaFold2 tiny reference submission:
@@ -138,6 +140,8 @@ NANOFOLD_MODAL_GPU=A10G modal run scripts/modal_train.py \
   --config submissions/minalphafold2/config.yaml \
   --track limited
 ```
+
+Resume requires a checkpoint with versioned sampling state and matching weights, world size, device type and loader settings. Older checkpoints remain usable for prediction/scoring but cannot resume training safely. See the [sampling contract](API.md#training-sampling-and-multiple-gpus).
 
 Fetch a checkpoint back from Modal when you want to run local public prediction/scoring:
 

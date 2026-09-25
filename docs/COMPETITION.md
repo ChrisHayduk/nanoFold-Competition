@@ -130,16 +130,32 @@ Official split definition:
 - val: `1,000` chains
 - hidden val: `1,000` chains
 
-Split construction policy:
-- candidate chains are filtered by length, resolution, monomer status, and strict standard-amino-acid sequence content
-- sequence clusters are built with MMseqs2 or a locked TSV produced with the same MMseqs2 identity/coverage settings
-- train, public val, and hidden val must be sequence-cluster-disjoint at the configured identity/coverage threshold
-- different chains from the same PDB entry cannot cross split boundaries
-- structure metadata is required; split allocation is stratified by secondary-structure class, broad domain architecture, length bin, and resolution bin
-- metadata sources include pinned CATH, SCOPe, ECOD, and RCSB-style structural classifications when those records cover a chain
-- required OpenFold feature-asset availability is enforced before split generation
-- source hashes, filter counts, clustering method, grouping policy, stratification fields, split distributions, and split-quality metrics are recorded in locks
-- `all.txt` is the public union of train + public val only; hidden chain IDs stay in maintainer-only hidden manifests
+The committed manifests, fingerprints, and source locks are frozen. They define
+single-chain prediction examples; the original chain cache did not establish
+biological monomer status. Assigned sequence clusters and PDB entries define
+split-separation groups. This is not a guarantee that every cross-split pair
+falls below the MMseqs identity threshold or that homologous families are absent
+across splits. `all.txt` contains train plus public validation only.
+
+New sampling work uses the explicit `--sampling-policy cath-v2` option with
+schema-2 structure metadata and fresh staging paths. The policy retains the CATH
+Class/Architecture/Topology/Homologous-superfamily identity of every annotated
+domain and represents missing annotation explicitly. It balances the eligible
+disjoint-unit population by CATH Architecture label-set signature, then length,
+then resolution. Secondary-structure measurements are separate annotations;
+synthetic fractions derived from broad domain classes are not sampling axes.
+
+Candidate groups join assigned sequence clusters, exact duplicate sequences,
+and PDB entries transitively, retaining one representative per group. Public
+validation and training are selected before salted hidden validation, making
+public selection independent of the hidden salt. Quality reports record
+annotation coverage, distributions against the eligible population, and CATH
+familiarity with training. These reports describe structural coverage; they do
+not establish family-disjoint generalization.
+
+The committed benchmark has not been regenerated with this policy. Existing
+results retain their original dataset identity. See [dataset sampling](DATA_SAMPLING.md)
+for candidate generation, source validation, quality gates, and release review.
 
 Protected official manifests:
 - `data/manifests/train.txt`
@@ -167,77 +183,58 @@ bash scripts/setup_official_data.sh \
   --disable-templates
 ```
 
-This command verifies the committed public manifest hashes, downloads the required OpenFold chain cache/MSAs and manifest mmCIF subset, then preprocesses train and public validation features plus labels. Rerun it with `--resume-preprocess` after an interrupted preprocessing run.
+This command verifies the committed public manifest hashes, downloads the
+required OpenFold chain cache/MSAs and manifest mmCIF subset, then preprocesses
+train and public validation features plus labels. Use `--resume-preprocess` only
+for outputs with matching schema-3 preprocessing provenance. Resume verifies
+each pair's raw-input digest before reuse. Changed or missing run provenance
+requires fresh feature and label directories. New preprocessing bytes must still
+match the published fingerprint to qualify for the frozen benchmark.
 
 The setup script expects `aws`, `unzip`, and `python` on `PATH`; it keeps hidden validation assets out of the public setup path.
 
-Maintainer full refreshes sanitize MSAs by default. Once a
-train/public-val/hidden-val trio exists, `scripts/full_official_data_refresh.sh`
-builds a private SHA256-only held-out-target filter from train, public
-validation, and hidden validation source MSAs against the public and hidden
-validation target sets, then preprocesses public and hidden features with that
-filter. The filter removes non-query MSA rows before the depth cap while
-preserving each chain's query row, so train MSAs cannot contain homolog rows for
-held-out validation targets. Filters built against hidden validation targets are
-private artifacts and must not be published.
+Maintainer asset rebuilding against the frozen manifests requires
+`scripts/full_official_data_refresh.sh --skip-manifest-regen`. The workflow
+builds a private held-out-target MSA filter from train, public-validation, and
+hidden-validation source rows against both held-out target sets. Detected
+non-query homologs are removed before the depth cap, and the query is preserved.
+Filters derived from hidden targets remain private. An explicit
+`--msa-row-filter <json>` may also be supplied to preprocessing.
 
-Ad hoc maintainer/research refreshes can still pass an explicit
-`--msa-row-filter <json>` to `scripts/setup_official_data.sh` or
-`scripts/full_official_data_refresh.sh`.
+The workflow runs `scripts/audit_msa_split.py --strict --run-mmseqs` on public
+training versus public validation and on all public targets versus hidden
+validation before fingerprinting. Strict mode rejects missing features,
+duplicate targets, chain/PDB overlap, exact target-sequence leakage, and detected
+residual MMseqs hits. Cluster checks require a complete `--cluster-tsv`; absent
+cluster assignments are not interpreted as proof of separation. MMseqs searches
+are heuristic and cover both source targets and non-query rows of at least 20 residues. A zero-hit
+audit does not prove absence of all sequence homology or all pairwise leakage.
 
-Use `scripts/audit_msa_split.py` to audit public or private split MSA state. It
-reports MSA availability/depth balance, binned MSA-depth JS divergence, target
-chain/cluster disjointness, exact processed-row overlap, optional MMseqs
-homology, and optional raw A3M identifier overlap without exposing hidden
-identifiers by default.
-When building a private processed-feature filter, repeat
-`--source-processed-features-dir` so the public feature root and private hidden
-feature root are scanned together.
+Standalone audits remain descriptive unless `--strict` is supplied. They also
+report MSA-depth distributions, exact background-row overlap, and optional raw
+A3M identifier overlap. Default output omits chain IDs from the depth CSV and
+omits examples. `--include-depth-identifiers`, `--include-examples`, and
+`--include-identifiers-in-mmseqs` explicitly enable these details for public or
+sealed private reports. Use `--val-features-dir` for a separate hidden feature
+root.
 
-Maintainer manifest generation path:
-- `scripts/build_manifests.py`
-- `scripts/regenerate_official_manifests.sh`
-- `scripts/build_hidden_manifest.py`
-- `scripts/sync_official_manifest_hashes.py`
-- `scripts/full_official_data_refresh.sh`
-- lock metadata: `leaderboard/official_manifest_source.lock.json`
+Automatic regeneration is disabled in both official wrappers.
+`scripts/regenerate_official_manifests.sh --help` gives staging guidance; new
+candidates use `scripts/stage_dataset_candidate.py` to build complete metadata,
+generate both source locks and independently verify fresh private outputs. The
+direct builders remain available with `--sampling-policy cath-v2`. The hidden builder requires a matching versioned public
+source lock. Follow [DATA_SAMPLING.md](DATA_SAMPLING.md) for the complete workflow.
+Do not sync candidate hashes into the published track configuration. Asset
+rebuilds write candidate fingerprints and raw/hidden asset locks under
+`.nanofold_private/asset_rebuild/leaderboard/` by default and reject protected
+release paths and aliases before execution.
 
-The committed public manifests are the participant-facing data contract. Hidden validation is generated privately against that fixed public split:
-
-```bash
-mkdir -p .nanofold_private/secrets
-python -c "import pathlib,secrets; pathlib.Path('.nanofold_private/secrets/hidden_split_salt.txt').write_text(secrets.token_urlsafe(48) + '\n')"
-chmod 600 .nanofold_private/secrets/hidden_split_salt.txt
-
-python scripts/build_hidden_manifest.py \
-  --hidden-split-salt-file .nanofold_private/secrets/hidden_split_salt.txt
-
-python scripts/verify_hidden_manifest.py
-```
-
-This maintainer flow requires MMseqs2 plus the public setup dependencies. The salt must be at least 32 characters and must never be committed. The hidden builder excludes every sequence/PDB component that touches train or public validation, then stratifies hidden validation against the public train+validation distribution.
-
-Private hidden preprocessing failures belong only in `.nanofold_private/manifests/hidden_processability_exclusions.txt`. After adding any failed chain IDs there, rerun `scripts/build_hidden_manifest.py` and `scripts/verify_hidden_manifest.py`.
-
-Commit-safe public outputs:
-- `data/manifests/train.txt`
-- `data/manifests/val.txt`
-- `data/manifests/all.txt`
-- `leaderboard/official_dataset_fingerprint.json`
-- `leaderboard/official_manifest_source.lock.json`
-
-Maintainer-only outputs live under the ignored `.nanofold_private/` workspace:
-- `.nanofold_private/manifests/hidden_val.txt`
-- `.nanofold_private/manifests/split_quality_report.json`
-- `.nanofold_private/manifests/hidden_processability_exclusions.txt`
-- `.nanofold_private/hidden_processed_features/`
-- `.nanofold_private/hidden_processed_labels/`
-- `.nanofold_private/leaderboard/official_hidden_fingerprint.json`
-- `.nanofold_private/leaderboard/private_hidden_assets.lock.json`
-- `.nanofold_private/leaderboard/private_hidden_manifest_source.lock.json`
-- `.nanofold_private/leaderboard/official_data_source.lock.json`
-
-Full public-data rebuilds use `bash scripts/full_official_data_refresh.sh --rewrite-lock` and are reserved for deliberate changes to the official public data contract. The default path builds `.nanofold_private/msa_row_filters/official_heldout_target_homology_filter.json` and applies it during public/hidden preprocessing; `--skip-msa-row-filter-build` is only for exploratory/debug runs.
+Keep hidden manifests, salts, labels, features, row filters, full quality reports,
+and hidden fingerprints/locks in the ignored `.nanofold_private/` workspace.
+Preprocessing failures stop asset rebuilding without modifying exclusions or
+resampling any split. Hidden failure details must not enter public exclusion
+lists. The detailed feature, source-lock, and private-asset procedures live in
+[DATA.md](DATA.md).
 
 ## 6) Fingerprint and Integrity Requirements
 
@@ -252,19 +249,24 @@ Fingerprint includes:
 - label file hash aggregate
 - track, source-lock, and preprocessing metadata
 
-Maintainer-only sanitized feature roots produced by
-`scripts/filter_processed_msa_features.py` also write `preprocess_meta.json`
-with `msa_row_filter_sha256`, so their fingerprints differ from the original
-processed features. Official public releases should prefer the raw-refresh path
-in `scripts/full_official_data_refresh.sh`, which builds the held-out filter
-before preprocessing so filtering happens before depth capping. Post-filter
-MMseqs residuals should be folded back into the filter with
-`scripts/extend_msa_row_filter_from_audit.py` and re-audited to zero hits.
-When sanitized features are audited for release or rebuttal, use
-`scripts/write_msa_row_filter_source_lock.py` to produce a compact public-safe
-source-lock summary with the row-filter hash, thresholds, normalized MMseqs
-settings, manifest counts, public manifest hashes, and aggregate row-removal
-counts.
+Preprocessing schema 3 records data-producing configuration and implementation
+digests, and binds each feature/label pair to its raw input bytes. A populated
+output root must retain matching run provenance. Resume cannot overwrite that
+provenance to describe outputs made under another configuration.
+
+Filtering existing processed MSAs with `scripts/filter_processed_msa_features.py`
+produces distinct preprocessing metadata and fingerprints. It cannot recover
+rows discarded by an earlier depth cap. For newly prepared data, filter raw MSA
+rows during preprocessing and audit the final features. If a residual MMseqs
+search finds hits, the extension/filtering tools can remove those rows before a
+new audit; the resulting zero-hit claim remains specific to that search.
+
+`scripts/write_msa_row_filter_source_lock.py` records filter digests, thresholds,
+normalized search settings, public manifest hashes, counts, and aggregate
+filtering results. By default it redacts unrecognized/private paths and private
+manifest hashes, validates final filter-digest correspondence and row counts,
+and omits per-chain records and excluded sequence hashes. It summarizes filtering
+provenance; it does not independently establish zero residual homology.
 
 Official mode requirements:
 - pinned manifest SHA checks
@@ -297,9 +299,14 @@ Track budget constants:
 All tracks use deterministic public validation settings (`center`, `top`) when the track defines them.
 
 Runtime reproducibility:
-- deterministic seeding support
-- deterministic DataLoader generator + worker seeding
-- checkpoint stores/restores RNG state for resume path
+
+- Deterministic seeding and distinct worker random streams across ranks.
+- Versioned checkpoint sampling state records epoch/cursor, loader generators, every rank's RNG and a canonical chain/weight digest.
+- Resume replays the consumed loader prefix before restoring model RNG, preserving sampling across interruptions under the same loader configuration.
+- Changed data bytes, sampling weights, worker/batch settings, world size or device type fail resume checks. Older checkpoints missing sampling state require a fresh training run and remain usable for prediction/scoring.
+- Atomic checkpoint replacement preserves the previous checkpoint on write failure. Every rank receives save failures; resume validates all rank RNG states and required AMP scaler/scheduler state before changing history.
+
+See the [training sampling contract](API.md#training-sampling-and-multiple-gpus) for replay costs and limits. These checks do not establish bitwise CUDA reproducibility across environments.
 
 ## 8) Scoring and Ranking
 

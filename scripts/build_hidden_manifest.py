@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -14,8 +15,11 @@ if str(SCRIPT_DIR) not in sys.path:
 
 from build_manifests import (  # noqa: E402
     DEFAULT_STRATIFY_FIELDS,
+    SAMPLING_POLICY,
     Candidate,
+    _allocate_hierarchical,
     _assert_quality_report,
+    _atomic_write,
     _build_candidates,
     _build_quality_report,
     _candidate_field,
@@ -30,6 +34,8 @@ from build_manifests import (  # noqa: E402
     _sha256,
     _stable_random_score,
     _structure_metadata_source_record,
+    _validate_generation_args,
+    _validate_metadata_identity,
 )
 
 
@@ -46,6 +52,8 @@ class SplitArgs:
     cluster_tsv: str
     structure_metadata: str
     expected_chain_cache_sha256: str
+    sampling_policy: str = "legacy-v1"
+    require_monomer: bool = False
 
 
 @dataclass(frozen=True)
@@ -61,6 +69,8 @@ def parse_args() -> argparse.Namespace:
             "committed public train/public validation manifests."
         )
     )
+    ap.add_argument("--sampling-policy", choices=[SAMPLING_POLICY], required=True,
+                    help="Requires a cath-v2 source lock; writes a new private hidden version.")
     ap.add_argument(
         "--chain-data-cache",
         type=Path,
@@ -101,7 +111,7 @@ def _read_manifest(path: Path) -> list[str]:
     ids = [line.strip() for line in path.read_text().splitlines() if line.strip() and not line.startswith("#")]
     duplicates = sorted(chain_id for chain_id, count in Counter(ids).items() if count > 1)
     if duplicates:
-        raise ValueError(f"Manifest contains duplicate chain IDs: {path}; examples: {duplicates[:8]}")
+        raise ValueError(f"Manifest contains {len(duplicates)} duplicate chain IDs: {path}")
     return ids
 
 
@@ -130,6 +140,12 @@ def _load_lock_args(path: Path) -> SplitArgs:
     for key in required:
         if key not in args:
             raise ValueError(f"Manifest lock missing args.{key}: {path}")
+    sampling_policy = raw.get("sampling_policy", args.get("sampling_policy", "legacy-v1"))
+    if sampling_policy not in ("legacy-v1", SAMPLING_POLICY):
+        raise ValueError("Manifest lock has an unsupported sampling policy.")
+    if args.get("sampling_policy", sampling_policy) != sampling_policy:
+        raise ValueError("Manifest lock sampling policy disagrees with args.sampling_policy.")
+    _validate_generation_args(argparse.Namespace(**{**args, "require_monomer": args.get("require_monomer", False)}))
     expected_sha = str(raw.get("chain_data_cache_sha256") or args.get("expected_chain_cache_sha256") or "")
     return SplitArgs(
         hidden_val_size=int(args["hidden_val_size"]),
@@ -143,31 +159,13 @@ def _load_lock_args(path: Path) -> SplitArgs:
         cluster_tsv=str(args.get("cluster_tsv") or ""),
         structure_metadata=str(args["structure_metadata"]),
         expected_chain_cache_sha256=expected_sha,
+        sampling_policy=sampling_policy,
+        require_monomer=args.get("require_monomer", False),
     )
 
 
 def _with_cluster_ids(candidates: list[Candidate], cluster_map: dict[str, str]) -> list[Candidate]:
-    out: list[Candidate] = []
-    for candidate in candidates:
-        out.append(
-            Candidate(
-                chain_id=candidate.chain_id,
-                sequence=candidate.sequence,
-                length=candidate.length,
-                resolution=candidate.resolution,
-                release_date=candidate.release_date,
-                cluster_id=cluster_map[candidate.chain_id],
-                pdb_id=candidate.pdb_id,
-                secondary_structure_class=candidate.secondary_structure_class,
-                secondary_helix_fraction=candidate.secondary_helix_fraction,
-                secondary_beta_fraction=candidate.secondary_beta_fraction,
-                secondary_coil_fraction=candidate.secondary_coil_fraction,
-                domain_architecture_class=candidate.domain_architecture_class,
-                domain_architecture_source=candidate.domain_architecture_source,
-                metadata_source_count=candidate.metadata_source_count,
-            )
-        )
-    return out
+    return [replace(candidate, cluster_id=cluster_map[candidate.chain_id]) for candidate in candidates]
 
 
 def _componentize(
@@ -193,10 +191,12 @@ def _componentize(
 
     by_cluster: defaultdict[str, list[str]] = defaultdict(list)
     by_pdb: defaultdict[str, list[str]] = defaultdict(list)
+    by_sequence: defaultdict[str, list[str]] = defaultdict(list)
     for candidate in candidates:
         by_cluster[cluster_map[candidate.chain_id]].append(candidate.chain_id)
         by_pdb[candidate.pdb_id].append(candidate.chain_id)
-    for members in by_cluster.values():
+        by_sequence[candidate.sequence].append(candidate.chain_id)
+    for members in list(by_cluster.values()) + list(by_sequence.values()):
         first = members[0]
         for member in members[1:]:
             union(first, member)
@@ -227,67 +227,12 @@ def _stratum(candidate: Candidate, fields: tuple[str, ...]) -> tuple[str, ...]:
 
 
 def _allocate_against_reference(
-    pool: list[Candidate],
-    reference: list[Candidate],
-    *,
-    size: int,
-    stratify_fields: tuple[str, ...],
+    pool: list[Candidate], reference: list[Candidate], *, size: int,
+    stratify_fields: tuple[str, ...], seed: int = 0, salt: str = "hidden_allocation",
 ) -> dict[tuple[str, ...], int]:
-    if size <= 0:
-        return {}
-    if size > len(pool):
-        raise ValueError(f"Requested {size} hidden chains but only {len(pool)} disjoint public-excluded units exist.")
-
-    by_pool: defaultdict[tuple[str, ...], list[Candidate]] = defaultdict(list)
-    for candidate in pool:
-        by_pool[_stratum(candidate, stratify_fields)].append(candidate)
-    reference_counts = Counter(_stratum(candidate, stratify_fields) for candidate in reference)
-    reference_total = sum(reference_counts.values())
-    if reference_total <= 0:
-        raise ValueError("Cannot stratify hidden split without public reference candidates.")
-
-    allocation: dict[tuple[str, ...], int] = {}
-    remainders: list[tuple[float, int, int, tuple[str, ...]]] = []
-    allocated = 0
-    for key, members in sorted(by_pool.items()):
-        exact = size * reference_counts.get(key, 0) / float(reference_total)
-        count = min(len(members), int(exact))
-        allocation[key] = count
-        allocated += count
-        remainders.append((exact - count, reference_counts.get(key, 0), len(members), key))
-
-    remaining = size - allocated
-    for _remainder, _reference_count, _capacity, key in sorted(
-        remainders,
-        key=lambda item: (-item[0], -item[1], -item[2], item[3]),
-    ):
-        if remaining <= 0:
-            break
-        if reference_counts.get(key, 0) <= 0:
-            continue
-        capacity = len(by_pool[key]) - allocation[key]
-        if capacity <= 0:
-            continue
-        allocation[key] += 1
-        remaining -= 1
-
-    if remaining > 0:
-        for key, members in sorted(
-            by_pool.items(),
-            key=lambda item: (-reference_counts.get(item[0], 0), -len(item[1]), item[0]),
-        ):
-            if remaining <= 0:
-                break
-            capacity = len(members) - allocation[key]
-            if capacity <= 0:
-                continue
-            take = min(capacity, remaining)
-            allocation[key] += take
-            remaining -= take
-
-    if remaining > 0:
-        raise RuntimeError(f"Internal allocation error: {remaining} hidden slots were not assigned.")
-    return allocation
+    return _allocate_hierarchical(
+        pool, reference, size=size, stratify_fields=stratify_fields, seed=seed, salt=salt,
+    )
 
 
 def _sample_by_allocation(
@@ -325,9 +270,41 @@ def _assert_public_manifests(train_ids: list[str], val_ids: list[str], all_ids: 
         raise ValueError("Public all.txt must equal the union of train.txt and val.txt.")
 
 
+def _validate_source_lock(
+    lock_path: Path, *, train_path: Path, val_path: Path, all_path: Path,
+    structure_metadata_path: Path, cluster_map: dict[str, str], cluster_tsv_path: Path | None = None,
+) -> None:
+    lock = json.loads(lock_path.read_text())
+    outputs = lock.get("outputs", {})
+    for name, path in (("train", train_path), ("val", val_path), ("all", all_path)):
+        expected = outputs.get(f"{name}_manifest_sha256")
+        if expected != _sha256(path):
+            raise ValueError(f"Public {name} manifest SHA256 disagrees with source lock.")
+        count_key = "unique_count" if name == "all" else f"{name}_count"
+        if outputs.get(count_key) != len(_read_manifest(path)):
+            raise ValueError(f"Public {name} manifest count disagrees with source lock.")
+    if lock.get("structure_metadata", {}).get("sha256") != _sha256(structure_metadata_path):
+        raise ValueError("Structure metadata SHA256 disagrees with source lock.")
+    if lock.get("clustering", {}).get("cluster_assignments_sha256") != _cluster_assignments_sha256(cluster_map):
+        raise ValueError("Cluster assignments SHA256 disagrees with source lock.")
+    expected_cluster_tsv_sha = lock.get("clustering", {}).get("cluster_tsv_sha256")
+    if expected_cluster_tsv_sha is not None:
+        if cluster_tsv_path is None or not cluster_tsv_path.is_file() or _sha256(cluster_tsv_path) != expected_cluster_tsv_sha:
+            raise ValueError("Cluster TSV SHA256 disagrees with source lock.")
+
+
 def _build_hidden_manifest(args: argparse.Namespace) -> dict[str, Any]:
     lock_args = _load_lock_args(args.lock_file)
+    if lock_args.sampling_policy != SAMPLING_POLICY:
+        raise ValueError("Hidden generation requires a cath-v2 public source lock; preserve frozen legacy splits.")
+    _validate_generation_args(argparse.Namespace(**vars(lock_args)))
+    for field in ("hidden_val_size", "seed"):
+        override = getattr(args, field)
+        if override is not None and override != getattr(lock_args, field):
+            raise ValueError(f"{field} override differs from source lock; create a new versioned source contract.")
     hidden_val_size = int(args.hidden_val_size if args.hidden_val_size is not None else lock_args.hidden_val_size)
+    if hidden_val_size <= 0:
+        raise ValueError("--hidden-val-size must be positive.")
     seed = int(args.seed if args.seed is not None else lock_args.seed)
     structure_metadata_path = args.structure_metadata or Path(lock_args.structure_metadata)
     mmseqs_bin = str(args.mmseqs_bin if args.mmseqs_bin is not None else lock_args.mmseqs_bin)
@@ -357,7 +334,8 @@ def _build_hidden_manifest(args: argparse.Namespace) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise ValueError(f"chain_data_cache.json must be a JSON object: {args.chain_data_cache}")
 
-    structure_metadata_accepted, structure_metadata = _load_structure_metadata(structure_metadata_path)
+    _validate_metadata_identity(structure_metadata_path, cache_sha, argparse.Namespace(**vars(lock_args)))
+    structure_metadata_accepted, structure_metadata = _load_structure_metadata(structure_metadata_path, require_schema_version=2)
     candidates, reject_reasons, structural_metadata_source = _build_candidates(
         data,
         min_len=lock_args.min_len,
@@ -365,6 +343,8 @@ def _build_hidden_manifest(args: argparse.Namespace) -> dict[str, Any]:
         max_resolution=lock_args.max_resolution,
         structure_metadata=structure_metadata,
         structure_metadata_accepted=structure_metadata_accepted,
+        sampling_policy=lock_args.sampling_policy,
+        require_monomer=lock_args.require_monomer,
     )
     candidate_by_id = {candidate.chain_id: candidate for candidate in candidates}
     missing_public = sorted(public_ids - set(candidate_by_id))
@@ -395,6 +375,11 @@ def _build_hidden_manifest(args: argparse.Namespace) -> dict[str, Any]:
             )
         cluster_map = cluster_map_or_none
 
+    _validate_source_lock(
+        args.lock_file, train_path=args.public_train_manifest, val_path=args.public_val_manifest,
+        all_path=args.public_all_manifest, structure_metadata_path=structure_metadata_path, cluster_map=cluster_map,
+        cluster_tsv_path=Path(cluster_tsv) if cluster_tsv else None,
+    )
     clustered_candidates = _with_cluster_ids(candidates, cluster_map)
     candidate_by_id = {candidate.chain_id: candidate for candidate in clustered_candidates}
     components = _componentize(clustered_candidates, cluster_map, seed=seed)
@@ -427,6 +412,7 @@ def _build_hidden_manifest(args: argparse.Namespace) -> dict[str, Any]:
         public_reference,
         size=hidden_val_size,
         stratify_fields=stratify_fields,
+        seed=seed, salt=f"hidden_val_fixed_public:{hidden_split_salt_digest}",
     )
     hidden = _sample_by_allocation(
         hidden_pool,
@@ -452,6 +438,10 @@ def _build_hidden_manifest(args: argparse.Namespace) -> dict[str, Any]:
     if pdb_overlap:
         raise RuntimeError(f"Hidden split leaks public PDB entries: {sorted(pdb_overlap)[:8]}")
 
+    public_sequences = {candidate_by_id[chain_id].sequence for chain_id in public_ids}
+    if public_sequences & {candidate.sequence for candidate in hidden}:
+        raise RuntimeError("Hidden split leaks exact public sequences.")
+
     selected_candidates = {
         chain_id: candidate_by_id[chain_id]
         for chain_id in train_ids + val_ids + hidden_ids
@@ -460,16 +450,26 @@ def _build_hidden_manifest(args: argparse.Namespace) -> dict[str, Any]:
         selected_candidates=selected_candidates,
         split_ids={"train": train_ids, "val": val_ids, "hidden_val": hidden_ids},
         stratify_fields=stratify_fields,
+        reference_candidates=public_reference,
     )
+    quality_report["reference_population"] = "fixed_public_chains"
     _assert_quality_report(quality_report)
 
     args.hidden_out_dir.mkdir(parents=True, exist_ok=True)
     hidden_manifest = args.hidden_out_dir / "hidden_val.txt"
     split_quality_report = args.hidden_out_dir / "split_quality_report.json"
-    hidden_manifest.write_text("\n".join(hidden_ids) + "\n")
-    split_quality_report.write_text(json.dumps(quality_report, indent=2, sort_keys=True) + "\n")
+    output_paths = (hidden_manifest, split_quality_report, args.private_lock_file)
+    if len({path.resolve() for path in output_paths}) != len(output_paths):
+        raise ValueError("Sampling output paths must be distinct.")
+    for path in output_paths:
+        if path.exists():
+            raise ValueError(f"Refusing to overwrite existing sampling output; use a new version directory: {path}")
+    _atomic_write(hidden_manifest, "\n".join(hidden_ids) + "\n")
+    _atomic_write(split_quality_report, json.dumps(quality_report, indent=2, sort_keys=True) + "\n")
 
     private_lock = {
+        "sampling_policy": SAMPLING_POLICY,
+        "source_lock_sha256": _sha256(args.lock_file),
         "notes": "Maintainer-only hidden manifest lock. Do not commit this file.",
         "chain_data_cache_sha256": cache_sha,
         "hidden_split_salt_sha256": hidden_split_salt_digest,
@@ -495,6 +495,14 @@ def _build_hidden_manifest(args: argparse.Namespace) -> dict[str, Any]:
             "public_component_count": len(public_components),
             "hidden_candidate_unit_count": len(hidden_pool),
             "private_processability_exclusion_count": len(private_processability_exclusions),
+            "private_processability_exclusions": {
+                "path": str(args.private_processability_exclusion_list),
+                "sha256": _sha256(args.private_processability_exclusion_list)
+                if args.private_processability_exclusion_list.is_file() else None,
+                "canonical_ids_sha256": hashlib.sha256(
+                    "".join(f"{chain_id}\n" for chain_id in sorted(private_processability_exclusions)).encode()
+                ).hexdigest(),
+            },
             "reject_reasons": dict(sorted(reject_reasons.items())),
         },
         "structure_metadata": _structure_metadata_source_record(structure_metadata_path),
@@ -509,6 +517,7 @@ def _build_hidden_manifest(args: argparse.Namespace) -> dict[str, Any]:
             "cluster_disjoint": True,
             "pdb_disjoint": True,
             "public_components_excluded": True,
+            "exact_sequence_disjoint": True,
         },
         "stratification": {
             "fields": list(stratify_fields),
@@ -519,7 +528,7 @@ def _build_hidden_manifest(args: argparse.Namespace) -> dict[str, Any]:
         },
     }
     args.private_lock_file.parent.mkdir(parents=True, exist_ok=True)
-    args.private_lock_file.write_text(json.dumps(private_lock, indent=2, sort_keys=True) + "\n")
+    _atomic_write(args.private_lock_file, json.dumps(private_lock, indent=2, sort_keys=True) + "\n")
 
     return {
         "hidden_manifest": hidden_manifest,

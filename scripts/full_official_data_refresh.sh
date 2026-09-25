@@ -5,15 +5,20 @@ usage() {
   cat <<'EOF'
 Usage: bash scripts/full_official_data_refresh.sh [options]
 
-Single maintainer end-to-end flow for official data refresh:
-  0) bootstrap chain_data_cache.json if missing
-  1) build required structure metadata for split stratification
-  2) regenerate official train/val/hidden_val/all manifests from locked inputs
-  3) sync official manifest hashes/counts across track + lock + docs
-  4) download OpenFold assets for public + hidden splits
-  5) build a heldout-target MSA row filter for the manifest trio
-  6) preprocess public + hidden split NPZs (features + labels) with that filter
-  7) rebuild official dataset fingerprint
+Maintainer asset rebuild for frozen official manifests (requires --skip-manifest-regen).
+New cath-v2 datasets use stage_dataset_candidate.py with fresh private paths; see
+regenerate_official_manifests.sh --help. Automatic manifest replacement is refused.
+
+Asset rebuild flow:
+  1) verify the frozen official manifest hashes/counts
+  2) download OpenFold assets for public + hidden splits
+  3) build a heldout-target MSA row filter for the manifest trio
+  4) preprocess public + hidden split NPZs (features + labels) with that filter
+  5) require complete features and zero cross-split target/target and target/MSA hits
+  6) stage candidate fingerprints/locks and verify published manifest hashes
+
+Rebuilt assets are candidates for review. Published fingerprints and existing
+sealed hidden reference files are never replaced by this command.
 
 Options:
   --track-id <id>                     Track id metadata for fingerprint (default: limited)
@@ -39,29 +44,29 @@ Options:
                                       Chain IDs excluded from official splitting because atom14 labels fail the processability gate
                                       (default: data/manifests/official_processability_exclusions.txt)
   --data-source-lock <path>           Raw official data source lock JSON
-                                      (default: <private-root>/leaderboard/official_data_source.lock.json)
+                                      (default: <private-root>/asset_rebuild/leaderboard/official_data_source.lock.json)
   --structure-candidates <path>       Accepted chain universe written by structure metadata build
                                       (default: data/manifests/structure_candidates.txt)
   --lock-file <path>                  Official manifest lock file
                                       (default: leaderboard/official_manifest_source.lock.json)
-  --track-file <path>                 Track policy YAML to update/check
+  --track-file <path>                 Frozen track policy YAML to check
                                       (default: tracks/limited.yaml)
-  --fingerprint-out <path>            Fingerprint output path
-                                      (default: leaderboard/official_dataset_fingerprint.json)
+  --fingerprint-out <path>            Candidate fingerprint output path
+                                      (default: <private-root>/asset_rebuild/leaderboard/official_dataset_fingerprint.json)
+                                      Other public track fingerprints are staged beside this file.
   --hidden-fingerprint-out <path>     Hidden fingerprint output path
-                                      (default: <private-root>/leaderboard/official_hidden_fingerprint.json)
-  --hidden-lock-file <path>           Hidden asset lock path
-                                      (default: <private-root>/leaderboard/private_hidden_assets.lock.json)
+                                      (default: <private-root>/asset_rebuild/leaderboard/official_hidden_fingerprint.json)
+  --hidden-lock-file <path>           Candidate hidden asset lock path
+                                      (default: <private-root>/asset_rebuild/leaderboard/private_hidden_assets.lock.json)
   --private-manifest-lock <path>      Hidden manifest source lock path
                                       (default: <private-root>/leaderboard/private_hidden_manifest_source.lock.json)
   --msa-names <csv>                   Comma-separated MSA filenames to download/preprocess
   --msa-row-filter <path>             Existing JSON of held-out-homolog MSA row hashes for public/hidden preprocessing
   --msa-row-filter-out <path>         Output path when auto-building the held-out MSA row filter
-                                      (default: <private-root>/msa_row_filters/official_heldout_target_homology_filter.json)
+                                      (default: <private-root>/asset_rebuild/msa_row_filters/official_heldout_target_homology_filter.json)
   --skip-msa-row-filter-build         Do not auto-build an MSA row filter when --msa-row-filter is omitted.
                                       This is for exploratory/debug runs only, not official trio refreshes.
-  --rewrite-lock                      Rewrite lock metadata after manifest regeneration
-  --skip-manifest-regen               Skip manifest regeneration step
+  --skip-manifest-regen               Required: keep the frozen published manifests
   --skip-setup                        Skip download+preprocess step
   --skip-fingerprint                  Skip fingerprint rebuild step
   --skip-hidden                       Skip hidden split download/preprocess/fingerprint/pinning
@@ -99,7 +104,7 @@ DATA_SOURCE_LOCK=""
 STRUCTURE_CANDIDATES="data/manifests/structure_candidates.txt"
 LOCK_FILE="leaderboard/official_manifest_source.lock.json"
 TRACK_FILE="tracks/limited.yaml"
-FINGERPRINT_OUT="leaderboard/official_dataset_fingerprint.json"
+FINGERPRINT_OUT=""
 HIDDEN_FINGERPRINT_OUT=""
 HIDDEN_LOCK_FILE=""
 PRIVATE_MANIFEST_LOCK=""
@@ -112,7 +117,6 @@ MSA_ROW_FILTER=""
 MSA_ROW_FILTER_OUT=""
 USER_MSA_ROW_FILTER=0
 USE_TEMPLATES=0
-REWRITE_LOCK=0
 SKIP_MANIFEST_REGEN=0
 SKIP_SETUP=0
 SKIP_FINGERPRINT=0
@@ -120,7 +124,6 @@ SKIP_HIDDEN=0
 SKIP_MSA_ROW_FILTER_BUILD=0
 RESUME_PREPROCESS=0
 DRY_RUN=0
-ORIGINAL_ARGS=("$@")
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -216,10 +219,6 @@ while [[ $# -gt 0 ]]; do
       PRIVATE_MANIFEST_LOCK="$2"
       shift 2
       ;;
-    --rewrite-lock)
-      REWRITE_LOCK=1
-      shift 1
-      ;;
     --skip-manifest-regen)
       SKIP_MANIFEST_REGEN=1
       shift 1
@@ -297,6 +296,13 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if [[ "$SKIP_MANIFEST_REGEN" -eq 0 ]]; then
+  echo "Official manifests are frozen; automatic regeneration is disabled." >&2
+  echo "Use --skip-manifest-regen to rebuild/audit published assets, or run" >&2
+  echo "bash scripts/regenerate_official_manifests.sh --help for cath-v2 staging commands." >&2
+  exit 1
+fi
+
 if [[ -z "$HIDDEN_MANIFESTS_DIR" ]]; then
   HIDDEN_MANIFESTS_DIR="$PRIVATE_ROOT/manifests"
 fi
@@ -307,19 +313,22 @@ if [[ -z "$HIDDEN_LABELS_DIR" ]]; then
   HIDDEN_LABELS_DIR="$PRIVATE_ROOT/hidden_processed_labels"
 fi
 if [[ -z "$DATA_SOURCE_LOCK" ]]; then
-  DATA_SOURCE_LOCK="$PRIVATE_ROOT/leaderboard/official_data_source.lock.json"
+  DATA_SOURCE_LOCK="$PRIVATE_ROOT/asset_rebuild/leaderboard/official_data_source.lock.json"
+fi
+if [[ -z "$FINGERPRINT_OUT" ]]; then
+  FINGERPRINT_OUT="$PRIVATE_ROOT/asset_rebuild/leaderboard/official_dataset_fingerprint.json"
 fi
 if [[ -z "$HIDDEN_FINGERPRINT_OUT" ]]; then
-  HIDDEN_FINGERPRINT_OUT="$PRIVATE_ROOT/leaderboard/official_hidden_fingerprint.json"
+  HIDDEN_FINGERPRINT_OUT="$PRIVATE_ROOT/asset_rebuild/leaderboard/official_hidden_fingerprint.json"
 fi
 if [[ -z "$HIDDEN_LOCK_FILE" ]]; then
-  HIDDEN_LOCK_FILE="$PRIVATE_ROOT/leaderboard/private_hidden_assets.lock.json"
+  HIDDEN_LOCK_FILE="$PRIVATE_ROOT/asset_rebuild/leaderboard/private_hidden_assets.lock.json"
 fi
 if [[ -z "$PRIVATE_MANIFEST_LOCK" ]]; then
   PRIVATE_MANIFEST_LOCK="$PRIVATE_ROOT/leaderboard/private_hidden_manifest_source.lock.json"
 fi
 if [[ -z "$MSA_ROW_FILTER_OUT" ]]; then
-  MSA_ROW_FILTER_OUT="$PRIVATE_ROOT/msa_row_filters/official_heldout_target_homology_filter.json"
+  MSA_ROW_FILTER_OUT="$PRIVATE_ROOT/asset_rebuild/msa_row_filters/official_heldout_target_homology_filter.json"
 fi
 if [[ "$SKIP_SETUP" -eq 0 && "$SKIP_MSA_ROW_FILTER_BUILD" -eq 0 && "$USER_MSA_ROW_FILTER" -eq 0 ]]; then
   MSA_ROW_FILTER="$MSA_ROW_FILTER_OUT"
@@ -332,153 +341,84 @@ run_cmd() {
   fi
 }
 
-update_processability_exclusions_from_errors() {
-  local error_dir="$1"
-  local update_output
-  local added
-
-  if [[ "$DRY_RUN" -eq 1 ]]; then
-    echo "+ python $SCRIPT_DIR/update_processability_exclusions.py --error-dir $error_dir --chain-data-cache $CHAIN_DATA_CACHE --output $PROCESSABILITY_EXCLUSION_LIST"
-    return 1
-  fi
-  if [[ ! -d "$error_dir" ]]; then
-    return 1
-  fi
-
-  update_output="$(
-    python "$SCRIPT_DIR/update_processability_exclusions.py" \
-      --error-dir "$error_dir" \
-      --chain-data-cache "$CHAIN_DATA_CACHE" \
-      --output "$PROCESSABILITY_EXCLUSION_LIST"
-  )"
-  echo "$update_output"
-  added="$(
-    printf '%s\n' "$update_output" \
-      | sed -n 's/^Screened .*; added \([0-9][0-9]*\) processability exclusions\.$/\1/p' \
-      | tail -n 1
-  )"
-  [[ "${added:-0}" -gt 0 ]]
-}
-
-restart_after_processability_update() {
-  if [[ "$SKIP_MANIFEST_REGEN" -eq 1 ]]; then
-    echo "Processability exclusions changed; rerun without --skip-manifest-regen so manifests can be rebuilt."
-    exit 1
-  fi
-  echo "Processability exclusions changed; rebuilding manifests from the locked official inputs."
-  exec bash "$0" "${ORIGINAL_ARGS[@]}" --resume-preprocess
-}
-
-ensure_chain_data_cache() {
-  if [[ "$SKIP_MANIFEST_REGEN" -eq 1 ]]; then
-    return
-  fi
-  if [[ -f "$CHAIN_DATA_CACHE" ]]; then
-    return
-  fi
-
-  local cache_dir
-  cache_dir="$(dirname "$CHAIN_DATA_CACHE")"
-  mkdir -p "$cache_dir"
-  echo "chain_data_cache.json not found at $CHAIN_DATA_CACHE; bootstrapping from RODA."
-
-  if [[ "$DRY_RUN" -eq 0 ]] && ! command -v aws >/dev/null 2>&1; then
-    echo "aws CLI not found. Install awscli first."
-    exit 1
-  fi
-
-  run_cmd aws s3 cp s3://openfold/data_caches/chain_data_cache.json "$CHAIN_DATA_CACHE" --no-sign-request
-}
-
 if ! command -v python >/dev/null 2>&1; then
   echo "python not found. Activate your environment first."
   exit 1
 fi
 
-if [[ "$DRY_RUN" -eq 0 && "$SKIP_MANIFEST_REGEN" -eq 0 ]]; then
-  if [[ -z "${NANOFOLD_HIDDEN_SPLIT_SALT:-}" ]]; then
-    echo "NANOFOLD_HIDDEN_SPLIT_SALT is required for official hidden manifest generation."
-    exit 1
+cd "$REPO_ROOT"
+
+# Resolve aliases before any download or output write. Hash consistency checks
+# alone cannot detect replacing the published fingerprint with new asset bytes.
+CANDIDATE_OUTPUTS=("$DATA_SOURCE_LOCK")
+if [[ "$SKIP_FINGERPRINT" -eq 0 ]]; then
+  CANDIDATE_OUTPUTS+=("$FINGERPRINT_OUT")
+  if [[ "$TRACK_ID" == "limited" ]]; then
+    CANDIDATE_FINGERPRINT_DIR="$(dirname -- "$FINGERPRINT_OUT")"
+    RESEARCH_FINGERPRINT_OUT="$CANDIDATE_FINGERPRINT_DIR/research_large_dataset_fingerprint.json"
+    UNLIMITED_FINGERPRINT_OUT="$CANDIDATE_FINGERPRINT_DIR/unlimited_dataset_fingerprint.json"
+    CANDIDATE_OUTPUTS+=("$RESEARCH_FINGERPRINT_OUT" "$UNLIMITED_FINGERPRINT_OUT")
   fi
-  if [[ "${#NANOFOLD_HIDDEN_SPLIT_SALT}" -lt 32 ]]; then
-    echo "NANOFOLD_HIDDEN_SPLIT_SALT must be at least 32 characters."
-    exit 1
+  if [[ "$SKIP_HIDDEN" -eq 0 ]]; then
+    CANDIDATE_OUTPUTS+=("$HIDDEN_FINGERPRINT_OUT" "$HIDDEN_LOCK_FILE")
   fi
 fi
+if [[ "$SKIP_SETUP" -eq 0 && "$USER_MSA_ROW_FILTER" -eq 0 && "$SKIP_MSA_ROW_FILTER_BUILD" -eq 0 ]]; then
+  CANDIDATE_OUTPUTS+=("$MSA_ROW_FILTER_OUT")
+fi
+python - "$REPO_ROOT" "$PRIVATE_ROOT" "$MANIFESTS_DIR" "$HIDDEN_MANIFESTS_DIR" \
+  "$LOCK_FILE" "$TRACK_FILE" "$PRIVATE_MANIFEST_LOCK" "$STRUCTURE_METADATA" \
+  "$METADATA_SOURCE_LOCK" "$FEATURE_EXCLUSION_LIST" "$PROCESSABILITY_EXCLUSION_LIST" \
+  "${CANDIDATE_OUTPUTS[@]}" <<'PYTHON'
+import sys
+from pathlib import Path
 
-cd "$REPO_ROOT"
+repo, private, manifests, hidden_manifests = (Path(p).resolve() for p in sys.argv[1:5])
+protected = [Path(p).resolve() for p in sys.argv[5:12]]
+protected.extend(manifests / name for name in ("train.txt", "val.txt", "all.txt"))
+protected.append(hidden_manifests / "hidden_val.txt")
+protected.append(private / "msa_row_filters/official_heldout_target_homology_filter.json")
+protected.extend(private / "leaderboard" / name for name in (
+    "official_data_source.lock.json", "official_hidden_fingerprint.json", "private_hidden_assets.lock.json",
+))
+protected.extend(repo / "leaderboard" / name for name in (
+    "official_dataset_fingerprint.json", "research_large_dataset_fingerprint.json",
+    "unlimited_dataset_fingerprint.json",
+))
+protected_roots = [repo / "leaderboard", repo / "tracks", repo / "data/manifests"]
+protected.extend(path for root in protected_roots for path in root.rglob("*") if path.is_file())
+outputs = [Path(p).resolve() for p in sys.argv[12:]]
+
+def aliases(left, right):
+    return left == right or (left.exists() and right.exists() and left.samefile(right))
+
+for index, output in enumerate(outputs):
+    if any(output.is_relative_to(root.resolve()) for root in protected_roots) or any(
+        aliases(output, reference) for reference in protected
+    ):
+        raise SystemExit("Refusing to overwrite a frozen dataset contract; use a candidate output path.")
+    if any(aliases(output, previous) for previous in outputs[:index]):
+        raise SystemExit("Candidate output paths must be distinct.")
+PYTHON
 
 if [[ "$DRY_RUN" -eq 1 ]]; then
   echo "DRY-RUN mode enabled: commands will be printed but not executed."
 fi
 
-ensure_chain_data_cache
-
-echo "[1/5] Build required structure metadata"
-if [[ "$SKIP_MANIFEST_REGEN" -eq 0 ]]; then
-  METADATA_SOURCE_CMD=(
-    python "$SCRIPT_DIR/download_structure_metadata_sources.py"
-    --chain-data-cache "$CHAIN_DATA_CACHE"
-    --out-dir "$METADATA_SOURCES_DIR"
-    --source-lock "$METADATA_SOURCE_LOCK"
-    --download-retries "$DOWNLOAD_RETRIES"
-    --download-retry-delay-seconds "$DOWNLOAD_RETRY_DELAY_SECONDS"
-  )
-  if [[ "$DRY_RUN" -eq 1 ]]; then
-    METADATA_SOURCE_CMD+=(--dry-run)
-  fi
-  run_cmd "${METADATA_SOURCE_CMD[@]}"
-
-  STRUCTURE_META_CMD=(
-    python "$SCRIPT_DIR/build_structure_metadata.py"
-    --chain-data-cache "$CHAIN_DATA_CACHE"
-    --metadata-out "$STRUCTURE_METADATA"
-    --metadata-sources-dir "$METADATA_SOURCES_DIR"
-    --metadata-source-lock "$METADATA_SOURCE_LOCK"
-    --feature-exclusion-list "$FEATURE_EXCLUSION_LIST"
-    --processability-exclusion-list "$PROCESSABILITY_EXCLUSION_LIST"
-    --candidate-manifest-out "$STRUCTURE_CANDIDATES"
-  )
-  run_cmd "${STRUCTURE_META_CMD[@]}"
+echo "[1/5] Verify frozen official manifest hashes"
+if [[ "$DRY_RUN" -eq 1 ]]; then
+  echo "+ python scripts/sync_official_manifest_hashes.py --check ..."
 else
-  echo "Skipping structure metadata rebuild (--skip-manifest-regen)."
-fi
-
-echo "[2/5] Manifest regeneration + hash sync"
-if [[ "$SKIP_MANIFEST_REGEN" -eq 0 ]]; then
-  REGEN_CMD=(
-    bash "$SCRIPT_DIR/regenerate_official_manifests.sh"
-    --chain-data-cache "$CHAIN_DATA_CACHE"
-    --out-dir "$MANIFESTS_DIR"
-    --private-root "$PRIVATE_ROOT"
-    --hidden-out-dir "$HIDDEN_MANIFESTS_DIR"
-    --lock-file "$LOCK_FILE"
-    --private-lock-file "$PRIVATE_MANIFEST_LOCK"
-    --structure-metadata "$STRUCTURE_METADATA"
-    --sync-hashes
-  )
-  if [[ "$REWRITE_LOCK" -eq 1 ]]; then
-    REGEN_CMD+=(--rewrite-lock)
-  fi
-  if [[ "$DRY_RUN" -eq 1 ]]; then
-    REGEN_CMD+=(--dry-run)
-  fi
-  run_cmd "${REGEN_CMD[@]}"
-else
-  if [[ "$DRY_RUN" -eq 1 ]]; then
-    echo "+ python scripts/sync_official_manifest_hashes.py --check ..."
-  else
-    python "$SCRIPT_DIR/sync_official_manifest_hashes.py" \
-      --manifests-dir "$MANIFESTS_DIR" \
-      --hidden-manifest "$HIDDEN_MANIFESTS_DIR/hidden_val.txt" \
-      --track-file "$TRACK_FILE" \
-      --track-file "$REPO_ROOT/tracks/research_large.yaml" \
-      --track-file "$REPO_ROOT/tracks/unlimited.yaml" \
-      --lock-file "$LOCK_FILE" \
-      --readme "$REPO_ROOT/README.md" \
-      --competition-doc "$REPO_ROOT/docs/COMPETITION.md" \
-      --check
-  fi
+  python "$SCRIPT_DIR/sync_official_manifest_hashes.py" \
+    --manifests-dir "$MANIFESTS_DIR" \
+    --hidden-manifest "$HIDDEN_MANIFESTS_DIR/hidden_val.txt" \
+    --track-file "$TRACK_FILE" \
+    --track-file "$REPO_ROOT/tracks/research_large.yaml" \
+    --track-file "$REPO_ROOT/tracks/unlimited.yaml" \
+    --lock-file "$LOCK_FILE" \
+    --readme "$REPO_ROOT/README.md" \
+    --competition-doc "$REPO_ROOT/docs/COMPETITION.md" \
+    --check
 fi
 
 echo "[3/5] Download public split raw assets"
@@ -507,9 +447,8 @@ if [[ "$SKIP_SETUP" -eq 0 ]]; then
     SETUP_CMD+=(--dry-run)
   fi
   if ! run_cmd "${SETUP_CMD[@]}"; then
-    if update_processability_exclusions_from_errors "$PROCESSED_FEATURES_DIR"; then
-      restart_after_processability_update
-    fi
+    echo "Data refresh stopped. Inspect the preprocessing error audit in the corresponding feature root."
+    echo "Manifests and exclusion lists will not be changed in response to preprocessing failures."
     exit 1
   fi
 else
@@ -600,15 +539,13 @@ if [[ "$SKIP_SETUP" -eq 0 ]]; then
     PUBLIC_PREPROCESS_COMMON+=(--skip-existing)
   fi
   if ! run_cmd "${PUBLIC_PREPROCESS_COMMON[@]}" --manifest "$MANIFESTS_DIR/train.txt"; then
-    if update_processability_exclusions_from_errors "$PROCESSED_FEATURES_DIR"; then
-      restart_after_processability_update
-    fi
+    echo "Data refresh stopped. Inspect the preprocessing error audit in the corresponding feature root."
+    echo "Manifests and exclusion lists will not be changed in response to preprocessing failures."
     exit 1
   fi
   if ! run_cmd "${PUBLIC_PREPROCESS_COMMON[@]}" --manifest "$MANIFESTS_DIR/val.txt"; then
-    if update_processability_exclusions_from_errors "$PROCESSED_FEATURES_DIR"; then
-      restart_after_processability_update
-    fi
+    echo "Data refresh stopped. Inspect the preprocessing error audit in the corresponding feature root."
+    echo "Manifests and exclusion lists will not be changed in response to preprocessing failures."
     exit 1
   fi
 else
@@ -640,13 +577,39 @@ if [[ "$SKIP_HIDDEN" -eq 0 && "$SKIP_SETUP" -eq 0 ]]; then
     HIDDEN_PREPROCESS_CMD+=(--skip-existing)
   fi
   if ! run_cmd "${HIDDEN_PREPROCESS_CMD[@]}"; then
-    if update_processability_exclusions_from_errors "$HIDDEN_FEATURES_DIR"; then
-      restart_after_processability_update
-    fi
+    echo "Data refresh stopped. Inspect the preprocessing error audit in the corresponding feature root."
+    echo "Manifests and exclusion lists will not be changed in response to preprocessing failures."
     exit 1
   fi
 else
   echo "Skipping hidden split preprocessing (--skip-hidden or --skip-setup)."
+fi
+
+echo "[3f/5] Enforce processed MSA and target separation audits"
+PUBLIC_AUDIT_CMD=(
+  python "$SCRIPT_DIR/audit_msa_split.py"
+  --train-manifest "$MANIFESTS_DIR/train.txt"
+  --val-manifest "$MANIFESTS_DIR/val.txt"
+  --features-dir "$PROCESSED_FEATURES_DIR"
+  --feature-exclusion-list "$FEATURE_EXCLUSION_LIST"
+  --out-dir "$PRIVATE_ROOT/audits/public_msa_split"
+  --strict --run-mmseqs --skip-plot
+  --threads "$DOWNLOAD_WORKERS"
+)
+run_cmd "${PUBLIC_AUDIT_CMD[@]}"
+if [[ "$SKIP_HIDDEN" -eq 0 ]]; then
+  HIDDEN_AUDIT_CMD=(
+    python "$SCRIPT_DIR/audit_msa_split.py"
+    --train-manifest "$MANIFESTS_DIR/all.txt"
+    --val-manifest "$HIDDEN_MANIFESTS_DIR/hidden_val.txt"
+    --features-dir "$PROCESSED_FEATURES_DIR"
+    --val-features-dir "$HIDDEN_FEATURES_DIR"
+    --feature-exclusion-list "$FEATURE_EXCLUSION_LIST"
+    --out-dir "$PRIVATE_ROOT/audits/hidden_msa_split"
+    --strict --run-mmseqs --skip-plot
+    --threads "$DOWNLOAD_WORKERS"
+  )
+  run_cmd "${HIDDEN_AUDIT_CMD[@]}"
 fi
 
 echo "[3f/5] Sync processed NPZ data to official manifests"
@@ -704,7 +667,7 @@ else
   run_cmd "${SOURCE_LOCK_CMD[@]}"
 fi
 
-echo "[4/5] Build official fingerprint"
+echo "[4/5] Stage candidate dataset fingerprints"
 if [[ "$SKIP_FINGERPRINT" -eq 0 ]]; then
   FP_CMD=(
     python "$SCRIPT_DIR/build_fingerprint.py"
@@ -726,7 +689,7 @@ if [[ "$SKIP_FINGERPRINT" -eq 0 ]]; then
       --val-manifest "$MANIFESTS_DIR/val.txt"
       --track "research_large"
       --source-lock "$LOCK_FILE"
-      --output "$REPO_ROOT/leaderboard/research_large_dataset_fingerprint.json"
+      --output "$RESEARCH_FINGERPRINT_OUT"
     )
     run_cmd "${RESEARCH_FP_CMD[@]}"
     UNLIMITED_FP_CMD=(
@@ -737,7 +700,7 @@ if [[ "$SKIP_FINGERPRINT" -eq 0 ]]; then
       --val-manifest "$MANIFESTS_DIR/val.txt"
       --track "unlimited"
       --source-lock "$LOCK_FILE"
-      --output "$REPO_ROOT/leaderboard/unlimited_dataset_fingerprint.json"
+      --output "$UNLIMITED_FINGERPRINT_OUT"
     )
     run_cmd "${UNLIMITED_FP_CMD[@]}"
   fi
@@ -784,7 +747,7 @@ else
 fi
 
 echo ""
-echo "Official data refresh flow complete."
+echo "Asset rebuild complete. Candidate fingerprints and locks require review before a versioned release."
 echo "Data root: $DATA_ROOT"
 echo "Manifests: $MANIFESTS_DIR"
 echo "Processed features: $PROCESSED_FEATURES_DIR"

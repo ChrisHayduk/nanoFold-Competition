@@ -26,6 +26,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from nanofold.a3m import GAP_ID, MASK_ID, RESTYPES, read_a3m, ungap_query_columns
 from nanofold.chain_paths import chain_data_dir, chain_npz_path
+from nanofold.mmseqs import iter_mmseqs_hits, validate_search_parameters
 
 MSA_TOKEN_TO_AA = {idx: aa for idx, aa in enumerate(RESTYPES)}
 MSA_TOKEN_TO_AA[20] = "X"
@@ -272,6 +273,8 @@ def _run_mmseqs(
     threads: int,
     max_seqs: int,
 ) -> list[str]:
+    validate_search_parameters(min_seq_id=min_seq_id, coverage=coverage, threads=threads, max_seqs=max_seqs)
+    output_m8.unlink(missing_ok=True)
     cmd = [
         mmseqs_bin,
         "easy-search",
@@ -285,6 +288,10 @@ def _run_mmseqs(
         str(coverage),
         "--cov-mode",
         "0",
+        "--alignment-mode",
+        "3",
+        "--seq-id-mode",
+        "0",
         "--threads",
         str(threads),
         "--max-seqs",
@@ -295,30 +302,30 @@ def _run_mmseqs(
     proc = subprocess.run(cmd, text=True, check=False)
     if proc.returncode != 0:
         raise RuntimeError(f"MMseqs failed with exit code {proc.returncode}: {' '.join(cmd)}")
+    if not output_m8.is_file():
+        raise RuntimeError("MMseqs completed without writing the expected alignment output")
     return cmd
 
 
-def _parse_excluded_hashes(output_m8: Path) -> set[str]:
+def _parse_excluded_hashes(
+    output_m8: Path, *, query_ids: set[str], source_hashes: set[str], min_seq_id: float, coverage: float,
+) -> tuple[set[str], int]:
     excluded: set[str] = set()
-    if not output_m8.exists():
-        return excluded
-    for line in output_m8.read_text().splitlines():
-        if not line.strip():
-            continue
-        parts = line.split("\t")
-        if len(parts) < 2:
-            continue
-        target = parts[1]
-        if not target.startswith("seq_"):
-            continue
-        digest = target.removeprefix("seq_").split(None, 1)[0]
-        if len(digest) == 64:
-            excluded.add(digest)
-    return excluded
+    hit_count = 0
+    for _query, target in iter_mmseqs_hits(
+        output_m8, query_ids=query_ids, target_ids={f"seq_{digest}" for digest in source_hashes},
+        min_seq_id=min_seq_id, coverage=coverage,
+    ):
+        excluded.add(target.removeprefix("seq_"))
+        hit_count += 1
+    return excluded, hit_count
 
 
 def main() -> None:
     args = parse_args()
+    validate_search_parameters(
+        min_seq_id=args.min_seq_id, coverage=args.coverage, threads=args.threads, max_seqs=args.max_seqs,
+    )
     mmseqs_path = shutil.which(args.mmseqs_bin)
     if mmseqs_path is None:
         raise SystemExit(f"MMseqs binary not found: {args.mmseqs_bin}")
@@ -365,6 +372,8 @@ def main() -> None:
         output_m8 = tmp_path / "heldout_vs_source_msa_rows.m8"
         mmseqs_tmp = tmp_path / "mmseqs_tmp"
         heldout_unique_count = _write_heldout_fasta(heldout_fasta, manifest_paths=heldout_manifests, cache=cache)
+        if heldout_unique_count == 0:
+            raise ValueError("Held-out manifests must contain target sequences")
         _write_source_fasta(source_fasta, sequences_by_hash)
         cmd = _run_mmseqs(
             mmseqs_bin=args.mmseqs_bin,
@@ -377,8 +386,11 @@ def main() -> None:
             threads=int(args.threads),
             max_seqs=int(args.max_seqs),
         )
-        excluded = _parse_excluded_hashes(output_m8)
-        hit_count = sum(1 for line in output_m8.read_text().splitlines() if line.strip()) if output_m8.exists() else 0
+        excluded, hit_count = _parse_excluded_hashes(
+            output_m8,
+            query_ids={f"heldout_{index}" for index in range(1, heldout_unique_count + 1)},
+            source_hashes=set(sequences_by_hash), min_seq_id=args.min_seq_id, coverage=args.coverage,
+        )
 
     payload = {
         "schema_version": 1,
@@ -387,6 +399,8 @@ def main() -> None:
             "min_seq_id": float(args.min_seq_id),
             "coverage": float(args.coverage),
             "cov_mode": 0,
+            "alignment_mode": 3,
+            "seq_id_mode": 0,
         },
         "mmseqs": {
             "binary": args.mmseqs_bin,

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import re
 import sys
 from collections import Counter
 from datetime import datetime, timezone
@@ -20,7 +22,7 @@ from nanofold.structure_metadata import (
     STRUCTURE_METADATA_SCHEMA_VERSION,
     domain_architecture_from_cath_class,
     domain_architecture_from_scop_sccs,
-    normalize_domain_architecture_class,
+    secondary_fractions_from_mmcif_annotations,
 )
 
 STANDARD_AAS = set("ARNDCQEGHILKMFPSTWYV")
@@ -70,7 +72,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-len", type=int, default=256)
     parser.add_argument("--max-resolution", type=float, default=3.0)
     parser.add_argument("--max-unknown-aa-fraction", type=float, default=0.0)
-    parser.add_argument("--sample-limit", type=int, default=0)
+    parser.add_argument(
+        "--require-monomer",
+        action="store_true",
+        help="Require an explicit biological oligomeric_count of 1; unknown assembly state is rejected.",
+    )
+    parser.add_argument(
+        "--sample-limit",
+        type=int,
+        default=0,
+        help="Debug-only limit on eligible chains processed; cath-v2 split generation requires 0 (the full universe).",
+    )
     parser.add_argument("--fail-fast", action="store_true")
     return parser.parse_args(argv)
 
@@ -103,40 +115,13 @@ def _unknown_aa_fraction(sequence: str) -> float:
 
 
 def _numeric(value: object, default: float) -> float:
-    if not isinstance(value, (str, bytes, bytearray, int, float)):
+    if isinstance(value, bool) or not isinstance(value, (str, bytes, bytearray, int, float)):
         return default
     try:
-        return float(value)
+        result = float(value)
     except (TypeError, ValueError):
         return default
-
-
-def _candidate_reject_reasons(
-    *,
-    sequence: str | None,
-    length: int,
-    resolution: float,
-    oligomeric_count: int,
-    min_len: int,
-    max_len: int,
-    max_resolution: float,
-    max_unknown_aa_fraction: float,
-) -> list[str]:
-    reasons: list[str] = []
-    if not sequence:
-        reasons.append("missing_sequence")
-        return reasons
-    if length < min_len:
-        reasons.append("min_length")
-    if length > max_len:
-        reasons.append("max_length")
-    if resolution != 999.0 and resolution > max_resolution:
-        reasons.append("resolution")
-    if oligomeric_count != 1:
-        reasons.append("oligomeric_count")
-    if _unknown_aa_fraction(sequence) > max_unknown_aa_fraction:
-        reasons.append("unknown_aa_fraction")
-    return reasons
+    return result if math.isfinite(result) else default
 
 
 def _candidate_rows(
@@ -146,28 +131,51 @@ def _candidate_rows(
     max_len: int,
     max_resolution: float,
     max_unknown_aa_fraction: float,
+    require_monomer: bool = False,
 ) -> tuple[list[dict[str, Any]], Counter[str]]:
+    if min_len <= 0 or max_len < min_len:
+        raise ValueError("Invalid sequence length bounds")
+    if not math.isfinite(max_resolution) or max_resolution <= 0:
+        raise ValueError("max_resolution must be positive and finite")
+    if not math.isfinite(max_unknown_aa_fraction) or not 0 <= max_unknown_aa_fraction <= 1:
+        raise ValueError("max_unknown_aa_fraction must be in [0, 1]")
     candidates: list[dict[str, Any]] = []
     reject_counts: Counter[str] = Counter()
     for chain_id, raw_meta in sorted(data.items()):
+        if not re.fullmatch(r"[0-9A-Za-z]{4}_[^\s_]+", chain_id):
+            reject_counts["invalid_chain_id"] += 1
+            continue
         if not isinstance(raw_meta, dict):
             reject_counts["bad_metadata"] += 1
             continue
-        meta: dict[str, Any] = raw_meta
-        sequence = _extract_sequence(meta)
-        length = int(_numeric(meta.get("seq_length", meta.get("sequence_length", len(sequence or ""))), len(sequence or "")))
-        resolution = _numeric(meta.get("resolution", 999.0), 999.0)
-        oligomeric_count = int(_numeric(meta.get("oligomeric_count", meta.get("num_chains", 1)), 1.0))
-        reasons = _candidate_reject_reasons(
-            sequence=sequence,
-            length=length,
-            resolution=resolution,
-            oligomeric_count=oligomeric_count,
-            min_len=min_len,
-            max_len=max_len,
-            max_resolution=max_resolution,
-            max_unknown_aa_fraction=max_unknown_aa_fraction,
+        sequence = _extract_sequence(raw_meta)
+        if not sequence:
+            reject_counts["missing_sequence"] += 1
+            continue
+        length = len(sequence)
+        declared_length = _numeric(raw_meta.get("seq_length", raw_meta.get("sequence_length", length)), -1)
+        resolution = _numeric(raw_meta.get("resolution"), 999.0)
+        # OpenFold uses zero for unavailable resolution, not a high-quality measurement.
+        if resolution <= 0:
+            resolution = 999.0
+        oligomer = _numeric(raw_meta.get("oligomeric_count"), -1)
+        oligomeric_count = int(oligomer) if oligomer > 0 and float(oligomer).is_integer() else None
+        oligomeric_state = (
+            "unknown" if oligomeric_count is None else ("known_monomer" if oligomeric_count == 1 else "known_multimer")
         )
+        reasons: list[str] = []
+        if declared_length != length:
+            reasons.append("sequence_length_mismatch")
+        if length < min_len:
+            reasons.append("min_length")
+        if length > max_len:
+            reasons.append("max_length")
+        if resolution != 999.0 and resolution > max_resolution:
+            reasons.append("resolution")
+        if require_monomer and oligomeric_count != 1:
+            reasons.append("unknown_oligomeric_count" if oligomeric_count is None else "oligomeric_count")
+        if _unknown_aa_fraction(sequence) > max_unknown_aa_fraction:
+            reasons.append("unknown_aa_fraction")
         if reasons:
             reject_counts.update(reasons)
             continue
@@ -177,6 +185,8 @@ def _candidate_rows(
                 "sequence": sequence,
                 "length": length,
                 "resolution": resolution,
+                "oligomeric_count": oligomeric_count,
+                "oligomeric_state": oligomeric_state,
             }
         )
     return candidates, reject_counts
@@ -193,145 +203,107 @@ def _add_source_value(out: dict[str, set[str]], key: str, value: str) -> None:
     out.setdefault(key, set()).add(normalized)
 
 
-def _extract_chain_from_domain_id(domain_id: str) -> tuple[str, str] | None:
-    text = domain_id.strip()
-    if len(text) < 6:
-        return None
-    if text[0].lower() == "e":
-        text = text[1:]
-    pdb_id = text[:4].lower()
-    chain = text[4:-1] if text[-1].isdigit() else text[4:]
-    if not pdb_id or not chain:
-        return None
-    return pdb_id, chain
+def _load_cath_annotations(path: Path) -> dict[str, list[dict[str, str]]]:
+    """Read CATH domains without collapsing hierarchy levels or multiple domains.
 
-
-def _load_cath_annotations(path: Path) -> dict[str, set[str]]:
-    annotations: dict[str, set[str]] = {}
-    if not path.exists():
-        return annotations
-    for raw_line in path.read_text(errors="ignore").splitlines():
+    IDs contain a PDB ID, case-sensitive author chain, and two-digit domain
+    number. The list has no boundaries and does not imply residue ordering.
+    """
+    annotations: dict[str, list[dict[str, str]]] = {}
+    seen: dict[str, tuple[str, ...]] = {}
+    for line_number, raw_line in enumerate(path.read_text().splitlines(), start=1):
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
         parts = line.split()
-        if len(parts) < 2:
+        if len(parts) != 12 or not re.fullmatch(r"[0-9A-Za-z]{4}[0-9A-Za-z][0-9]{2}", parts[0]):
+            raise ValueError(f"Malformed CATH domain-list row at {path.name}:{line_number}")
+        if any(not value.isdigit() for value in parts[1:11]):
+            raise ValueError(f"Invalid CATH integer field at {path.name}:{line_number}")
+        hierarchy = [int(value) for value in parts[1:5]]
+        if any(value <= 0 for value in hierarchy) or int(parts[10]) <= 0:
+            raise ValueError(f"Invalid CATH hierarchy or domain length at {path.name}:{line_number}")
+        if _numeric(parts[11], -1) < 0:
+            raise ValueError(f"Invalid CATH resolution at {path.name}:{line_number}")
+        domain_id = parts[0][:4].lower() + parts[0][4:]
+        record = tuple(parts[1:])
+        if domain_id in seen:
+            if seen[domain_id] != record:
+                raise ValueError(f"Conflicting CATH annotations for domain {domain_id}")
             continue
-        domain_id = parts[0].strip()
-        if len(domain_id) < 5:
-            continue
-        pdb_id, chain = domain_id[:4].lower(), domain_id[4]
-        _add_source_value(annotations, _chain_key(pdb_id, chain), domain_architecture_from_cath_class(parts[1]))
-    return annotations
+        seen[domain_id] = record
+        codes = [".".join(str(value) for value in hierarchy[:depth]) for depth in range(1, 5)]
+        annotations.setdefault(_chain_key(domain_id[:4], domain_id[4]), []).append(
+            {
+                "domain_id": domain_id,
+                "class_id": codes[0],
+                "architecture_id": codes[1],
+                "topology_id": codes[2],
+                "homologous_superfamily_id": codes[3],
+            }
+        )
+    if not annotations:
+        raise ValueError(f"CATH domain list contains no annotations: {path}")
+    return {key: sorted(domains, key=lambda domain: domain["domain_id"]) for key, domains in annotations.items()}
 
 
 def _load_scope_annotations(path: Path) -> dict[str, set[str]]:
     annotations: dict[str, set[str]] = {}
-    if not path.exists():
-        return annotations
-    for raw_line in path.read_text(errors="ignore").splitlines():
+    seen: dict[str, tuple[str, ...]] = {}
+    for line_number, raw_line in enumerate(path.read_text().splitlines(), start=1):
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
         parts = line.split()
-        if len(parts) < 4:
-            continue
-        pdb_id = parts[1].lower()
-        chain_range = parts[2]
-        chain = chain_range.split(":", 1)[0].strip("_")
-        if not chain or chain in {"-", "."}:
-            parsed = _extract_chain_from_domain_id(parts[0])
-            if parsed is None:
-                continue
-            pdb_id, chain = parsed
-        _add_source_value(annotations, _chain_key(pdb_id, chain), domain_architecture_from_scop_sccs(parts[3]))
+        if len(parts) != 6 or not re.fullmatch(r"[a-z]\.[0-9]+\.[0-9]+\.[0-9]+", parts[3]):
+            raise ValueError(f"Malformed SCOPe row at {path.name}:{line_number}")
+        record = tuple(parts[1:])
+        if parts[0] in seen and seen[parts[0]] != record:
+            raise ValueError(f"Conflicting SCOPe annotations for domain {parts[0]}")
+        seen[parts[0]] = record
+        chains = {segment.split(":", 1)[0] for segment in parts[2].split(",") if ":" in segment}
+        for chain in sorted(chains - {"", "-", ".", "_"}):
+            _add_source_value(annotations, _chain_key(parts[1], chain), domain_architecture_from_scop_sccs(parts[3]))
     return annotations
-
-
-def _classify_ecod_line(line: str) -> str:
-    lowered = line.lower()
-    if "alpha" in lowered and "beta" in lowered:
-        return "alpha_beta"
-    if "a+b" in lowered or "a/b" in lowered:
-        return "alpha_beta"
-    if "alpha" in lowered or "helical" in lowered or "helix" in lowered:
-        return "alpha"
-    if "beta" in lowered or "sandwich" in lowered or "barrel" in lowered:
-        return "beta"
-    return "unknown"
 
 
 def _load_ecod_annotations(path: Path) -> dict[str, set[str]]:
+    """Record mapped ECOD coverage without inferring a class from free text."""
     annotations: dict[str, set[str]] = {}
-    if not path.exists():
-        return annotations
-    for raw_line in path.read_text(errors="ignore").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
+    for line_number, raw_line in enumerate(path.read_text().splitlines(), start=1):
+        if not raw_line.strip() or raw_line.lstrip().startswith("#"):
             continue
-        parsed = None
-        for token in line.replace("\t", " ").split():
-            if token.startswith("e") and len(token) >= 6:
-                parsed = _extract_chain_from_domain_id(token)
-                if parsed is not None:
-                    break
-        if parsed is None:
-            continue
-        pdb_id, chain = parsed
-        _add_source_value(annotations, _chain_key(pdb_id, chain), _classify_ecod_line(line))
+        parts = raw_line.split("\t")
+        if len(parts) < 6 or not re.fullmatch(r"[0-9A-Za-z]{4}", parts[4]):
+            raise ValueError(f"Malformed ECOD row at {path.name}:{line_number}")
+        chain = parts[5].strip()
+        if chain and chain not in {"-", ".", "_"}:
+            _add_source_value(annotations, _chain_key(parts[4], chain), "annotated")
     return annotations
-
-
-def _walk_values(obj: Any) -> list[Any]:
-    values: list[Any] = []
-    if isinstance(obj, dict):
-        for value in obj.values():
-            values.extend(_walk_values(value))
-    elif isinstance(obj, list):
-        for value in obj:
-            values.extend(_walk_values(value))
-    else:
-        values.append(obj)
-    return values
 
 
 def _load_rcsb_annotations(path: Path) -> tuple[dict[str, set[str]], dict[str, dict[str, Any]]]:
     annotations: dict[str, set[str]] = {}
     metadata: dict[str, dict[str, Any]] = {}
-    if not path.exists():
-        return annotations, metadata
-    for raw_line in path.read_text(errors="ignore").splitlines():
+    for line_number, raw_line in enumerate(path.read_text().splitlines(), start=1):
         if not raw_line.strip():
             continue
-        try:
-            row = json.loads(raw_line)
-        except json.JSONDecodeError:
-            continue
-        chain_id = str(row.get("chain_id") or "").strip()
-        if not chain_id:
-            continue
-        values = [str(value).lower() for value in _walk_values(row)]
-        joined = " ".join(values)
-        classes: set[str] = set()
-        if "cath" in joined:
-            classes.add("cath_annotated")
-        if "scop" in joined:
-            classes.add("scope_annotated")
-        if "alpha" in joined and "beta" in joined:
-            classes.add("alpha_beta")
-        elif "helix" in joined or "alpha" in joined:
-            classes.add("alpha")
-        elif "sheet" in joined or "strand" in joined or "beta" in joined:
-            classes.add("beta")
-        for cls in classes:
-            _add_source_value(annotations, chain_id, normalize_domain_architecture_class(cls))
+        row = json.loads(raw_line)
+        if not isinstance(row, dict) or not isinstance(row.get("chain_id"), str):
+            raise ValueError(f"Malformed RCSB record at {path.name}:{line_number}")
+        chain_id = row["chain_id"]
+        if chain_id in metadata:
+            raise ValueError(f"Duplicate RCSB chain record: {chain_id}")
         entry = row.get("entry") if isinstance(row.get("entry"), dict) else {}
         entity = row.get("entity") if isinstance(row.get("entity"), dict) else {}
         metadata[chain_id] = {
             "experimental_method": _first_nested_value(entry, ("exptl", "method")),
             "taxonomy_id": _first_nested_value(entity, ("rcsb_entity_source_organism", "ncbi_taxonomy_id")),
             "source_organism": _first_nested_value(entity, ("rcsb_entity_source_organism", "scientific_name")),
+            "errors": row.get("errors", []),
         }
+        if entry or entity:
+            _add_source_value(annotations, chain_id, "annotated")
     return annotations, metadata
 
 
@@ -348,53 +320,117 @@ def _first_nested_value(obj: Any, path: tuple[str, ...]) -> Any:
     return current
 
 
-def _load_external_sources(metadata_sources_dir: Path) -> tuple[dict[str, dict[str, set[str]]], dict[str, dict[str, Any]]]:
-    cath = _load_cath_annotations(metadata_sources_dir / "cath-domain-list.txt")
-    scope = _load_scope_annotations(metadata_sources_dir / "dir.cla.scope.txt")
-    ecod = _load_ecod_annotations(metadata_sources_dir / "ecod.latest.domains.txt")
-    rcsb, rcsb_meta = _load_rcsb_annotations(metadata_sources_dir / "rcsb_chain_metadata.jsonl")
-    return {"cath": cath, "scope": scope, "ecod": ecod, "rcsb": rcsb}, rcsb_meta
+SOURCE_FILENAMES = {
+    "cath_domain_list": "cath-domain-list.txt",
+    "scope_classification": "dir.cla.scope.txt",
+    "ecod_domains": "ecod.latest.domains.txt",
+    "rcsb_chain_metadata": "rcsb_chain_metadata.jsonl",
+    "dssp_mmcif": "dssp_mmcif",
+}
+
+
+def _tree_sha256(root: Path) -> str:
+    import hashlib
+
+    hasher = hashlib.sha256()
+    for path in sorted(path for path in root.rglob("*") if path.is_file()):
+        hasher.update(path.relative_to(root).as_posix().encode("utf-8"))
+        hasher.update(b"\t")
+        hasher.update(_sha256(path).encode("ascii"))
+        hasher.update(b"\n")
+    return hasher.hexdigest()
+
+
+def _verify_source_lock(source_lock: Path, metadata_sources_dir: Path, chain_data_cache: Path) -> dict[str, Any]:
+    if not source_lock.is_file():
+        raise ValueError(f"Missing metadata source lock: {source_lock}")
+    raw = json.loads(source_lock.read_text())
+    if not isinstance(raw, dict) or not isinstance(raw.get("sources"), dict):
+        raise ValueError("Metadata source lock must contain a sources object")
+    if raw.get("schema_version", 1) not in {1, 2}:
+        raise ValueError("Unsupported metadata source lock schema version")
+    cache_record = raw.get("chain_data_cache")
+    if not isinstance(cache_record, dict) or cache_record.get("sha256") != _sha256(chain_data_cache):
+        raise ValueError("Metadata source lock chain_data_cache SHA-256 mismatch")
+    verified: dict[str, Any] = {}
+    for name, record in raw["sources"].items():
+        if name not in SOURCE_FILENAMES:
+            raise ValueError(f"Unsupported metadata source: {name}")
+        if not isinstance(record, dict):
+            raise ValueError(f"Invalid metadata source record: {name}")
+        if record.get("skipped") is True:
+            if name == "cath_domain_list":
+                raise ValueError("CATH domain list is a required metadata source")
+            continue
+        path = metadata_sources_dir / SOURCE_FILENAMES[name]
+        digest_field = "tree_sha256" if name == "dssp_mmcif" else "sha256"
+        expected = record.get(digest_field)
+        if not isinstance(expected, str) or not re.fullmatch(r"[0-9a-f]{64}", expected):
+            raise ValueError(f"Missing valid {digest_field} for metadata source {name}")
+        if not path.exists() or (not path.is_dir() if name == "dssp_mmcif" else not path.is_file()):
+            raise ValueError(f"Missing metadata source {name}: {path}")
+        observed = _tree_sha256(path) if name == "dssp_mmcif" else _sha256(path)
+        if observed != expected:
+            raise ValueError(f"Metadata source SHA-256 mismatch: {name}")
+        verified[name] = record
+    if "cath_domain_list" not in verified:
+        raise ValueError("CATH domain list is a required metadata source")
+    return verified
+
+
+def _load_external_sources(
+    metadata_sources_dir: Path,
+    verified_sources: dict[str, Any],
+) -> tuple[dict[str, dict[str, set[str]]], dict[str, dict[str, Any]], dict[str, list[dict[str, str]]]]:
+    cath_domains = _load_cath_annotations(metadata_sources_dir / "cath-domain-list.txt")
+    cath: dict[str, set[str]] = {}
+    for chain_id, domains in cath_domains.items():
+        # CATH '0' denotes an absent PDB chain field, not a literal author chain 0.
+        if _chain_name(chain_id) == "0":
+            continue
+        for domain in domains:
+            raw_class = domain["class_id"]
+            broad_class = (
+                domain_architecture_from_cath_class(raw_class) if raw_class in {"1", "2", "3", "4"} else "other"
+            )
+            cath.setdefault(chain_id, set()).add(broad_class)
+    scope = (
+        _load_scope_annotations(metadata_sources_dir / "dir.cla.scope.txt")
+        if "scope_classification" in verified_sources
+        else {}
+    )
+    ecod = (
+        _load_ecod_annotations(metadata_sources_dir / "ecod.latest.domains.txt")
+        if "ecod_domains" in verified_sources
+        else {}
+    )
+    rcsb, rcsb_meta = (
+        _load_rcsb_annotations(metadata_sources_dir / "rcsb_chain_metadata.jsonl")
+        if "rcsb_chain_metadata" in verified_sources
+        else ({}, {})
+    )
+    return {"cath": cath, "scope": scope, "ecod": ecod, "rcsb": rcsb}, rcsb_meta, cath_domains
 
 
 def _select_domain_architecture(
     chain_id: str,
     external_sources: dict[str, dict[str, set[str]]],
-    fallback_secondary_class: str,
 ) -> tuple[str, str, dict[str, list[str]]]:
-    values_by_source: dict[str, list[str]] = {}
-    for source_name in ("cath", "scope", "ecod", "rcsb"):
-        values = sorted(external_sources.get(source_name, {}).get(chain_id, set()))
-        if values:
-            values_by_source[source_name] = values
-    for source_name in ("cath", "scope", "ecod", "rcsb"):
-        source_values = values_by_source.get(source_name)
-        if source_values:
-            chosen = normalize_domain_architecture_class(source_values[0])
-            if chosen not in {"unknown", "cath_annotated", "scope_annotated"}:
-                return chosen, source_name, values_by_source
-    fallback = normalize_domain_architecture_class(fallback_secondary_class)
-    return fallback, "secondary_structure_fallback", values_by_source
-
-
-def _metadata_source_hashes(source_lock: Path) -> dict[str, Any]:
-    if not source_lock.exists():
-        return {}
-    try:
-        raw = json.loads(source_lock.read_text())
-    except json.JSONDecodeError:
-        return {}
-    if not isinstance(raw, dict):
-        return {}
-    return {
-        "lock_path": str(source_lock),
-        "lock_sha256": _sha256(source_lock),
-        "sources": raw.get("sources", {}),
+    if _chain_name(chain_id) == "0":
+        return "unknown", "unknown", {}
+    values_by_source = {
+        name: sorted(values[chain_id]) for name, values in external_sources.items() if values.get(chain_id)
     }
+    for source_name in ("cath", "scope"):
+        values = values_by_source.get(source_name, [])
+        if values:
+            return values[0] if len(values) == 1 else "multi_class", source_name, values_by_source
+    return "unknown", "unknown", values_by_source
 
 
 def _load_feature_exclusions(path: Path) -> set[str]:
-    if not path.exists():
-        return set()
+    if not path.is_file():
+        raise ValueError(f"Missing required exclusion list: {path}")
     out: set[str] = set()
     for raw_line in path.read_text().splitlines():
         line = raw_line.split("#", 1)[0].strip()
@@ -412,61 +448,74 @@ def _feature_exclusion_source(path: Path, chain_ids: set[str]) -> dict[str, Any]
     }
 
 
-def _derived_secondary_fractions(domain_class: str) -> tuple[str, float, float, float]:
-    cls = normalize_domain_architecture_class(domain_class)
-    if cls == "alpha":
-        return "alpha", 0.70, 0.05, 0.25
-    if cls == "beta":
-        return "beta", 0.05, 0.55, 0.40
-    if cls == "alpha_beta":
-        return "alpha_beta", 0.35, 0.25, 0.40
-    if cls == "coil_or_sparse":
-        return "coil_or_sparse", 0.05, 0.05, 0.90
-    return "mixed_low_confidence", 0.25, 0.15, 0.60
-
-
 def _source_metadata_fields(
     *,
     chain_id: str,
+    length: int,
     resolution: float,
     external_sources: dict[str, dict[str, set[str]]],
     rcsb_metadata: dict[str, dict[str, Any]],
+    cath_domains_by_chain: dict[str, list[dict[str, str]]],
+    dssp_dir: Path | None,
 ) -> tuple[dict[str, Any], str, str, dict[str, bool]]:
-    domain_class, domain_source, domain_source_values = _select_domain_architecture(
-        chain_id,
-        external_sources,
-        fallback_secondary_class="mixed_low_confidence",
-    )
-    derived_cls, derived_helix, derived_beta, derived_coil = _derived_secondary_fractions(domain_class)
+    domain_class, domain_source, domain_source_values = _select_domain_architecture(chain_id, external_sources)
+    raw_domains = cath_domains_by_chain.get(chain_id, [])
+    ambiguous_chain = _chain_name(chain_id) == "0" and bool(raw_domains)
+    cath_domains = [] if ambiguous_chain else raw_domains
+    secondary: tuple[str, float | None, float | None, float | None, str | None] = ("unknown", None, None, None, None)
+    if dssp_dir is not None:
+        mmcif_path = dssp_dir / f"{_pdb_id(chain_id)}.cif"
+        if mmcif_path.is_file():
+            secondary = secondary_fractions_from_mmcif_annotations(
+                str(mmcif_path), chain_id=_chain_name(chain_id), length=length
+            )
+    secondary_class, helix, beta, coil, secondary_source = secondary
     source_coverage = {
         source_name: bool(external_sources.get(source_name, {}).get(chain_id))
         for source_name in ("cath", "scope", "ecod", "rcsb")
     }
-    source_coverage["domain_class_projection"] = True
-    metadata_source_count = sum(1 for present in source_coverage.values() if present)
+    source_coverage["secondary_structure"] = secondary_source is not None
+    nonempty_class_sets = {
+        tuple(values) for source, values in domain_source_values.items() if source in {"cath", "scope"}
+    }
     fields = {
         "accepted": True,
         "reject_reasons": [],
-        "secondary_structure_class": derived_cls,
-        "secondary_helix_fraction": round(float(derived_helix), 4),
-        "secondary_beta_fraction": round(float(derived_beta), 4),
-        "secondary_coil_fraction": round(float(derived_coil), 4),
-        "secondary_structure_source": f"domain_class_projection:{domain_source}",
+        "secondary_structure_class": secondary_class,
+        "secondary_helix_fraction": helix,
+        "secondary_beta_fraction": beta,
+        "secondary_coil_fraction": coil,
+        "secondary_structure_source": secondary_source,
         "domain_architecture_class": domain_class,
         "domain_architecture_source": domain_source,
         "domain_architecture_source_values": domain_source_values,
+        "domain_class_source_conflict": len(nonempty_class_sets) > 1,
+        "cath_domains": cath_domains,
+        "cath_class_ids": sorted({domain["class_id"] for domain in cath_domains}),
+        "cath_architecture_ids": sorted({domain["architecture_id"] for domain in cath_domains}),
+        "cath_topology_ids": sorted({domain["topology_id"] for domain in cath_domains}),
+        "cath_homologous_superfamily_ids": sorted({domain["homologous_superfamily_id"] for domain in cath_domains}),
+        "cath_annotation_status": "annotated" if cath_domains else "unknown",
+        "cath_mapping_status": "ambiguous_blank_chain"
+        if ambiguous_chain
+        else ("exact_author_chain" if cath_domains else "unannotated"),
+        "cath_unresolved_domains": raw_domains if ambiguous_chain else [],
         "metadata_source_coverage": source_coverage,
-        "metadata_source_count": metadata_source_count,
+        "metadata_source_count": sum(source_coverage.values()),
         "rcsb_metadata": rcsb_metadata.get(chain_id, {}),
         "structure_resolution": float(resolution),
     }
-    return fields, derived_cls, domain_class, source_coverage
+    return fields, secondary_class, domain_class, source_coverage
 
 
 def _sha256(path: Path) -> str:
     import hashlib
 
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    hasher = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
 
 
 def build_metadata(
@@ -482,7 +531,16 @@ def build_metadata(
     max_unknown_aa_fraction: float,
     sample_limit: int = 0,
     fail_fast: bool = False,
+    require_monomer: bool = False,
 ) -> dict[str, Any]:
+    """Build metadata with the eligible-universe size and any debug truncation recorded.
+
+    ``sample_limit`` is for debugging only. Official cath-v2 generation requires
+    zero, which processes every eligible chain, including subsequent exclusions.
+    """
+    if isinstance(sample_limit, bool) or not isinstance(sample_limit, int) or sample_limit < 0:
+        raise ValueError("sample_limit must be a nonnegative integer")
+    verified_sources = _verify_source_lock(metadata_source_lock, metadata_sources_dir, chain_data_cache)
     raw = json.loads(chain_data_cache.read_text())
     if not isinstance(raw, dict):
         raise ValueError(f"chain_data_cache must be a JSON object: {chain_data_cache}")
@@ -492,7 +550,9 @@ def build_metadata(
         max_len=max_len,
         max_resolution=max_resolution,
         max_unknown_aa_fraction=max_unknown_aa_fraction,
+        require_monomer=require_monomer,
     )
+    eligible_candidate_count = len(candidates)
     if sample_limit > 0:
         candidates = candidates[:sample_limit]
 
@@ -501,7 +561,8 @@ def build_metadata(
     secondary_counts: Counter[str] = Counter()
     domain_counts: Counter[str] = Counter()
     source_counts: Counter[str] = Counter()
-    external_sources, rcsb_metadata = _load_external_sources(metadata_sources_dir)
+    external_sources, rcsb_metadata, cath_domains = _load_external_sources(metadata_sources_dir, verified_sources)
+    dssp_dir = metadata_sources_dir / "dssp_mmcif" if "dssp_mmcif" in verified_sources else None
     feature_exclusions = _load_feature_exclusions(feature_exclusion_list)
     processability_exclusions = _load_feature_exclusions(processability_exclusion_list)
 
@@ -516,6 +577,8 @@ def build_metadata(
             "reject_reasons": [],
             "length": int(candidate["length"]),
             "resolution": float(candidate["resolution"]),
+            "oligomeric_count": candidate["oligomeric_count"],
+            "oligomeric_state": candidate["oligomeric_state"],
         }
         if chain_id in feature_exclusions:
             entry["reject_reasons"] = ["missing_required_feature_asset"]
@@ -530,6 +593,9 @@ def build_metadata(
         try:
             fields, cls, domain_class, source_coverage = _source_metadata_fields(
                 chain_id=chain_id,
+                length=int(candidate["length"]),
+                cath_domains_by_chain=cath_domains,
+                dssp_dir=dssp_dir,
                 resolution=float(candidate["resolution"]),
                 external_sources=external_sources,
                 rcsb_metadata=rcsb_metadata,
@@ -551,8 +617,19 @@ def build_metadata(
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "source": {
             "chain_data_cache": str(chain_data_cache),
+            "chain_data_cache_sha256": _sha256(chain_data_cache),
+            "chain_id_namespace": "author_asym_id",
+            "cath_annotation_semantics": "domain presence, not residue coverage",
+            "cath_source_domain_count": sum(len(domains) for domains in cath_domains.values()),
+            "cath_source_blank_chain_domain_count": sum(
+                len(domains) for chain, domains in cath_domains.items() if _chain_name(chain) == "0"
+            ),
             "metadata_sources_dir": str(metadata_sources_dir),
-            "metadata_source_lock": _metadata_source_hashes(metadata_source_lock),
+            "metadata_source_lock": {
+                "lock_path": str(metadata_source_lock),
+                "lock_sha256": _sha256(metadata_source_lock),
+                "sources": verified_sources,
+            },
             "feature_exclusion_list": _feature_exclusion_source(feature_exclusion_list, feature_exclusions),
             "processability_exclusion_list": _feature_exclusion_source(
                 processability_exclusion_list,
@@ -560,6 +637,9 @@ def build_metadata(
             ),
         },
         "config": {
+            "sample_limit": sample_limit,
+            "require_monomer": require_monomer,
+            "prediction_target": "single_chain",
             "min_len": int(min_len),
             "max_len": int(max_len),
             "max_resolution": float(max_resolution),
@@ -573,7 +653,12 @@ def build_metadata(
             },
         },
         "summary": {
+            "eligible_candidate_count": eligible_candidate_count,
             "candidate_count": len(candidates),
+            "oligomeric_state": dict(sorted(Counter(item["oligomeric_state"] for item in candidates).items())),
+            "cath_annotation_status": dict(
+                sorted(Counter(item.get("cath_annotation_status", "rejected") for item in entries).items())
+            ),
             "accepted": sum(1 for item in entries if item["accepted"]),
             "rejected": sum(1 for item in entries if not item["accepted"]),
             "reject_reasons": dict(sorted(reject_counts.items())),
@@ -599,6 +684,7 @@ def main(argv: list[str] | None = None) -> None:
         max_unknown_aa_fraction=float(args.max_unknown_aa_fraction),
         sample_limit=int(args.sample_limit),
         fail_fast=bool(args.fail_fast),
+        require_monomer=bool(args.require_monomer),
     )
     args.metadata_out.parent.mkdir(parents=True, exist_ok=True)
     args.metadata_out.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")

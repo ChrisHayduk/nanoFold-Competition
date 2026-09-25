@@ -1,0 +1,357 @@
+from __future__ import annotations
+
+import importlib.util
+import json
+import sys
+from pathlib import Path
+
+import gemmi
+import numpy as np
+import pytest
+
+from nanofold.chain_paths import chain_data_dir, chain_npz_path
+
+
+def _write_structure(path: Path, offset: float = 0, length: int = 3) -> None:
+    structure = gemmi.Structure()
+    model = gemmi.Model(1)
+    chain = gemmi.Chain("A")
+    for index in range(length):
+        residue = gemmi.Residue()
+        residue.name = "ALA"
+        residue.seqid = gemmi.SeqId(index + 1, " ")
+        residue.label_seq = index + 1
+        residue.entity_type = gemmi.EntityType.Polymer
+        atom = gemmi.Atom()
+        atom.name = "CA"
+        atom.element = gemmi.Element("C")
+        atom.pos = gemmi.Position(offset + index * 3.8, 0, 0)
+        atom.occ = 1
+        residue.add_atom(atom)
+        chain.add_residue(residue)
+    model.add_chain(chain)
+    structure.add_model(model)
+    structure.setup_entities()
+    structure.make_mmcif_document().write_file(str(path))
+
+
+@pytest.fixture
+def preprocessing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    spec = importlib.util.spec_from_file_location("preprocess_resume_script", Path("scripts/preprocess.py").resolve())
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    alignments = tmp_path / "alignments"
+    chain_dir = chain_data_dir(alignments, "1abc_A")
+    chain_dir.mkdir(parents=True)
+    msa = chain_dir / "uniref90_hits.a3m"
+    msa.write_text(">query\nAAA\n>hit\nAA-\n")
+    mmcifs = tmp_path / "mmcif"
+    mmcifs.mkdir()
+    cif = mmcifs / "1abc.cif"
+    _write_structure(cif)
+    manifest = tmp_path / "train.txt"
+    manifest.write_text("1abc_A\n")
+    features = tmp_path / "features"
+    labels = tmp_path / "labels"
+    argv = [
+        "preprocess.py", "--manifest", str(manifest), "--alignments-root", str(alignments),
+        "--mmcif-root", str(mmcifs), "--processed-features-dir", str(features),
+        "--processed-labels-dir", str(labels), "--disable-templates", "--strict", "--fail-fast",
+        "--min-projection-valid-ca", "3",
+    ]
+
+    def run(*extra: str) -> None:
+        monkeypatch.setattr(sys, "argv", [*argv, *extra])
+        module.main()
+
+    return module, run, features, labels, msa, cif
+
+
+def test_resume_preserves_metadata_and_skips_only_unchanged_inputs(preprocessing) -> None:
+    _, run, features, labels, msa, cif = preprocessing
+    run()
+    feature_path = chain_npz_path(features, "1abc_A")
+    label_path = chain_npz_path(labels, "1abc_A")
+    before = feature_path.stat().st_mtime_ns
+    metadata_before = (features / "preprocess_meta.json").read_bytes()
+    run("--skip-existing")
+    assert feature_path.stat().st_mtime_ns == before
+    assert (features / "preprocess_meta.json").read_bytes() == metadata_before
+
+    msa.write_text(">query\nAAA\n>hit\nAA-\n>new\nA-A\n")
+    run("--skip-existing")
+    with np.load(feature_path) as data:
+        assert data["msa"].shape == (3, 3)
+        msa_source_hash = data["source_inputs_sha256"].item()
+
+    _write_structure(cif, offset=4)
+    run("--skip-existing")
+    with np.load(feature_path) as data, np.load(label_path) as ground_truth:
+        assert data["source_inputs_sha256"].item() != msa_source_hash
+        assert data["source_inputs_sha256"].item() == ground_truth["source_inputs_sha256"].item()
+        assert ground_truth["ca_coords"][0, 0] == 4
+
+
+def test_resume_rejects_changed_config_without_relabeling_existing_output(preprocessing) -> None:
+    _, run, features, _, _, _ = preprocessing
+    run()
+    meta = features / "preprocess_meta.json"
+    before = meta.read_bytes()
+    with pytest.raises(ValueError, match="different preprocessing provenance"):
+        run("--skip-existing", "--max-msa-seqs", "1")
+    assert meta.read_bytes() == before
+    with np.load(chain_npz_path(features, "1abc_A")) as data:
+        assert data["msa"].shape[0] == 2
+
+
+@pytest.mark.parametrize("missing_metadata", [True, False])
+def test_populated_outputs_require_current_explicit_provenance(preprocessing, missing_metadata: bool) -> None:
+    _, run, features, _, _, _ = preprocessing
+    run()
+    meta = features / "preprocess_meta.json"
+    if missing_metadata:
+        meta.unlink()
+    else:
+        recorded = json.loads(meta.read_text())
+        recorded["schema_version"] = 2
+        meta.write_text(json.dumps(recorded))
+    with pytest.raises(ValueError, match="fresh output directories"):
+        run("--skip-existing")
+
+
+def test_resume_reprocesses_corrupt_shapes_and_nonfinite_labels(preprocessing) -> None:
+    _, run, features, labels, _, _ = preprocessing
+    run()
+    feature_path = chain_npz_path(features, "1abc_A")
+    label_path = chain_npz_path(labels, "1abc_A")
+    with np.load(feature_path) as data:
+        arrays = dict(data)
+    arrays["deletions"] = np.zeros((1, 1), dtype=np.int32)
+    np.savez_compressed(feature_path, **arrays)
+    with np.load(label_path) as data:
+        arrays = dict(data)
+    arrays["atom14_positions"][0, 0, 0] = np.nan
+    np.savez_compressed(label_path, **arrays)
+    run("--skip-existing")
+    with np.load(feature_path) as data, np.load(label_path) as ground_truth:
+        assert data["deletions"].shape == data["msa"].shape
+        assert np.isfinite(ground_truth["atom14_positions"]).all()
+
+
+def test_invalid_generated_arrays_never_replace_valid_files(preprocessing) -> None:
+    module, run, features, labels, _, _ = preprocessing
+    run()
+    feature_path = chain_npz_path(features, "1abc_A")
+    label_path = chain_npz_path(labels, "1abc_A")
+    before = (feature_path.read_bytes(), label_path.read_bytes())
+    with np.load(feature_path) as data, np.load(label_path) as ground_truth:
+        feature_arrays, label_arrays = dict(data), dict(ground_truth)
+    feature_arrays["msa"][0, 0] = 1
+    with pytest.raises(ValueError, match="query row"):
+        module._save_validated_outputs(feature_path, feature_arrays, label_path, label_arrays)
+    assert (feature_path.read_bytes(), label_path.read_bytes()) == before
+    assert list(features.glob("*.npz")) == [feature_path]
+    assert list(labels.glob("*.npz")) == [label_path]
+
+
+def test_fingerprint_cannot_legitimize_mixed_preprocessing_configurations(preprocessing, tmp_path: Path) -> None:
+    from nanofold.dataset_integrity import build_split_fingerprint
+
+    _, run, features, labels, _, _ = preprocessing
+    run()
+    manifest = tmp_path / "fingerprint_manifest.txt"
+    manifest.write_text("1abc_A\n")
+    fingerprint_args = {
+        "processed_features_dir": features,
+        "processed_labels_dir": labels,
+        "manifest_paths": {"train": manifest},
+        "require_no_missing": True,
+        "require_labels": True,
+    }
+    build_split_fingerprint(**fingerprint_args)
+    # Matching pair-level hashes still cannot override the run-level provenance.
+    for path in (chain_npz_path(features, "1abc_A"), chain_npz_path(labels, "1abc_A")):
+        with np.load(path) as data:
+            arrays = dict(data)
+        arrays["preprocess_config_sha256"] = np.asarray("a" * 64)
+        np.savez_compressed(path, **arrays)
+    with pytest.raises(ValueError, match="Preprocessing provenance mismatch"):
+        build_split_fingerprint(**fingerprint_args)
+
+
+def test_preprocessing_records_resolved_author_for_label_chain_alias(preprocessing) -> None:
+    _, run, features, labels, _, cif = preprocessing
+    structure = gemmi.read_structure(str(cif))
+    structure[0][0].name = "AUTHOR"
+    for residue in structure[0][0]:
+        residue.subchain = "A"
+    structure.make_mmcif_document().write_file(str(cif))
+    run()
+    for path in (chain_npz_path(features, "1abc_A"), chain_npz_path(labels, "1abc_A")):
+        with np.load(path) as data:
+            assert data["chain_id"].item() == "1abc_A"
+            assert data["resolved_author_chain_id"].item() == "AUTHOR"
+            assert data["chain_mapping_method"].item() == "label_id"
+
+
+def test_resume_and_fingerprint_reject_swapped_homomer_pairs(preprocessing, tmp_path: Path) -> None:
+    from nanofold.dataset_integrity import build_split_fingerprint
+
+    _, run, features, labels, msa, cif = preprocessing
+    structure = gemmi.read_structure(str(cif))
+    second_chain = structure[0][0].clone()
+    second_chain.name = "B"
+    for residue in second_chain:
+        residue.subchain = "B_label"
+        for atom in residue:
+            atom.pos.x += 100
+    structure[0].add_chain(second_chain)
+    structure.make_mmcif_document().write_file(str(cif))
+    second_msa = chain_data_dir(msa.parent.parent, "1abc_B") / msa.name
+    second_msa.parent.mkdir()
+    second_msa.write_bytes(msa.read_bytes())
+    manifest = tmp_path / "homomers.txt"
+    manifest.write_text("1abc_A\n1abc_B\n")
+    run("--manifest", str(manifest))
+    with np.load(chain_npz_path(features, "1abc_A")) as first, np.load(chain_npz_path(features, "1abc_B")) as second:
+        assert first["source_inputs_sha256"].item() != second["source_inputs_sha256"].item()
+    for directory in (features, labels):
+        chain_npz_path(directory, "1abc_B").write_bytes(chain_npz_path(directory, "1abc_A").read_bytes())
+    for require_labels in (True, False):
+        with pytest.raises(ValueError, match="chain_id.*requested chain 1abc_B"):
+            build_split_fingerprint(
+                processed_features_dir=features,
+                processed_labels_dir=labels if require_labels else None,
+                manifest_paths={"train": manifest},
+                require_no_missing=True,
+                require_labels=require_labels,
+            )
+    run("--manifest", str(manifest), "--skip-existing")
+    with np.load(chain_npz_path(labels, "1abc_B")) as data:
+        assert data["chain_id"].item() == "1abc_B"
+        assert data["ca_coords"][0, 0] == 100
+
+
+@pytest.mark.parametrize("template_pdb,template_chain,expected_count", [
+    ("1abc", "A", 0), ("1abc", "X", 0), ("1abc", "B", 0), ("2def", "A", 1),
+])
+def test_templates_exclude_target_entry_including_aliases_and_homomers(
+    preprocessing, template_pdb: str, template_chain: str, expected_count: int,
+) -> None:
+    module, _, _, _, msa, cif = preprocessing
+    _write_structure(cif, length=5)
+    structure = gemmi.read_structure(str(cif))
+    for residue in structure[0][0]:
+        residue.subchain = "X"
+    second_chain = structure[0][0].clone()
+    second_chain.name = "B"
+    for residue in second_chain:
+        residue.subchain = "Y"
+    structure[0].add_chain(second_chain)
+    structure.make_mmcif_document().write_file(str(cif))
+    (cif.parent / "2def.cif").write_bytes(cif.read_bytes())
+    (msa.parent / "pdb70_hits.hhr").write_text(
+        f"No 1\n>{template_pdb}_{template_chain} synthetic\n"
+        f"Q query 1 AAAAA 5 (5)\nT {template_pdb}_{template_chain} 1 AAAAA 5 (5)\n"
+    )
+    templates = module._extract_template_features(
+        chain_dir=msa.parent, mmcif_root=cif.parent, target_pdb_id="1abc", target_chain_id="A",
+        target_seq="AAAAA", target_L=5, template_hhr_name="pdb70_hits.hhr", max_templates=1,
+    )
+    assert templates["template_ca_coords"].shape == (expected_count, 5, 3)
+
+
+def test_strict_preprocessing_enforces_valid_coordinate_minimum(preprocessing) -> None:
+    _, run, features, labels, _, _ = preprocessing
+    with pytest.raises(ValueError, match="valid C-alpha count below threshold"):
+        run("--min-projection-valid-ca", "4")
+    assert not list(features.glob("*.npz"))
+    assert not list(labels.glob("*.npz"))
+
+
+@pytest.mark.parametrize("flag,value", [
+    ("--min-projection-seq-identity", "nan"),
+    ("--min-projection-coverage", "inf"),
+    ("--min-projection-aligned-fraction", "-1"),
+    ("--min-projection-valid-ca", "0"),
+    ("--max-msa-seqs", "-1"),
+    ("--max-templates", "-1"),
+])
+def test_invalid_preprocessing_thresholds_fail_before_creating_outputs(preprocessing, flag: str, value: str) -> None:
+    _, run, features, labels, _, _ = preprocessing
+    with pytest.raises(ValueError, match="must be"):
+        run(flag, value)
+    assert not features.exists()
+    assert not labels.exists()
+
+
+@pytest.mark.parametrize("metadata_change", ["missing", "downgraded"])
+@pytest.mark.parametrize("require_labels", [True, False])
+def test_fingerprint_requires_run_provenance_for_new_pairs(
+    preprocessing, tmp_path: Path, metadata_change: str, require_labels: bool,
+) -> None:
+    from nanofold.dataset_integrity import build_split_fingerprint
+
+    _, run, features, labels, _, _ = preprocessing
+    run()
+    meta = features / "preprocess_meta.json"
+    if metadata_change == "missing":
+        meta.unlink()
+    else:
+        raw = json.loads(meta.read_text())
+        raw["schema_version"] = 2
+        meta.write_text(json.dumps(raw))
+    manifest = tmp_path / "fingerprint_manifest.txt"
+    manifest.write_text("1abc_A\n")
+    with pytest.raises(ValueError, match="require schema-version 3 preprocessing metadata"):
+        build_split_fingerprint(
+            processed_features_dir=features,
+            processed_labels_dir=labels if require_labels else None,
+            manifest_paths={"train": manifest},
+            require_no_missing=True,
+            require_labels=require_labels,
+        )
+
+
+def test_template_coordinates_follow_polymer_positions_after_missing_residues(preprocessing) -> None:
+    module, _, _, _, msa, cif = preprocessing
+    template_path = cif.parent / "2def.cif"
+    _write_structure(template_path, length=6)
+    structure = gemmi.read_structure(str(template_path))
+    del structure[0][0][2]
+    structure.make_mmcif_document().write_file(str(template_path))
+    (msa.parent / "pdb70_hits.hhr").write_text(
+        "No 1\n>2def_A synthetic\nQ query 1 AAAAAA 6 (6)\nT 2def_A 1 AAAAAA 6 (6)\n"
+    )
+    templates = module._extract_template_features(
+        chain_dir=msa.parent, mmcif_root=cif.parent, target_pdb_id="1abc", target_chain_id="A",
+        target_seq="AAAAAA", target_L=6, template_hhr_name="pdb70_hits.hhr", max_templates=1,
+    )
+    np.testing.assert_array_equal(templates["template_ca_mask"], [[True, True, False, True, True, True]])
+    np.testing.assert_allclose(templates["template_ca_coords"][0, :, 0], [0, 3.8, 0, 11.4, 15.2, 19.0])
+
+
+@pytest.mark.parametrize("invalid_mapping", ["missing_indices", "duplicate_indices", "query_mismatch", "template_mismatch"])
+def test_templates_omit_unverifiable_residue_mappings(preprocessing, invalid_mapping: str) -> None:
+    module, _, _, _, msa, cif = preprocessing
+    template_path = cif.parent / "2def.cif"
+    _write_structure(template_path, length=6)
+    structure = gemmi.read_structure(str(template_path))
+    if invalid_mapping == "missing_indices":
+        for residue in structure[0][0]:
+            residue.label_seq = None
+    elif invalid_mapping == "duplicate_indices":
+        structure[0][0][1].label_seq = 1
+    structure.make_mmcif_document().write_file(str(template_path))
+    query = "GGGGGG" if invalid_mapping == "query_mismatch" else "AAAAAA"
+    template = "GGGGGG" if invalid_mapping == "template_mismatch" else "AAAAAA"
+    (msa.parent / "pdb70_hits.hhr").write_text(
+        f"No 1\n>2def_A synthetic\nQ query 1 {query} 6 (6)\nT 2def_A 1 {template} 6 (6)\n"
+    )
+    templates = module._extract_template_features(
+        chain_dir=msa.parent, mmcif_root=cif.parent, target_pdb_id="1abc", target_chain_id="A",
+        target_seq="AAAAAA", target_L=6, template_hhr_name="pdb70_hits.hhr", max_templates=1,
+    )
+    assert templates["template_ca_coords"].shape == (0, 6, 3)
