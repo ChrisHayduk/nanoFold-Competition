@@ -30,8 +30,24 @@ from nanofold.competition_policy import (
 )
 from nanofold.data import ProcessedNPZDataset, collate_batch
 from nanofold.dataset_integrity import verify_split_against_fingerprint
-from nanofold.metrics import FOLDSCORE_COMPONENT_NAMES, foldscore_components
+from nanofold.metrics import FOLDSCORE_COMPONENT_NAMES, FOLDSCORE_VERSION, foldscore_components
+from nanofold.prediction_contract import (
+    PREDICTION_FORMAT_VERSION,
+    prepare_prediction_directory,
+    validate_checkpoint_for_prediction,
+    validate_checkpoint_output_names,
+    validate_complete_chain_ids,
+)
 from nanofold.residue_constants import CA_ATOM14_SLOT
+from nanofold.scoring_io import (
+    load_feature_crop as _load_feature_crop,
+)
+from nanofold.scoring_io import (
+    load_label_crop as _load_label_crop,
+)
+from nanofold.scoring_io import (
+    validate_scoring_alignment,
+)
 from nanofold.submission_runtime import load_submission_hooks, run_submission_batch
 from nanofold.utils import (
     count_parameters,
@@ -40,6 +56,8 @@ from nanofold.utils import (
     load_torch_checkpoint,
     make_dataloader_generator,
     seed_worker,
+    set_seed,
+    sha256_file,
     should_pin_memory,
     to_device,
     utc_now_iso,
@@ -225,92 +243,6 @@ def _sanitize_predict_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
-def _load_label_crop(
-    *,
-    labels_dir: Path,
-    chain_id: str,
-    crop_size: int,
-    crop_mode: str,
-) -> Dict[str, torch.Tensor]:
-    label_path = chain_npz_path(labels_dir, chain_id)
-    if not label_path.exists():
-        raise FileNotFoundError(f"Missing label file for scoring: {label_path}")
-    with np.load(label_path) as data:
-        missing = [key for key in ("ca_coords", "ca_mask", "atom14_positions", "atom14_mask") if key not in data]
-        if missing:
-            raise ValueError(f"Label file {label_path} is missing required keys: {', '.join(missing)}")
-        labels: Dict[str, torch.Tensor] = {
-            "ca_coords": torch.from_numpy(data["ca_coords"]).float(),
-            "ca_mask": torch.from_numpy(data["ca_mask"]).bool(),
-            "atom14_positions": torch.from_numpy(np.asarray(data["atom14_positions"], dtype=np.float32)),
-            "atom14_mask": torch.from_numpy(np.asarray(data["atom14_mask"], dtype=bool)),
-        }
-    ca_coords = labels["ca_coords"]
-    ca_mask = labels["ca_mask"]
-    if ca_coords.ndim != 2 or ca_coords.shape[-1] != 3:
-        raise ValueError(f"Invalid ca_coords shape in {label_path}: {tuple(ca_coords.shape)}")
-    if ca_mask.ndim != 1:
-        raise ValueError(f"Invalid ca_mask shape in {label_path}: {tuple(ca_mask.shape)}")
-    if ca_coords.shape[0] != ca_mask.shape[0]:
-        raise ValueError(f"Label length mismatch in {label_path}")
-    atom14_positions = labels["atom14_positions"]
-    if atom14_positions.ndim != 3 or atom14_positions.shape[1:] != (14, 3):
-        raise ValueError(f"Invalid atom14_positions shape in {label_path}: {tuple(atom14_positions.shape)}")
-    if atom14_positions.shape[0] != ca_coords.shape[0]:
-        raise ValueError(f"atom14_positions length mismatch in {label_path}")
-    atom14_mask = labels["atom14_mask"]
-    if atom14_mask.ndim != 2 or atom14_mask.shape[1] != 14:
-        raise ValueError(f"Invalid atom14_mask shape in {label_path}: {tuple(atom14_mask.shape)}")
-    if atom14_mask.shape[0] != ca_coords.shape[0]:
-        raise ValueError(f"atom14_mask length mismatch in {label_path}")
-    L = int(ca_coords.shape[0])
-    if L <= crop_size:
-        return labels
-    if crop_mode == "center":
-        start = (L - crop_size) // 2
-    elif crop_mode == "random":
-        raise ValueError("Scoring external labels with random crop is unsupported; use deterministic crop mode.")
-    else:
-        raise ValueError(f"Unsupported crop_mode={crop_mode!r}")
-    end = start + crop_size
-    cropped = dict(labels)
-    cropped["ca_coords"] = labels["ca_coords"][start:end]
-    cropped["ca_mask"] = labels["ca_mask"][start:end]
-    cropped["atom14_positions"] = labels["atom14_positions"][start:end]
-    cropped["atom14_mask"] = labels["atom14_mask"][start:end]
-    return cropped
-
-
-def _load_feature_crop(
-    *,
-    features_dir: Path,
-    chain_id: str,
-    crop_size: int,
-    crop_mode: str,
-) -> Dict[str, torch.Tensor]:
-    feature_path = chain_npz_path(features_dir, chain_id)
-    if not feature_path.exists():
-        raise FileNotFoundError(f"Missing feature file for scoring: {feature_path}")
-    with np.load(feature_path) as data:
-        if "aatype" not in data:
-            raise ValueError(f"Feature file {feature_path} is missing required key: aatype")
-        features = {"aatype": torch.from_numpy(np.asarray(data["aatype"], dtype=np.int64))}
-    aatype = features["aatype"]
-    if aatype.ndim != 1:
-        raise ValueError(f"Invalid aatype shape in {feature_path}: {tuple(aatype.shape)}")
-    L = int(aatype.shape[0])
-    if L <= crop_size:
-        return features
-    if crop_mode == "center":
-        start = (L - crop_size) // 2
-    elif crop_mode == "random":
-        raise ValueError("Scoring external features with random crop is unsupported; use deterministic crop mode.")
-    else:
-        raise ValueError(f"Unsupported crop_mode={crop_mode!r}")
-    end = start + crop_size
-    return {"aatype": aatype[start:end]}
-
-
 def _resolve_checkpoints(args: argparse.Namespace) -> List[Path]:
     explicit: List[Path] = []
     if args.ckpt:
@@ -348,6 +280,7 @@ def _resolve_checkpoints(args: argparse.Namespace) -> List[Path]:
     for ckpt in deduped:
         if not ckpt.exists():
             raise FileNotFoundError(f"Checkpoint not found: {ckpt}")
+    validate_checkpoint_output_names(deduped)
     return deduped
 
 
@@ -357,6 +290,7 @@ def _score_chain(
     labels: Dict[str, torch.Tensor],
     features: Dict[str, torch.Tensor],
 ) -> Dict[str, float]:
+    validate_scoring_alignment(labels, features)
     has_atom14_labels = "atom14_positions" in labels and "atom14_mask" in labels
     if not has_atom14_labels:
         raise ValueError("FoldScore eval requires label atom14_positions/atom14_mask.")
@@ -374,6 +308,8 @@ def _score_chain(
         true_atom14=labels["atom14_positions"],
         atom14_mask=labels["atom14_mask"],
         aatype=features["aatype"],
+        residue_index=features.get("residue_index"),
+        between_segment_residues=features.get("between_segment_residues"),
     )
     metrics = {name: float(value.detach().cpu()) for name, value in comps.items()}
     ca_mask = labels["ca_mask"].to(dtype=torch.bool)
@@ -387,6 +323,8 @@ def _score_chain(
 
 
 def _masked_kabsch_rmsd(pred: torch.Tensor, true: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    pred = pred.float()
+    true = true.to(device=pred.device, dtype=torch.float32)
     active = mask.to(dtype=torch.bool)
     if int(active.sum().item()) < 3:
         return torch.tensor(float("nan"), device=pred.device, dtype=pred.dtype)
@@ -413,9 +351,43 @@ def _scalar_output_metrics(out: Dict[str, Any]) -> Dict[str, torch.Tensor]:
         if not torch.is_tensor(value) or value.numel() == 0:
             continue
         scalar = value.detach().float().mean().cpu()
-        if torch.isfinite(scalar):
-            metrics[str(key)] = scalar
+        metrics[str(key)] = scalar
     return metrics
+
+
+def _summarize_chain_metrics(
+    rows: List[Dict[str, Any]], *, expected_chain_ids: list[str], scored: bool,
+) -> Dict[str, Any]:
+    validate_complete_chain_ids([str(row["chain_id"]) for row in rows], expected_chain_ids)
+    out: Dict[str, Any] = {"scored_chain_count": len(rows) if scored else 0}
+    for name in FOLDSCORE_COMPONENT_NAMES:
+        if not scored:
+            out[f"mean_{name}"] = float("nan")
+            continue
+        values = [float(row.get(name, float("nan"))) for row in rows]
+        if not values or any(not np.isfinite(value) or not 0.0 <= value <= 1.0 for value in values):
+            raise ValueError(f"Every manifest chain must have a finite {name} in [0, 1]; refusing an incomplete mean.")
+        out[f"mean_{name}"] = float(sum(values) / len(expected_chain_ids))
+    rmsd = [float(row.get("rmsd_ca", float("nan"))) for row in rows]
+    if any(np.isinf(value) or value < 0 for value in rmsd):
+        raise ValueError("RMSD diagnostics contain an invalid value.")
+    valid_rmsd = [value for value in rmsd if np.isfinite(value)]
+    out["mean_rmsd_ca"] = float(sum(valid_rmsd) / len(valid_rmsd)) if valid_rmsd else float("nan")
+    out["rmsd_ca_valid_count"] = len(valid_rmsd)
+    out["rmsd_ca_undefined_count"] = len(rows) - len(valid_rmsd)
+    return out
+
+
+def _summarize_submission_metrics(metrics: Dict[str, list[tuple[torch.Tensor, int]]]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for name, entries in metrics.items():
+        valid = [(float(value), count) for value, count in entries if torch.isfinite(value)]
+        valid_count = sum(count for _, count in valid)
+        prefix = f"submission_{name}"
+        out[f"mean_{prefix}"] = sum(value * count for value, count in valid) / valid_count if valid_count else float("nan")
+        out[f"{prefix}_valid_count"] = valid_count
+        out[f"{prefix}_nonfinite_count"] = sum(count for _, count in entries) - valid_count
+    return out
 
 
 def _prediction_path_for_ckpt(pred_out_dir: Path, ckpt: Path, multi: bool) -> Path:
@@ -440,7 +412,7 @@ def main() -> None:
             raise ValueError(
                 "Official hidden prediction requires a sanitized config with empty `data.processed_labels_dir`."
             )
-    predict_cfg = _sanitize_predict_config(cfg) if args.official else cfg
+    predict_cfg = _sanitize_predict_config(cfg)
     predict_data_cfg = predict_cfg["data"]
     verify_manifest_paths = (
         {args.split: _manifest_for_split(cfg, args, track_spec)}
@@ -481,7 +453,7 @@ def main() -> None:
             processed_labels_dir=verify_labels_dir,
             manifest_paths=verify_manifest_paths,
             fingerprint_path=fingerprint_path,
-            require_no_missing=False,
+            require_no_missing=True,
             require_labels=verify_labels_dir is not None,
             track_id=track_spec.track_id,
         )
@@ -510,7 +482,7 @@ def main() -> None:
     )
 
     include_labels = not bool(args.official) and not bool(args.score_labels_dir)
-    labels_dir_for_dataset = str(data_cfg.get("processed_labels_dir", "")).strip() or None
+    labels_dir_for_dataset = str(cfg["data"].get("processed_labels_dir", "")).strip() or None
     fail_if_labels_present = False
     if args.official:
         include_labels = False
@@ -524,18 +496,12 @@ def main() -> None:
             include_labels=include_labels,
             fail_if_labels_present=fail_if_labels_present,
             manifest_path=manifest_path,
-            allow_missing=not bool(args.official),
+            allow_missing=False,
         )
     except (FileNotFoundError, RuntimeError) as exc:
         if args.official:
             raise RuntimeError(f"{exc}\n\n{_guidance_for_missing_data(track_spec)}") from exc
         raise
-
-    if getattr(ds, "missing_chain_ids", None):
-        print(
-            f"[{args.split}] Skipping {len(ds.missing_chain_ids)} missing preprocessed chains "
-            f"(first: {', '.join(ds.missing_chain_ids[:6])})"
-        )
 
     collate_fn = partial(
         collate_batch,
@@ -554,13 +520,6 @@ def main() -> None:
         worker_init_fn=seed_worker if num_workers > 0 else None,
         generator=make_dataloader_generator(seed + 17),
     )
-
-    model = hooks.build_model(predict_cfg)
-    if not isinstance(model, torch.nn.Module):
-        raise TypeError("`build_model(cfg)` must return a torch.nn.Module")
-    model = model.to(device)
-    if args.official:
-        enforce_model_param_limit(track_spec=track_spec, n_params=count_parameters(model))
 
     score_labels_dir = Path(args.score_labels_dir).resolve() if args.score_labels_dir else None
     score_features_dir = Path(str(data_cfg["processed_features_dir"])).resolve()
@@ -586,18 +545,35 @@ def main() -> None:
     all_per_chain_rows: List[Dict[str, Any]] = []
 
     for ckpt_idx, ckpt_path in enumerate(checkpoints):
+        # Reset both main-process and worker crop/MSA randomness for each checkpoint.
+        set_seed(seed + 17)
+        assert loader.generator is not None
+        loader.generator.manual_seed(seed + 17)
+        checkpoint_sha256 = sha256_file(ckpt_path)
         ckpt = load_torch_checkpoint(ckpt_path, map_location="cpu")
+        if sha256_file(ckpt_path) != checkpoint_sha256:
+            raise ValueError("Checkpoint changed while it was being loaded.")
+        checkpoint_model_contract_verified = validate_checkpoint_for_prediction(
+            ckpt, predict_cfg, submission_source_sha256=hooks.source_sha256, require_metadata=bool(args.official),
+            training_fingerprint_sha256=(sha256_file(fingerprint_path) if args.official and args.split not in HIDDEN_SPLITS else None),
+            track_id=track_spec.track_id if args.official else None,
+        )
+        model = hooks.build_model(predict_cfg)
+        if not isinstance(model, torch.nn.Module):
+            raise TypeError("`build_model(cfg)` must return a torch.nn.Module")
+        model = model.to(device)
+        if args.official:
+            enforce_model_param_limit(track_spec=track_spec, n_params=count_parameters(model))
         model.load_state_dict(ckpt["model"], strict=True)
         model.eval()
 
-        losses: List[torch.Tensor] = []
-        scalar_metrics: Dict[str, List[torch.Tensor]] = {}
+        scalar_metrics: Dict[str, list[tuple[torch.Tensor, int]]] = {}
         per_chain_rows: List[Dict[str, Any]] = []
 
         save_pred_root = None
         if pred_out_dir:
             save_pred_root = _prediction_path_for_ckpt(pred_out_dir, ckpt_path, multi=(len(checkpoints) > 1))
-            save_pred_root.mkdir(parents=True, exist_ok=True)
+            prepare_prediction_directory(save_pred_root)
 
         start = time.perf_counter()
         with torch.no_grad():
@@ -611,14 +587,13 @@ def main() -> None:
                         batch=batch_device,
                         cfg=predict_cfg,
                         training=False,
-                        expose_supervision=include_labels,
                     )
                 pred_atom14 = run_out["pred_atom14"].detach()
-                pred_atom14_cpu = pred_atom14.detach().cpu() if save_pred_root is not None else None
+                pred_atom14_cpu = pred_atom14.detach().float().cpu() if save_pred_root is not None else None
                 if "loss" in run_out:
-                    losses.append(run_out["loss"].detach().cpu())
+                    scalar_metrics.setdefault("loss", []).append((run_out["loss"].detach().cpu(), len(chain_ids)))
                 for metric_name, metric_value in _scalar_output_metrics(run_out).items():
-                    scalar_metrics.setdefault(metric_name, []).append(metric_value)
+                    scalar_metrics.setdefault(metric_name, []).append((metric_value, len(chain_ids)))
 
                 residue_mask = batch["residue_mask"].detach().cpu()
                 for idx, chain_id in enumerate(chain_ids):
@@ -631,8 +606,11 @@ def main() -> None:
                             "pred_atom14": pred_atom14_cpu[idx][:masked_length].numpy().astype(np.float32),
                             "masked_length": np.array(masked_length, dtype=np.int32),
                             "ckpt": str(ckpt_path),
+                            "ckpt_sha256": checkpoint_sha256,
+                            "chain_id": str(chain_id),
                         }
-                        np.savez_compressed(chain_npz_path(save_pred_root, chain_id), **arrays)
+                        with chain_npz_path(save_pred_root, chain_id).open("xb") as prediction_file:
+                            np.savez_compressed(prediction_file, **arrays)
 
                     if include_labels:
                         label_tensors: Dict[str, torch.Tensor] = {
@@ -641,7 +619,10 @@ def main() -> None:
                         }
                         label_tensors["atom14_positions"] = batch_device["atom14_positions"][idx][:masked_length]
                         label_tensors["atom14_mask"] = batch_device["atom14_mask"][idx][:masked_length]
-                        feature_tensors = {"aatype": batch_device["aatype"][idx][:masked_length]}
+                        feature_tensors: Dict[str, torch.Tensor] = {
+                            key: batch_device[key][idx][:masked_length]
+                            for key in ("aatype", "residue_index", "between_segment_residues") if key in batch_device
+                        }
                         chain_metrics = _score_chain(
                             pred_atom14=pred_atom14[idx][:masked_length],
                             labels=label_tensors,
@@ -675,6 +656,8 @@ def main() -> None:
 
                     row = {
                         "ckpt": str(ckpt_path),
+                        "ckpt_sha256": checkpoint_sha256,
+                        "foldscore_version": FOLDSCORE_VERSION,
                         "step": int(ckpt.get("step", 0)),
                         "chain_id": chain_id,
                         **chain_metrics,
@@ -684,29 +667,12 @@ def main() -> None:
                     per_chain_rows.append(row)
                     all_per_chain_rows.append(row)
 
-        component_means: Dict[str, float] = {}
-        for component_name in FOLDSCORE_COMPONENT_NAMES:
-            values = [
-                float(item[component_name])
-                for item in per_chain_rows
-                if component_name in item and not np.isnan(float(item[component_name]))
-            ]
-            component_means[f"mean_{component_name}"] = (
-                float(sum(values) / len(values)) if values else float("nan")
-            )
-        rmsd_values = [
-            float(item["rmsd_ca"])
-            for item in per_chain_rows
-            if "rmsd_ca" in item and not np.isnan(float(item["rmsd_ca"]))
-        ]
-        component_means["mean_rmsd_ca"] = float(sum(rmsd_values) / len(rmsd_values)) if rmsd_values else float("nan")
+        component_means = _summarize_chain_metrics(
+            per_chain_rows, expected_chain_ids=ds.chain_ids, scored=include_labels or score_labels_dir is not None,
+        )
         mean_lddt = component_means["mean_lddt_ca"]
         mean_foldscore = component_means["mean_foldscore"]
-        scalar_means = {
-            f"mean_{name}": float(torch.stack(values).mean())
-            for name, values in scalar_metrics.items()
-            if values
-        }
+        scalar_means = _summarize_submission_metrics(scalar_metrics)
         eval_seconds = float(time.perf_counter() - start)
         step = int(ckpt.get("step", 0))
         cumulative_samples_seen = int(ckpt.get("cumulative_samples_seen", step * effective_batch_size))
@@ -721,8 +687,13 @@ def main() -> None:
         )
         ckpt_result = {
             "ckpt": str(ckpt_path),
+            "ckpt_sha256": checkpoint_sha256,
+            "checkpoint_model_contract_verified": checkpoint_model_contract_verified,
+            "training_fingerprint_sha256": ckpt.get("fingerprint_sha256"),
+            "training_fingerprint_verified": bool(args.official and args.split not in HIDDEN_SPLITS),
+            "training_track_id": ckpt.get("track_id"),
             "step": step,
-            "mean_loss": float(torch.stack(losses).mean()) if losses else float("nan"),
+            "mean_loss": scalar_means.get("mean_submission_loss", float("nan")),
             "mean_foldscore": mean_foldscore,
             "mean_lddt_ca": mean_lddt,
             **component_means,
@@ -757,6 +728,7 @@ def main() -> None:
         "split": args.split,
         "track": track_spec.track_id,
         "official_mode": bool(args.official),
+        "foldscore_version": FOLDSCORE_VERSION,
         "ckpt": final_ckpt_result["ckpt"],
         "num_checkpoints": len(all_ckpt_results),
         "checkpoints": all_ckpt_results,
@@ -776,7 +748,8 @@ def main() -> None:
         "env": get_env_metadata(device),
         "pred_out_dir": str(pred_out_dir) if pred_out_dir else None,
         "score_labels_dir": str(score_labels_dir) if score_labels_dir else None,
-        "predict_config_sanitized": bool(args.official),
+        "predict_config_sanitized": True,
+        "prediction_format_version": PREDICTION_FORMAT_VERSION,
         "finished_at": utc_now_iso(),
     }
     for key, value in final_ckpt_result.items():

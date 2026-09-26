@@ -10,6 +10,8 @@ The short version:
 - Hidden manifests, hidden features, hidden labels, hidden fingerprints, and hidden locks live under `.nanofold_private/` and must never be committed.
 - Models receive processed feature tensors and must return `pred_atom14` with shape `(B, L, 14, 3)`.
 
+Training requires processed features and labels for every train and public-validation manifest entry, including local research runs. Missing files cannot silently shrink either population. Public-validation submission hooks receive features only; the trainer retains labels for scoring and reports valid, nonfinite and missing counts for each metric. See [training and validation reproducibility](API.md#training-sampling-and-multiple-gpus).
+
 ## 1. Data Sources
 
 Official nanoFold data is built from public structure and alignment sources, then frozen into manifests, NPZ files, and fingerprints.
@@ -723,3 +725,5 @@ molecular-replacement scoring. C-alpha, GDT_TS, and backbone atom14 lDDT remain
 diagnostic outputs.
 
 Hidden leaderboard rank is track-specific. `limited` and `research_large` use `foldscore_auc_hidden`, computed across official checkpoint predictions over the fixed sample budget. `unlimited` fixes effective batch size at `8` but uses the final hidden FoldScore because it has no shared max-step or sample budget.
+
+The dataset loader rejects mismatched feature/label identities, residue counts, residue indices, nonboolean masks, nonfinite coordinates and inconsistent C-alpha/atom14 supervision. Label-only residue indices cannot change inference features. All training/evaluation assets must pass the same integrity checks. [Modal training](MODAL_TRAINING.md) describes public-only volume and bundle validation.

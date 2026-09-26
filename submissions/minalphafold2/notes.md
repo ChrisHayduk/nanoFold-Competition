@@ -4,7 +4,7 @@ This submission uses the upstream `ChrisHayduk/minAlphaFold2` implementation as
 the actual model code.
 
 - upstream repository: `https://github.com/ChrisHayduk/minAlphaFold2`
-- pinned commit: `f2e6c237fe4b98f2ca94ebdcc5ecc06dc04852c3`
+- pinned commit: `c382fe70b628a445e8e17b2b9e680ca93951ffd9`
 - vendored path: `third_party/minAlphaFold2`
 
 `submission.py` is intentionally just an adapter. It converts nanoFold's
@@ -12,6 +12,9 @@ official batch tensors into the feature tensors expected by
 `minalphafold.model.AlphaFold2`, derives the upstream AlphaFold2-style
 supervision tensors, trains with `minalphafold.losses.AlphaFoldLoss`, and
 returns `pred_atom14 = output["atom14_coords"]`.
+Padded residues and nonexistent atom slots are zeroed in the returned coordinates.
+Padded residues do not contribute to experimentally-resolved or geometry losses;
+peptide/torsion supervision respects residue-index gaps and explicit segment breaks.
 
 The model architecture is loaded directly from
 `third_party/minAlphaFold2/configs/tiny.toml`.
@@ -32,6 +35,38 @@ Because the limited-track reference uses a single recycling cycle, the
 recycling LayerNorm parameters are frozen at their initial values. The model
 still uses minAlphaFold2's forward path, but the config does not allocate
 training budget to learning a previous-cycle embedding that is never observed.
+
+## Recipe controls
+
+The adapter validates its configuration before model construction. `experiment.fape`
+accepts `backbone_clamp_mode` values `fully_clamped` (default), `fully_unclamped`,
+`batchwise`, `samplewise`, `soft_mix`, and `finetune_unclamp`. The last mode uses
+fully clamped backbone FAPE until the fine-tuning phase. Side-chain FAPE stays
+clamped in every mode. `clamped_probability` must lie in `[0, 1]`; its default is
+0.9. Batchwise sampling shares one decision across all microbatches and ranks of
+an optimizer update. Evaluation uses the deterministic expected mixture.
+
+`experiment.recycle.train_mode` is `sample_uniform` by default or `fixed`.
+Training samples from 1 through `model.n_cycles` in the first mode and uses exactly
+that many cycles in the second. Evaluation always uses `model.n_cycles`.
+If supplied, `min_train_cycles` must be 1, `max_train_cycles` must equal
+`model.n_cycles`, and `eval_mode` must be `fixed_max`. The adapter explicitly sets
+the model's training/evaluation mode.
+
+`experiment.loss_schedule.mode: initial_only` disables fine-tuning losses,
+including at the final checkpoint. The default `finetune` linearly blends the
+complete initial and fine-tuning objectives once across the configured ramp.
+Learning-rate scheduling is independent: an initial-only recipe must explicitly
+specify its intended `finetune_start_step` and `finetune_lr_scale`.
+
+`data.msa_depth` caps the raw rows delivered by the loader. `model.msa_depth` and
+`model.extra_msa_depth` cap centers and remaining extra rows after block deletion.
+The reference raw/center caps are both 192, so it supplies no extra rows even
+when the extra-row cap is 64. Research configurations requesting up to 192 centers
+and 64 extras need a raw cap of at least 256; shallow alignments and training block
+deletion can still yield fewer rows. The adapter reports `msa_cluster_rows`,
+`msa_extra_rows` and `recycle_cycles` from the actual forward pass. Official track
+caps remain enforced by the runner.
 
 ## Method Rationale
 

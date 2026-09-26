@@ -48,12 +48,7 @@ def set_seed(seed: int, *, deterministic: bool = False) -> None:
         if hasattr(torch.backends, "cudnn"):
             torch.backends.cudnn.benchmark = False
             torch.backends.cudnn.deterministic = True
-        try:
-            torch.use_deterministic_algorithms(True)
-        except Exception:
-            # Some ops are nondeterministic on specific platforms; keep the
-            # run alive while still forcing deterministic behavior where possible.
-            pass
+        torch.use_deterministic_algorithms(True)
 
 
 def make_dataloader_generator(seed: int) -> torch.Generator:

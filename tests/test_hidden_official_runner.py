@@ -5,7 +5,6 @@ import json
 import sys
 from pathlib import Path
 
-import numpy as np
 import pytest
 import yaml
 
@@ -20,109 +19,6 @@ def _load_run_official_module():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
-
-
-def _atom14_from_ca(ca: np.ndarray) -> np.ndarray:
-    atom14 = np.repeat(ca[:, None, :], 14, axis=1).astype(np.float32)
-    atom14[:, :, 1] += np.arange(14, dtype=np.float32)[None, :] * 0.1
-    atom14[:, :, 2] += np.arange(14, dtype=np.float32)[None, :] * 0.05
-    return atom14
-
-
-def test_hidden_scoring_with_synthetic_predictions(tmp_path: Path) -> None:
-    module = _load_run_official_module()
-    score_fn = getattr(module, "_score_hidden_predictions")
-
-    manifest = tmp_path / "hidden_manifest.txt"
-    manifest.write_text("1abc_A\n")
-
-    labels_dir = tmp_path / "hidden_labels"
-    labels_dir.mkdir()
-    features_dir = tmp_path / "hidden_features"
-    features_dir.mkdir()
-    true_ca = np.zeros((8, 3), dtype=np.float32)
-    true_ca[:, 0] = np.arange(8, dtype=np.float32) * 3.8
-    ca_mask = np.ones((8,), dtype=bool)
-    true_atom14 = _atom14_from_ca(true_ca)
-    atom14_mask = np.ones((8, 14), dtype=bool)
-    np.savez_compressed(
-        chain_npz_path(features_dir, "1abc_A"),
-        aatype=np.zeros((8,), dtype=np.int32),
-        msa=np.zeros((1, 8), dtype=np.int32),
-        deletions=np.zeros((1, 8), dtype=np.int32),
-        template_aatype=np.zeros((0, 8), dtype=np.int32),
-        template_ca_coords=np.zeros((0, 8, 3), dtype=np.float32),
-        template_ca_mask=np.zeros((0, 8), dtype=bool),
-    )
-    np.savez_compressed(
-        chain_npz_path(labels_dir, "1abc_A"),
-        ca_coords=true_ca,
-        ca_mask=ca_mask,
-        atom14_positions=true_atom14,
-        atom14_mask=atom14_mask,
-    )
-
-    pred_root = tmp_path / "hidden_preds"
-    pred_root.mkdir()
-    ckpt_0 = "/tmp/ckpt_step_0.pt"
-    ckpt_1 = "/tmp/ckpt_step_1000.pt"
-    ckpt_2 = "/tmp/ckpt_step_2000.pt"
-    (pred_root / "ckpt_step_0").mkdir()
-    (pred_root / "ckpt_step_1000").mkdir()
-    (pred_root / "ckpt_step_2000").mkdir()
-    np.savez_compressed(
-        chain_npz_path(pred_root / "ckpt_step_0", "1abc_A"),
-        pred_atom14=true_atom14,
-        masked_length=np.array(8),
-    )
-    np.savez_compressed(
-        chain_npz_path(pred_root / "ckpt_step_1000", "1abc_A"),
-        pred_atom14=true_atom14,
-        masked_length=np.array(8),
-    )
-    np.savez_compressed(
-        chain_npz_path(pred_root / "ckpt_step_2000", "1abc_A"),
-        pred_atom14=true_atom14,
-        masked_length=np.array(8),
-    )
-
-    result = score_fn(
-        hidden_manifest=manifest,
-        hidden_features_dir=features_dir,
-        hidden_labels_dir=labels_dir,
-        pred_root=pred_root,
-        checkpoint_entries=[
-            {"ckpt": ckpt_0, "step": 0, "cumulative_samples_seen": 0, "cumulative_cropped_residues_seen": 0, "cumulative_nonpad_residues_seen": 0},
-            {"ckpt": ckpt_1, "step": 1000, "cumulative_samples_seen": 1000, "cumulative_cropped_residues_seen": 1000, "cumulative_nonpad_residues_seen": 1000},
-            {"ckpt": ckpt_2, "step": 2000, "cumulative_samples_seen": 2000, "cumulative_cropped_residues_seen": 2000, "cumulative_nonpad_residues_seen": 2000},
-        ],
-        crop_size=8,
-        sample_budget=2000,
-        per_chain_out_path=tmp_path / "per_chain_hidden.jsonl",
-    )
-
-    assert result["final_hidden_foldscore"] == 1.0
-    assert result["foldscore_auc_hidden"] == 1.0
-    assert result["final_hidden_gdt_ha_ca"] == 1.0
-    assert result["gdt_ha_ca_auc_hidden"] == 1.0
-    assert result["final_hidden_lddt_atom14"] == 1.0
-    assert result["lddt_atom14_auc_hidden"] == 1.0
-    assert result["final_hidden_cad_atom14"] == 1.0
-    assert result["cad_atom14_auc_hidden"] == 1.0
-    assert result["final_hidden_sg_atom14"] == 1.0
-    assert result["sg_atom14_auc_hidden"] == 1.0
-    assert result["final_hidden_sc_atom14"] == 1.0
-    assert result["sc_atom14_auc_hidden"] == 1.0
-    assert result["final_hidden_molprobity_clash_atom14"] == 1.0
-    assert result["molprobity_clash_atom14_auc_hidden"] == 1.0
-    assert result["final_hidden_bb_atom14"] == 1.0
-    assert result["bb_atom14_auc_hidden"] == 1.0
-    assert result["final_hidden_dipdiff_atom14"] == 1.0
-    assert result["dipdiff_atom14_auc_hidden"] == 1.0
-    assert result["foldscore_at_steps"]["0"] == 1.0
-    assert result["foldscore_at_steps"]["1000"] == 1.0
-    assert result["foldscore_at_steps"]["2000"] == 1.0
-    assert result["foldscore_at_samples"]["2000"] == 1.0
 
 
 def test_rank_metric_value_supports_auc_and_final_hidden() -> None:
@@ -146,62 +42,6 @@ def test_rank_metric_value_supports_auc_and_final_hidden() -> None:
         hidden_results=hidden_results,
         eval_public_summary=eval_public_summary,
     ) == 0.5
-
-
-def test_hidden_scoring_rejects_non_monotone_sample_axis(tmp_path: Path) -> None:
-    module = _load_run_official_module()
-    score_fn = getattr(module, "_score_hidden_predictions")
-
-    manifest = tmp_path / "hidden_manifest.txt"
-    manifest.write_text("1abc_A\n")
-
-    labels_dir = tmp_path / "hidden_labels"
-    labels_dir.mkdir()
-    features_dir = tmp_path / "hidden_features"
-    features_dir.mkdir()
-    true_ca = np.zeros((8, 3), dtype=np.float32)
-    true_ca[:, 0] = np.arange(8, dtype=np.float32) * 3.8
-    ca_mask = np.ones((8,), dtype=bool)
-    true_atom14 = _atom14_from_ca(true_ca)
-    atom14_mask = np.ones((8, 14), dtype=bool)
-    np.savez_compressed(
-        chain_npz_path(features_dir, "1abc_A"),
-        aatype=np.zeros((8,), dtype=np.int32),
-        msa=np.zeros((1, 8), dtype=np.int32),
-        deletions=np.zeros((1, 8), dtype=np.int32),
-        template_aatype=np.zeros((0, 8), dtype=np.int32),
-        template_ca_coords=np.zeros((0, 8, 3), dtype=np.float32),
-        template_ca_mask=np.zeros((0, 8), dtype=bool),
-    )
-    np.savez_compressed(
-        chain_npz_path(labels_dir, "1abc_A"),
-        ca_coords=true_ca,
-        ca_mask=ca_mask,
-        atom14_positions=true_atom14,
-        atom14_mask=atom14_mask,
-    )
-
-    pred_root = tmp_path / "hidden_preds"
-    pred_root.mkdir()
-    for stem in ("ckpt_step_0", "ckpt_step_1000", "ckpt_step_2000"):
-        (pred_root / stem).mkdir()
-        np.savez_compressed(chain_npz_path(pred_root / stem, "1abc_A"), pred_atom14=true_atom14, masked_length=np.array(8))
-
-    with pytest.raises(ValueError, match="strictly increasing"):
-        score_fn(
-            hidden_manifest=manifest,
-            hidden_features_dir=features_dir,
-            hidden_labels_dir=labels_dir,
-            pred_root=pred_root,
-            checkpoint_entries=[
-                {"ckpt": "/tmp/ckpt_step_0.pt", "step": 0, "cumulative_samples_seen": 0, "cumulative_cropped_residues_seen": 0, "cumulative_nonpad_residues_seen": 0},
-                {"ckpt": "/tmp/ckpt_step_1000.pt", "step": 1000, "cumulative_samples_seen": 1000, "cumulative_cropped_residues_seen": 1000, "cumulative_nonpad_residues_seen": 1000},
-                {"ckpt": "/tmp/ckpt_step_2000.pt", "step": 2000, "cumulative_samples_seen": 1000, "cumulative_cropped_residues_seen": 2000, "cumulative_nonpad_residues_seen": 2000},
-            ],
-            crop_size=8,
-            sample_budget=2000,
-            per_chain_out_path=tmp_path / "per_chain_hidden.jsonl",
-        )
 
 
 def test_hidden_lock_missing_or_incomplete_fails(tmp_path: Path) -> None:

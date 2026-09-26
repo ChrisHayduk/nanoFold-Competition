@@ -31,6 +31,13 @@ from nanofold.competition_policy import (
 )
 from nanofold.data import ProcessedNPZDataset, collate_batch
 from nanofold.dataset_integrity import verify_split_against_fingerprint
+from nanofold.prediction_contract import (
+    PREDICTION_FORMAT_VERSION,
+    prepare_prediction_directory,
+    validate_checkpoint_for_prediction,
+    validate_checkpoint_output_names,
+    validate_complete_chain_ids,
+)
 from nanofold.submission_runtime import load_submission_hooks, run_submission_batch
 from nanofold.utils import (
     count_parameters,
@@ -39,6 +46,8 @@ from nanofold.utils import (
     load_torch_checkpoint,
     make_dataloader_generator,
     seed_worker,
+    set_seed,
+    sha256_file,
     should_pin_memory,
     to_device,
     utc_now_iso,
@@ -247,6 +256,7 @@ def _resolve_checkpoints(args: argparse.Namespace) -> List[Path]:
     for ckpt in deduped:
         if not ckpt.exists():
             raise FileNotFoundError(f"Checkpoint not found: {ckpt}")
+    validate_checkpoint_output_names(deduped)
     return deduped
 
 
@@ -319,7 +329,7 @@ def main() -> None:
             processed_features_dir=str(cfg["data"]["processed_features_dir"]),
             manifest_paths=verify_manifest_paths,
             fingerprint_path=fingerprint_path,
-            require_no_missing=False,
+            require_no_missing=True,
             track_id=track_spec.track_id,
         )
         print(f"Feature fingerprint verification succeeded: {Path(fingerprint_path).resolve()}")
@@ -354,18 +364,12 @@ def main() -> None:
             include_labels=False,
             fail_if_labels_present=bool(args.official) and bool(forbid_labels_dir) and not bool(args.allow_labels_mounted),
             manifest_path=manifest_path,
-            allow_missing=not bool(args.official),
+            allow_missing=False,
         )
     except (FileNotFoundError, RuntimeError) as exc:
         if args.official:
             raise RuntimeError(f"{exc}\n\n{_guidance_for_missing_data(track_spec)}") from exc
         raise
-
-    if getattr(ds, "missing_chain_ids", None):
-        print(
-            f"[{args.split}] Skipping {len(ds.missing_chain_ids)} missing preprocessed chains "
-            f"(first: {', '.join(ds.missing_chain_ids[:6])})"
-        )
 
     collate_fn = partial(
         collate_batch,
@@ -385,13 +389,6 @@ def main() -> None:
         generator=make_dataloader_generator(seed + 17),
     )
 
-    model = hooks.build_model(predict_cfg)
-    if not isinstance(model, torch.nn.Module):
-        raise TypeError("`build_model(cfg)` must return a torch.nn.Module")
-    model = model.to(device)
-    if args.official:
-        enforce_model_param_limit(track_spec=track_spec, n_params=count_parameters(model))
-
     pred_out_dir = Path(args.pred_out_dir).resolve()
     pred_out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -403,15 +400,33 @@ def main() -> None:
     residue_budget = compute_residue_budget(int(cfg["train"]["max_steps"]), effective_batch_size, crop_size)
     checkpoint_rows: List[Dict[str, Any]] = []
     for ckpt_idx, ckpt_path in enumerate(checkpoints):
+        # Reset both main-process and worker crop/MSA randomness for each checkpoint.
+        set_seed(seed + 17)
+        assert loader.generator is not None
+        loader.generator.manual_seed(seed + 17)
+        checkpoint_sha256 = sha256_file(ckpt_path)
         ckpt = load_torch_checkpoint(ckpt_path, map_location="cpu")
+        if sha256_file(ckpt_path) != checkpoint_sha256:
+            raise ValueError("Checkpoint changed while it was being loaded.")
+        checkpoint_model_contract_verified = validate_checkpoint_for_prediction(
+            ckpt, predict_cfg, submission_source_sha256=hooks.source_sha256, require_metadata=bool(args.official),
+            training_fingerprint_sha256=(sha256_file(fingerprint_path) if args.official and args.split not in HIDDEN_SPLITS else None),
+            track_id=track_spec.track_id if args.official else None,
+        )
+        model = hooks.build_model(predict_cfg)
+        if not isinstance(model, torch.nn.Module):
+            raise TypeError("`build_model(cfg)` must return a torch.nn.Module")
+        model = model.to(device)
+        if args.official:
+            enforce_model_param_limit(track_spec=track_spec, n_params=count_parameters(model))
         model.load_state_dict(ckpt["model"], strict=True)
         model.eval()
 
         pred_root = _prediction_path_for_ckpt(pred_out_dir, ckpt_path, multi=(len(checkpoints) > 1))
-        pred_root.mkdir(parents=True, exist_ok=True)
+        prepare_prediction_directory(pred_root)
 
         start = time.perf_counter()
-        prediction_count = 0
+        predicted_chain_ids: list[str] = []
         with torch.no_grad():
             for batch in tqdm(loader, desc=f"predict:{args.split}:{ckpt_path.name}"):
                 chain_ids = list(batch["chain_id"])
@@ -424,7 +439,7 @@ def main() -> None:
                         cfg=predict_cfg,
                         training=False,
                     )
-                pred_atom14_cpu = run_out["pred_atom14"].detach().cpu()
+                pred_atom14_cpu = run_out["pred_atom14"].detach().float().cpu()
                 residue_mask = batch["residue_mask"].detach().cpu()
                 for idx, chain_id in enumerate(chain_ids):
                     masked_length = int(residue_mask[idx].sum().item())
@@ -432,10 +447,15 @@ def main() -> None:
                         "pred_atom14": pred_atom14_cpu[idx][:masked_length].numpy().astype(np.float32),
                         "masked_length": np.array(masked_length, dtype=np.int32),
                         "ckpt": str(ckpt_path),
+                        "ckpt_sha256": checkpoint_sha256,
+                        "chain_id": str(chain_id),
                     }
-                    np.savez_compressed(chain_npz_path(pred_root, chain_id), **arrays)
-                    prediction_count += 1
+                    with chain_npz_path(pred_root, chain_id).open("xb") as prediction_file:
+                        np.savez_compressed(prediction_file, **arrays)
+                    predicted_chain_ids.append(str(chain_id))
 
+        validate_complete_chain_ids(predicted_chain_ids, ds.chain_ids)
+        prediction_count = len(predicted_chain_ids)
         step = int(ckpt.get("step", 0))
         cumulative_samples_seen = int(ckpt.get("cumulative_samples_seen", step * effective_batch_size))
         cumulative_cropped_residues_seen = int(
@@ -450,6 +470,11 @@ def main() -> None:
         checkpoint_rows.append(
             {
                 "ckpt": str(ckpt_path),
+                "ckpt_sha256": checkpoint_sha256,
+                "checkpoint_model_contract_verified": checkpoint_model_contract_verified,
+                "training_fingerprint_sha256": ckpt.get("fingerprint_sha256"),
+                "training_fingerprint_verified": bool(args.official and args.split not in HIDDEN_SPLITS),
+                "training_track_id": ckpt.get("track_id"),
                 "step": step,
                 "num_chains": prediction_count,
                 "prediction_dir": str(pred_root.resolve()),
@@ -474,6 +499,7 @@ def main() -> None:
     final_row = checkpoint_rows[-1]
     out: Dict[str, Any] = {
         "mode": "predict",
+        "prediction_format_version": PREDICTION_FORMAT_VERSION,
         "split": args.split,
         "track": track_spec.track_id,
         "official_mode": bool(args.official),

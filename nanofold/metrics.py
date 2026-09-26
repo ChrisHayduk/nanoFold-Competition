@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Dict, Iterable
 
 import torch
@@ -22,6 +23,7 @@ FOLDSCORE_SC_ATOM14_WEIGHT = 0.09375
 FOLDSCORE_MOLPROBITY_CLASH_ATOM14_WEIGHT = 0.125
 FOLDSCORE_BB_ATOM14_WEIGHT = 0.125
 FOLDSCORE_DIPDIFF_ATOM14_WEIGHT = 0.125
+FOLDSCORE_VERSION = "2-segment-aware-float32"
 BACKBONE_ATOM14_SLOTS = (0, 1, 2, 3)
 SIDECHAIN_ATOM14_SLOTS = tuple(range(4, ATOM14_NUM_SLOTS))
 MOLPROBITY_HEAVY_ATOM_VDW_RADII = {
@@ -537,6 +539,8 @@ def molprobity_clash_atom14_score(
     atom14_mask: torch.Tensor,
     aatype: torch.Tensor,
     overlap_cutoff: float = 0.4,
+    *,
+    peptide_bonds: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Compute an atom-name-aware heavy-atom clash score.
 
@@ -564,7 +568,11 @@ def molprobity_clash_atom14_score(
     flat_radii = radii.reshape(-1)
     valid = point_mask[:, None] & point_mask[None, :]
     valid &= residue_indices[:, None] < residue_indices[None, :]
-    valid &= torch.abs(residue_indices[:, None] - residue_indices[None, :]) > 1
+    connected = _validated_peptide_bonds(peptide_bonds, length=L, device=device)
+    bonded_neighbors = torch.zeros((L, L), dtype=torch.bool, device=device)
+    indices = torch.arange(L - 1, device=device)
+    bonded_neighbors[indices, indices + 1] = connected
+    valid &= ~bonded_neighbors[residue_indices[:, None], residue_indices[None, :]]
     valid &= flat_radii[:, None] > 0
     valid &= flat_radii[None, :] > 0
     if not bool(valid.any()):
@@ -590,23 +598,52 @@ def _dihedral_angle(p0: torch.Tensor, p1: torch.Tensor, p2: torch.Tensor, p3: to
     return torch.atan2(y, x)
 
 
+def _validated_peptide_bonds(bonds: torch.Tensor | None, *, length: int, device: torch.device) -> torch.Tensor:
+    if bonds is None:
+        return torch.ones(max(0, length - 1), device=device, dtype=torch.bool)
+    if bonds.shape != (max(0, length - 1),) or bonds.dtype != torch.bool:
+        raise ValueError("peptide_bonds must have boolean shape (L-1,).")
+    return bonds.to(device=device)
+
+
+def _peptide_bonds(
+    *, length: int, device: torch.device,
+    residue_index: torch.Tensor | None, between_segment_residues: torch.Tensor | None,
+) -> torch.Tensor:
+    connected = torch.ones(length - 1, device=device, dtype=torch.bool)
+    if residue_index is not None:
+        if residue_index.shape != (length,) or residue_index.dtype not in (torch.int32, torch.int64):
+            raise ValueError("Scoring residue_index must have integer shape (L,).")
+        indices = residue_index.to(device=device)
+        connected &= indices[1:] - indices[:-1] == 1
+    if between_segment_residues is not None:
+        breaks = between_segment_residues.to(device=device)
+        if breaks.shape != (length,) or breaks.dtype not in (torch.bool, torch.int32, torch.int64) or not bool(((breaks == 0) | (breaks == 1)).all()):
+            raise ValueError("Scoring between_segment_residues must have binary integer shape (L,).")
+        connected &= breaks[1:] == 0
+    return connected
+
+
 @torch.no_grad()
 def backbone_atom14_score(
     pred_atom14: torch.Tensor,
     true_atom14: torch.Tensor,
     atom14_mask: torch.Tensor,
+    *,
+    peptide_bonds: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Compute high-is-better phi/psi/omega backbone dihedral agreement."""
     device = pred_atom14.device
     true = true_atom14.to(device=device, dtype=pred_atom14.dtype)
     mask = atom14_mask.to(device=device, dtype=torch.bool)
     L = int(pred_atom14.shape[0])
+    connected = _validated_peptide_bonds(peptide_bonds, length=L, device=device)
     if L < 2:
         return torch.ones((), device=device, dtype=pred_atom14.dtype)
 
     errors_by_angle: Dict[str, list[torch.Tensor]] = {"phi": [], "psi": [], "omega": []}
     for idx in range(L):
-        if idx > 0:
+        if idx > 0 and bool(connected[idx - 1]):
             phi_mask = mask[idx - 1, 2] & mask[idx, 0] & mask[idx, 1] & mask[idx, 2]
             if bool(phi_mask.item()):
                 errors_by_angle["phi"].append(
@@ -620,7 +657,7 @@ def backbone_atom14_score(
                         _dihedral_angle(true[idx - 1, 2], true[idx, 0], true[idx, 1], true[idx, 2]),
                     )
                 )
-        if idx < L - 1:
+        if idx < L - 1 and bool(connected[idx]):
             psi_mask = mask[idx, 0] & mask[idx, 1] & mask[idx, 2] & mask[idx + 1, 0]
             omega_mask = mask[idx, 1] & mask[idx, 2] & mask[idx + 1, 0] & mask[idx + 1, 1]
             if bool(psi_mask.item()):
@@ -660,6 +697,8 @@ def dipdiff_atom14_score(
     pred_atom14: torch.Tensor,
     true_atom14: torch.Tensor,
     atom14_mask: torch.Tensor,
+    *,
+    peptide_bonds: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Compute a DipDiff-inspired local CA/O backbone distance score."""
     device = pred_atom14.device
@@ -667,8 +706,13 @@ def dipdiff_atom14_score(
     mask = atom14_mask.to(device=device, dtype=torch.bool)
     local_scores = []
     L = int(pred_atom14.shape[0])
+    connected = _validated_peptide_bonds(peptide_bonds, length=L, device=device)
     for idx in range(L):
-        window_residues = [j for j in (idx - 1, idx, idx + 1) if 0 <= j < L]
+        window_residues = [idx]
+        if idx > 0 and bool(connected[idx - 1]):
+            window_residues.insert(0, idx - 1)
+        if idx < L - 1 and bool(connected[idx]):
+            window_residues.append(idx + 1)
         pred_points = []
         true_points = []
         for residue_index in window_residues:
@@ -703,6 +747,8 @@ def foldscore_from_components(
     dipdiff_atom14_score: torch.Tensor | float,
 ) -> torch.Tensor:
     gdt = torch.as_tensor(gdt_ha_ca_score)
+    if not gdt.is_floating_point() or gdt.dtype in (torch.float16, torch.bfloat16):
+        gdt = gdt.float()
     atom14 = torch.as_tensor(lddt_atom14_score, device=gdt.device, dtype=gdt.dtype)
     cad = torch.as_tensor(cad_atom14_score, device=gdt.device, dtype=gdt.dtype)
     sg = torch.as_tensor(sg_atom14_score, device=gdt.device, dtype=gdt.dtype)
@@ -710,6 +756,9 @@ def foldscore_from_components(
     clash = torch.as_tensor(molprobity_clash_atom14_score, device=gdt.device, dtype=gdt.dtype)
     bb = torch.as_tensor(bb_atom14_score, device=gdt.device, dtype=gdt.dtype)
     dipdiff = torch.as_tensor(dipdiff_atom14_score, device=gdt.device, dtype=gdt.dtype)
+    for component in (gdt, atom14, cad, sg, sc, clash, bb, dipdiff):
+        if component.ndim != 0 or not torch.isfinite(component) or not 0.0 <= float(component) <= 1.0:
+            raise ValueError("FoldScore components must be finite scalar values in [0, 1].")
     return (
         FOLDSCORE_GDT_HA_CA_WEIGHT * gdt
         + FOLDSCORE_LDDT_ATOM14_WEIGHT * atom14
@@ -729,6 +778,9 @@ def foldscore_components(
     atom14_mask: torch.Tensor,
     aatype: torch.Tensor,
     cutoff: float = 15.0,
+    *,
+    residue_index: torch.Tensor | None = None,
+    between_segment_residues: torch.Tensor | None = None,
 ) -> Dict[str, torch.Tensor]:
     """Compute nanoFold FoldScore components for one chain.
 
@@ -759,12 +811,21 @@ def foldscore_components(
     if aatype.dtype not in (torch.int32, torch.int64) or ((aatype < 0) | (aatype >= len(RESTYPE_INDEX_TO_3))).any():
         raise ValueError("aatype must contain valid integer residue types.")
 
-    pred = pred_atom14[:L]
-    true = true_atom14[:L].to(device=pred.device, dtype=pred.dtype)
+    # Match saved-prediction scoring and avoid unsupported/unstable half-precision
+    # SVD and distance kernels when a submission produces AMP coordinates.
+    pred = pred_atom14.to(dtype=torch.float32)
+    true = true_atom14.to(device=pred.device, dtype=torch.float32)
+    if not torch.isfinite(pred).all() or not torch.isfinite(true).all():
+        raise ValueError("Scoring coordinates must remain finite in float32.")
     mask = atom14_mask[:L].to(device=pred.device, dtype=torch.bool)
     residue_types = _as_aatype_tensor(aatype, length=L, device=pred.device)
+    connected = _peptide_bonds(
+        length=L, device=pred.device, residue_index=residue_index, between_segment_residues=between_segment_residues,
+    )
 
     ca_mask = mask[:, CA_ATOM14_SLOT]
+    if not bool(ca_mask.any()):
+        raise ValueError("FoldScore requires at least one observed CA atom in the target labels.")
     ca_score = lddt_ca(
         pred[:, CA_ATOM14_SLOT, :],
         true[:, CA_ATOM14_SLOT, :],
@@ -808,9 +869,9 @@ def foldscore_components(
     cad_score = cad_atom14_score(pred, true, mask)
     sg_score = spheregrinder_atom14_score(pred, true, mask)
     sc_score = sidechain_atom14_score(pred, true, mask, residue_types)
-    clash_score = molprobity_clash_atom14_score(pred, mask, residue_types)
-    bb_score = backbone_atom14_score(pred, true, mask)
-    dipdiff_score = dipdiff_atom14_score(pred, true, mask)
+    clash_score = molprobity_clash_atom14_score(pred, mask, residue_types, peptide_bonds=connected)
+    bb_score = backbone_atom14_score(pred, true, mask, peptide_bonds=connected)
+    dipdiff_score = dipdiff_atom14_score(pred, true, mask, peptide_bonds=connected)
 
     foldscore = foldscore_from_components(
         gdt_ha_ca_score=gdt_ha_score,
@@ -839,22 +900,24 @@ def foldscore_components(
 
 
 def foldscore_auc(points: Iterable[tuple[int | float, int | float, float]], *, sample_budget: int | float) -> float:
-    """Trapezoidal AUC over `(step, cumulative_samples_seen, foldscore)` points."""
-    rows = sorted((float(samples), float(score)) for _step, samples, score in points)
-    if not rows:
-        return float("nan")
-    if len(rows) == 1:
-        return rows[0][1]
-
-    area = 0.0
-    previous_samples = rows[0][0]
-    for samples, _score in rows[1:]:
-        if samples <= previous_samples:
+    """Full-budget trapezoidal AUC; partial or invalid curves are not scores."""
+    budget = float(sample_budget)
+    if not math.isfinite(budget) or budget <= 0:
+        raise ValueError("AUC sample budget must be finite and positive.")
+    rows = sorted((float(samples), float(score), float(step)) for step, samples, score in points)
+    if len(rows) < 2:
+        raise ValueError("AUC requires at least two checkpoints covering the complete sample budget.")
+    for samples, score, step in rows:
+        if not all(math.isfinite(value) for value in (samples, score, step)) or samples < 0 or step < 0 or not 0 <= score <= 1:
+            raise ValueError("AUC points must have finite nonnegative axes and scores in [0, 1].")
+    for previous, current in zip(rows, rows[1:], strict=False):
+        if current[0] <= previous[0] or current[2] <= previous[2]:
             raise ValueError("AUC points must have strictly increasing cumulative sample counts.")
-        previous_samples = samples
-
+    if rows[0][0] != 0 or rows[0][2] != 0 or rows[-1][0] != budget:
+        raise ValueError("AUC checkpoints must cover step zero through the complete sample budget.")
+    area = 0.0
     for idx in range(1, len(rows)):
-        x0, y0 = rows[idx - 1]
-        x1, y1 = rows[idx]
+        x0, y0, _ = rows[idx - 1]
+        x1, y1, _ = rows[idx]
         area += (x1 - x0) * (y0 + y1) * 0.5
-    return area / max(float(sample_budget), 1.0)
+    return area / budget

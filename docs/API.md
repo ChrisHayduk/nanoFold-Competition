@@ -76,6 +76,18 @@ Resume requires the same effective sampling population and weights, dataset cont
 
 Checkpoint writes use staged, flushed files followed by atomic replacement. A failed write preserves the previous checkpoint, and rank-zero save failures propagate to every rank. Resume validates RNG states for all ranks and requires valid AMP scaler state when AMP is enabled, plus the configured scheduler's saved state, before changing run history.
 
+Schedulers used for resumed training must implement both `state_dict()` and `load_state_dict()`. A fresh invocation refuses an existing run's files unless `--resume` or `--reset-run` is explicit. Positive integer step, accumulation and batch settings are required; booleans and fractional values are rejected.
+
+Checkpoints and metrics record the trainer-file SHA256 and FoldScore version. Missing or changed trainer identity is a resume metadata mismatch, so changed training or validation semantics cannot silently continue a run. Maintainer mismatch overrides are recorded in metrics and do not establish equivalent continuation.
+
+Resuming an earlier step fails if the run directory still contains newer checkpoints, including an advanced `ckpt_last.pt`. Resume the latest checkpoint or preserve the existing run directory separately before restoring an earlier trajectory. The trainer does not silently delete later scientific evidence or mix checkpoint trajectories.
+
+`--max-runtime-seconds N` is an optional positive finite wall-clock allowance, including startup and validation. The trainer checks it at optimizer boundaries, coordinates stopping across ranks, writes a complete checkpoint, records `status: paused` and `stop_reason: max_runtime_seconds`, and exits 75 if training is incomplete. It exits 0 when the final step is complete. This runtime option is outside the scientific config and sampling contract; a resumed invocation can use a different allowance. Allow time for one optimizer step, validation and checkpoint persistence when setting an external timeout.
+
+Every training and validation manifest entry must have processed inputs. Validation passes only inference features to submission hooks, retaining labels in the trusted scorer. Python, NumPy, Torch/device and loader random streams are isolated and restored, including on evaluation failure, and each validation starts from the same evaluation seed. Validation cannot change the following training draws. Hooks that need labels do not provide a validation loss; training-loss reporting is unaffected.
+
+Validation reports `val_target_count` and each metric's `_valid_count`, `_nonfinite_count` and `_missing_count`. lDDT-Cα and requested FoldScore components require finite scores for the entire nonempty manifest. Secondary metrics such as Kabsch RMSD may be undefined for insufficient observations; their means and explicit counts identify that restricted denominator. Submission diagnostics cannot replace trusted scores or counts. Rank-zero validation failures are propagated to all ranks.
+
 Exposure counters must be nonnegative integers consistent with the checkpoint
 step and effective batch size. Samples must equal `step * effective_batch_size`;
 nonpadding and cropped residue counts must lie within the corresponding sample
@@ -245,6 +257,33 @@ a shared prefix or omit failed targets. Official scoring binds the manifest,
 split, crop, prediction root, checkpoint schedule, and exposure counts to
 maintainer-supplied inputs rather than trusting a prediction summary.
 
+Current outputs declare `foldscore_version: 2-segment-aware-float32`. Coordinates
+are scored in float32, including AMP predictions. A peptide connection requires
+consecutive feature `residue_index` values and no `between_segment_residues` flag
+on the next residue. BB dihedrals and DipDiff windows stop at these boundaries;
+clash scoring exempts adjacent residues only when that connection exists.
+Targets with no observed CA atom are rejected. Historical scores are not
+rewritten and must not be combined with this version in a ranking.
+
+Both inference entrypoints require every manifest target, pass submission code
+only features and a label-sanitized config, and reset crop/MSA randomness for
+each checkpoint. `eval.py` keeps trusted scoring labels outside submission
+hooks. Its `mean_submission_*` diagnostics cannot replace metric means and
+report explicit valid/nonfinite target counts; `rmsd_ca_valid_count` and
+`rmsd_ca_undefined_count` describe the optional RMSD denominator.
+
+Prediction format 1 binds every NPZ to `chain_id`, `ckpt_sha256` and its exact
+`masked_length`. Official prediction checks checkpoint model/submission
+settings and the loaded entrypoint hash; public official prediction additionally
+checks its training fingerprint and track. Hidden input verification does not
+verify the separate training corpus. Summaries distinguish these checks with
+`checkpoint_model_contract_verified` and `training_fingerprint_verified`.
+Legacy unbound artifacts can only be scored as research outputs. Prediction
+directories must be empty, checkpoint stems must be distinct, and existing
+prediction files are never overwritten. Per-chain score records retain the
+checkpoint hash and metric version. AUC requires finite scores and the complete
+step-zero-to-budget curve; partial curves and duplicate axes fail.
+
 The composite is:
 
 ```text
@@ -288,3 +327,7 @@ Implementation uses:
 
 Sanity vector:
 - if predictions match labels exactly, at least three C-alpha atoms plus valid inter-residue atom14 pairs are present, and the predicted structure has no heavy-atom clashes under the clash component, score is `1.0`.
+
+Private research results can be checked with `scripts/verify_experiment_result.py`. Supply the final bundled `--config`, public `--fingerprint`, public-validation `--manifest`, actual `--checkpoint`, evaluation `--summary`, `--per-chain` JSONL, prespecified `--seed`, `--final-step`, `--sample-budget`, and a fresh `--out` receipt path. It requires exact checkpoint/config/data identities, every validation target exactly once, current metric versions, consistent component-weighted FoldScore and independently recomputed means. Only the two processed-data directory paths may differ in the checkpoint's resolved config, allowing runtime staging; the receipt records these relocations and still requires the original config-byte and fingerprint hashes. This checks one final endpoint; source/runtime provenance, full data verification, prediction scoring and a complete campaign remain separate checks. This interface requires the private research route without official config overrides.
+
+For public-only remote research bundles and resumable execution, see [Modal training](MODAL_TRAINING.md).

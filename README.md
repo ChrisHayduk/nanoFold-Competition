@@ -190,6 +190,8 @@ for the staging workflow, validation gates, and remaining scientific limits.
 
 Training resume preserves the sampler epoch/cursor, loader generators and per-rank RNG, and checks the actual sampling weights and dataset bytes. Checkpoint replacement is atomic, and invalid RNG or AMP state fails before changing run history. Checkpoints lacking supported sampling state require a fresh training run. See the [training sampling contract](docs/API.md#training-sampling-and-multiple-gpus).
 
+Training requires every train and public-validation input, including in local research runs. Public validation receives features only and uses an isolated random stream, so its frequency cannot change subsequent training randomness. Metric records include valid, nonfinite and missing target counts; incomplete or nonfinite primary scores fail explicitly. Existing run outputs require `--resume` or an explicit `--reset-run`. For bounded execution, `train.py --max-runtime-seconds N` saves at an optimizer boundary and exits 75 when paused; resume keeps the original scientific budget.
+
 Unweighted distributed epochs drop incomplete tails instead of repeating
 chains. Resume also validates exposure counters against the step and global
 batch size. Split verification replays the selected policy from locked inputs,
@@ -508,3 +510,5 @@ CI enforces the same PR guardrail:
 |---:|---|---|---:|---:|---:|---|---|---|
 | 1 | [minalphafold2_full](submissions/minalphafold2_full) | nanoFold Maintainers | 0.2634 | 0.3423 | 0.3426 | 2026-05-01 | `85f8c9c` | minAlphaFold2 full profile limited-track benchmark |
 <!-- LEADERBOARD_END -->
+
+Private research campaigns can use [verified Modal bundles](docs/MODAL_TRAINING.md) and the [fixed-endpoint result verifier](docs/API.md). Freeze configuration, dataset, source/runtime and scoring identities before comparing runs.

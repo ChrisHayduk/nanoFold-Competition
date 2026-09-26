@@ -4,6 +4,7 @@ import argparse
 import copy
 import hashlib
 import json
+import math
 import os
 import re
 import subprocess
@@ -13,8 +14,6 @@ from pathlib import Path
 from statistics import mean, pstdev
 from typing import Any, Dict, List
 
-import numpy as np
-import torch
 import yaml
 
 # Allow running as `python scripts/run_official.py` from repo root.
@@ -22,16 +21,14 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from nanofold.chain_paths import chain_npz_path
 from nanofold.competition_policy import DEFAULT_TRACK_ID, load_track_spec
 from nanofold.data import read_manifest
 from nanofold.leaderboard_identity import resolve_leaderboard_team
 from nanofold.metrics import (
-    FOLDSCORE_COMPONENT_NAMES,
     FOLDSCORE_CURVE_COMPONENT_NAMES,
-    foldscore_auc,
-    foldscore_components,
+    FOLDSCORE_VERSION,
 )
+from nanofold.prediction_contract import validate_complete_chain_ids
 
 DEFAULT_CHECKPOINT_STEPS = "0,1000,2000,5000,last"
 SEALED_RUNTIME_ENV = "NANOFOLD_OFFICIAL_SEALED_RUNTIME"
@@ -397,206 +394,6 @@ def _parse_step_from_ckpt_path(ckpt_path: str, *, max_steps: int) -> int | None:
     return None
 
 
-def _prediction_subdir(pred_root: Path, ckpt_path: str, n_ckpts: int) -> Path:
-    if n_ckpts <= 1:
-        return pred_root
-    return pred_root / Path(ckpt_path).stem
-
-
-def _center_crop_atom14_labels(
-    atom14_positions: np.ndarray,
-    atom14_mask: np.ndarray,
-    aatype: np.ndarray,
-    crop_size: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    L = int(atom14_positions.shape[0])
-    if L <= crop_size:
-        return atom14_positions, atom14_mask, aatype
-    start = (L - crop_size) // 2
-    end = start + crop_size
-    return atom14_positions[start:end], atom14_mask[start:end], aatype[start:end]
-
-
-def _score_hidden_predictions(
-    *,
-    hidden_manifest: Path,
-    hidden_features_dir: Path,
-    hidden_labels_dir: Path,
-    pred_root: Path,
-    checkpoint_entries: List[Dict[str, Any]],
-    crop_size: int,
-    sample_budget: int,
-    per_chain_out_path: Path,
-) -> Dict[str, Any]:
-    chain_ids = read_manifest(hidden_manifest)
-    n_ckpts = len(checkpoint_entries)
-    checkpoint_scores: List[Dict[str, Any]] = []
-    per_chain_rows: List[Dict[str, Any]] = []
-
-    for item in checkpoint_entries:
-        ckpt_path = str(item["ckpt"])
-        step = int(item.get("step", 0))
-        cumulative_samples_seen = int(item.get("cumulative_samples_seen", -1))
-        cumulative_cropped_residues_seen = int(item.get("cumulative_cropped_residues_seen", -1))
-        cumulative_nonpad_residues_seen = int(item.get("cumulative_nonpad_residues_seen", -1))
-        if cumulative_samples_seen < 0:
-            raise ValueError(f"Checkpoint entry is missing `cumulative_samples_seen`: {item}")
-        ckpt_pred_dir = _prediction_subdir(pred_root, ckpt_path, n_ckpts=n_ckpts)
-        score_lists: Dict[str, List[float]] = {name: [] for name in FOLDSCORE_COMPONENT_NAMES}
-
-        for chain_id in chain_ids:
-            pred_path = chain_npz_path(ckpt_pred_dir, chain_id)
-            feature_path = chain_npz_path(hidden_features_dir, chain_id)
-            label_path = chain_npz_path(hidden_labels_dir, chain_id)
-            if not pred_path.exists():
-                raise FileNotFoundError(f"Missing prediction file for hidden scoring: {pred_path}")
-            if not feature_path.exists():
-                raise FileNotFoundError(f"Missing hidden feature file: {feature_path}")
-            if not label_path.exists():
-                raise FileNotFoundError(f"Missing hidden label file: {label_path}")
-
-            with np.load(pred_path) as pred_npz:
-                if "pred_atom14" not in pred_npz:
-                    raise ValueError(f"Official hidden scoring requires pred_atom14 in {pred_path}")
-                pred_atom14 = np.asarray(pred_npz["pred_atom14"], dtype=np.float32)
-            with np.load(feature_path) as feature_npz:
-                if "aatype" not in feature_npz:
-                    raise ValueError(f"Official hidden scoring feature file {feature_path} is missing aatype")
-                aatype = np.asarray(feature_npz["aatype"], dtype=np.int64)
-            with np.load(label_path) as label_npz:
-                missing_label_keys = [
-                    key
-                    for key in ("ca_coords", "ca_mask", "atom14_positions", "atom14_mask")
-                    if key not in label_npz
-                ]
-                if missing_label_keys:
-                    raise ValueError(
-                        f"Official hidden scoring label file {label_path} is missing required keys: "
-                        f"{', '.join(missing_label_keys)}"
-                    )
-                true_atom14 = np.asarray(label_npz["atom14_positions"], dtype=np.float32)
-                atom14_mask = np.asarray(label_npz["atom14_mask"], dtype=bool)
-            true_atom14, atom14_mask, aatype = _center_crop_atom14_labels(
-                true_atom14,
-                atom14_mask,
-                aatype,
-                crop_size=crop_size,
-            )
-
-            comps = foldscore_components(
-                pred_atom14=torch.from_numpy(pred_atom14),
-                true_atom14=torch.from_numpy(true_atom14),
-                atom14_mask=torch.from_numpy(atom14_mask),
-                aatype=torch.from_numpy(aatype),
-            )
-            metrics = {name: float(value.detach().cpu()) for name, value in comps.items()}
-            for name, value in metrics.items():
-                if not np.isfinite(value):
-                    raise ValueError(f"Nonfinite hidden {name}; refusing an incomplete mean.")
-                score_lists[name].append(float(value))
-            per_chain_rows.append(
-                {
-                    "split": "hidden_val",
-                    "ckpt": ckpt_path,
-                    "step": step,
-                    "cumulative_samples_seen": cumulative_samples_seen,
-                    "chain_id": chain_id,
-                    **metrics,
-                }
-            )
-
-        mean_scores = {
-            f"mean_{name}": float(sum(values) / len(values)) if values else float("nan")
-            for name, values in score_lists.items()
-        }
-        checkpoint_scores.append(
-            {
-                "ckpt": ckpt_path,
-                "step": step,
-                "cumulative_samples_seen": cumulative_samples_seen,
-                "cumulative_cropped_residues_seen": cumulative_cropped_residues_seen,
-                "cumulative_nonpad_residues_seen": cumulative_nonpad_residues_seen,
-                **mean_scores,
-                "num_chains": len(chain_ids),
-            }
-        )
-
-    per_chain_out_path.parent.mkdir(parents=True, exist_ok=True)
-    with per_chain_out_path.open("w") as f:
-        for row in per_chain_rows:
-            f.write(json.dumps(row) + "\n")
-
-    sorted_points = sorted(checkpoint_scores, key=lambda x: int(x["cumulative_samples_seen"]))
-    previous_samples: int | None = None
-    for row in sorted_points:
-        current_samples = int(row["cumulative_samples_seen"])
-        if previous_samples is not None and current_samples <= previous_samples:
-            raise ValueError(
-                "Hidden scoring requires strictly increasing cumulative_samples_seen values; "
-                f"got {current_samples} after {previous_samples}."
-            )
-        previous_samples = current_samples
-
-    final_hidden = float("nan")
-    if sorted_points:
-        final_hidden = float(sorted_points[-1]["mean_foldscore"])
-
-    if not sorted_points or int(sorted_points[0]["cumulative_samples_seen"]) != 0:
-        raise ValueError("Hidden scoring requires a step-0 checkpoint with cumulative_samples_seen=0.")
-    if int(sorted_points[-1]["cumulative_samples_seen"]) != int(sample_budget):
-        raise ValueError(
-            "Hidden scoring requires a final checkpoint at the full sample budget "
-            f"({sample_budget}); got {sorted_points[-1]['cumulative_samples_seen']}."
-        )
-
-    auc_hidden = foldscore_auc(
-        (
-            (
-                int(row["step"]),
-                int(row["cumulative_samples_seen"]),
-                float(row["mean_foldscore"]),
-            )
-            for row in sorted_points
-        ),
-        sample_budget=sample_budget,
-    )
-    foldscore_at_steps = {str(int(row["step"])): float(row["mean_foldscore"]) for row in sorted_points}
-    foldscore_at_samples = {
-        str(int(row["cumulative_samples_seen"])): float(row["mean_foldscore"]) for row in sorted_points
-    }
-    out = {
-        "final_hidden_foldscore": final_hidden,
-        "foldscore_auc_hidden": auc_hidden,
-        "foldscore_at_steps": foldscore_at_steps,
-        "foldscore_at_samples": foldscore_at_samples,
-        "checkpoint_metrics_hidden": checkpoint_scores,
-        "per_chain_scores_hidden_path": str(per_chain_out_path.resolve()),
-    }
-    for name in FOLDSCORE_CURVE_COMPONENT_NAMES:
-        key = f"mean_{name}"
-        out[f"final_hidden_{name}"] = float(sorted_points[-1].get(key, final_hidden))
-        out[f"{name}_auc_hidden"] = foldscore_auc(
-            (
-                (
-                    int(row["step"]),
-                    int(row["cumulative_samples_seen"]),
-                    float(row.get(key, row["mean_foldscore"])),
-                )
-                for row in sorted_points
-            ),
-            sample_budget=sample_budget,
-        )
-        out[f"{name}_at_steps"] = {
-            str(int(row["step"])): float(row.get(key, row["mean_foldscore"]))
-            for row in sorted_points
-        }
-        out[f"{name}_at_samples"] = {
-            str(int(row["cumulative_samples_seen"])): float(row.get(key, row["mean_foldscore"]))
-            for row in sorted_points
-        }
-    return out
-
-
 def _write_temp_predict_config(
     *,
     cfg: Dict[str, Any],
@@ -747,8 +544,18 @@ def main() -> None:
         )
 
     eval_public_summary = _read_json(eval_public_summary_path)
+    if eval_public_summary.get("foldscore_version") != FOLDSCORE_VERSION:
+        raise ValueError("Public score artifact has a missing or incompatible FoldScore version.")
     public_per_chain_rows = _read_per_chain(per_chain_public_path)
-    public_scores = [float(row["foldscore"]) for row in public_per_chain_rows if "foldscore" in row]
+    validate_complete_chain_ids([str(row.get("chain_id", "")) for row in public_per_chain_rows], read_manifest(val_manifest_path))
+    current_checkpoint_sha256 = _sha256(ckpt_last_path)
+    if any(row.get("foldscore_version") != FOLDSCORE_VERSION or row.get("ckpt_sha256") != current_checkpoint_sha256 for row in public_per_chain_rows):
+        raise ValueError("Public per-chain scores do not match the current checkpoint and FoldScore version.")
+    public_scores = [float(row.get("foldscore", float("nan"))) for row in public_per_chain_rows]
+    if any(not math.isfinite(value) or not 0 <= value <= 1 for value in public_scores):
+        raise ValueError("Every public manifest target requires a finite FoldScore.")
+    if not math.isclose(mean(public_scores), float(eval_public_summary["mean_foldscore"]), rel_tol=0, abs_tol=1e-7):
+        raise ValueError("Public score summary disagrees with its complete per-chain records.")
     public_summary = {
         "count": len(public_scores),
         "mean": float(mean(public_scores)) if public_scores else float("nan"),
@@ -874,6 +681,8 @@ def main() -> None:
             env=_scrub_hidden_env(stage="score"),
         )
         hidden_eval_summary = _read_json(hidden_eval_summary_path)
+        if hidden_eval_summary.get("foldscore_version") != FOLDSCORE_VERSION:
+            raise ValueError("Hidden score artifact has a missing or incompatible FoldScore version.")
         hidden_results = {
             "final_hidden_foldscore": float(hidden_eval_summary.get("final_hidden_foldscore", float("nan"))),
             "foldscore_auc_hidden": float(hidden_eval_summary.get("foldscore_auc_hidden", float("nan"))),
@@ -935,6 +744,7 @@ def main() -> None:
     )
 
     result = {
+        "foldscore_version": FOLDSCORE_VERSION,
         "run_name": run_name,
         "submission_name": submission_dir.name,
         "submission_dir": str(submission_dir),

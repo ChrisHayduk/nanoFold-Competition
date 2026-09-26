@@ -19,8 +19,23 @@ from nanofold.dataset_integrity import verify_split_against_fingerprint
 from nanofold.metrics import (
     FOLDSCORE_COMPONENT_NAMES,
     FOLDSCORE_CURVE_COMPONENT_NAMES,
+    FOLDSCORE_VERSION,
     foldscore_auc,
     foldscore_components,
+)
+from nanofold.prediction_contract import (
+    PREDICTION_FORMAT_VERSION,
+    load_prediction,
+    validate_checkpoint_output_names,
+)
+from nanofold.scoring_io import (
+    load_feature_crop as _load_feature_crop,
+)
+from nanofold.scoring_io import (
+    load_label_crop as _load_label_crop,
+)
+from nanofold.scoring_io import (
+    validate_scoring_alignment,
 )
 from nanofold.utils import default_torch_device, get_env_metadata, sha256_file, utc_now_iso
 
@@ -85,103 +100,13 @@ def _labels_to_device(labels: Dict[str, torch.Tensor], device: torch.device) -> 
     return {key: value.to(device=device, non_blocking=device.type == "cuda") for key, value in labels.items()}
 
 
-def _load_label_crop(
-    *,
-    labels_dir: Path,
-    chain_id: str,
-    crop_size: int,
-    crop_mode: str,
-) -> Dict[str, torch.Tensor]:
-    label_path = chain_npz_path(labels_dir, chain_id)
-    if not label_path.exists():
-        raise FileNotFoundError(f"Missing label file for scoring: {label_path}")
-    with np.load(label_path) as data:
-        missing = [key for key in ("ca_coords", "ca_mask", "atom14_positions", "atom14_mask") if key not in data]
-        if missing:
-            raise ValueError(f"Label file {label_path} is missing required keys: {', '.join(missing)}")
-        labels: Dict[str, torch.Tensor] = {
-            "ca_coords": torch.from_numpy(data["ca_coords"]).float(),
-            "ca_mask": torch.from_numpy(data["ca_mask"]).bool(),
-            "atom14_positions": torch.from_numpy(np.asarray(data["atom14_positions"], dtype=np.float32)),
-            "atom14_mask": torch.from_numpy(np.asarray(data["atom14_mask"], dtype=bool)),
-        }
-    ca_coords = labels["ca_coords"]
-    ca_mask = labels["ca_mask"]
-    if ca_coords.ndim != 2 or ca_coords.shape[-1] != 3:
-        raise ValueError(f"Invalid ca_coords shape in {label_path}: {tuple(ca_coords.shape)}")
-    if ca_mask.ndim != 1:
-        raise ValueError(f"Invalid ca_mask shape in {label_path}: {tuple(ca_mask.shape)}")
-    if ca_coords.shape[0] != ca_mask.shape[0]:
-        raise ValueError(f"Label length mismatch in {label_path}")
-    atom14_positions = labels["atom14_positions"]
-    if atom14_positions.ndim != 3 or atom14_positions.shape[1:] != (14, 3):
-        raise ValueError(f"Invalid atom14_positions shape in {label_path}: {tuple(atom14_positions.shape)}")
-    if atom14_positions.shape[0] != ca_coords.shape[0]:
-        raise ValueError(f"atom14_positions length mismatch in {label_path}")
-    atom14_mask = labels["atom14_mask"]
-    if atom14_mask.ndim != 2 or atom14_mask.shape[1] != 14:
-        raise ValueError(f"Invalid atom14_mask shape in {label_path}: {tuple(atom14_mask.shape)}")
-    if atom14_mask.shape[0] != ca_coords.shape[0]:
-        raise ValueError(f"atom14_mask length mismatch in {label_path}")
-
-    L = int(ca_coords.shape[0])
-    if L <= crop_size:
-        return labels
-    if crop_mode == "center":
-        start = (L - crop_size) // 2
-    elif crop_mode == "random":
-        raise ValueError("Scoring external labels with random crop is unsupported; use deterministic crop mode.")
-    else:
-        raise ValueError(f"Unsupported crop_mode={crop_mode!r}")
-    end = start + crop_size
-    cropped = dict(labels)
-    cropped["ca_coords"] = labels["ca_coords"][start:end]
-    cropped["ca_mask"] = labels["ca_mask"][start:end]
-    cropped["atom14_positions"] = labels["atom14_positions"][start:end]
-    cropped["atom14_mask"] = labels["atom14_mask"][start:end]
-    return cropped
-
-
-def _load_feature_crop(
-    *,
-    features_dir: Path,
-    chain_id: str,
-    crop_size: int,
-    crop_mode: str,
-) -> Dict[str, torch.Tensor]:
-    feature_path = chain_npz_path(features_dir, chain_id)
-    if not feature_path.exists():
-        raise FileNotFoundError(f"Missing feature file for scoring: {feature_path}")
-    with np.load(feature_path) as data:
-        if "aatype" not in data:
-            raise ValueError(f"Feature file {feature_path} is missing required key: aatype")
-        raw_aatype = np.asarray(data["aatype"])
-        if raw_aatype.dtype.kind not in "iu" or np.any(raw_aatype < 0) or np.any(raw_aatype > 20):
-            raise ValueError("Feature aatype must contain integer residue tokens in [0, 20].")
-        features = {"aatype": torch.from_numpy(raw_aatype.astype(np.int64))}
-    aatype = features["aatype"]
-    if aatype.ndim != 1:
-        raise ValueError(f"Invalid aatype shape in {feature_path}: {tuple(aatype.shape)}")
-
-    L = int(aatype.shape[0])
-    if L <= crop_size:
-        return features
-    if crop_mode == "center":
-        start = (L - crop_size) // 2
-    elif crop_mode == "random":
-        raise ValueError("Scoring external features with random crop is unsupported; use deterministic crop mode.")
-    else:
-        raise ValueError(f"Unsupported crop_mode={crop_mode!r}")
-    end = start + crop_size
-    return {"aatype": aatype[start:end]}
-
-
 def _score_chain(
     *,
     pred_atom14: torch.Tensor,
     labels: Dict[str, torch.Tensor],
     features: Dict[str, torch.Tensor],
 ) -> Dict[str, float]:
+    validate_scoring_alignment(labels, features)
     has_atom14_labels = "atom14_positions" in labels and "atom14_mask" in labels
     if not has_atom14_labels:
         raise ValueError("FoldScore scoring requires label atom14_positions/atom14_mask.")
@@ -190,6 +115,8 @@ def _score_chain(
         true_atom14=labels["atom14_positions"],
         atom14_mask=labels["atom14_mask"],
         aatype=features["aatype"],
+        residue_index=features.get("residue_index"),
+        between_segment_residues=features.get("between_segment_residues"),
     )
     return {name: float(value.detach().cpu()) for name, value in comps.items()}
 
@@ -296,18 +223,25 @@ def _validate_official_summary(
 def _validate_hidden_axis(checkpoint_rows: List[Dict[str, Any]], sample_budget: int, *, require_step_zero: bool = True) -> List[Dict[str, Any]]:
     if not checkpoint_rows:
         raise ValueError("Hidden scoring requires checkpoint metadata.")
+    if type(sample_budget) is not int or sample_budget <= 0:
+        raise ValueError("Hidden scoring requires a positive integer sample budget.")
     previous_samples: int | None = None
+    previous_step: int | None = None
     for row in checkpoint_rows:
-        current_samples = int(row.get("cumulative_samples_seen", -1))
-        if current_samples < 0:
-            raise ValueError(f"Checkpoint entry is missing `cumulative_samples_seen`: {row}")
+        current_samples = row.get("cumulative_samples_seen")
+        step = row.get("step")
+        if type(current_samples) is not int or current_samples < 0 or type(step) is not int or step < 0:
+            raise ValueError("Hidden scoring requires nonnegative integer step and cumulative sample counts.")
+        if previous_step is not None and step <= previous_step:
+            raise ValueError("Hidden scoring requires strictly increasing checkpoint steps.")
         if previous_samples is not None and current_samples <= previous_samples:
             raise ValueError(
                 "Hidden scoring requires strictly increasing cumulative_samples_seen values; "
                 f"got {current_samples} after {previous_samples}."
             )
         previous_samples = current_samples
-    if require_step_zero and int(checkpoint_rows[0]["cumulative_samples_seen"]) != 0:
+        previous_step = step
+    if require_step_zero and (checkpoint_rows[0]["cumulative_samples_seen"] != 0 or checkpoint_rows[0]["step"] != 0):
         raise ValueError("Hidden scoring requires a step-0 checkpoint with cumulative_samples_seen=0.")
     if int(checkpoint_rows[-1]["cumulative_samples_seen"]) != int(sample_budget):
         raise ValueError(
@@ -319,6 +253,8 @@ def _validate_hidden_axis(checkpoint_rows: List[Dict[str, Any]], sample_budget: 
 
 def _hidden_curve_metrics(checkpoint_rows: List[Dict[str, Any]], *, sample_budget: int, compute_auc: bool = True) -> Dict[str, Any]:
     rows = _validate_hidden_axis(checkpoint_rows, sample_budget=sample_budget, require_step_zero=compute_auc)
+    if any(not np.isfinite(float(row["mean_foldscore"])) or not 0 <= float(row["mean_foldscore"]) <= 1 for row in rows):
+        raise ValueError("Hidden FoldScore values must be finite and in [0, 1].")
     final_hidden = float(rows[-1]["mean_foldscore"])
     auc_hidden = foldscore_auc(
         (
@@ -342,26 +278,30 @@ def _hidden_curve_metrics(checkpoint_rows: List[Dict[str, Any]], *, sample_budge
     }
     for name in FOLDSCORE_CURVE_COMPONENT_NAMES:
         key = f"mean_{name}"
-        out[f"final_hidden_{name}"] = float(rows[-1].get(key, final_hidden))
+        # Legacy summaries can omit diagnostics; do not fabricate them from FoldScore.
+        if not any(key in row for row in rows):
+            continue
+        if any(key not in row or not np.isfinite(float(row[key])) or not 0 <= float(row[key]) <= 1 for row in rows):
+            raise ValueError(f"Hidden {name} requires a finite value at every checkpoint.")
+        out[f"final_hidden_{name}"] = float(rows[-1][key])
         out[f"{name}_auc_hidden"] = foldscore_auc(
             (
                 (
                     int(row["step"]),
                     int(row["cumulative_samples_seen"]),
-                    float(row.get(key, row["mean_foldscore"])),
+                    float(row[key]),
                 )
                 for row in rows
             ),
             sample_budget=sample_budget,
         ) if compute_auc else float("nan")
         out[f"{name}_at_steps"] = {
-            str(int(row["step"])): float(row.get(key, row["mean_foldscore"])) for row in rows
+            str(int(row["step"])): float(row[key]) for row in rows
         }
         out[f"{name}_at_samples"] = {
-            str(int(row["cumulative_samples_seen"])): float(row.get(key, row["mean_foldscore"]))
+            str(int(row["cumulative_samples_seen"])): float(row[key])
             for row in rows
         }
-    out["final_hidden_lddt_ca"] = float(rows[-1].get("mean_lddt_ca", final_hidden))
     return out
 
 
@@ -418,6 +358,18 @@ def main() -> None:
         )
     if crop_size <= 0 or crop_mode != "center":
         raise ValueError("Scoring requires a positive crop size and deterministic center cropping.")
+    format_version = prediction_summary.get("prediction_format_version")
+    if format_version is not None and (type(format_version) is not int or format_version != PREDICTION_FORMAT_VERSION):
+        raise ValueError("Unsupported prediction format version.")
+    if args.official and format_version != PREDICTION_FORMAT_VERSION:
+        raise ValueError("Official scoring requires predictions bound to chain and checkpoint identities.")
+    require_binding = format_version == PREDICTION_FORMAT_VERSION
+    validate_checkpoint_output_names([Path(str(item["ckpt"])) for item in checkpoints])
+    compute_hidden_auc = not (args.official and track.rank_metric == "final_hidden_foldscore" and len(checkpoints) == 1)
+    if split in HIDDEN_SPLITS:
+        _validate_hidden_axis(
+            checkpoints, sample_budget=prediction_summary.get("sample_budget", 0), require_step_zero=compute_hidden_auc,
+        )
     n_ckpts = len(checkpoints)
     device = _resolve_score_device(str(args.device))
     per_chain_rows: List[Dict[str, Any]] = []
@@ -450,13 +402,9 @@ def main() -> None:
                 raise FileNotFoundError(f"Missing prediction file for scoring: {pred_path}")
             if not pred_path.resolve().is_relative_to(pred_root):
                 raise ValueError("Prediction file resolves outside the trusted prediction directory.")
-            with np.load(pred_path) as pred_npz:
-                if "pred_atom14" not in pred_npz:
-                    raise ValueError(f"Prediction file is missing required `pred_atom14`: {pred_path}")
-                pred_atom14 = torch.from_numpy(np.asarray(pred_npz["pred_atom14"], dtype=np.float32)).to(
-                    device=device,
-                    non_blocking=device.type == "cuda",
-                )
+            pred_atom14 = load_prediction(
+                pred_path, chain_id=chain_id, checkpoint_sha256=item.get("ckpt_sha256"), require_binding=require_binding,
+            ).to(device=device, non_blocking=device.type == "cuda")
             labels = _load_label_crop(
                 labels_dir=labels_dir,
                 chain_id=chain_id,
@@ -476,14 +424,18 @@ def main() -> None:
                 labels=labels,
                 features=features,
             )
+            if set(metrics) != set(FOLDSCORE_COMPONENT_NAMES):
+                raise ValueError("Every scored chain must provide every FoldScore component exactly once.")
             for name, value in metrics.items():
-                if not np.isfinite(value):
-                    raise ValueError(f"Nonfinite {name} for a scored chain; refusing an incomplete mean.")
+                if not np.isfinite(value) or not 0.0 <= value <= 1.0:
+                    raise ValueError(f"Invalid {name} for a scored chain; refusing an incomplete mean.")
                 chain_metrics[name].append(float(value))
             per_chain_rows.append(
                 {
                     "split": split,
                     "ckpt": ckpt_path,
+                    "ckpt_sha256": item.get("ckpt_sha256"),
+                    "foldscore_version": FOLDSCORE_VERSION,
                     "step": int(item.get("step", 0)),
                     "cumulative_samples_seen": int(item.get("cumulative_samples_seen", -1)),
                     "chain_id": chain_id,
@@ -493,7 +445,9 @@ def main() -> None:
 
         scored_row = dict(item)
         for name, values in chain_metrics.items():
-            scored_row[f"mean_{name}"] = float(sum(values) / len(values)) if values else float("nan")
+            if len(values) != len(chain_ids):
+                raise ValueError(f"Missing {name} values; refusing an incomplete manifest denominator.")
+            scored_row[f"mean_{name}"] = float(sum(values) / len(chain_ids))
         scored_row["num_chains"] = len(chain_ids)
         scored_row["score_wall_time_seconds"] = float(time.perf_counter() - ckpt_start)
         scored_checkpoints.append(scored_row)
@@ -507,19 +461,14 @@ def main() -> None:
         )
 
     per_chain_out_path = Path(args.per_chain_out).resolve() if args.per_chain_out else None
-    if per_chain_out_path:
-        per_chain_out_path.parent.mkdir(parents=True, exist_ok=True)
-        with per_chain_out_path.open("w") as f:
-            for row in per_chain_rows:
-                f.write(json.dumps(row) + "\n")
-        print(f"Wrote per-chain scores to {per_chain_out_path.resolve()}")
-
     final_row = scored_checkpoints[-1]
     out: Dict[str, Any] = {
         "mode": "score",
         "split": split,
         "track": str(prediction_summary["track"]),
-        "official_mode": bool(prediction_summary.get("official_mode", False)),
+        "official_mode": bool(args.official),
+        "foldscore_version": FOLDSCORE_VERSION,
+        "prediction_identity_verified": require_binding,
         "prediction_summary_path": str(prediction_summary_path),
         "features_dir": str(features_dir),
         "labels_dir": str(labels_dir),
@@ -545,10 +494,17 @@ def main() -> None:
         out.update(
             _hidden_curve_metrics(
                 scored_checkpoints,
-                sample_budget=int(prediction_summary.get("sample_budget", 0)),
-                compute_auc=not (args.official and track.rank_metric == "final_hidden_foldscore" and len(scored_checkpoints) == 1),
+                sample_budget=prediction_summary.get("sample_budget", 0),
+                compute_auc=compute_hidden_auc,
             )
         )
+
+    if per_chain_out_path:
+        per_chain_out_path.parent.mkdir(parents=True, exist_ok=True)
+        with per_chain_out_path.open("w") as f:
+            for row in per_chain_rows:
+                f.write(json.dumps(row) + "\n")
+        print(f"Wrote per-chain scores to {per_chain_out_path.resolve()}")
 
     print(json.dumps(out, indent=2))
     if args.save:

@@ -3,6 +3,11 @@ from __future__ import annotations
 import importlib.util
 import json
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from nanofold.metrics import FOLDSCORE_VERSION
 
 
 def _load_script(path: str):
@@ -137,3 +142,16 @@ def test_readme_leaderboard_renderer_groups_by_track() -> None:
     assert rendered.index("### `limited`") < rendered.index("### `unlimited`")
     assert "| # | Name | Team | Rank Score | Hidden FoldScore | Public FoldScore | Date | Commit | Description |" in rendered
     assert "| 1 | [small_submission](submissions/small_submission) | Small Lab |" in rendered
+
+
+def test_new_metric_version_cannot_replace_or_mix_with_legacy_scores(tmp_path: Path, monkeypatch) -> None:
+    module = _load_script("scripts/add_leaderboard_entry.py")
+    leaderboard = tmp_path / "leaderboard.json"
+    original = json.dumps([{"track": "limited", "run_name": "same", "commit": "abcdef0", "rank_score": .5}])
+    leaderboard.write_text(original)
+    result = tmp_path / "result.json"
+    result.write_text(json.dumps({"track": "limited", "run_name": "same", "commit": "abcdef0", "rank_score": .8, "foldscore_version": FOLDSCORE_VERSION}))
+    monkeypatch.setattr(module, "parse_args", lambda: SimpleNamespace(result=str(result), leaderboard=str(leaderboard), description="", team="", no_render=True))
+    with pytest.raises(ValueError, match="different FoldScore versions"):
+        module.main()
+    assert leaderboard.read_text() == original

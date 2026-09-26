@@ -1,18 +1,22 @@
 from __future__ import annotations
 
 import math
+import random
 
 import numpy as np
 import pytest
 import torch
+from torch.utils.data import DataLoader, TensorDataset
 
 from eval import _load_feature_crop, _load_label_crop
 from nanofold.chain_paths import chain_npz_path
 from train import (
     WeightedDistributedSampler,
     _append_scalar_output_metrics,
+    _capture_rng_state,
     _cfg_with_runtime,
     _epoch_aware_sampler,
+    _isolated_validation,
     _scalar_output_metrics,
     _summarize_eval_metrics,
     _validate_train_sample_weights_opt_in,
@@ -25,7 +29,10 @@ from train import (
 def test_summarize_eval_metrics_omits_loss_when_submission_does_not_return_one() -> None:
     metrics = _summarize_eval_metrics([torch.tensor(0.25), torch.tensor(0.75)], [])
 
-    assert metrics == {"val_lddt_ca": 0.5}
+    assert metrics["val_lddt_ca"] == 0.5
+    assert metrics["val_target_count"] == metrics["val_lddt_ca_valid_count"] == 2
+    assert metrics["val_lddt_ca_nonfinite_count"] == metrics["val_lddt_ca_missing_count"] == 0
+    assert "val_loss" not in metrics
 
 
 def test_summarize_eval_metrics_includes_loss_when_available() -> None:
@@ -34,7 +41,9 @@ def test_summarize_eval_metrics_includes_loss_when_available() -> None:
         [torch.tensor(1.0), torch.tensor(3.0)],
     )
 
-    assert metrics == {"val_lddt_ca": 0.5, "val_loss": 2.0}
+    assert metrics["val_lddt_ca"] == 0.5
+    assert metrics["val_loss"] == 2.0
+    assert metrics["val_loss_valid_count"] == 2
 
 
 def test_summarize_eval_metrics_includes_rmsd_when_available() -> None:
@@ -45,7 +54,7 @@ def test_summarize_eval_metrics_includes_rmsd_when_available() -> None:
         [torch.tensor(6.0), torch.tensor(8.0)],
     )
 
-    assert metrics == {
+    assert {key: metrics[key] for key in ("val_lddt_ca", "val_loss", "val_rmsd_ca", "val_rmsd_atom14")} == {
         "val_lddt_ca": 0.5,
         "val_loss": 2.0,
         "val_rmsd_ca": 3.0,
@@ -74,6 +83,8 @@ def test_public_eval_metrics_weight_each_valid_target_equally_across_unequal_bat
 
     individual = aggregate([slice(i, i + 1) for i in range(3)])
     assert individual["val_rmsd_ca"] > 0
+    assert individual["val_rmsd_ca_valid_count"] == 2
+    assert individual["val_rmsd_ca_nonfinite_count"] == 1
     assert aggregate([slice(0, 2), slice(2, 3)]) == pytest.approx(individual)
     assert aggregate([slice(0, 1), slice(1, 3)]) == pytest.approx(individual)
 
@@ -87,10 +98,14 @@ def test_public_eval_scalar_outputs_weight_batch_means_by_target_count_and_keep_
     _append_scalar_output_metrics(scalar_metrics, {
         "loss_component": torch.tensor(5.0), "per_target": torch.tensor([3.0]),
     }, batch_size=1)
-    metrics = _summarize_eval_metrics([], [torch.tensor([2., 2.]), torch.tensor([5.])], scalar_metrics=scalar_metrics)
+    metrics = _summarize_eval_metrics(
+        [torch.ones(3)], [torch.tensor([2., 2.]), torch.tensor([5.])], scalar_metrics=scalar_metrics,
+    )
     assert metrics["val_loss"] == pytest.approx(3.0)
     assert metrics["val_loss_component"] == pytest.approx(3.0)
     assert metrics["val_per_target"] == pytest.approx(2.0)
+    assert metrics["val_per_target_valid_count"] == 2
+    assert metrics["val_per_target_nonfinite_count"] == 1
 
 
 def test_summarize_eval_metrics_includes_loss_components_and_foldscore_components() -> None:
@@ -130,11 +145,51 @@ def test_scalar_output_metrics_keeps_finite_scalar_tensors_only() -> None:
     assert metrics["loss_fape_loss"].item() == 2.0
 
 
-def test_summarize_eval_metrics_reports_nan_score_for_empty_eval_loader() -> None:
-    metrics = _summarize_eval_metrics([], [])
+@pytest.mark.parametrize("scores,expected", [([], None), ([torch.ones(2)], 3), ([torch.tensor([1., float('nan')])], 2)])
+def test_public_eval_rejects_empty_missing_or_nonfinite_primary_scores(scores, expected) -> None:
+    with pytest.raises(ValueError, match="every target|missing or nonfinite"):
+        _summarize_eval_metrics(scores, [], expected_targets=expected)
 
-    assert "val_loss" not in metrics
-    assert math.isnan(metrics["val_lddt_ca"])
+
+def test_public_eval_diagnostics_cannot_overwrite_trusted_scores_or_denominators() -> None:
+    metrics = _summarize_eval_metrics(
+        [torch.tensor([0.2, 0.6])], [], expected_targets=2,
+        scalar_metrics={"lddt_ca": [torch.tensor([99., 99.])], "target_count": [torch.tensor(99.)],
+                        "foldscore": [torch.tensor(99.)], "lddt_ca_valid_count": [torch.tensor(99.)],
+                        "auxiliary": [torch.tensor([float("nan"), float("nan")])]},
+        foldscore_metric_values={"foldscore": [torch.tensor([0.1, 0.3])]},
+    )
+    assert metrics["val_target_count"] == metrics["val_lddt_ca_valid_count"] == 2
+    assert metrics["val_lddt_ca"] == pytest.approx(0.4)
+    assert metrics["val_foldscore"] == pytest.approx(0.2)
+    assert metrics["val_auxiliary_valid_count"] == 0
+    assert metrics["val_auxiliary_nonfinite_count"] == 2
+    assert math.isnan(metrics["val_auxiliary"])
+
+
+def test_failed_validation_restores_training_rng_loader_and_mixed_module_modes() -> None:
+    model = torch.nn.Sequential(torch.nn.Linear(1, 1), torch.nn.Dropout())
+    model.train()
+    model[0].eval()
+    generator = torch.Generator().manual_seed(43)
+    loader = DataLoader(TensorDataset(torch.arange(3)), generator=generator)
+    device = torch.device("cpu")
+    before = _capture_rng_state(device)
+    loader_before = generator.get_state().clone()
+    with pytest.raises(RuntimeError, match="scoring failure"):
+        with _isolated_validation(model, loader, device):
+            assert not any(module.training for module in model.modules())
+            random.random()
+            np.random.random()
+            torch.rand(3)
+            next(iter(loader))
+            raise RuntimeError("scoring failure")
+    after = _capture_rng_state(device)
+    assert before["python"] == after["python"]
+    assert before["numpy"] == after["numpy"]
+    assert torch.equal(before["torch"], after["torch"])
+    assert torch.equal(loader_before, generator.get_state())
+    assert model.training and not model[0].training and model[1].training
 
 
 def test_eval_external_score_loaders_use_encoded_chain_paths(tmp_path) -> None:

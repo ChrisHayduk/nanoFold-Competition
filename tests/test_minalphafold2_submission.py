@@ -97,26 +97,6 @@ def test_minalphafold2_finetune_ramp_weight_scales_linearly() -> None:
     assert submission._finetune_ramp_weight({**cfg, "_runtime": {"step": 30000}}) == pytest.approx(1.0)
 
 
-def test_minalphafold2_finetune_auxiliary_weights_follow_ramp() -> None:
-    loss_fn = submission.AlphaFoldLoss(finetune=True)
-    target_weights = {
-        attr: float(getattr(loss_fn, attr))
-        for attr in submission.FINETUNE_AUXILIARY_WEIGHT_ATTRS
-    }
-
-    submission._apply_finetune_ramp(loss_fn, 0.0)
-    for attr in submission.FINETUNE_AUXILIARY_WEIGHT_ATTRS:
-        assert float(getattr(loss_fn, attr)) == pytest.approx(0.0)
-
-    submission._apply_finetune_ramp(loss_fn, 0.5)
-    for attr in submission.FINETUNE_AUXILIARY_WEIGHT_ATTRS:
-        assert float(getattr(loss_fn, attr)) == pytest.approx(target_weights[attr] * 0.5)
-
-    submission._apply_finetune_ramp(loss_fn, 1.5)
-    for attr in submission.FINETUNE_AUXILIARY_WEIGHT_ATTRS:
-        assert float(getattr(loss_fn, attr)) == pytest.approx(target_weights[attr])
-
-
 def test_minalphafold2_handoff_blends_initial_and_finetune_losses(monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = yaml.safe_load(Path("submissions/minalphafold2/config.yaml").read_text())
 
@@ -225,6 +205,10 @@ def test_minalphafold2_run_batch_returns_af2_loss() -> None:
     assert out["pred_atom14"].shape == (1, 8, 14, 3)
     assert out["loss"].requires_grad
     assert torch.isfinite(out["loss"])
+    out["loss"].backward()
+    gradients = [p.grad for p in model.parameters() if p.grad is not None]
+    assert gradients and all(torch.isfinite(grad).all() for grad in gradients)
+    assert any(torch.count_nonzero(grad) for grad in gradients)
 
 
 def test_minalphafold2_run_batch_returns_finetune_loss_at_handoff() -> None:
@@ -239,5 +223,149 @@ def test_minalphafold2_run_batch_returns_finetune_loss_at_handoff() -> None:
     assert out["loss"].requires_grad
     assert torch.isfinite(out["loss"])
     loss_fn = model.nanofold_finetune_loss_fn
-    for attr in submission.FINETUNE_AUXILIARY_WEIGHT_ATTRS:
+    for attr in ("structural_violation_weight", "experimentally_resolved_weight", "tm_score_weight"):
         assert float(getattr(loss_fn, attr)) > 0.0
+
+
+@pytest.mark.parametrize("state", [{}, {"completed_steps": True}, {"completed_steps": 1.5},
+                                    {"completed_steps": -1}, {"completed_steps": 30001},
+                                    {"completed_steps": 1, "ignored": 2}])
+def test_minalphafold2_scheduler_rejects_invalid_resume_without_changing_lr(state: dict[str, Any]) -> None:
+    cfg = yaml.safe_load(Path("submissions/minalphafold2/config.yaml").read_text())
+    optimizer = submission.build_optimizer(cfg, torch.nn.Linear(1, 1))
+    scheduler = submission.build_scheduler(cfg, optimizer)
+    scheduler.load_state_dict({"completed_steps": 500})
+    with pytest.raises(ValueError):
+        scheduler.load_state_dict(state)
+    assert scheduler.state_dict() == {"completed_steps": 500}
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(1.0e-3)
+
+
+def test_minalphafold2_explicit_fixed_recycling_and_inference_mode() -> None:
+    cfg = yaml.safe_load(Path("submissions/minalphafold2/config.yaml").read_text())
+    cfg["model"]["n_cycles"] = 4
+    cfg["experiment"] = {"recycle": {"train_mode": "fixed", "max_train_cycles": 4}}
+    model = submission.build_model(cfg)
+    batch = _synthetic_supervised_batch(length=4)
+    trained = submission.run_batch(model, batch, cfg, training=True)
+    assert trained["recycle_cycles"].item() == 4
+    trained["loss"].backward()
+    recycle_gradient = dict(model.named_parameters())["recycle_norm_s.weight"].grad
+    assert recycle_gradient is not None and torch.isfinite(recycle_gradient).all()
+
+    cfg["experiment"]["recycle"]["train_mode"] = "sample_uniform"
+    with torch.no_grad():
+        evaluated = submission.run_batch(model, batch, cfg, training=False)
+        again = submission.run_batch(model, batch, cfg, training=False)
+    assert not model.training
+    assert evaluated["recycle_cycles"].item() == 4
+    torch.testing.assert_close(evaluated["pred_atom14"], again["pred_atom14"], rtol=0, atol=0)
+
+
+def test_minalphafold2_fape_policy_controls_real_geometric_loss() -> None:
+    cfg = yaml.safe_load(Path("submissions/minalphafold2/config.yaml").read_text())
+    cfg["experiment"] = {"fape": {"backbone_clamp_mode": "fully_clamped"}}
+    model = submission.build_model(cfg)
+    batch = _synthetic_supervised_batch(length=8)
+    # A large geometric error must remain visible under the unclamped objective.
+    batch["atom14_positions"] *= 20.0
+    with torch.no_grad():
+        clamped = submission.run_batch(model, batch, cfg, training=False)["loss"]
+        cfg["experiment"]["fape"]["backbone_clamp_mode"] = "fully_unclamped"
+        unclamped = submission.run_batch(model, batch, cfg, training=False)["loss"]
+        cfg["experiment"]["fape"] = {"backbone_clamp_mode": "batchwise", "clamped_probability": 0.9}
+        mixture = submission.run_batch(model, batch, cfg, training=False)["loss"]
+    assert unclamped > clamped
+    torch.testing.assert_close(mixture, 0.9 * clamped + 0.1 * unclamped)
+
+
+def test_minalphafold2_batchwise_fape_shares_step_decision_without_consuming_rng() -> None:
+    cfg = {"seed": 2, "_runtime": {"step": 10}, "experiment": {"fape": {"backbone_clamp_mode": "batchwise"}}}
+    features = {"aatype": torch.zeros((2, 3), dtype=torch.long)}
+    state = torch.get_rng_state().clone()
+    first = submission._fape_clamp_weight(cfg, features, training=True)
+    second = submission._fape_clamp_weight(cfg, features, training=True)
+    assert first is not None and second is not None
+    assert first.item() in (0.0, 1.0)
+    torch.testing.assert_close(first, second)
+    assert torch.equal(state, torch.get_rng_state())
+
+
+def test_minalphafold2_initial_only_does_not_activate_at_final_checkpoint(monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = yaml.safe_load(Path("submissions/minalphafold2/config.yaml").read_text())
+    cfg["experiment"] = {"loss_schedule": {"mode": "initial_only"}}
+    cfg["_runtime"] = {"step": 30000}
+    model = submission.build_model(cfg)
+    def unexpected_finetune(*args: Any, **kwargs: Any) -> torch.Tensor:
+        pytest.fail("Initial-only recipes must never use the fine-tuning loss.")
+    monkeypatch.setattr(model.nanofold_finetune_loss_fn, "forward", unexpected_finetune)
+    out = submission.run_batch(model, _synthetic_supervised_batch(), cfg, training=False)
+    assert torch.isfinite(out["loss"])
+
+
+def test_minalphafold2_supervision_masks_padding_and_chain_breaks() -> None:
+    cfg = yaml.safe_load(Path("submissions/minalphafold2/config.yaml").read_text())
+    batch = _synthetic_supervised_batch(length=6)
+    batch["residue_mask"][:, 5:] = False
+    batch["residue_index"][:, 2:] += 10
+    batch["between_segment_residues"][:, 4] = 1
+    features = submission._build_minalphafold_inputs(batch, cfg, training=False)
+    assert torch.count_nonzero(features["atom37_exists"][:, 5:]) == 0
+    assert features["true_torsion_mask"][0, 1, :2].all()
+    assert torch.count_nonzero(features["true_torsion_mask"][0, [2, 4], :2]) == 0
+    assert features["loss_residue_index"][0, 4] - features["loss_residue_index"][0, 3] == 2
+    # Model relative-position inputs retain the deposited residue numbering.
+    torch.testing.assert_close(features["residue_index"], batch["residue_index"])
+
+
+def test_minalphafold2_finetune_loss_ignores_companion_padding() -> None:
+    def example(length: int) -> dict[str, Any]:
+        batch = _synthetic_supervised_batch(length=length)
+        item = {key: value[0] for key, value in batch.items()}
+        item.update(
+            template_aatype=torch.zeros((0, length), dtype=torch.long),
+            template_ca_coords=torch.zeros((0, length, 3)),
+            template_ca_mask=torch.zeros((0, length), dtype=torch.bool),
+        )
+        return item
+
+    cfg = yaml.safe_load(Path("submissions/minalphafold2/config.yaml").read_text())
+    cfg["_runtime"] = {"step": 30000}
+    model = submission.build_model(cfg)
+    short, long = example(4), example(7)
+    with torch.no_grad():
+        alone = [submission.run_batch(model, collate_batch([item], 8, 4), cfg, training=False)
+                 for item in (short, long)]
+        together = submission.run_batch(model, collate_batch([short, long], 8, 4), cfg, training=False)
+    assert torch.count_nonzero(together["pred_atom14"][0, 4:]) == 0
+    torch.testing.assert_close(together["pred_atom14"][0, :4], alone[0]["pred_atom14"][0], rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(together["loss"], (alone[0]["loss"] + alone[1]["loss"]) / 2, rtol=1e-5, atol=1e-5)
+
+
+def test_minalphafold2_reports_real_extra_msa_capacity() -> None:
+    cfg = yaml.safe_load(Path("submissions/minalphafold2/config.yaml").read_text())
+    cfg["model"].update(msa_depth=4, extra_msa_depth=2)
+    model = submission.build_model(cfg)
+    with torch.no_grad():
+        shallow = submission.run_batch(model, _synthetic_supervised_batch(length=4, msa_depth=4), cfg, training=False)
+        deep = submission.run_batch(model, _synthetic_supervised_batch(length=4, msa_depth=8), cfg, training=False)
+    assert shallow["msa_cluster_rows"].item() == 4
+    assert shallow["msa_extra_rows"].item() == 0
+    assert deep["msa_cluster_rows"].item() == 4
+    assert deep["msa_extra_rows"].item() == 2
+
+
+@pytest.mark.parametrize("section,value", [
+    ("fape", {"backbone_clamp_mode": "unclamp_typo"}),
+    ("fape", {"backbone_clamp_mdoe": "fully_unclamped"}),
+    ("fape", {"clamped_probability": float("nan")}),
+    ("fape", {"clamped_probability": 1.1}),
+    ("recycle", {"train_mode": "fixed_typo"}),
+    ("recycle", {"max_train_cycles": 4}),
+    ("loss_schedule", {"mode": "initial_typo"}),
+])
+def test_minalphafold2_rejects_invalid_recipe_controls(section: str, value: dict[str, Any]) -> None:
+    cfg = yaml.safe_load(Path("submissions/minalphafold2/config.yaml").read_text())
+    cfg["experiment"] = {section: value}
+    with pytest.raises(ValueError):
+        submission.validate_config(cfg)

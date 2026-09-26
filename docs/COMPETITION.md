@@ -404,6 +404,8 @@ Runtime reproducibility:
 - Atomic checkpoint replacement preserves the previous checkpoint on write failure. Every rank receives save failures; resume validates all rank RNG states and required AMP scaler/scheduler state before changing history.
 - Exposure counters must be exact nonnegative integers consistent with the step,
   effective batch, crop bounds and counter aliases before resume changes history.
+- Public validation uses features-only submission inputs and an isolated, repeatable random stream; changing validation cadence does not advance training RNG. Every manifest input is required, and metric records expose missing/nonfinite denominators. Primary scores must cover the complete validation manifest.
+- Existing outputs require explicit resume or reset. `--max-runtime-seconds N` pauses at an optimizer boundary with a complete checkpoint and exit code 75; it does not change the configured scientific budget. Completed training exits 0.
 
 See the [training sampling contract](API.md#training-sampling-and-multiple-gpus) for replay costs and limits. These checks do not establish bitwise CUDA reproducibility across environments.
 
@@ -444,6 +446,20 @@ average. The maintainer fixes the manifest, split, prediction root, crop,
 milestones and exposure counts independently of submission-writable prediction
 metadata. Official AUC tracks use the documented checkpoint schedule; choosing
 different checkpoints changes the evaluation and is rejected.
+
+Current results use FoldScore `2-segment-aware-float32`: float32 scoring,
+backbone dihedrals and local distance windows restricted to connected peptide
+segments, and no bonded-neighbor clash exemption across a declared break or
+residue-index gap. Every manifest target must produce every finite primary
+component; targets with no observed CA atom fail. Undefined RMSD diagnostics
+retain explicit counts. Inference hooks receive features only, even during
+local labeled evaluation. Prediction files and per-chain scores carry chain and
+checkpoint identities, and new prediction runs require empty output directories.
+
+Official result artifacts include `foldscore_version`. Leaderboard insertion
+rejects old or missing versions on new results and refuses to mix versions
+within a track. Preserve historical leaderboards and use a separate leaderboard
+file for this metric version; old results are not relabeled or rewritten.
 
 Canonical result artifact:
 - `runs/<run_name>/result.json`

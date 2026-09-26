@@ -9,6 +9,7 @@ import random
 import sys
 import tempfile
 import time
+from contextlib import contextmanager
 from datetime import timedelta
 from functools import partial
 from pathlib import Path
@@ -39,7 +40,7 @@ from nanofold.competition_policy import (
 )
 from nanofold.data import ProcessedNPZDataset, collate_batch
 from nanofold.dataset_integrity import verify_dataset_against_fingerprint
-from nanofold.metrics import FOLDSCORE_COMPONENT_NAMES, foldscore_components, lddt_ca
+from nanofold.metrics import FOLDSCORE_COMPONENT_NAMES, FOLDSCORE_VERSION, foldscore_components, lddt_ca
 from nanofold.submission_runtime import (
     load_submission_hooks,
     run_submission_batch,
@@ -302,6 +303,32 @@ def _restore_rng_state(state: Mapping[str, Any], device: torch.device) -> None:
         raise ValueError("Checkpoint contains invalid rank RNG state; cannot resume sampling.") from exc
 
 
+@contextmanager
+def _isolated_validation(model: nn.Module, loader: DataLoader, device: torch.device) -> Iterator[None]:
+    """Make validation repeatable without advancing training random streams."""
+    rng_state = _capture_rng_state(device)
+    generator = _loader_generator(loader)
+    loader_state = generator.get_state()
+    modes = [(module, module.training) for module in model.modules()]
+    seed = generator.initial_seed()
+    try:
+        random.seed(seed)
+        np.random.seed(seed % (2**32))
+        torch.default_generator.manual_seed(seed)
+        if device.type == "cuda":
+            torch.cuda.default_generators[device.index or 0].manual_seed(seed)
+        elif device.type == "mps":
+            torch.mps.manual_seed(seed)
+        generator.manual_seed(seed)
+        model.eval()
+        yield
+    finally:
+        generator.set_state(loader_state)
+        _restore_rng_state(rng_state, device)
+        for module, training in modes:
+            module.training = training
+
+
 def _start_train_epoch(train_loader: DataLoader, epoch: int) -> tuple[Iterator[Any], torch.Tensor]:
     sampler = _epoch_aware_sampler(train_loader.sampler)
     if sampler is not None:
@@ -460,8 +487,10 @@ def _restore_scaler_state(scaler: Any, checkpoint: Mapping[str, Any], *, enabled
 
 
 def _restore_scheduler_state(scheduler: Any, checkpoint: Mapping[str, Any]) -> None:
-    if scheduler is None or not callable(getattr(scheduler, "load_state_dict", None)):
+    if scheduler is None:
         return
+    if not callable(getattr(scheduler, "load_state_dict", None)):
+        raise ValueError("Resume requires a scheduler implementing load_state_dict().")
     state = checkpoint.get("scheduler")
     if not isinstance(state, dict):
         raise ValueError("Resume requires the configured scheduler's checkpoint state.")
@@ -476,6 +505,38 @@ def _restore_scheduler_state(scheduler: Any, checkpoint: Mapping[str, Any]) -> N
         scheduler.load_state_dict(state)
     except (KeyError, TypeError, ValueError, RuntimeError) as exc:
         raise ValueError("Checkpoint contains invalid scheduler state; cannot resume training.") from exc
+
+
+def _reject_future_checkpoints(checkpoint_dir: Path, *, resumed_step: int, resume_path: Path) -> None:
+    """Do not mix an older resumed trajectory with already saved future models."""
+    future_paths = []
+    for path in checkpoint_dir.glob("ckpt_step_*.pt"):
+        step_text = path.stem.removeprefix("ckpt_step_")
+        if not step_text.isdecimal():
+            raise ValueError(f"Unrecognized checkpoint filename in run directory: {path.name}")
+        if int(step_text) > resumed_step:
+            future_paths.append(path.name)
+    last_path = checkpoint_dir / "ckpt_last.pt"
+    if not future_paths and last_path.exists() and last_path.resolve() != resume_path.resolve():
+        last = load_torch_checkpoint(last_path, map_location="cpu")
+        last_step = last.get("step")
+        if type(last_step) is not int or last_step < 0:
+            raise ValueError("Existing ckpt_last.pt has an invalid optimizer step; preserve and inspect it.")
+        if last_step > resumed_step:
+            future_paths.append(last_path.name)
+    if future_paths:
+        raise ValueError(
+            f"Cannot resume step {resumed_step} while newer checkpoints remain: {', '.join(sorted(future_paths))}. "
+            "Resume the latest checkpoint, or preserve the current run directory separately before restoring "
+            "an earlier trajectory. No checkpoints have been removed."
+        )
+
+
+def _positive_runtime_seconds(value: str) -> float:
+    seconds = float(value)
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise argparse.ArgumentTypeError("Runtime seconds must be finite and positive.")
+    return seconds
 
 
 def parse_args() -> argparse.Namespace:
@@ -539,6 +600,13 @@ def parse_args() -> argparse.Namespace:
         "--allow-resume-mismatch",
         action="store_true",
         help="Allow resume metadata mismatches (maintainer-only); sampling-state compatibility remains required.",
+    )
+    ap.add_argument(
+        "--max-runtime-seconds", type=_positive_runtime_seconds, default=None,
+        help=(
+            "Pause at an optimizer boundary after this wall-clock allowance, save a resumable checkpoint, "
+            "and exit 75 if unfinished. Includes startup and validation; does not change the scientific budget."
+        ),
     )
     return ap.parse_args()
 
@@ -616,8 +684,7 @@ def _append_scalar_output_metrics(
             per_target = value.reshape(batch_size, -1).mean(dim=1)
         else:
             per_target = value.mean().expand(batch_size)
-        if torch.isfinite(per_target).any():
-            target.setdefault(str(key), []).append(per_target)
+        target.setdefault(str(key), []).append(per_target)
 
 
 def _summarize_eval_metrics(
@@ -627,22 +694,37 @@ def _summarize_eval_metrics(
     atom14_rmsds: list[torch.Tensor] | None = None,
     scalar_metrics: Dict[str, list[torch.Tensor]] | None = None,
     foldscore_metric_values: Dict[str, list[torch.Tensor]] | None = None,
+    expected_targets: int | None = None,
 ) -> Dict[str, float]:
-    metrics = {
-        "val_lddt_ca": _mean_tensors(scores),
-    }
+    n = sum(value.numel() for value in scores)
+    if n == 0 or (expected_targets is not None and n != expected_targets):
+        raise ValueError("Public validation must score every target in its nonempty manifest.")
+    values_by_name = {"lddt_ca": scores}
     if losses:
-        metrics["val_loss"] = _mean_tensors(losses)
+        values_by_name["loss"] = losses
     if ca_rmsds is not None:
-        metrics["val_rmsd_ca"] = _mean_tensors(ca_rmsds)
+        values_by_name["rmsd_ca"] = ca_rmsds
     if atom14_rmsds is not None:
-        metrics["val_rmsd_atom14"] = _mean_tensors(atom14_rmsds)
+        values_by_name["rmsd_atom14"] = atom14_rmsds
+    reserved_names = {*values_by_name, *FOLDSCORE_COMPONENT_NAMES, "target_count"}
     if scalar_metrics is not None:
         for name, values in sorted(scalar_metrics.items()):
-            metrics[f"val_{name}"] = _mean_tensors(values)
+            if name not in reserved_names and not name.endswith("_count"):
+                values_by_name[name] = values
     if foldscore_metric_values is not None:
         for name, values in sorted(foldscore_metric_values.items()):
-            metrics[f"val_{name}"] = _mean_tensors(values)
+            values_by_name[name] = values
+    metrics: Dict[str, float] = {"val_target_count": n}
+    required = {"lddt_ca", *(foldscore_metric_values or {})}
+    for name, values in values_by_name.items():
+        count = sum(value.numel() for value in values)
+        finite_count = sum(int(torch.isfinite(value).sum().item()) for value in values)
+        if count > n or (name in required and (count != n or finite_count != n)):
+            raise ValueError(f"Public validation metric `{name}` is missing or nonfinite for a target.")
+        metrics[f"val_{name}"] = _mean_tensors(values)
+        metrics[f"val_{name}_valid_count"] = finite_count
+        metrics[f"val_{name}_nonfinite_count"] = count - finite_count
+        metrics[f"val_{name}_missing_count"] = n - count
     return metrics
 
 
@@ -682,6 +764,7 @@ def resume_metadata_mismatches(
     track_id: str,
     fingerprint_sha256: str | None,
     n_params: int,
+    training_runtime_sha256: str | None = None,
 ) -> list[str]:
     expected_pairs = {
         "submission_entrypoint_sha256": submission_entrypoint_sha256,
@@ -690,6 +773,8 @@ def resume_metadata_mismatches(
         "fingerprint_sha256": fingerprint_sha256,
         "n_params": n_params,
     }
+    if training_runtime_sha256 is not None:
+        expected_pairs["training_runtime_sha256"] = training_runtime_sha256
     mismatches: list[str] = []
     for key, expected in expected_pairs.items():
         actual = ckpt_obj.get(key)
@@ -711,7 +796,7 @@ def make_loader(
     distributed_world_size: int = 1,
 ) -> DataLoader:
     data_cfg = cfg["data"]
-    for field in ("crop_size", "msa_depth"):
+    for field in ("crop_size", "msa_depth", "batch_size"):
         value = data_cfg[field]
         if type(value) is not int or value <= 0:
             raise ValueError(f"`data.{field}` must be a positive integer.")
@@ -947,6 +1032,16 @@ def _distributed_any(value: bool, *, device: torch.device, enabled: bool) -> boo
     return bool(int(tensor.item()) > 0)
 
 
+def _runtime_limit_reached(
+    started_at: float, max_seconds: float | None, *, device: torch.device, distributed: bool,
+) -> bool:
+    if max_seconds is None:
+        return False
+    return _distributed_any(
+        time.perf_counter() - started_at >= max_seconds, device=device, enabled=distributed,
+    )
+
+
 def _distributed_metric_names(metrics: Mapping[str, float], *, enabled: bool) -> list[str]:
     local_names = sorted(metrics)
     if not enabled:
@@ -1147,6 +1242,7 @@ def _verify_dataset(
 
 
 def main() -> None:
+    invocation_start = time.perf_counter()
     args = parse_args()
     if args.reset_run and args.resume:
         raise ValueError("`--reset-run` cannot be combined with `--resume`.")
@@ -1160,6 +1256,11 @@ def main() -> None:
         data_cfg["processed_features_dir"] = args.processed_features_dir
     if args.processed_labels_dir:
         data_cfg["processed_labels_dir"] = args.processed_labels_dir
+    for field, default in (("max_steps", None), ("grad_accum_steps", 1), ("log_every", 50),
+                           ("eval_every", 500), ("save_every", 500)):
+        value = cfg["train"].get(field, default)
+        if type(value) is not int or value <= 0:
+            raise ValueError(f"`train.{field}` must be a positive integer.")
 
     dist_info = _init_distributed()
     distributed = bool(dist_info["enabled"])
@@ -1208,6 +1309,12 @@ def main() -> None:
     hooks = load_submission_hooks(cfg, config_path, allowed_root=config_path.parent)
     run_name = cfg.get("run_name", "run")
     paths = RunPaths.from_run_name(run_name)
+    if not args.resume and not args.reset_run and paths.run_dir.exists():
+        if any(path.is_file() or path.is_symlink() for path in paths.run_dir.rglob("*")):
+            raise FileExistsError(
+                f"Run directory already contains outputs: {paths.run_dir}. "
+                "Use --resume for continuation or --reset-run to explicitly replace run outputs."
+            )
     ensure_dir(paths.run_dir)
     ensure_dir(paths.ckpt_dir)
     step_metrics_path = paths.run_dir / "train_metrics.jsonl"
@@ -1231,7 +1338,8 @@ def main() -> None:
         if distributed:
             print(f"Distributed training enabled: world_size={world_size}")
 
-    allow_missing = not bool(args.official)
+    # Missing inputs change both the sampling population and evaluation denominator.
+    allow_missing = False
     try:
         train_loader = make_loader(
             cfg,
@@ -1320,6 +1428,7 @@ def main() -> None:
     sample_budget = compute_sample_budget(max_steps, effective_batch_size)
     residue_budget = compute_residue_budget(max_steps, effective_batch_size, crop_size)
     config_sha256 = _sha256_file(config_path)
+    training_runtime_sha256 = _sha256_file(__file__)
     fingerprint_sha256 = (
         _sha256_file(fingerprint_path) if (args.official or args.verify_fingerprint) and Path(fingerprint_path).exists() else None
     )
@@ -1340,6 +1449,8 @@ def main() -> None:
         "submission_entrypoint_sha256": hooks.source_sha256,
         "config_path": str(config_path),
         "config_sha256": config_sha256,
+        "training_runtime_sha256": training_runtime_sha256,
+        "foldscore_version": FOLDSCORE_VERSION,
         "config": cfg,
         "effective_batch_size": effective_batch_size,
         "configured_grad_accum_steps": configured_grad_accum_steps,
@@ -1355,6 +1466,8 @@ def main() -> None:
         "fingerprint_sha256": fingerprint_sha256,
         "env": env_meta,
         "started_at": utc_now_iso(),
+        "status": "running",
+        "max_runtime_seconds": getattr(args, "max_runtime_seconds", None),
         "updated_at": utc_now_iso(),
         "history": [],
         "step_metrics_jsonl": str(step_metrics_path),
@@ -1390,6 +1503,8 @@ def main() -> None:
             "submission_entrypoint_sha256": hooks.source_sha256,
             "config": cfg,
             "config_sha256": config_sha256,
+            "training_runtime_sha256": training_runtime_sha256,
+            "foldscore_version": FOLDSCORE_VERSION,
             "track_id": track_spec.track_id,
             "n_params": n_params,
             "effective_batch_size": effective_batch_size,
@@ -1437,6 +1552,7 @@ def main() -> None:
             track_id=track_spec.track_id,
             fingerprint_sha256=fingerprint_sha256,
             n_params=n_params,
+            training_runtime_sha256=training_runtime_sha256,
         )
         if resume_mismatches and not args.allow_resume_mismatch:
             joined = "\n".join(f"- {item}" for item in resume_mismatches)
@@ -1449,6 +1565,7 @@ def main() -> None:
         cumulative_samples_seen, cumulative_cropped_residues_seen, cumulative_nonpad_residues_seen = (
             _resume_exposure_counters(ckpt, effective_batch_size=effective_batch_size, crop_size=crop_size)
         )
+        _reject_future_checkpoints(paths.ckpt_dir, resumed_step=ckpt["step"], resume_path=resume_path)
         _restore_scaler_state(scaler, ckpt, enabled=use_amp)
         _restore_scheduler_state(scheduler, ckpt)
         model.load_state_dict(ckpt["model"], strict=True)
@@ -1478,6 +1595,8 @@ def main() -> None:
                     metrics["submission_entrypoint_sha256"] = hooks.source_sha256
                     metrics["config_path"] = str(config_path)
                     metrics["config_sha256"] = config_sha256
+                    metrics["training_runtime_sha256"] = training_runtime_sha256
+                    metrics["foldscore_version"] = FOLDSCORE_VERSION
                     metrics["effective_batch_size"] = effective_batch_size
                     metrics["sample_budget"] = sample_budget
                     metrics["residue_budget"] = residue_budget
@@ -1491,7 +1610,12 @@ def main() -> None:
         metrics["cumulative_cropped_residues_seen"] = cumulative_cropped_residues_seen
         metrics["cumulative_nonpad_residues_seen"] = cumulative_nonpad_residues_seen
         metrics["cumulative_residues_seen"] = cumulative_nonpad_residues_seen
+        metrics["resume_metadata_mismatches"] = resume_mismatches
         if is_main:
+            metrics["status"] = "running"
+            metrics["max_runtime_seconds"] = getattr(args, "max_runtime_seconds", None)
+            metrics.pop("stop_reason", None)
+            metrics.pop("finished_at", None)
             Path(paths.metrics_path).write_text(json.dumps(metrics, indent=2))
     else:
         train_iter, train_epoch_start_generator_state = _start_train_epoch(train_loader, train_sampler_epoch)
@@ -1507,6 +1631,7 @@ def main() -> None:
         metrics["cumulative_nonpad_residues_seen"] = cumulative_nonpad_residues_seen
         metrics["cumulative_residues_seen"] = cumulative_nonpad_residues_seen
         metrics["finished_at"] = utc_now_iso()
+        metrics["status"] = "complete"
         metrics["updated_at"] = utc_now_iso()
         if is_main:
             Path(paths.metrics_path).write_text(json.dumps(metrics, indent=2))
@@ -1547,7 +1672,6 @@ def main() -> None:
     run_start = time.perf_counter()
 
     def run_eval() -> Dict[str, float]:
-        model.eval()
         scores: list[torch.Tensor] = []
         losses: list[torch.Tensor] = []
         ca_rmsds: list[torch.Tensor] = []
@@ -1563,7 +1687,7 @@ def main() -> None:
             max_steps=max_steps,
             sample_budget=sample_budget,
         )
-        with torch.no_grad():
+        with _isolated_validation(model, val_loader, device), torch.no_grad():
             for batch in tqdm(val_loader, desc="val", leave=False, disable=not show_progress):
                 batch = to_device(batch, device)
                 with make_autocast_ctx(device=device, enabled=use_amp):
@@ -1573,7 +1697,7 @@ def main() -> None:
                         batch=batch,
                         cfg=runtime_cfg,
                         training=False,
-                        expose_supervision=True,
+                        expose_supervision=False,
                     )
                 pred_ca = out["pred_ca"]
                 batch_size = int(pred_ca.shape[0])
@@ -1596,16 +1720,20 @@ def main() -> None:
                     true_atom14 = batch["atom14_positions"]
                     atom14_mask = batch["atom14_mask"] & batch["residue_mask"][:, :, None]
                     for batch_idx in range(pred_atom14.shape[0]):
+                        length = int(batch["residue_mask"][batch_idx].sum().item())
                         comps = foldscore_components(
-                            pred_atom14=pred_atom14[batch_idx],
-                            true_atom14=true_atom14[batch_idx],
-                            atom14_mask=atom14_mask[batch_idx],
-                            aatype=batch["aatype"][batch_idx],
+                            pred_atom14=pred_atom14[batch_idx, :length],
+                            true_atom14=true_atom14[batch_idx, :length],
+                            atom14_mask=atom14_mask[batch_idx, :length],
+                            aatype=batch["aatype"][batch_idx, :length],
+                            residue_index=batch["residue_index"][batch_idx, :length] if "residue_index" in batch else None,
+                            between_segment_residues=(
+                                batch["between_segment_residues"][batch_idx, :length]
+                                if "between_segment_residues" in batch else None
+                            ),
                         )
                         for name, value in comps.items():
                             foldscore_metric_values.setdefault(name, []).append(value.detach().cpu())
-        model.train()
-        train_model.train()
         empty_device_cache(device)
         return _summarize_eval_metrics(
             scores,
@@ -1614,9 +1742,17 @@ def main() -> None:
             atom14_rmsds,
             scalar_metrics=scalar_metrics,
             foldscore_metric_values=foldscore_metric_values if eval_foldscore_components else None,
+            expected_targets=len(cast(ProcessedNPZDataset, val_loader.dataset)),
         )
 
+    stopped_for_runtime = False
     while step < max_steps:
+        if _runtime_limit_reached(
+            invocation_start, getattr(args, "max_runtime_seconds", None), device=device, distributed=distributed,
+        ):
+            _save_checkpoint_files(step_value=step)
+            stopped_for_runtime = True
+            break
         optimizer_zero_grad(opt)
         running_loss = 0.0
         scalar_metric_sums: Dict[str, float] = {}
@@ -1788,12 +1924,31 @@ def main() -> None:
             )
             sys.stdout.flush()
 
+        # Finish a due validation before pausing so resume cannot skip a declared
+        # trajectory checkpoint. The external timeout must reserve that work.
+        if step < max_steps and step % eval_every != 0 and _runtime_limit_reached(
+            invocation_start, getattr(args, "max_runtime_seconds", None), device=device, distributed=distributed,
+        ):
+            _save_checkpoint_files(step_value=step)
+            stopped_for_runtime = True
+            break
+
         if step % eval_every == 0 or step == max_steps:
             _distributed_barrier(distributed)
+            val_metrics: Dict[str, Any] = {}
+            validation_errors: list[Any] = [None]
             if is_main:
                 log_line(f"[eval] step {step}: starting public validation")
                 sys.stdout.flush()
-                val_metrics = run_eval()
+                try:
+                    val_metrics = run_eval()
+                except Exception as exc:
+                    validation_errors[0] = f"{type(exc).__name__}: {exc}"
+            if distributed:
+                dist.broadcast_object_list(validation_errors, src=0)
+            if validation_errors[0] is not None:
+                raise RuntimeError(f"Public validation failed on rank zero: {validation_errors[0]}")
+            if is_main:
                 val_metrics["step"] = step
                 val_metrics["train_loss"] = train_loss
                 val_metrics["lr"] = lr
@@ -1840,13 +1995,21 @@ def main() -> None:
     metrics["cumulative_nonpad_residues_seen"] = cumulative_nonpad_residues_seen
     metrics["cumulative_residues_seen"] = cumulative_nonpad_residues_seen
     metrics["wall_time_seconds"] = float(time.perf_counter() - run_start)
-    metrics["finished_at"] = utc_now_iso()
+    if stopped_for_runtime:
+        metrics["status"] = "paused"
+        metrics["stop_reason"] = "max_runtime_seconds"
+        metrics["paused_at"] = utc_now_iso()
+    else:
+        metrics["status"] = "complete"
+        metrics["finished_at"] = utc_now_iso()
     metrics["updated_at"] = utc_now_iso()
     if is_main:
         Path(paths.metrics_path).write_text(json.dumps(metrics, indent=2))
-        print("Done. Metrics:", paths.metrics_path)
+        print("Paused at optimizer boundary. Metrics:" if stopped_for_runtime else "Done. Metrics:", paths.metrics_path)
         print("Checkpoint:", paths.ckpt_dir / "ckpt_last.pt")
     _destroy_distributed(distributed)
+    if stopped_for_runtime:
+        raise SystemExit(75)
 
 
 if __name__ == "__main__":

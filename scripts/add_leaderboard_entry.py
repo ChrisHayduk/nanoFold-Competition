@@ -12,7 +12,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from nanofold.leaderboard_identity import resolve_leaderboard_team
-from nanofold.metrics import FOLDSCORE_CURVE_COMPONENT_NAMES
+from nanofold.metrics import FOLDSCORE_CURVE_COMPONENT_NAMES, FOLDSCORE_VERSION
 
 
 def parse_args() -> argparse.Namespace:
@@ -87,6 +87,7 @@ def _result_to_entry(
     rank_score = result.get("rank_score", default_rank_score)
     rank_tiebreak_score = result.get("rank_tiebreak_score", hidden_score)
     entry = {
+        "foldscore_version": str(result.get("foldscore_version", "legacy-unversioned")),
         "rank_metric": rank_metric,
         "rank_score": _to_float(rank_score),
         "rank_tiebreak_score": _to_float(rank_tiebreak_score),
@@ -130,6 +131,7 @@ def _dedupe_entries(entries: List[Dict[str, Any]], new_entry: Dict[str, Any]) ->
             str(row.get("run_name", "")) == new_entry.get("run_name", "")
             and str(row.get("commit", "")) == new_entry.get("commit", "")
             and str(row.get("track", "")) == new_entry.get("track", "")
+            and str(row.get("foldscore_version", "legacy-unversioned")) == new_entry.get("foldscore_version", "legacy-unversioned")
         ):
             continue
         out.append(row)
@@ -156,6 +158,9 @@ def _rank_entries(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     tracks = sorted({str(row.get("track", "")) for row in entries}, key=lambda x: (track_order.get(x, 999), x))
     for track in tracks:
         track_rows = [row for row in entries if str(row.get("track", "")) == track]
+        versions = {str(row.get("foldscore_version", "legacy-unversioned")) for row in track_rows}
+        if len(versions) != 1:
+            raise ValueError("Cannot rank different FoldScore versions together; preserve the old leaderboard and use a separate versioned leaderboard file.")
         track_rows = sorted(
             track_rows,
             key=lambda x: (-score_value(x), -tiebreak_value(x), str(x.get("date", ""))),
@@ -184,6 +189,10 @@ def main() -> None:
         entries = []
 
     new_entry = _result_to_entry(result, args.description, args.team)
+    if new_entry["foldscore_version"] != FOLDSCORE_VERSION:
+        raise ValueError("New leaderboard results must declare the current FoldScore version.")
+    if not math.isfinite(new_entry["rank_score"]) or not 0 <= new_entry["rank_score"] <= 1:
+        raise ValueError("New leaderboard rank scores must be finite and in [0, 1].")
     merged = _dedupe_entries(entries, new_entry)
     ranked = _rank_entries(merged)
     _save_json(leaderboard_path, ranked)

@@ -9,6 +9,7 @@ import torch
 from torch.utils.data import Dataset
 
 from .chain_paths import chain_npz_path
+from .residue_constants import CA_ATOM14_SLOT
 
 FEATURE_KEYS = (
     "aatype",
@@ -145,7 +146,11 @@ class ProcessedNPZDataset(Dataset):
         if not features_path.exists():
             raise FileNotFoundError(f"Missing feature file: {features_path}")
 
-        with np.load(features_path) as feature_data:
+        with np.load(features_path, allow_pickle=False) as feature_data:
+            if "chain_id" in feature_data:
+                identity = feature_data["chain_id"]
+                if identity.shape != () or str(identity.item()) != chain_id:
+                    raise ValueError(f"Feature chain_id does not match manifest chain {chain_id}.")
             L = int(feature_data["aatype"].shape[0])
 
             template_aatype = (
@@ -191,23 +196,53 @@ class ProcessedNPZDataset(Dataset):
             labels_path = chain_npz_path(self.processed_labels_dir, chain_id)
             if not labels_path.exists():
                 raise FileNotFoundError(f"Missing label file: {labels_path}")
-            with np.load(labels_path) as label_data:
+            with np.load(labels_path, allow_pickle=False) as label_data:
+                if "chain_id" in label_data:
+                    identity = label_data["chain_id"]
+                    if identity.shape != () or str(identity.item()) != chain_id:
+                        raise ValueError(f"Label chain_id does not match manifest chain {chain_id}.")
                 missing = [key for key in LABEL_KEYS if key not in label_data]
                 if missing:
                     raise KeyError(f"Label file {labels_path} is missing required keys: {', '.join(missing)}")
+                expected_shapes = {
+                    "ca_coords": (L, 3), "ca_mask": (L,),
+                    "atom14_positions": (L, 14, 3), "atom14_mask": (L, 14),
+                }
+                label_arrays = {key: label_data[key] for key in LABEL_KEYS}
+                for key, shape in expected_shapes.items():
+                    if label_arrays[key].shape != shape:
+                        raise ValueError(f"Label {key} for {chain_id} must have shape {shape}.")
+                for key in ("ca_coords", "atom14_positions"):
+                    if label_arrays[key].dtype.kind != "f" or not np.isfinite(label_arrays[key]).all():
+                        raise ValueError(f"Label {key} must contain finite floating point coordinates.")
+                for key in ("ca_mask", "atom14_mask"):
+                    if label_arrays[key].dtype != np.bool_:
+                        raise ValueError(f"Label {key} must have boolean dtype.")
+                ca_mask = label_arrays["ca_mask"]
+                if not ca_mask.any() or not np.array_equal(ca_mask, label_arrays["atom14_mask"][:, CA_ATOM14_SLOT]):
+                    raise ValueError("Labels require observed CA atoms and matching CA masks.")
+                if not np.allclose(label_arrays["ca_coords"][ca_mask], label_arrays["atom14_positions"][ca_mask, CA_ATOM14_SLOT],
+                                   rtol=0, atol=1e-5):
+                    raise ValueError("Label CA coordinates disagree with atom14 positions.")
 
-                out["ca_coords"] = torch.from_numpy(label_data["ca_coords"]).float()  # (L,3)
-                out["ca_mask"] = torch.from_numpy(label_data["ca_mask"]).bool()  # (L,)
+                out["ca_coords"] = torch.from_numpy(label_arrays["ca_coords"]).float()  # (L,3)
+                out["ca_mask"] = torch.from_numpy(label_arrays["ca_mask"]).bool()  # (L,)
                 out["atom14_positions"] = torch.from_numpy(
-                    np.asarray(label_data["atom14_positions"], dtype=np.float32)
+                    np.asarray(label_arrays["atom14_positions"], dtype=np.float32)
                 )  # (L,14,3)
                 out["atom14_mask"] = torch.from_numpy(
-                    np.asarray(label_data["atom14_mask"], dtype=bool)
+                    np.asarray(label_arrays["atom14_mask"], dtype=bool)
                 )  # (L,14)
-                if "residue_index" in label_data and "residue_index" not in out:
-                    out["residue_index"] = torch.from_numpy(
+                if not torch.isfinite(out["ca_coords"]).all() or not torch.isfinite(out["atom14_positions"]).all():
+                    raise ValueError("Label coordinates must remain finite in float32.")
+                if "residue_index" in label_data:
+                    label_residue_index = torch.from_numpy(
                         np.asarray(label_data["residue_index"], dtype=np.int64)
-                    )  # (L,)
+                    )
+                    if label_residue_index.shape != (L,):
+                        raise ValueError(f"Label residue_index for {chain_id} must have shape {(L,)}.")
+                    if not torch.equal(residue_index, label_residue_index):
+                        raise ValueError(f"Feature and label residue_index disagree for {chain_id}.")
                 if "resolution" in label_data:
                     out["resolution"] = torch.tensor(
                         float(np.asarray(label_data["resolution"]).item()),

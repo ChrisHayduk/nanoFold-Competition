@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import math
 
+import pytest
 import torch
 
 from nanofold.metrics import (
     FOLDSCORE_COMPONENT_NAMES,
     FOLDSCORE_WEIGHT_BY_COMPONENT,
+    _kabsch_align,
     backbone_atom14_score,
     dipdiff_atom14_score,
     foldscore_auc,
@@ -213,3 +215,74 @@ def test_foldscore_auc_rejects_duplicate_sample_axis() -> None:
         assert "strictly increasing" in str(exc)
     else:
         raise AssertionError("duplicate cumulative sample counts should fail")
+
+
+@pytest.mark.parametrize("points,budget", [
+    ([], 100), ([(0, 0, .5)], 100), ([(1, 10, .5), (2, 100, .6)], 100),
+    ([(0, 0, .5), (1, 50, .6)], 100), ([(0, 0, .5), (1, 100, float("nan"))], 100),
+    ([(0, 0, .5), (1, 100, 1.5)], 100), ([(0, 0, .5), (1, 100, .5)], 0),
+    ([(0, 0, .5), (1, 100, .5)], float("inf")),
+])
+def test_auc_rejects_partial_or_invalid_curves(points, budget) -> None:
+    with pytest.raises(ValueError):
+        foldscore_auc(points, sample_budget=budget)
+
+
+def test_integral_zero_component_does_not_truncate_fractional_components() -> None:
+    scores = {f"{name}_score": .5 for name in FOLDSCORE_WEIGHT_BY_COMPONENT}
+    scores["gdt_ha_ca_score"] = 0
+    assert float(foldscore_from_components(**scores)) == .375
+
+
+def test_scoring_upcasts_amp_outputs_and_rejects_unsupervised_targets() -> None:
+    reference = _atom14_chain().half()
+    mask = torch.ones((6, 14), dtype=torch.bool)
+    residues = torch.zeros(6, dtype=torch.long)
+    half_scores = foldscore_components(reference, reference, mask, residues)
+    float_scores = foldscore_components(reference.float(), reference.float(), mask, residues)
+    assert all(torch.equal(half_scores[key], float_scores[key]) for key in half_scores)
+    with pytest.raises(ValueError, match="observed CA"):
+        foldscore_components(reference, reference, torch.zeros_like(mask), residues)
+
+
+def test_kabsch_preserves_chirality_and_ignores_masked_points() -> None:
+    target = torch.tensor([[0., 0., 0.], [4., 0., 0.], [0., 5., 0.], [0., 0., 6.], [100., 100., 100.]])
+    mask = torch.tensor([True, True, True, True, False])
+    translated = target + torch.tensor([9., 8., -3.])
+    translated[-1] = -10000
+    aligned, active = _kabsch_align(translated, target, mask)
+    assert torch.allclose(aligned[active], target[active], atol=1e-5)
+    mirror = target * torch.tensor([-1., 1., 1.])
+    aligned, active = _kabsch_align(mirror, target, mask)
+    assert torch.linalg.vector_norm(aligned[active] - target[active], dim=-1).mean() > 1
+
+
+@pytest.mark.parametrize("metadata", [
+    {"residue_index": torch.tensor([0, 1, 8, 9])},
+    {"between_segment_residues": torch.tensor([0, 0, 1, 0])},
+])
+def test_local_backbone_scores_do_not_bridge_segment_breaks(metadata) -> None:
+    generator = torch.Generator().manual_seed(19)
+    reference = torch.randn((4, 14, 3), generator=generator)
+    prediction = reference.clone()
+    prediction[2:] += torch.tensor([8., -4., 6.])
+    mask = torch.zeros((4, 14), dtype=torch.bool)
+    mask[:, :4] = True
+    residues = torch.zeros(4, dtype=torch.long)
+    connected = foldscore_components(prediction, reference, mask, residues)
+    disconnected = foldscore_components(prediction, reference, mask, residues, **metadata)
+    assert disconnected["bb_atom14"] == pytest.approx(1., abs=1e-6)
+    assert disconnected["dipdiff_atom14"] == 1
+    assert connected["bb_atom14"] < .99
+    assert connected["dipdiff_atom14"] < 1
+
+
+def test_clashes_across_segment_break_are_not_exempted_as_bonded_neighbors() -> None:
+    reference = torch.zeros((2, 14, 3))
+    mask = torch.zeros((2, 14), dtype=torch.bool)
+    mask[:, 1] = True
+    residues = torch.zeros(2, dtype=torch.long)
+    connected = foldscore_components(reference, reference, mask, residues)
+    disconnected = foldscore_components(reference, reference, mask, residues, residue_index=torch.tensor([0, 4]))
+    assert connected["molprobity_clash_atom14"] == 1
+    assert disconnected["molprobity_clash_atom14"] < .2

@@ -105,3 +105,67 @@ def test_features_only_dataset_rejects_label_members_without_fingerprint(tmp_pat
     np.savez_compressed(chain_npz_path(features, "1abc_A"), **contents)
     with pytest.raises(ValueError, match="label-only fields"):
         ProcessedNPZDataset(features, manifest, include_labels=False)
+
+
+@pytest.mark.parametrize("defect", ["feature_identity", "label_identity", "length", "residue_index",
+                                  "mask_type", "mask_disagreement", "coordinate_disagreement", "nonfinite"])
+def test_dataset_rejects_mispaired_supervision(tmp_path: Path, defect: str) -> None:
+    features, labels = tmp_path / "features", tmp_path / "labels"
+    features.mkdir()
+    labels.mkdir()
+    manifest = tmp_path / "train.txt"
+    manifest.write_text("1abc_A\n")
+    feature_path, label_path = chain_npz_path(features, "1abc_A"), chain_npz_path(labels, "1abc_A")
+    _write_feature_npz(feature_path)
+    _write_label_npz(label_path)
+    path = feature_path if defect == "feature_identity" else label_path
+    with np.load(path) as archive:
+        contents = dict(archive)
+    if defect.endswith("identity"):
+        contents["chain_id"] = np.asarray("2def_A")
+        match = "chain_id does not match"
+    elif defect == "length":
+        contents["atom14_positions"] = np.zeros((7, 14, 3), dtype=np.float32)
+        match = "must have shape"
+    elif defect == "residue_index":
+        contents["residue_index"] = np.arange(8, dtype=np.int32) + 2
+        match = "residue_index disagree"
+    elif defect == "mask_type":
+        contents["ca_mask"] = np.ones(8, dtype=np.int32)
+        match = "boolean dtype"
+    elif defect == "mask_disagreement":
+        contents["atom14_mask"][0, 1] = False
+        match = "matching CA masks"
+    elif defect == "coordinate_disagreement":
+        contents["ca_coords"][0, 0] = 1
+        match = "coordinates disagree"
+    else:
+        contents["atom14_positions"][0, 0, 0] = np.nan
+        match = "finite floating point"
+    np.savez_compressed(path, **contents)
+    dataset = ProcessedNPZDataset(features, manifest, processed_labels_dir=labels)
+    with pytest.raises(ValueError, match=match):
+        dataset[0]
+
+
+def test_dataset_rejects_label_only_residue_gaps_when_feature_indices_absent(tmp_path: Path) -> None:
+    features, labels = tmp_path / "features", tmp_path / "labels"
+    features.mkdir()
+    labels.mkdir()
+    manifest = tmp_path / "train.txt"
+    manifest.write_text("1abc_A\n")
+    feature_path, label_path = chain_npz_path(features, "1abc_A"), chain_npz_path(labels, "1abc_A")
+    _write_feature_npz(feature_path)
+    _write_label_npz(label_path)
+    with np.load(feature_path) as archive:
+        contents = {key: archive[key] for key in archive.files if key != "residue_index"}
+    np.savez_compressed(feature_path, **contents)
+    indices = np.asarray([0, 1, 2, 5, 6, 7, 8, 9], dtype=np.int32)
+    with np.load(label_path) as archive:
+        contents = dict(archive)
+    contents["residue_index"] = indices
+    np.savez_compressed(label_path, **contents)
+    # Inference on these feature bytes would see arange(8). Label-only geometry
+    # must not change the model inputs on the labeled evaluation path.
+    with pytest.raises(ValueError, match="residue_index disagree"):
+        ProcessedNPZDataset(features, manifest, processed_labels_dir=labels)[0]

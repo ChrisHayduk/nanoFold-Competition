@@ -133,7 +133,7 @@ NANOFOLD_MODAL_GPU=A10G modal run scripts/modal_train.py \
 
 The default GPU is `A10G`. Set `NANOFOLD_MODAL_GPU=L40S` or another Modal-supported GPU type when you want a larger or faster worker.
 
-Remote runs auto-resume from `runs/<run_name>/checkpoints/ckpt_last.pt` in the `nanofold-runs` volume. To continue a run, repeat the same command without `--reset-run`:
+Remote runs auto-resume from `runs/<run_name>/checkpoints/ckpt_last.pt` in the `nanofold-runs` volume after checking an immutable code, data, and runtime identity. The worker commits checkpoints during training and requests a graceful pause after at most 22 hours, below the 24-hour platform limit. A paused run requires another explicit launch. To continue a run, repeat the same command without `--reset-run`:
 
 ```bash
 NANOFOLD_MODAL_GPU=A10G modal run scripts/modal_train.py \
@@ -152,7 +152,7 @@ modal volume get nanofold-runs \
   runs/minalphafold2_reference/checkpoints/ckpt_last.pt
 ```
 
-Use separate run names or separate Modal run volumes for concurrent experiments. Do not upload hidden validation assets in participant workflows; this path only uses public train and public validation data.
+Use separate run names for concurrent experiments and keep one active writer per run. Do not upload hidden validation assets in participant workflows; this path only uses public train and public validation data. For frozen candidate datasets, nonofficial seed replicates, packaging, and resume requirements, see [Modal training and resumable experiments](MODAL_TRAINING.md).
 
 ## 4) Score Public Validation
 
