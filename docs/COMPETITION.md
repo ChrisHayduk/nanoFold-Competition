@@ -8,6 +8,8 @@ Official rules are strict because the benchmark is only meaningful if the scarce
 
 ## Design Principles
 
+Private research comparisons on additional public cohorts must prespecify their sampling universe, group exclusions and endpoints. The research fingerprint interface in [API.md](API.md) verifies evaluation inputs; those results remain separate from official leaderboard submissions.
+
 - Reward data efficiency, not just final checkpoint quality.
 - Make biological priors compete under the same sample budget.
 - Keep hidden labels sealed from submission code.
@@ -447,7 +449,8 @@ milestones and exposure counts independently of submission-writable prediction
 metadata. Official AUC tracks use the documented checkpoint schedule; choosing
 different checkpoints changes the evaluation and is rejected.
 
-Current results use FoldScore `2-segment-aware-float32`: float32 scoring,
+Current results use FoldScore `3-canonical-chi-segment-aware-float32`: canonical
+chi-angle symmetry (VAL chi1 and LEU chi2 are not pi-periodic), float32 scoring,
 backbone dihedrals and local distance windows restricted to connected peptide
 segments, and no bonded-neighbor clash exemption across a declared break or
 residue-index gap. Every manifest target must produce every finite primary
@@ -599,3 +602,13 @@ echo "Self-check passed."
 ```
 
 Use the same `<track_id>` in the submission config, local training command, validation command, and pull-request description. Submit separate configs or separate submission directories for the same method on multiple tracks.
+
+
+Cα RMSD from `eval.py` and `score.py` is an additional diagnostic in angstroms,
+not a FoldScore component. Records include observed Cα count, status and
+`kabsch-ca-v1` metric identity. A target with fewer than three observed Cα atoms
+is explicitly undefined. A checkpoint's full-cohort RMSD mean is null if any
+expected target is undefined; reported counts preserve that denominator. Private
+experiment contracts can require and independently validate this outcome.
+
+Complete RODA acquisition is a maintainer operation outside submission execution. It requires a prespecified source lock and a fresh destination, preserves downloaded inputs, and verifies a completion receipt. Source integrity does not establish split eligibility or authorize changes to published manifests; see [Data](DATA.md) for the preparation contract.

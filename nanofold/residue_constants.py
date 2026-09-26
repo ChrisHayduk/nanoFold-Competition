@@ -93,13 +93,13 @@ CHI1_CHI2_ATOM_NAMES: Dict[str, Tuple[Tuple[str, str, str, str], ...]] = {
     "UNK": (),
 }
 
-# Some chi definitions are symmetric under a 180 degree flip of terminal atoms.
+# Canonical AF2 chi1/chi2 definitions with 180-degree terminal-atom symmetry.
+# VAL chi1 and LEU chi2 are not pi-periodic: their tetrahedral branched methyl
+# groups do not coincide after a 180-degree rotation about the chi axis.
 CHI_PI_PERIODIC: Dict[Tuple[str, int], bool] = {
     ("ASP", 1): True,
     ("PHE", 1): True,
     ("TYR", 1): True,
-    ("VAL", 0): True,
-    ("LEU", 1): True,
 }
 
 # Canonical atom14 slot for the Cα atom (same for every standard residue).

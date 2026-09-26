@@ -94,6 +94,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Verify dataset fingerprint even outside official mode.",
     )
+    ap.add_argument("--fingerprint-split-only", action="store_true", help="Research only: verify a fingerprint containing only the selected split.")
     ap.add_argument("--hidden-manifest", type=str, default="", help="Hidden split manifest path override.")
     ap.add_argument(
         "--forbid-labels-dir",
@@ -270,6 +271,9 @@ def _prediction_path_for_ckpt(pred_out_dir: Path, ckpt: Path, multi: bool) -> Pa
 
 def main() -> None:
     args = parse_args()
+    split_only = getattr(args, "fingerprint_split_only", False)
+    if split_only and (args.official or not args.verify_fingerprint):
+        raise ValueError("--fingerprint-split-only requires research mode and --verify-fingerprint.")
     if args.official and args.split in HIDDEN_SPLITS and str(os.environ.get(SEALED_RUNTIME_ENV, "")).strip() != "1":
         raise ValueError(
             "Official hidden prediction requires a sealed runtime. "
@@ -296,7 +300,7 @@ def main() -> None:
     predict_data_cfg = predict_cfg["data"]
     verify_manifest_paths = (
         {args.split: _manifest_for_split(cfg, args, track_spec)}
-        if args.split in HIDDEN_SPLITS
+        if args.split in HIDDEN_SPLITS or split_only
         else {
             "train": str(cfg["data"]["train_manifest"]),
             "val": str(cfg["data"]["val_manifest"]),

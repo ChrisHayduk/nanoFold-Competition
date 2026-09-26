@@ -8,6 +8,7 @@ import pytest
 from nanofold.structure_metadata import (
     dihedral_degrees,
     secondary_class_from_fractions,
+    secondary_fractions_from_atom14,
     secondary_fractions_from_mmcif_annotations,
 )
 
@@ -110,3 +111,43 @@ def test_unresolved_or_unobserved_residues_are_not_called_coil(tmp_path: Path, o
         None,
         None,
     )
+
+
+def _known_alpha_backbone() -> tuple[np.ndarray, np.ndarray]:
+    # Independent analytic geometry: central phi=-60 and psi=-45 degrees;
+    # both connecting peptide C-N lengths are exactly 1.33 angstrom.
+    positions = np.zeros((3, 14, 3), dtype=np.float64)
+    mask = np.zeros((3, 14), dtype=np.float64)
+    positions[0, 2] = [0, 1.33 / 2, 1.33 * np.sqrt(3) / 2]
+    positions[1, 0] = [0, 0, 0]
+    positions[1, 1] = [1, 0, 0]
+    positions[1, 2] = [1, 1, 0]
+    positions[2, 0] = [1 - 1.33 / np.sqrt(2), 1, -1.33 / np.sqrt(2)]
+    mask[0, 2] = mask[2, 0] = 1
+    mask[1, :3] = 1
+    return positions, mask
+
+
+def test_secondary_torsion_connected_analytic_alpha_oracle() -> None:
+    positions, mask = _known_alpha_backbone()
+    assert secondary_fractions_from_atom14(positions, mask) == ("alpha", 1.0, 0.0, 0.0)
+
+
+@pytest.mark.parametrize("side", [0, 2])
+def test_secondary_torsions_do_not_bridge_disconnected_fragments(side: int) -> None:
+    positions, mask = _known_alpha_backbone()
+    positions[side] += 20
+    assert secondary_fractions_from_atom14(positions, mask) == ("unknown", None, None, None)
+
+
+@pytest.mark.parametrize("bad_mask", [float("nan"), -1.0, 0.5, 2.0])
+def test_secondary_torsions_reject_nonbinary_observation_masks(bad_mask: float) -> None:
+    positions, mask = _known_alpha_backbone()
+    mask[1, 0] = bad_mask
+    assert secondary_fractions_from_atom14(positions, mask) == ("unknown", None, None, None)
+
+
+def test_secondary_torsions_ignore_unobserved_coordinate_values() -> None:
+    positions, mask = _known_alpha_backbone()
+    positions[mask == 0] = np.nan
+    assert secondary_fractions_from_atom14(positions, mask) == ("alpha", 1.0, 0.0, 0.0)

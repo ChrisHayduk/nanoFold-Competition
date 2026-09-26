@@ -289,9 +289,12 @@ def secondary_fractions_from_atom14(
     resources are unavailable.
     """
     pos = np.asarray(atom14_positions)
-    mask = np.asarray(atom14_mask).astype(bool)
-    if pos.ndim != 3 or pos.shape[1:] != (14, 3) or mask.shape != pos.shape[:2]:
+    raw_mask = np.asarray(atom14_mask)
+    if (pos.ndim != 3 or pos.shape[1:] != (14, 3) or raw_mask.shape != pos.shape[:2]
+            or pos.dtype.kind not in "fiu" or raw_mask.dtype.kind not in "bfiu"
+            or not np.isfinite(raw_mask).all() or not np.isin(raw_mask, [0, 1]).all()):
         return "unknown", None, None, None
+    mask = raw_mask.astype(bool)
 
     n_slot, ca_slot, c_slot = 0, 1, 2
     helix = 0
@@ -306,6 +309,14 @@ def secondary_fractions_from_atom14(
             and mask[idx + 1, n_slot]
         )
         if not required:
+            continue
+        # Match the deposited-conformer continuity criterion in mmcif.py. An
+        # angle between disconnected fragments is not an observed torsion.
+        peptide_lengths = [
+            np.linalg.norm(pos[idx - 1, c_slot].astype(np.float64) - pos[idx, n_slot].astype(np.float64)),
+            np.linalg.norm(pos[idx, c_slot].astype(np.float64) - pos[idx + 1, n_slot].astype(np.float64)),
+        ]
+        if not all(np.isfinite(distance) and 1.0 <= distance <= 1.8 for distance in peptide_lengths):
             continue
         phi = dihedral_degrees(pos[idx - 1, c_slot], pos[idx, n_slot], pos[idx, ca_slot], pos[idx, c_slot])
         psi = dihedral_degrees(pos[idx, n_slot], pos[idx, ca_slot], pos[idx, c_slot], pos[idx + 1, n_slot])

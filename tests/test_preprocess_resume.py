@@ -276,6 +276,58 @@ def test_resume_reprocesses_corrupt_shapes_and_nonfinite_labels(preprocessing) -
         assert np.isfinite(ground_truth["atom14_positions"]).all()
 
 
+@pytest.mark.parametrize("valid_ca,recorded_count", [(0, 3), (2, 2), (3, 999)])
+def test_resume_reprocesses_labels_below_quality_or_with_false_counts(
+    preprocessing, valid_ca: int, recorded_count: int,
+) -> None:
+    _, run, features, labels, _, _ = preprocessing
+    run()
+    feature_path = chain_npz_path(features, "1abc_A")
+    label_path = chain_npz_path(labels, "1abc_A")
+    with np.load(feature_path) as data, np.load(label_path) as ground_truth:
+        feature_arrays, label_arrays = dict(data), dict(ground_truth)
+    # Keep provenance and all structural shapes valid; only supervision quality
+    # or its recorded diagnostic changes.
+    label_arrays["ca_mask"][valid_ca:] = False
+    label_arrays["atom14_mask"][valid_ca:] = False
+    feature_arrays["projection_valid_ca_count"] = np.asarray(recorded_count, dtype=np.int32)
+    np.savez_compressed(feature_path, **feature_arrays)
+    np.savez_compressed(label_path, **label_arrays)
+    run("--skip-existing")
+    with np.load(feature_path) as data, np.load(label_path) as ground_truth:
+        assert np.count_nonzero(ground_truth["ca_mask"]) == 3
+        assert data["projection_valid_ca_count"].item() == 3
+
+
+@pytest.mark.parametrize("metric", [
+    "projection_seq_identity", "projection_alignment_coverage", "projection_aligned_fraction",
+])
+def test_resume_reprocesses_cached_projection_below_configured_threshold(preprocessing, metric: str) -> None:
+    _, run, features, _, _, _ = preprocessing
+    run(strict=False)
+    feature_path = chain_npz_path(features, "1abc_A")
+    with np.load(feature_path) as data:
+        arrays = dict(data)
+    arrays[metric] = np.asarray(0.1, dtype=np.float32)
+    np.savez_compressed(feature_path, **arrays)
+    run("--skip-existing", strict=False)
+    with np.load(feature_path) as data:
+        assert data[metric].item() == 1.0
+
+
+def test_resume_preserves_valid_float32_projection_threshold_boundary(preprocessing) -> None:
+    _, run, features, _, msa, cif = preprocessing
+    _write_structure(cif, length=10)
+    msa.write_text(">query\nAAAAAAAAAR\n")
+    run(strict=False)
+    feature_path = chain_npz_path(features, "1abc_A")
+    with np.load(feature_path) as data:
+        assert data["projection_seq_identity"].item() == np.float32(0.9)
+    modified = feature_path.stat().st_mtime_ns
+    run("--skip-existing", strict=False)
+    assert feature_path.stat().st_mtime_ns == modified
+
+
 def test_invalid_generated_arrays_never_replace_valid_files(preprocessing) -> None:
     module, run, features, labels, _, _ = preprocessing
     run()

@@ -39,6 +39,7 @@ from nanofold.prediction_contract import (
     validate_complete_chain_ids,
 )
 from nanofold.residue_constants import CA_ATOM14_SLOT
+from nanofold.rmsd import rmsd_ca_diagnostic, summarize_rmsd_ca
 from nanofold.scoring_io import (
     load_feature_crop as _load_feature_crop,
 )
@@ -289,7 +290,7 @@ def _score_chain(
     pred_atom14: torch.Tensor,
     labels: Dict[str, torch.Tensor],
     features: Dict[str, torch.Tensor],
-) -> Dict[str, float]:
+) -> Dict[str, Any]:
     validate_scoring_alignment(labels, features)
     has_atom14_labels = "atom14_positions" in labels and "atom14_mask" in labels
     if not has_atom14_labels:
@@ -312,35 +313,10 @@ def _score_chain(
         between_segment_residues=features.get("between_segment_residues"),
     )
     metrics = {name: float(value.detach().cpu()) for name, value in comps.items()}
-    ca_mask = labels["ca_mask"].to(dtype=torch.bool)
-    rmsd_ca = _masked_kabsch_rmsd(
-        pred_atom14[:, CA_ATOM14_SLOT, :],
-        labels["ca_coords"],
-        ca_mask,
-    )
-    metrics["rmsd_ca"] = float(rmsd_ca.detach().cpu())
-    return metrics
-
-
-def _masked_kabsch_rmsd(pred: torch.Tensor, true: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    pred = pred.float()
-    true = true.to(device=pred.device, dtype=torch.float32)
-    active = mask.to(dtype=torch.bool)
-    if int(active.sum().item()) < 3:
-        return torch.tensor(float("nan"), device=pred.device, dtype=pred.dtype)
-    pred_active = pred[active]
-    true_active = true[active].to(device=pred.device, dtype=pred.dtype)
-    pred_centered = pred_active - pred_active.mean(dim=0, keepdim=True)
-    true_centered = true_active - true_active.mean(dim=0, keepdim=True)
-    covariance = pred_centered.transpose(0, 1) @ true_centered
-    u, _, vh = torch.linalg.svd(covariance, full_matrices=False)
-    correction = torch.ones(3, device=pred.device, dtype=pred.dtype)
-    if torch.det(u @ vh) < 0:
-        correction[-1] = -1.0
-    rotation = u @ torch.diag(correction) @ vh
-    aligned = pred_centered @ rotation
-    squared_error = (aligned - true_centered).square().sum(dim=-1)
-    return torch.sqrt(squared_error.mean().clamp_min(0.0))
+    return {**metrics, **rmsd_ca_diagnostic(
+        pred_atom14[:, CA_ATOM14_SLOT, :], labels["atom14_positions"][:, CA_ATOM14_SLOT, :],
+        labels["atom14_mask"][:, CA_ATOM14_SLOT],
+    )}
 
 
 def _scalar_output_metrics(out: Dict[str, Any]) -> Dict[str, torch.Tensor]:
@@ -368,13 +344,11 @@ def _summarize_chain_metrics(
         if not values or any(not np.isfinite(value) or not 0.0 <= value <= 1.0 for value in values):
             raise ValueError(f"Every manifest chain must have a finite {name} in [0, 1]; refusing an incomplete mean.")
         out[f"mean_{name}"] = float(sum(values) / len(expected_chain_ids))
-    rmsd = [float(row.get("rmsd_ca", float("nan"))) for row in rows]
-    if any(np.isinf(value) or value < 0 for value in rmsd):
-        raise ValueError("RMSD diagnostics contain an invalid value.")
-    valid_rmsd = [value for value in rmsd if np.isfinite(value)]
-    out["mean_rmsd_ca"] = float(sum(valid_rmsd) / len(valid_rmsd)) if valid_rmsd else float("nan")
-    out["rmsd_ca_valid_count"] = len(valid_rmsd)
-    out["rmsd_ca_undefined_count"] = len(rows) - len(valid_rmsd)
+    if scored:
+        out.update(summarize_rmsd_ca(rows, expected_count=len(expected_chain_ids)))
+    else:
+        out.update({"mean_rmsd_ca": None, "rmsd_ca_valid_count": 0,
+                    "rmsd_ca_undefined_count": len(rows), "rmsd_ca_status": "unscored"})
     return out
 
 
@@ -753,7 +727,7 @@ def main() -> None:
         "finished_at": utc_now_iso(),
     }
     for key, value in final_ckpt_result.items():
-        if key.startswith("mean_") and key not in out:
+        if (key.startswith("mean_") or key.startswith("rmsd_ca_")) and key not in out:
             out[key] = value
     print(json.dumps(out, indent=2))
 

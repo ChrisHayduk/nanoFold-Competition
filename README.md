@@ -78,6 +78,8 @@ part of the official rank score.
 
 The final hidden FoldScore is the tie-breaker for fixed-budget tracks and the primary rank metric for `unlimited`. Public validation exists for debugging, not ranking.
 
+Evaluation also reports Cα Kabsch RMSD as a diagnostic with observed-atom and valid/undefined target counts. Its full-cohort mean is null if any expected target has fewer than three observed Cα atoms; RMSD does not change the leaderboard metric.
+
 ## What This Repo Provides
 
 - official track policy in `tracks/limited.yaml`
@@ -244,7 +246,10 @@ and residue indices, preserving unresolved positions in repeated sequences.
 Every optimal alignment must agree on the placement of observed coordinates.
 Maintainers can use `scripts/fetch_openproteinset_mmcif.py` to retrieve structures
 from a pinned OpenProteinSet archive, with bounded transport retries and strict
-content checks; see [the source contract](docs/DATA.md).
+content checks; see [the source contract](docs/DATA.md). Full RODA snapshots use
+`scripts/setup_openproteinset_roda.sh NEW_DATA_ROOT --source-lock SOURCE_LOCK.json`;
+the destination must be new, raw sources are retained, and a complete integrity
+receipt gates preparation. Offline proposal/freeze instructions are in the same guide.
 Feature archives containing supervision are rejected, and feature/label output
 directories must be separate. Collated batches include `msa_mask` to distinguish
 real MSA gaps from padding; maintained submissions use it for MSA statistics.
@@ -512,3 +517,5 @@ CI enforces the same PR guardrail:
 <!-- LEADERBOARD_END -->
 
 Private research campaigns can use [verified Modal bundles](docs/MODAL_TRAINING.md) and the [fixed-endpoint result verifier](docs/API.md). Freeze configuration, dataset, source/runtime and scoring identities before comparing runs.
+
+Separate public evaluation cohorts require explicit feature/label fingerprints and independently verified group exclusion; the [research evaluation interface](docs/API.md) supports scoring without mounting the training corpus.

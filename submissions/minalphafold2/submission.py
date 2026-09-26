@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-import sys
+import runpy
 from pathlib import Path
 from typing import Any, Dict, Iterable, NamedTuple, Sequence
 
@@ -14,22 +14,20 @@ if not (MINALPHAFOLD2_ROOT / "minalphafold").exists():
         "Expected upstream minAlphaFold2 checkout at third_party/minAlphaFold2. "
         "Run `git submodule update --init --recursive`."
     )
-if str(MINALPHAFOLD2_ROOT) not in sys.path:
-    sys.path.insert(0, str(MINALPHAFOLD2_ROOT))
-
-from minalphafold.data import (  # noqa: E402
-    EXTRA_MSA_FEAT_DIM,
-    MSA_FEAT_DIM,
-    TEMPLATE_ANGLE_DIM,
-    TEMPLATE_PAIR_DIM,
-    build_msa_features,
-    build_supervision,
-    build_target_feat,
-)
-from minalphafold.losses import AlphaFoldLoss  # noqa: E402
-from minalphafold.model import AlphaFold2  # noqa: E402
-from minalphafold.model_config import ModelConfig  # noqa: E402
-from minalphafold.trainer import load_model_config, loss_inputs_from_batch  # noqa: E402
+_dependency_loader = runpy.run_path(str(REPO_ROOT / "nanofold/official_adapter_loader.py"))
+_backend = _dependency_loader["load_backend"](REPO_ROOT)
+EXTRA_MSA_FEAT_DIM = _backend.data.EXTRA_MSA_FEAT_DIM
+MSA_FEAT_DIM = _backend.data.MSA_FEAT_DIM
+TEMPLATE_ANGLE_DIM = _backend.data.TEMPLATE_ANGLE_DIM
+TEMPLATE_PAIR_DIM = _backend.data.TEMPLATE_PAIR_DIM
+build_msa_features = _backend.data.build_msa_features
+build_supervision = _backend.data.build_supervision
+build_target_feat = _backend.data.build_target_feat
+AlphaFoldLoss = _backend.losses.AlphaFoldLoss
+AlphaFold2 = _backend.model.AlphaFold2
+ModelConfig = _backend.model_config.ModelConfig
+load_model_config = _backend.trainer.load_model_config
+loss_inputs_from_batch = _backend.trainer.loss_inputs_from_batch
 
 DEFAULT_MODEL_CONFIG_PATH = MINALPHAFOLD2_ROOT / "configs" / "tiny.toml"
 AF2_INITIAL_SAMPLES = 10_000_000
@@ -243,6 +241,7 @@ def _model_cfg(cfg: Dict[str, Any]) -> ModelConfig:
 
 def validate_config(cfg: Dict[str, Any]) -> None:
     """Check the adapter's scientific controls before allocating a model."""
+    _backend.verify_source_binding()
     _recycle_plan(cfg, training=True)
     _loss_schedule_mode(cfg)
     _fape_clamp_weight(cfg, {"aatype": torch.zeros((1, 1), dtype=torch.long)}, training=False)
@@ -256,6 +255,15 @@ def validate_config(cfg: Dict[str, Any]) -> None:
     unknown = set(cfg.get("experiment", {})) - supported
     if unknown:
         raise ValueError(f"Unsupported experiment fields: {sorted(unknown)}.")
+
+
+def runtime_source_files(cfg: Dict[str, Any]) -> list[Path]:
+    """Source files actually loaded by this official adapter, plus its profile."""
+    validate_config(cfg)
+    profile = Path(str(cfg.get("model", {}).get("profile_path", DEFAULT_MODEL_CONFIG_PATH)))
+    if not profile.is_absolute():
+        profile = REPO_ROOT / profile
+    return sorted({*_backend.source_files, profile.resolve(strict=True)})
 
 
 def build_model(cfg: Dict[str, Any]) -> torch.nn.Module:

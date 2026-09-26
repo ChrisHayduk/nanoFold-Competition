@@ -15,6 +15,7 @@ import eval as evaluate
 import predict
 import score
 from nanofold.chain_paths import chain_npz_path
+from nanofold.dataset_integrity import build_split_fingerprint
 from nanofold.metrics import FOLDSCORE_COMPONENT_NAMES, FOLDSCORE_VERSION
 from nanofold.prediction_contract import (
     load_prediction,
@@ -22,6 +23,7 @@ from nanofold.prediction_contract import (
     validate_checkpoint_for_prediction,
     validate_checkpoint_output_names,
 )
+from nanofold.rmsd import RMSD_CA_VERSION
 from nanofold.scoring_io import load_feature_crop, load_label_crop, validate_scoring_alignment
 
 
@@ -64,7 +66,7 @@ def test_prediction_output_cannot_mix_checkpoints_or_overwrite_results(tmp_path:
 
 
 def test_eval_uses_complete_manifest_denominator_and_separate_diagnostic_namespace() -> None:
-    rows = [{"chain_id": cid, **{name: value for name in FOLDSCORE_COMPONENT_NAMES}} for cid, value in (("a", .25), ("b", .75))]
+    rows = [{"chain_id": cid, "rmsd_ca": None, "rmsd_ca_atom_count": 0, "rmsd_ca_status": "undefined_insufficient_ca", "rmsd_ca_version": RMSD_CA_VERSION, **{name: value for name in FOLDSCORE_COMPONENT_NAMES}} for cid, value in (("a", .25), ("b", .75))]
     result = evaluate._summarize_chain_metrics(rows, expected_chain_ids=["a", "b"], scored=True)
     assert result["mean_foldscore"] == .5
     assert result["rmsd_ca_valid_count"] == 0
@@ -138,7 +140,7 @@ def test_eval_isolates_labels_and_replays_rng_per_checkpoint_with_complete_diagn
     monkeypatch.setattr(evaluate, "parse_args", lambda: args)
     monkeypatch.setattr(evaluate, "load_submission_hooks", lambda *a, **kw: hooks)
     monkeypatch.setattr(evaluate, "default_torch_device", lambda: torch.device("cpu"))
-    monkeypatch.setattr(evaluate, "_score_chain", lambda **kw: {name: .5 for name in FOLDSCORE_COMPONENT_NAMES})
+    monkeypatch.setattr(evaluate, "_score_chain", lambda **kw: {**{name: .5 for name in FOLDSCORE_COMPONENT_NAMES}, "rmsd_ca": 0.0, "rmsd_ca_atom_count": 4, "rmsd_ca_status": "defined", "rmsd_ca_version": RMSD_CA_VERSION})
     evaluate.main()
     summary = json.loads(Path(args.save).read_text())
     assert seen == ["1abc_A", "2abc_A", "3abc_A"] * 2
@@ -208,3 +210,68 @@ def test_hidden_axis_does_not_truncate_or_repair_invalid_counters(counts) -> Non
     rows = [{"step": step, "cumulative_samples_seen": count, "mean_foldscore": .5} for step, count in zip((0, 5, 10), counts, strict=True)]
     with pytest.raises(ValueError):
         score._hidden_curve_metrics(rows, sample_budget=10)
+
+
+@pytest.mark.parametrize("split_only", [False, True])
+def test_research_prediction_and_scoring_verify_real_tensor_fingerprints(tmp_path: Path, monkeypatch, split_only: bool) -> None:
+    cfg, config = _fixture(tmp_path, count=2)
+    for chain in ("1abc_A", "2abc_A"):
+        feature_path = chain_npz_path(cfg["data"]["processed_features_dir"], chain)
+        with np.load(feature_path) as source:
+            arrays = {key: source[key] for key in source.files}
+        arrays.update(template_aatype=np.zeros((1, 4), np.int32), template_ca_coords=np.zeros((1, 4, 3), np.float32), template_ca_mask=np.ones((1, 4), bool))
+        np.savez(feature_path, **arrays)
+    train_manifest = tmp_path / "train.txt"
+    train_manifest.write_text("1abc_A\n")
+    Path(cfg["data"]["val_manifest"]).write_text("2abc_A\n")
+    cfg["data"]["train_manifest"] = str(train_manifest)
+    config.write_text(yaml.safe_dump(cfg))
+    manifests = {"val": cfg["data"]["val_manifest"]}
+    if not split_only:
+        manifests = {"train": str(train_manifest), **manifests}
+    fingerprint = build_split_fingerprint(
+        processed_features_dir=cfg["data"]["processed_features_dir"],
+        processed_labels_dir=cfg["data"]["processed_labels_dir"],
+        manifest_paths=manifests, require_no_missing=True, require_labels=True, track_id="limited",
+    )
+    fingerprint_path = tmp_path / "fingerprint.json"
+    fingerprint_path.write_text(json.dumps(fingerprint))
+    # New-cohort evaluation must not need the training cohort to be mounted.
+    if split_only:
+        train_manifest.unlink()
+        chain_npz_path(cfg["data"]["processed_features_dir"], "1abc_A").unlink()
+    checkpoint = tmp_path / "checkpoint.pt"
+    torch.save({"model": {}, "step": 0, "config": cfg}, checkpoint)
+    args = _arguments(config, checkpoint, tmp_path)
+    args.pred_out_dir = str(tmp_path / "predictions")
+    args.verify_fingerprint = True
+    args.fingerprint_split_only = split_only
+    args.fingerprint = str(fingerprint_path)
+    hooks = SimpleNamespace(
+        build_model=lambda cfg: torch.nn.Identity(),
+        run_batch=lambda **kw: {"pred_atom14": torch.zeros((*kw["batch"]["aatype"].shape, 14, 3))},
+        module_ref="fixture", source_sha256=None, source_path=None,
+    )
+    monkeypatch.setattr(predict, "parse_args", lambda: args)
+    monkeypatch.setattr(predict, "load_submission_hooks", lambda *a, **kw: hooks)
+    monkeypatch.setattr(predict, "default_torch_device", lambda: torch.device("cpu"))
+    predict.main()
+    score_args = argparse.Namespace(
+        prediction_summary=args.save, manifest=cfg["data"]["val_manifest"],
+        features_dir=cfg["data"]["processed_features_dir"], labels_dir=cfg["data"]["processed_labels_dir"],
+        crop_size=-1, crop_mode="", official=False, device="cpu", per_chain_out=str(tmp_path / "scores.jsonl"),
+        save=str(tmp_path / "scores.json"), fingerprint=str(fingerprint_path), fingerprint_split_only=split_only,
+        track="limited", split="val", config=str(config),
+    )
+    monkeypatch.setattr(score, "parse_args", lambda: score_args)
+    score.main()
+    assert json.loads(Path(score_args.save).read_text())["num_chains"] == 1
+    original_output = Path(score_args.save).read_bytes()
+    label_path = chain_npz_path(cfg["data"]["processed_labels_dir"], "2abc_A")
+    with np.load(label_path) as source:
+        arrays = {key: source[key] for key in source.files}
+    arrays["atom14_positions"][0, 0, 0] += 1
+    np.savez(label_path, **arrays)
+    with pytest.raises(ValueError, match="fingerprint mismatch"):
+        score.main()
+    assert Path(score_args.save).read_bytes() == original_output

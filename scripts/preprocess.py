@@ -846,6 +846,7 @@ def _existing_outputs_are_valid(
     expected_msa_row_filter_sha256: str | None,
     expected_preprocess_config_sha256: str,
     expected_source_inputs_sha256: str,
+    projection_args: argparse.Namespace,
     expected_sequence: str | None = None,
 ) -> bool:
     if not feature_path.exists() or not label_path.exists():
@@ -886,6 +887,30 @@ def _existing_outputs_are_valid(
                 return False
             if expected_sequence is not None and not np.array_equal(features["aatype"], sequence_to_ids(expected_sequence)):
                 return False
+            valid_ca = int(np.count_nonzero(labels["ca_mask"]))
+            recorded_count = features["projection_valid_ca_count"]
+            if (
+                valid_ca < projection_args.min_projection_valid_ca
+                or recorded_count.shape != ()
+                or not np.issubdtype(recorded_count.dtype, np.integer)
+                or int(recorded_count.item()) != valid_ca
+            ):
+                return False
+            for name, threshold in (
+                ("projection_seq_identity", projection_args.min_projection_seq_identity),
+                ("projection_alignment_coverage", projection_args.min_projection_coverage),
+                ("projection_aligned_fraction", projection_args.min_projection_aligned_fraction),
+            ):
+                metric = features[name]
+                if metric.shape != () or not np.issubdtype(metric.dtype, np.floating):
+                    return False
+                value = float(metric.item())
+                if not np.isfinite(value) or not 0.0 <= value <= 1.0:
+                    return False
+                # Generation stores these diagnostics in float32 after checking
+                # the full-precision threshold. Compare at that same precision.
+                if not projection_args.strict and value < float(np.float32(threshold)):
+                    return False
             for data in (features, labels):
                 if "preprocess_config_sha256" not in data.files:
                     return False
@@ -1121,6 +1146,7 @@ def main() -> None:
                 expected_msa_row_filter_sha256=msa_row_filter.sha256 if msa_row_filter is not None else None,
                 expected_preprocess_config_sha256=config_sha256,
                 expected_source_inputs_sha256=source_sha256,
+                projection_args=args,
                 expected_sequence=expected_sequences.get(cid),
             ):
                 if err_marker.exists():

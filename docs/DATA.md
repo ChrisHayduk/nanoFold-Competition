@@ -12,6 +12,8 @@ The short version:
 
 Training requires processed features and labels for every train and public-validation manifest entry, including local research runs. Missing files cannot silently shrink either population. Public-validation submission hooks receive features only; the trainer retains labels for scoring and reports valid, nonfinite and missing counts for each metric. See [training and validation reproducibility](API.md#training-sampling-and-multiple-gpus).
 
+Separate public research evaluation can use an explicitly frozen, selected-split fingerprint with `predict.py` and `score.py --fingerprint-split-only`. Prediction verifies features; scoring verifies features and labels. This permits evaluation without mounting the original training cohort while retaining its checkpoint identity. See [API.md](API.md) for the required flags and independent-group requirement.
+
 ## 1. Data Sources
 
 Official nanoFold data is built from public structure and alignment sources, then frozen into manifests, NPZ files, and fingerprints.
@@ -194,6 +196,65 @@ or group coverage; those gates remain required. Archive modification time does
 not establish the structures' revision cutoff. Current RCSB files can differ from
 the archived members, so record the exact source bytes used for each rebuild.
 
+For a complete maintainer snapshot, use a new destination and a prespecified
+source lock:
+
+```bash
+bash scripts/setup_openproteinset_roda.sh .nanofold_private/roda-snapshot \
+  --source-lock .nanofold_private/roda-source-lock.json
+```
+
+The lock is a JSON object with `schema_version: 1` and `files`, mapping every
+downloaded relative path to its lowercase `sha256` and integer `size_bytes`.
+It must cover exactly the four source locations below; missing, extra, changed,
+symlinked or special files fail verification before preparation:
+
+| Source | Path relative to the source directory |
+| --- | --- |
+| `s3://openfold/pdb/` (recursive) | `alignment_data/alignment_dir_roda/` |
+| `s3://openfold/pdb_mmcif.zip` | `pdb_data/pdb_mmcif.zip` |
+| `s3://openfold/duplicate_pdb_chains.txt` | `pdb_data/duplicate_pdb_chains.txt` |
+| `s3://openfold/data_caches/` (recursive) | `pdb_data/data_caches/` |
+
+If an independently verified lock is unavailable, first download those objects
+into a separate unverified source directory with that layout. Record observed
+bytes for review without accepting the dataset:
+
+```bash
+python scripts/prepare_openproteinset_roda.py propose-lock \
+  --sources .nanofold_private/roda-unverified-sources \
+  --output .nanofold_private/roda-proposed-lock.json
+```
+
+The proposed JSON and accompanying `.provenance.json` both have status
+`unverified_unaccepted`. Setup and offline preparation reject this proposal
+envelope. Observed hashes establish local identity, not independent source
+authenticity. After reviewing the acquisition provenance, explicitly freeze a
+separate source-lock JSON containing only `schema_version: 1` and the reviewed
+`files` map. Prepare the existing downloads against that lock without fetching
+them again:
+
+```bash
+python scripts/prepare_openproteinset_roda.py prepare-local \
+  --sources .nanofold_private/roda-unverified-sources \
+  --source-lock .nanofold_private/roda-source-lock.json \
+  --data-root .nanofold_private/roda-prepared
+```
+
+Preparation preserves the original downloads and refuses existing destinations.
+Archive extraction rejects escaping paths, duplicate or case-colliding members,
+symlinks and file/directory collisions; ZIP member CRCs are checked while reading.
+Flattening copies checked bytes and rejects collisions. Duplicate-chain expansion
+requires valid chain names and a downloaded representative for every group.
+`source_receipt.json` is published only after complete source and output checks;
+it binds the frozen lock, preparation source, all source objects, prepared file
+hashes and relative duplicate symlinks. A failed destination is incomplete and
+must be preserved for diagnosis; retry into a new directory. Retaining raw and
+prepared copies requires additional disk space. These are source-integrity gates;
+structural eligibility, homology exclusions and tensor fingerprints are still
+required. Network acquisition belongs to maintainer preparation, outside official
+submission execution.
+
 For an exploratory preprocessing audit, write a separate manifest containing
 only chains with both feature and label NPZ files:
 
@@ -236,6 +297,12 @@ overlap. Its default JSON output avoids raw sequences and hidden identifiers;
 depth CSVs also omit identifiers by default. Use identifier flags only when the output may contain those identities. `--strict` fails incomplete coverage, split overlap and exact held-out target leakage; `--run-mmseqs` adds separate thresholded searches against source targets and non-query MSA rows of at least 20 residues. Either kind of hit fails a strict audit. Missing or malformed MMseqs output is an error. Use `--val-features-dir` when held-out features have a separate root. Shared background MSA rows alone are descriptive overlap, not evidence of target leakage.
 
 If asset preprocessing is interrupted, rerun the same full-refresh command with `--resume-preprocess`. For direct `scripts/preprocess.py` commands, add `--skip-existing`.
+
+Cached pairs must still satisfy the configured projection quality: the observed
+C-alpha mask count must meet the minimum and agree with the recorded diagnostic.
+Non-strict preprocessing also rechecks the stored finite projection fractions
+against the configured thresholds. A pair with valid provenance but damaged
+masks or failing diagnostics is regenerated from its bound inputs.
 
 Resume requires the same raw inputs, pinned chain-cache bytes, split policy, effective filters, preprocessing implementation and configuration. New outputs contain source-content and configuration hashes; a changed or missing provenance record requires a fresh output directory. Existing files are validated before they can be skipped, including exact target equality to the selected cache sequence when cache binding is enabled.
 
@@ -698,6 +765,12 @@ After `predict.py` writes the chain artifact, the NPZ for `1abc_A` would contain
     "ckpt": "runs/example/checkpoints/ckpt_last.pt",
 }
 ```
+
+Cα RMSD uses these same atom14 coordinates and observation masks, rather than
+a separate coordinate source. Proper-rotation Kabsch alignment removes the
+arbitrary global frame. At least three observed Cα atoms are required; fewer
+observations produce an explicitly undefined target. A complete-cohort RMSD mean
+is withheld if any target is undefined, and valid/undefined counts remain visible.
 
 The scoring code compares `pred_atom14` with label `atom14_positions` using `atom14_mask`. The official FoldScore is a CASP15-inspired raw composite:
 

@@ -36,6 +36,12 @@ submission:
 
 Competition submissions should use `submission.path` under `submissions/<name>/`.
 
+Both entrypoint forms require readable Python source. Each load executes the
+current source bytes in a fresh module namespace and records their SHA256;
+source changes during import fail. Named entrypoints retain package-relative
+imports. Imported dependencies remain subject to the separate source-bundle
+and submission rules.
+
 ## Data Config Schema
 
 - `data.processed_features_dir`
@@ -257,7 +263,9 @@ a shared prefix or omit failed targets. Official scoring binds the manifest,
 split, crop, prediction root, checkpoint schedule, and exposure counts to
 maintainer-supplied inputs rather than trusting a prediction summary.
 
-Current outputs declare `foldscore_version: 2-segment-aware-float32`. Coordinates
+Current outputs declare `foldscore_version: 3-canonical-chi-segment-aware-float32`.
+This version removes incorrect 180-degree torsion symmetry for VAL chi1 and LEU
+chi2; earlier scores must be rescored before comparison. Coordinates
 are scored in float32, including AMP predictions. A peptide connection requires
 consecutive feature `residue_index` values and no `between_segment_residues` flag
 on the next residue. BB dihedrals and DipDiff windows stop at these boundaries;
@@ -269,8 +277,17 @@ Both inference entrypoints require every manifest target, pass submission code
 only features and a label-sanitized config, and reset crop/MSA randomness for
 each checkpoint. `eval.py` keeps trusted scoring labels outside submission
 hooks. Its `mean_submission_*` diagnostics cannot replace metric means and
-report explicit valid/nonfinite target counts; `rmsd_ca_valid_count` and
-`rmsd_ca_undefined_count` describe the optional RMSD denominator.
+report explicit valid/nonfinite target counts. Both `eval.py` and `score.py`
+emit `rmsd_ca` in angstroms after proper-rotation Kabsch alignment of the observed
+atom14 Cα slots. `rmsd_ca_version: kabsch-ca-v1`, `rmsd_ca_atom_count` and
+`rmsd_ca_status` bind each target's diagnostic. Fewer than three observed Cα
+atoms gives `rmsd_ca: null` with `undefined_insufficient_ca`; collapsed or
+collinear predictions retain their actual alignment error. Checkpoint and
+final summaries include `rmsd_ca_valid_count`, `rmsd_ca_undefined_count` and
+`rmsd_ca_status`. `mean_rmsd_ca` is null whenever any expected target is undefined;
+no finite-only subset mean is substituted. Canonical reporting contracts can
+request `rmsd_ca` and verify its full-cohort mean, version, support and coverage
+independently of the bounded FoldScore components.
 
 Prediction format 1 binds every NPZ to `chain_id`, `ckpt_sha256` and its exact
 `masked_length`. Official prediction checks checkpoint model/submission
@@ -331,3 +348,7 @@ Sanity vector:
 Private research results can be checked with `scripts/verify_experiment_result.py`. Supply the final bundled `--config`, public `--fingerprint`, public-validation `--manifest`, actual `--checkpoint`, evaluation `--summary`, `--per-chain` JSONL, prespecified `--seed`, `--final-step`, `--sample-budget`, and a fresh `--out` receipt path. It requires exact checkpoint/config/data identities, every validation target exactly once, current metric versions, consistent component-weighted FoldScore and independently recomputed means. Only the two processed-data directory paths may differ in the checkpoint's resolved config, allowing runtime staging; the receipt records these relocations and still requires the original config-byte and fingerprint hashes. This checks one final endpoint; source/runtime provenance, full data verification, prediction scoring and a complete campaign remain separate checks. This interface requires the private research route without official config overrides.
 
 For public-only remote research bundles and resumable execution, see [Modal training](MODAL_TRAINING.md).
+
+For a separately prespecified public evaluation cohort, `predict.py --verify-fingerprint --fingerprint-split-only --fingerprint EVAL_FP` verifies a fingerprint containing only the selected split. Prediction still hides labels from submission code. Score those predictions with `score.py --fingerprint-split-only --fingerprint EVAL_FP --track TRACK --split val --manifest EVAL_MANIFEST`; scoring verifies the feature and label bytes. These options require research mode. Without `--fingerprint-split-only`, research scoring with `--fingerprint` verifies the full training/validation fingerprint and requires `--config` to identify the training manifest. Neither option changes a checkpoint's original training identity or establishes independence of the new cohort; source-group exclusion must be verified separately.
+
+Maintainer source preparation accepts `scripts/setup_openproteinset_roda.sh NEW_DATA_ROOT --source-lock SOURCE_LOCK.json`. The source lock lists exact relative file paths, SHA256 hashes and byte sizes. `prepare_openproteinset_roda.py propose-lock` records an unaccepted local snapshot; `prepare-local` verifies an explicitly supplied frozen lock without downloading. Preparation requires new output directories and publishes `source_receipt.json` only after complete checks. See [Data](DATA.md) for schema, source layout and receipt scope.

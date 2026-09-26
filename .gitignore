@@ -10,6 +10,7 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 /.ci_smoke/
+/tracks/smoke_experiment_audit_*.yaml
 /.nanofold_private/
 /.nanofold_hidden*
 /.nanofold_hf_cache/

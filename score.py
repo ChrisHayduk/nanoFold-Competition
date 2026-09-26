@@ -28,6 +28,8 @@ from nanofold.prediction_contract import (
     load_prediction,
     validate_checkpoint_output_names,
 )
+from nanofold.residue_constants import CA_ATOM14_SLOT
+from nanofold.rmsd import RMSD_CA_FIELDS, rmsd_ca_diagnostic, summarize_rmsd_ca
 from nanofold.scoring_io import (
     load_feature_crop as _load_feature_crop,
 )
@@ -52,7 +54,8 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--official", action="store_true", help="Require trusted track, manifest, split, prediction directory, and checkpoint schedule.")
     ap.add_argument("--track", default="", help="Trusted track ID for official scoring.")
     ap.add_argument("--config", default="", help="Trusted config supplying unfixed crop and budget values for research tracks.")
-    ap.add_argument("--fingerprint", default="", help="Trusted scoring feature-and-label fingerprint (defaults to the track fingerprint).")
+    ap.add_argument("--fingerprint", default="", help="Verify this feature-and-label fingerprint, including in research mode (official mode defaults to the track fingerprint).")
+    ap.add_argument("--fingerprint-split-only", action="store_true", help="Research only: the supplied fingerprint contains only the selected split.")
     ap.add_argument("--split", default="", help="Trusted split for official scoring.")
     ap.add_argument("--pred-out-dir", default="", help="Trusted prediction directory for official scoring.")
     ap.add_argument("--checkpoint-steps", default="", help="Trusted comma-separated checkpoint schedule for official scoring (supports last).")
@@ -105,7 +108,7 @@ def _score_chain(
     pred_atom14: torch.Tensor,
     labels: Dict[str, torch.Tensor],
     features: Dict[str, torch.Tensor],
-) -> Dict[str, float]:
+) -> Dict[str, Any]:
     validate_scoring_alignment(labels, features)
     has_atom14_labels = "atom14_positions" in labels and "atom14_mask" in labels
     if not has_atom14_labels:
@@ -118,7 +121,11 @@ def _score_chain(
         residue_index=features.get("residue_index"),
         between_segment_residues=features.get("between_segment_residues"),
     )
-    return {name: float(value.detach().cpu()) for name, value in comps.items()}
+    metrics = {name: float(value.detach().cpu()) for name, value in comps.items()}
+    return {**metrics, **rmsd_ca_diagnostic(
+        pred_atom14[:, CA_ATOM14_SLOT, :], labels["atom14_positions"][:, CA_ATOM14_SLOT, :],
+        labels["atom14_mask"][:, CA_ATOM14_SLOT],
+    )}
 
 
 def _prediction_subdir(pred_root: Path, ckpt_path: str, n_ckpts: int) -> Path:
@@ -307,6 +314,10 @@ def _hidden_curve_metrics(checkpoint_rows: List[Dict[str, Any]], *, sample_budge
 
 def main() -> None:
     args = parse_args()
+    split_only = getattr(args, "fingerprint_split_only", False)
+    supplied_fingerprint = getattr(args, "fingerprint", "")
+    if split_only and (args.official or not supplied_fingerprint):
+        raise ValueError("--fingerprint-split-only requires research mode and --fingerprint.")
     prediction_summary_path = Path(args.prediction_summary).resolve()
     prediction_summary = json.loads(prediction_summary_path.read_text())
     if not isinstance(prediction_summary, dict):
@@ -356,6 +367,27 @@ def main() -> None:
             manifest_paths=manifests, expected_fingerprint_path=fingerprint,
             require_no_missing=True, require_labels=True, track_id=track.track_id,
         )
+    elif supplied_fingerprint:
+        if not args.track or not args.split or not args.manifest:
+            raise ValueError("Research fingerprint verification requires explicit --track, --split and --manifest.")
+        track = load_track_spec(args.track)
+        if split != args.split or prediction_summary.get("track") != track.track_id:
+            raise ValueError("Research scoring split/track disagrees with prediction metadata.")
+        if Path(str(prediction_summary["manifest_path"])).resolve() != manifest_path:
+            raise ValueError("Research scoring manifest disagrees with prediction metadata.")
+        manifests = {split: manifest_path}
+        if not split_only and split not in HIDDEN_SPLITS:
+            if not args.config:
+                raise ValueError("Full research fingerprint verification requires --config for the training manifest.")
+            cfg = yaml.safe_load(Path(args.config).read_text())
+            if split != "val" or Path(cfg["data"]["val_manifest"]).resolve() != manifest_path:
+                raise ValueError("Full research scoring requires the config validation manifest.")
+            manifests = {"train": Path(cfg["data"]["train_manifest"]), "val": manifest_path}
+        verify_split_against_fingerprint(
+            processed_features_dir=features_dir, processed_labels_dir=labels_dir,
+            manifest_paths=manifests, expected_fingerprint_path=supplied_fingerprint,
+            require_no_missing=True, require_labels=True, track_id=track.track_id,
+        )
     if crop_size <= 0 or crop_mode != "center":
         raise ValueError("Scoring requires a positive crop size and deterministic center cropping.")
     format_version = prediction_summary.get("prediction_format_version")
@@ -385,6 +417,7 @@ def main() -> None:
         ckpt_name = Path(ckpt_path).name
         pred_dir = _prediction_subdir(pred_root, ckpt_path, n_ckpts=n_ckpts)
         chain_metrics: Dict[str, List[float]] = {name: [] for name in FOLDSCORE_COMPONENT_NAMES}
+        checkpoint_chain_rows: List[Dict[str, Any]] = []
         ckpt_start = time.perf_counter()
         print(
             f"Scoring checkpoint {ckpt_index}/{n_ckpts}: {ckpt_name} "
@@ -424,13 +457,14 @@ def main() -> None:
                 labels=labels,
                 features=features,
             )
-            if set(metrics) != set(FOLDSCORE_COMPONENT_NAMES):
+            if set(metrics) != set(FOLDSCORE_COMPONENT_NAMES) | RMSD_CA_FIELDS:
                 raise ValueError("Every scored chain must provide every FoldScore component exactly once.")
-            for name, value in metrics.items():
+            for name in FOLDSCORE_COMPONENT_NAMES:
+                value = metrics[name]
                 if not np.isfinite(value) or not 0.0 <= value <= 1.0:
                     raise ValueError(f"Invalid {name} for a scored chain; refusing an incomplete mean.")
                 chain_metrics[name].append(float(value))
-            per_chain_rows.append(
+            checkpoint_chain_rows.append(
                 {
                     "split": split,
                     "ckpt": ckpt_path,
@@ -443,7 +477,9 @@ def main() -> None:
                 }
             )
 
+        per_chain_rows.extend(checkpoint_chain_rows)
         scored_row = dict(item)
+        scored_row.update(summarize_rmsd_ca(checkpoint_chain_rows, expected_count=len(chain_ids)))
         for name, values in chain_metrics.items():
             if len(values) != len(chain_ids):
                 raise ValueError(f"Missing {name} values; refusing an incomplete manifest denominator.")
@@ -489,6 +525,8 @@ def main() -> None:
     }
     for name in FOLDSCORE_COMPONENT_NAMES:
         out[f"mean_{name}"] = float(final_row.get(f"mean_{name}", float("nan")))
+
+    out.update({key: value for key, value in final_row.items() if key == "mean_rmsd_ca" or key.startswith("rmsd_ca_")})
 
     if split in HIDDEN_SPLITS:
         out.update(

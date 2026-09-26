@@ -160,31 +160,38 @@ def test_backbone_score_equal_weights_phi_psi_omega_errors() -> None:
     assert perturbed < perfect
 
 
-def test_sidechain_score_uses_chi_angles_and_symmetry() -> None:
-    true_atom14 = torch.zeros((1, 14, 3), dtype=torch.float32)
-    pred_atom14 = true_atom14.clone()
+@pytest.mark.parametrize(
+    "residue_type,chi_slots,expected_score",
+    [
+        (19, (0, 1, 4, 5), 0.0),  # VAL chi1
+        (10, (1, 4, 5, 6), 0.0),  # LEU chi2
+        (4, (0, 1, 4, 5), 0.0),   # CYS chi1
+        (3, (1, 4, 5, 6), 1.0),   # ASP chi2
+        (13, (1, 4, 5, 6), 1.0),  # PHE chi2
+        (18, (1, 4, 5, 6), 1.0),  # TYR chi2
+    ],
+)
+def test_sidechain_half_turn_obeys_canonical_torsion_symmetry(
+    residue_type: int, chi_slots: tuple[int, int, int, int], expected_score: float,
+) -> None:
+    # These four points have a right-angle dihedral; reflecting only the final
+    # point through the chi axis changes the angle by exactly pi. Masking only
+    # this torsion makes the expected normalized error an independent 0/1 oracle.
+    # Branched tetrahedral VAL/LEU cannot use the planar ASP/PHE/TYR equivalence.
+    target = torch.zeros((1, 14, 3), dtype=torch.float32)
+    target[0, list(chi_slots)] = torch.tensor([
+        [0.0, 0.0, 0.0], [1.0, 0.0, 0.0],
+        [1.0, 1.0, 0.0], [1.0, 1.0, 1.0],
+    ])
+    prediction = target.clone()
+    prediction[0, chi_slots[-1], 2] = -1.0
     mask = torch.zeros((1, 14), dtype=torch.bool)
-    # VAL: N, CA, C, O, CB, CG1, CG2. chi1 is pi-periodic under CG1/CG2 symmetry.
-    true_atom14[0, 0] = torch.tensor([0.0, 0.0, 0.0])
-    true_atom14[0, 1] = torch.tensor([1.0, 0.0, 0.0])
-    true_atom14[0, 2] = torch.tensor([2.0, 0.1, 0.0])
-    true_atom14[0, 3] = torch.tensor([2.4, -0.8, 0.0])
-    true_atom14[0, 4] = torch.tensor([1.0, 1.0, 0.0])
-    true_atom14[0, 5] = torch.tensor([1.0, 1.0, 1.0])
-    true_atom14[0, 6] = torch.tensor([1.0, 2.0, 0.0])
-    pred_atom14.copy_(true_atom14)
-    pred_atom14[0, 5] = torch.tensor([1.0, 1.0, -1.0])
-    mask[0, :7] = True
-    val_aatype = torch.tensor([19], dtype=torch.long)
-
-    assert torch.isclose(
-        sidechain_atom14_score(pred_atom14, true_atom14, mask, val_aatype),
-        torch.tensor(1.0),
-        atol=1e-6,
+    mask[0, list(chi_slots)] = True
+    residues = torch.tensor([residue_type], dtype=torch.long)
+    assert sidechain_atom14_score(target, target, mask, residues).item() == pytest.approx(1.0)
+    assert sidechain_atom14_score(prediction, target, mask, residues).item() == pytest.approx(
+        expected_score, abs=1e-6,
     )
-
-    cys_aatype = torch.tensor([4], dtype=torch.long)
-    assert sidechain_atom14_score(pred_atom14, true_atom14, mask, cys_aatype) < 1.0
 
 
 def test_dipdiff_uses_three_residue_ca_o_distance_windows() -> None:

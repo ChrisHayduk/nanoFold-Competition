@@ -210,3 +210,127 @@ def test_load_submission_hooks_rejects_out_of_tree_path(tmp_path) -> None:
     cfg = {"submission": {"path": str(outside_entry)}}
     with pytest.raises(ValueError, match="inside"):
         load_submission_hooks(cfg, config_path, allowed_root=config_dir)
+
+
+def test_path_submission_executes_current_source_despite_valid_stale_bytecode(tmp_path) -> None:
+    import hashlib
+    import importlib.util
+    import os
+    import py_compile
+    import sys
+    from pathlib import Path
+
+    source = tmp_path / "submission.py"
+    original = (
+        "VALUE = 1\n"
+        "def build_model(cfg): return VALUE\n"
+        "def build_optimizer(cfg, model): return VALUE\n"
+        "def run_batch(model, batch, cfg, training): return VALUE\n"
+    )
+    source.write_text(original)
+    cache = py_compile.compile(str(source), doraise=True, invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP)
+    assert cache is not None
+    timestamp = source.stat()
+    cache_bytes = Path(cache).read_bytes()
+    changed = original.replace("VALUE = 1", "VALUE = 2")
+    assert len(changed) == len(original)
+    source.write_text(changed)
+    os.utime(source, ns=(timestamp.st_atime_ns, timestamp.st_mtime_ns))
+
+    # Establish that the fixture actually defeats normal timestamp validation.
+    stale_spec = importlib.util.spec_from_file_location("stale_control", source)
+    assert stale_spec is not None and stale_spec.loader is not None
+    stale = importlib.util.module_from_spec(stale_spec)
+    stale_spec.loader.exec_module(stale)
+    assert stale.VALUE == 1
+
+    paths_before = list(sys.path)
+    hooks = load_submission_hooks({"submission": {"path": str(source)}}, tmp_path / "config.yaml")
+    expected_name = "nanofold_submission_" + hashlib.sha1(str(source.resolve()).encode()).hexdigest()[:12]
+    assert hooks.build_model({}) == 2
+    assert hooks.module.__name__ == hooks.build_model.__module__ == expected_name
+    assert hooks.module.__spec__ is not None and hooks.module.__spec__.name == expected_name
+    assert hooks.module.__file__ == hooks.source_path == str(source.resolve())
+    assert hooks.module_ref == f"path:{source.resolve()}"
+    assert hooks.source_sha256 == hashlib.sha256(changed.encode()).hexdigest()
+    assert Path(cache).read_bytes() == cache_bytes
+    assert sys.path == paths_before
+
+
+@pytest.mark.parametrize("preloaded", [False, True])
+def test_named_submission_uses_current_source_and_preserves_package_imports(tmp_path, monkeypatch, preloaded) -> None:
+    import hashlib
+    import importlib
+    import os
+    import py_compile
+    import sys
+
+    package = tmp_path / "source_bound_fixture"
+    package.mkdir()
+    (package / "__init__.py").write_text("")
+    (package / "helper.py").write_text("OFFSET = 40\n")
+    source = package / "submission.py"
+    original = (
+        "from __future__ import annotations\n"
+        "from dataclasses import dataclass\n"
+        "from .helper import OFFSET\n"
+        "VALUE = 1\n"
+        "@dataclass\n"
+        "class State:\n"
+        "    value: int = VALUE\n"
+        "def build_model(cfg): return State().value + OFFSET\n"
+        "def build_optimizer(cfg, model): return VALUE\n"
+        "def run_batch(model, batch, cfg, training): return VALUE\n"
+    )
+    source.write_text(original)
+    py_compile.compile(str(source), doraise=True, invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    module_name = "source_bound_fixture.submission"
+    try:
+        if preloaded:
+            old = importlib.import_module(module_name)
+            assert old.build_model({}) == 41
+        timestamp = source.stat()
+        changed = original.replace("VALUE = 1", "VALUE = 2")
+        source.write_text(changed)
+        os.utime(source, ns=(timestamp.st_atime_ns, timestamp.st_mtime_ns))
+        # Both variants start with a stale normally-imported module: one loaded
+        # before mutation, one loaded afterward from the timestamp-valid cache.
+        stale = importlib.import_module(module_name)
+        assert stale.build_model({}) == 41
+        hooks = load_submission_hooks({"submission": {"module": module_name}}, tmp_path / "config.yaml")
+        assert hooks.build_model({}) == 42
+        assert hooks.module.__package__ == "source_bound_fixture"
+        assert hooks.module.__name__ == hooks.module_ref.removeprefix("module:") == module_name
+        assert sys.modules[module_name] is hooks.module
+        assert getattr(sys.modules["source_bound_fixture"], "submission") is hooks.module
+        assert hooks.source_sha256 == hashlib.sha256(changed.encode()).hexdigest()
+        assert hooks.source_path == str(source.resolve())
+    finally:
+        for key in list(sys.modules):
+            if key == "source_bound_fixture" or key.startswith("source_bound_fixture."):
+                sys.modules.pop(key, None)
+
+
+@pytest.mark.parametrize("mode", ["path", "module"])
+def test_submission_source_mutation_during_import_is_not_misattributed(tmp_path, monkeypatch, mode) -> None:
+    import sys
+
+    source = tmp_path / "self_mutating_submission.py"
+    source.write_text(
+        "from pathlib import Path\n"
+        "Path(__file__).write_text('# changed during import\\n')\n"
+        "def build_model(cfg): return 1\n"
+        "def build_optimizer(cfg, model): return 1\n"
+        "def run_batch(model, batch, cfg, training): return 1\n"
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    value = str(source) if mode == "path" else source.stem
+    with pytest.raises(ImportError, match="changed during import"):
+        load_submission_hooks({"submission": {mode: value}}, tmp_path / "config.yaml")
+    assert source.stem not in sys.modules
+
+
+def test_named_non_source_submission_is_rejected(tmp_path) -> None:
+    with pytest.raises(ImportError, match="readable Python source"):
+        load_submission_hooks({"submission": {"module": "sys"}}, tmp_path / "config.yaml")

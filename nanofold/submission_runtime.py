@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import importlib.machinery
 import importlib.util
 import sys
 from dataclasses import dataclass
@@ -43,46 +44,70 @@ class SubmissionHooks:
     build_scheduler: Optional[Callable[[Dict[str, Any], torch.optim.Optimizer], Any]]
 
 
-def _import_module_from_name(module_name: str) -> tuple[str, ModuleType]:
-    module = importlib.import_module(module_name)
-    return f"module:{module_name}", module
+def _execute_module_source(spec: importlib.machinery.ModuleSpec) -> tuple[ModuleType, str, str]:
+    """Execute and fingerprint readable Python source, independent of caches."""
+    if not spec.origin:
+        raise ImportError("Submission entrypoint must have readable Python source")
+    source_path = Path(spec.origin).resolve()
+    if source_path.suffix not in {".py", ".pyw"} or not source_path.is_file():
+        raise ImportError(f"Submission entrypoint must have readable Python source: {spec.origin}")
+    source = source_path.read_bytes()
+    source_digest = hashlib.sha256(source).hexdigest()
+    module = importlib.util.module_from_spec(spec)
+    previous = sys.modules.get(spec.name)
+    parent_name, _, child_name = spec.name.rpartition(".")
+    parent = sys.modules.get(parent_name) if parent_name else None
+    absent = object()
+    previous_child = getattr(parent, child_name, absent) if parent is not None else absent
+    sys.modules[spec.name] = module
+    if parent is not None:
+        setattr(parent, child_name, module)
+    try:
+        exec(compile(source, str(source_path), "exec"), module.__dict__)
+        if sha256_file(source_path) != source_digest:
+            raise ImportError(f"Submission source changed during import: {source_path}")
+    except BaseException:
+        if previous is None:
+            sys.modules.pop(spec.name, None)
+        else:
+            sys.modules[spec.name] = previous
+        if parent is not None:
+            if previous_child is absent:
+                delattr(parent, child_name)
+            else:
+                setattr(parent, child_name, previous_child)
+        raise
+    return module, str(source_path), source_digest
 
 
-def _import_module_from_path(module_path: Path) -> tuple[str, ModuleType]:
+def _import_module_from_name(module_name: str) -> tuple[str, ModuleType, str, str]:
+    spec = importlib.util.find_spec(module_name)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not find a Python-source submission module: {module_name}")
+    module, source_path, source_digest = _execute_module_source(spec)
+    return f"module:{module_name}", module, source_path, source_digest
+
+
+def _import_module_from_path(module_path: Path) -> tuple[str, ModuleType, str, str]:
     resolved = module_path.resolve()
-    if not resolved.exists():
-        raise FileNotFoundError(f"Submission module path does not exist: {resolved}")
     if not resolved.is_file():
         raise FileNotFoundError(f"Submission module path is not a file: {resolved}")
-
     digest = hashlib.sha1(str(resolved).encode("utf-8")).hexdigest()[:12]
     module_name = f"nanofold_submission_{digest}"
     spec = importlib.util.spec_from_file_location(module_name, str(resolved))
     if spec is None or spec.loader is None:
         raise ImportError(f"Could not create import spec for submission module: {resolved}")
-
-    module = importlib.util.module_from_spec(spec)
     added = False
     module_dir = str(resolved.parent)
     if module_dir not in sys.path:
         sys.path.insert(0, module_dir)
         added = True
     try:
-        spec.loader.exec_module(module)
+        module, source_path, source_digest = _execute_module_source(spec)
     finally:
         if added:
-            sys.path.pop(0)
-    return f"path:{resolved}", module
-
-
-def _resolve_module_source_path(module: ModuleType) -> str | None:
-    module_file = getattr(module, "__file__", None)
-    if not isinstance(module_file, str) or module_file.strip() == "":
-        return None
-    resolved = Path(module_file).resolve()
-    if not resolved.exists() or not resolved.is_file():
-        return None
-    return str(resolved)
+            sys.path.remove(module_dir)
+    return f"path:{resolved}", module, source_path, source_digest
 
 
 def _ensure_path_within_root(path: Path, allowed_root: Path) -> None:
@@ -125,7 +150,7 @@ def load_submission_hooks(
 
     if has_name:
         assert isinstance(module_name, str)
-        module_ref, module = _import_module_from_name(module_name.strip())
+        module_ref, module, source_path, source_sha256 = _import_module_from_name(module_name.strip())
     else:
         assert isinstance(module_path, str)
         path = Path(module_path.strip())
@@ -134,7 +159,7 @@ def load_submission_hooks(
         path = path.resolve()
         if allowed_root is not None:
             _ensure_path_within_root(path, Path(allowed_root).resolve())
-        module_ref, module = _import_module_from_path(path)
+        module_ref, module, source_path, source_sha256 = _import_module_from_path(path)
 
     required = ("build_model", "build_optimizer", "run_batch")
     missing = [name for name in required if not callable(getattr(module, name, None))]
@@ -144,9 +169,6 @@ def load_submission_hooks(
     build_scheduler = getattr(module, "build_scheduler", None)
     if build_scheduler is not None and not callable(build_scheduler):
         raise TypeError("`build_scheduler` exists but is not callable.")
-
-    source_path = _resolve_module_source_path(module)
-    source_sha256 = sha256_file(source_path) if source_path is not None else None
 
     return SubmissionHooks(
         module_ref=module_ref,
