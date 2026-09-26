@@ -20,7 +20,7 @@ Output (per chain):
     ca_coords: (L,3) float32          # required
     ca_mask: (L,) bool                # required
     atom14_positions: (L,14,3) float32   # full atom14 layout (AF2 supplement 1.2.1)
-    atom14_mask: (L,14) bool          # True where coordinate was present in mmCIF
+    atom14_mask: (L,14) bool          # selected positive-occupancy atoms after query projection
     residue_index: (L,) int32         # contiguous 0..L-1 (AF2 supplement 1.2.9)
     resolution: float32               # Å, 0.0 if unknown
 
@@ -66,7 +66,13 @@ from nanofold.residue_constants import ATOM14_NUM_SLOTS, CA_ATOM14_SLOT
 
 
 def parse_args() -> argparse.Namespace:
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(
+        description="Preprocess OpenProteinSet alignments and deposited structures into verified feature/label pairs.",
+        epilog=(
+            "Coordinate labels use coherent positive-occupancy conformers; source coordinates are never adjusted. "
+            "See docs/DATA.md for coordinate selection, projection, and source-provenance requirements."
+        ),
+    )
     ap.add_argument("--raw-root", type=str, default="data/raw", help="Root from scripts/prepare_data.py")
     ap.add_argument(
         "--alignments-root",

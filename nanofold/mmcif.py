@@ -13,9 +13,13 @@ sequence order, not the author numbering from the mmCIF — this matches AF2
 supplement 1.2.9 and avoids the edge cases around insertion codes and gaps
 in author numbering.
 
-Altloc handling follows AF2 supplement 1.2.1 *"taking the one with the
-largest occupancy"*: for each atom we pick the altloc with the highest
-occupancy, breaking ties in favour of the "no altloc" / "A" conformer.
+Alternate locations are selected as coherent residue conformers, retaining
+shared atoms and positive occupancy only. Backbone support is fixed before
+choosing conformers for continuity across deposited polymer neighbors;
+occupancy breaks equal-geometry choices. Coordinates are never adjusted.
+The first deposited model anchors identity and atom support. A later whole
+model can replace it only with identical identity/support and fewer backbone
+violations; equal-geometry models retain their deposited order.
 """
 
 from __future__ import annotations
@@ -53,9 +57,9 @@ class ChainAtoms:
       1.2.9 — *not* the author numbering from the mmCIF).
     * ``atom14_positions``: ``(L, 14, 3)`` Å coordinates in the per-residue
       atom14 slot ordering from ``residue_constants``.
-    * ``atom14_mask``: ``(L, 14)`` 1.0 where a coordinate was present in
-      the mmCIF, 0.0 otherwise. Atoms missing in ground truth are masked
-      out of downstream losses.
+    * ``atom14_mask``: ``(L, 14)`` 1.0 for positive-occupancy coordinates
+      in the selected residue conformer, 0.0 otherwise. Unobserved atoms
+      are masked out of downstream losses.
     * ``resolution``: Å (0.0 when none was found). Consumed by loss
       resolution filters (supplement 1.9.6 / 1.9.10 train on resolutions
       in [0.1, 3.0]).
@@ -84,54 +88,151 @@ class ChainAtoms:
 
     @property
     def ca_mask(self) -> np.ndarray:
-        """(L,) bool — True where the Cα atom was present in the mmCIF."""
+        """(L,) bool — True where the selected Cα atom has positive occupancy."""
         return self.atom14_mask[:, CA_ATOM14_SLOT] > 0.5
 
 
-def _best_atom_by_occupancy(atoms: List[gemmi.Atom]) -> Optional[gemmi.Atom]:
-    """Pick the best altloc per AF2 supplement 1.2.1: highest occupancy, with
-    the no-altloc / "A" conformer breaking ties."""
-    if not atoms:
-        return None
-
-    def priority(a: gemmi.Atom) -> Tuple[float, int, str]:
-        altloc = a.altloc or "\0"
-        preferred = 1 if altloc in ("\0", "A") else 0
-        occupancy = float(a.occ)
-        if not np.isfinite(occupancy):
-            raise ValueError(f"Nonfinite occupancy for atom {a.name}")
-        return (occupancy, preferred, altloc)
-
-    return max(atoms, key=priority)
+@dataclass
+class _ResidueConformer:
+    positions: np.ndarray
+    mask: np.ndarray
+    occupancy: float
 
 
-def _collect_atom14(
-    residue: gemmi.Residue,
-    residue_name_3: str,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Fill atom14 slots for one residue using the per-atom best-altloc atom."""
-    positions = np.zeros((ATOM14_NUM_SLOTS, 3), dtype=np.float32)
-    mask = np.zeros((ATOM14_NUM_SLOTS,), dtype=np.float32)
+def _residue_conformers(residue: gemmi.Residue) -> list[_ResidueConformer]:
+    """One named alternate plus shared atoms, with geometry-independent support.
 
-    slot_table = ATOM14_INDEX.get(residue_name_3)
-    if slot_table is None:
-        return positions, mask
-
-    atoms_by_name: dict[str, List[gemmi.Atom]] = {}
+    First maximize observed backbone atom count. Incomparable equal-count
+    masks use the fixed CA, N, C, O preference. Every returned candidate has
+    that exact backbone mask, so geometry cannot win by hiding a bond.
+    """
+    slot_table = ATOM14_INDEX.get(residue.name.upper(), {})
+    atoms: dict[tuple[str, str], gemmi.Atom] = {}
     for atom in residue:
-        atoms_by_name.setdefault(atom.name, []).append(atom)
-
-    for atom_name, slot in slot_table.items():
-        best = _best_atom_by_occupancy(atoms_by_name.get(atom_name, []))
-        if best is None:
+        if atom.name not in slot_table:
             continue
-        coordinates = np.array([best.pos.x, best.pos.y, best.pos.z], dtype=np.float32)
-        if not np.isfinite(coordinates).all():
-            raise ValueError(f"Nonfinite coordinates for {residue_name_3} atom {atom_name}")
-        positions[slot] = coordinates
-        mask[slot] = 1.0
+        occupancy = float(atom.occ)
+        if not np.isfinite(occupancy):
+            raise ValueError(f"Nonfinite occupancy for atom {atom.name}")
+        if occupancy < 0:
+            raise ValueError(f"Negative occupancy for atom {atom.name}")
+        if occupancy == 0:
+            continue
+        coordinates = (atom.pos.x, atom.pos.y, atom.pos.z)
+        if not np.isfinite(np.asarray(coordinates, dtype=np.float32)).all():
+            raise ValueError(f"Nonfinite coordinates for {residue.name} atom {atom.name}")
+        altloc = "" if atom.altloc in ("", "\0", " ", ".", "?") else atom.altloc
+        key = (atom.name, altloc)
+        previous = atoms.get(key)
+        # Duplicate records for the same site must not make atom row order a
+        # tie-breaker. This never mixes different named alternate locations.
+        if previous is None or (occupancy, *coordinates) > (
+            float(previous.occ), previous.pos.x, previous.pos.y, previous.pos.z,
+        ):
+            atoms[key] = atom
 
-    return positions, mask
+    altlocs = sorted({altloc for _, altloc in atoms if altloc}) or [""]
+    candidates = []
+    for altloc in altlocs:
+        positions = np.zeros((ATOM14_NUM_SLOTS, 3), dtype=np.float32)
+        mask = np.zeros((ATOM14_NUM_SLOTS,), dtype=np.float32)
+        occupancies = []
+        for atom_name, slot in slot_table.items():
+            selected_atom = atoms.get((atom_name, altloc))
+            if selected_atom is not None:
+                occupancies.append(float(selected_atom.occ))
+            else:
+                selected_atom = atoms.get((atom_name, ""))
+            if selected_atom is not None:
+                positions[slot] = (selected_atom.pos.x, selected_atom.pos.y, selected_atom.pos.z)
+                mask[slot] = 1.0
+        occupancy = sum(occupancies) / len(occupancies) if occupancies else 0.0
+        candidates.append(_ResidueConformer(positions, mask, occupancy))
+
+    def support(candidate: _ResidueConformer) -> tuple[int, tuple[bool, ...]]:
+        backbone = tuple(bool(candidate.mask[slot]) for slot in (1, 0, 2, 3))
+        return sum(backbone), backbone
+
+    best_support = max(support(candidate) for candidate in candidates)
+    return [candidate for candidate in candidates if support(candidate) == best_support]
+
+
+def _backbone_violations(left: _ResidueConformer, right: _ResidueConformer) -> tuple[int, int]:
+    violations = []
+    for left_slot, right_slot, lower, upper in ((2, 0, 1.0, 1.8), (1, 1, 2.5, 4.5)):
+        outside = False
+        if left.mask[left_slot] and right.mask[right_slot]:
+            distance = float(np.linalg.norm(
+                left.positions[left_slot].astype(np.float64) - right.positions[right_slot].astype(np.float64)
+            ))
+            outside = not lower <= distance <= upper
+        violations.append(int(outside))
+    return violations[0], violations[1]
+
+
+def _polymer_neighbors(left: gemmi.Residue, right: gemmi.Residue) -> bool:
+    return (
+        left.subchain == right.subchain
+        and left.label_seq is not None and right.label_seq is not None
+        and right.label_seq == left.label_seq + 1
+    )
+
+
+def _select_chain_conformers(residues: list[gemmi.Residue]) -> list[_ResidueConformer]:
+    """Minimize peptide, then CA violations; maximize occupancy on ties.
+
+    Only consecutive known deposited polymer positions in the same subchain
+    contribute geometry. Sorted alternate labels and predecessor order make
+    ties deterministic, without requiring equal labels across residues.
+    """
+    candidates = [_residue_conformers(residue) for residue in residues]
+    if all(len(choices) == 1 for choices in candidates):
+        return [choices[0] for choices in candidates]
+
+    costs = [(0, 0, -choice.occupancy) for choice in candidates[0]]
+    predecessors: list[list[int]] = []
+    for index in range(1, len(residues)):
+        adjacent = _polymer_neighbors(residues[index - 1], residues[index])
+        next_costs = []
+        previous_indices = []
+        for choice in candidates[index]:
+            options = []
+            for previous_index, previous in enumerate(candidates[index - 1]):
+                peptide, ca = _backbone_violations(previous, choice) if adjacent else (0, 0)
+                cost = costs[previous_index]
+                options.append((cost[0] + peptide, cost[1] + ca, cost[2] - choice.occupancy, previous_index))
+            best = min(options)
+            next_costs.append(best[:3])
+            previous_indices.append(best[3])
+        costs = next_costs
+        predecessors.append(previous_indices)
+
+    selected_index = min(range(len(costs)), key=lambda index: costs[index])
+    selected = [candidates[-1][selected_index]]
+    for index in range(len(residues) - 2, -1, -1):
+        selected_index = predecessors[index][selected_index]
+        selected.append(candidates[index][selected_index])
+    return selected[::-1]
+
+
+def _chain_backbone_violations(
+    residues: list[gemmi.Residue], conformers: list[_ResidueConformer],
+) -> tuple[int, int]:
+    peptide = ca = 0
+    for index in range(len(residues) - 1):
+        if _polymer_neighbors(residues[index], residues[index + 1]):
+            edge_peptide, edge_ca = _backbone_violations(conformers[index], conformers[index + 1])
+            peptide += edge_peptide
+            ca += edge_ca
+    return peptide, ca
+
+
+def _residue_signature(residues: list[gemmi.Residue]) -> list[tuple[str, str, int | None, str | None]]:
+    return [
+        (residue.name.upper(), residue.subchain, residue.label_seq,
+         str(residue.seqid) if residue.label_seq is None else None)
+        for residue in residues
+    ]
 
 
 def _chain_polymer_sequence(chain: gemmi.Chain) -> str:
@@ -194,11 +295,16 @@ def extract_chain_atoms(
 ) -> ChainAtoms:
     """Parse ``mmcif_path`` and return the atom14 structure for ``chain_id``.
 
-    Follows AF2 supplement 1.2.1 Parsing: first model only (rejects NMR
-    ensembles); polymer residues only (skips HETATM ligands/water);
-    altlocs resolved by occupancy with no-altloc / "A" preferred; residue
-    numbering is contiguous 0..N-1 from sequence order, not author
-    numbering.
+    The first deposited model anchors chain identity and observed atom support.
+    A later whole model is eligible only with identical residue identity, chain
+    mapping and atom14 masks; fewer peptide, then CA spacing violations choose
+    between eligible models, with deposited order breaking ties. Invalid first
+    models fail; malformed or noncomparable later models are ineligible.
+
+    Within each model, positive-occupancy residue conformers are selected for
+    observed backbone support, deposited-neighbor continuity, then occupancy.
+    Polymer residues only are kept, numbered contiguously from sequence order.
+    No coordinates are idealized or removed because of geometry.
 
     If ``expected_sequence`` is provided and ``require_full_match=True``,
     the structure-derived sequence must match exactly. Set
@@ -221,8 +327,7 @@ def extract_chain_atoms(
         raise KeyError(f"Chain '{chain_id}' not found in {mmcif_path}") from None
 
     sequence_letters: List[str] = []
-    atom14_positions_list: List[np.ndarray] = []
-    atom14_mask_list: List[np.ndarray] = []
+    residues: list[gemmi.Residue] = []
     polymer_residue_indices: List[int] = []
     selected_subchains = {
         res.subchain for res in chain
@@ -255,11 +360,9 @@ def extract_chain_atoms(
             raise ValueError("Polymer label_seq_id must be positive")
         polymer_residue_indices.append(res.label_seq - 1 if res.label_seq is not None else -1)
 
-        positions, mask = _collect_atom14(res, residue_name_3)
-        atom14_positions_list.append(positions)
-        atom14_mask_list.append(mask)
+        residues.append(res)
 
-    if not atom14_positions_list:
+    if not residues:
         raise ValueError(f"No polymer residues found for {pdb_id}_{chain_id} in {mmcif_path}")
     known_polymer_indices = [index for index in polymer_residue_indices if index >= 0]
     if len(set(known_polymer_indices)) != len(known_polymer_indices):
@@ -273,8 +376,49 @@ def extract_chain_atoms(
             f"structure seq len={len(sequence)}, expected len={len(expected_sequence)}"
         )
 
-    atom14_positions = np.stack(atom14_positions_list, axis=0)
-    atom14_mask = np.stack(atom14_mask_list, axis=0)
+    conformers = _select_chain_conformers(residues)
+    atom14_mask = np.stack([conformer.mask for conformer in conformers], axis=0)
+    best_score = _chain_backbone_violations(residues, conformers) if len(st) > 1 else (0, 0)
+    signature = _residue_signature(residues)
+    for model_index, alternative_model in enumerate(st):
+        if best_score == (0, 0):
+            break
+        if model_index == 0:
+            continue
+        try:
+            alternative_chain, alternative_label, alternative_method = _resolve_chain(
+                alternative_model, chain_id=chain_id, expected_sequence=expected_sequence,
+            )
+        except (KeyError, ValueError):
+            continue
+        if (alternative_chain.name, alternative_label, alternative_method) != (
+            chain.name, label_chain_id, chain_mapping_method,
+        ):
+            continue
+        alternative_residues = [
+            residue for residue in alternative_chain
+            if residue.entity_type == gemmi.EntityType.Polymer
+            and (alternative_label is None or residue.subchain == alternative_label)
+        ]
+        if _residue_signature(alternative_residues) != signature:
+            continue
+        # Identical subchains in this Structure share the same deposited entity
+        # sequence. The signature also preserves known polymer positions and,
+        # when absent, author numbering including insertion codes.
+        try:
+            alternative_conformers = _select_chain_conformers(alternative_residues)
+        except ValueError:
+            # An invalid alternative cannot invalidate the first model or be
+            # repaired/masked to become eligible for selection.
+            continue
+        alternative_mask = np.stack([item.mask for item in alternative_conformers], axis=0)
+        if not np.array_equal(alternative_mask, atom14_mask):
+            continue
+        score = _chain_backbone_violations(alternative_residues, alternative_conformers)
+        if score < best_score:
+            conformers, best_score = alternative_conformers, score
+
+    atom14_positions = np.stack([conformer.positions for conformer in conformers], axis=0)
     residue_index = np.arange(len(sequence), dtype=np.int32)
 
     resolution_value = getattr(st, "resolution", 0.0) or 0.0

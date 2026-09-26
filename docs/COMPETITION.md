@@ -84,7 +84,12 @@ Required label NPZ keys (per chain):
 - `ca_coords (L,3) float32`
 - `ca_mask (L,) bool`
 - `atom14_positions (L,14,3) float32` — full AF2 atom14 layout
-- `atom14_mask (L,14) bool` — 1 where coordinate was present in mmCIF
+- `atom14_mask (L,14) bool` — true for positive-occupancy atoms in the selected deposited conformer, after query projection
+
+Coordinate preprocessing preserves deposited coordinates and selects coherent
+residue conformers before projection. Zero-occupancy atoms and sequence
+mismatches are masked; [coordinate selection](DATA.md#coordinate-selection)
+defines the deterministic policy.
 
 Optional label NPZ keys:
 - `residue_index (L,) int32` — contiguous 0..L-1 (AF2 supplement 1.2.9)

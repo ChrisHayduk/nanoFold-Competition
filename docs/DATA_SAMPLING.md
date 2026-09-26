@@ -69,6 +69,15 @@ Generation requires both public and private source locks. CATH v4 additionally b
 
 The original cluster map, full group map and graph-construction receipt retain their byte and canonical assignment bindings. Relocation overrides must resolve to the same locked inputs; replacing their contents does not preserve the contract. Source-validation receipts bind the raw queries, uniformly pinned historical structure source, strict validation predicate and complete ranked attempt evidence. Fixed structure thresholds are identity 0.90, coverage 0.70, aligned fraction 0.70 and at least 32 valid Cα positions. CATH v4 does not permit a partial-label relaxation or substitute current structures for the pinned historical source.
 
+Coordinate parser changes require replaying every original unit's ranked
+qualification prefix under the new predicate, even if the selected manifest
+bytes appear unchanged. Positive-occupancy masks and coherent conformer
+selection can change valid-CA counts. A changed exhausted-group set must fail
+against the approved exclusion catalog; it cannot silently add exclusions or
+weaken thresholds. New qualification bindings require fresh candidate locks and
+processed assets. The original sequence graph can be reused only after verifying
+its unchanged sequence inputs and construction evidence.
+
 Verification requires complete typed generation arguments and replays the public and hidden selections, representatives and ordering. Repinning hashes cannot make an inconsistent seed, size or selection pass. Private processability exclusions are checked against locked bytes, canonical IDs and counts; use `--private-processability-exclusion-list` to relocate the same file. An omitted exclusion file is recorded explicitly as absent; a supplied path must exist. Verification reports cannot overwrite audited inputs, including through symlink or hardlink aliases.
 
 `cath-v3` retains its complete original-group coverage contract with the original quality-ranked representatives and no CATH-v4 eligibility/catalog inputs. `cath-v2` retains its own replay contract: one selected representative per original cluster/exact-sequence/PDB unit, public validation and train selected before hidden validation from the remaining units, without a requirement to cover every eligible unit. Its hidden-only generator excludes every unit touching a private exclusion. A frozen source lock is verified under its recorded policy; verification never relabels an existing selection as another policy.

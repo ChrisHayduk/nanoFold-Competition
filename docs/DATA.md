@@ -305,7 +305,50 @@ For each chain ID, preprocessing:
 10. Projects atom14 coordinates onto query positions, masking every label at a sequence mismatch.
 11. Rejects chains that fail projection quality thresholds, including the valid-CA minimum in strict alignment mode.
 12. Validates and writes one feature NPZ and one label NPZ per chain, with matching configuration and source-content hashes.
-13. Records schema-3 run provenance in `preprocess_meta.json`. This run metadata is required for fingerprinting provenance-bearing pairs; removing or downgrading it is an error. Resume verifies raw inputs and existing files before skipping work. Chain resolution prefers author IDs, then explicit polymer label IDs, then a unique sequence match; ambiguous matches fail. Alternate atom locations are selected by occupancy; invalid nonfinite coordinates fail.
+13. Records schema-3 run provenance in `preprocess_meta.json`. This run metadata is required for fingerprinting provenance-bearing pairs; removing or downgrading it is an error. Resume verifies raw inputs and existing files before skipping work. Chain resolution prefers author IDs, then explicit polymer label IDs, then a unique sequence match; ambiguous matches fail. Coordinate selection follows the policy below.
+
+### Coordinate selection
+
+The first deposited model anchors residue identity and observation support.
+Other deposited models are eligible only when their resolved chain, residue
+identities, polymer positions and complete atom14 masks match that anchor.
+The parser selects one whole eligible model by the fewest peptide C–N distance
+violations, then CA distance violations, then deposited model order. Coordinates
+are never mixed between models. This conservative comparison does not replace
+the anchor with a model having different observed atom coverage.
+An invalid first model fails parsing. Malformed or noncomparable later models
+are ineligible. Model comparison stops at the first eligible model with no
+scored backbone violations; it does not validate every model in the source.
+
+Within each residue, a candidate contains one named alternate location plus
+shared blank atoms. Missing atoms are never borrowed from a different named alternate.
+Only positive-occupancy atoms are observed; zero occupancy retains the residue
+and its sequence position but contributes no atom label. Negative or nonfinite
+occupancy and nonfinite observed coordinates invalidate that model. Deposited zero-occupancy
+coordinates can represent atoms with unreliable locations, as described in the
+[wwPDB processing procedures](https://www.wwpdb.org/documentation/procedure).
+
+Before comparing geometry, selection maximizes the number of observed N, CA, C
+and O atoms in each residue. Equal-count masks are resolved by the fixed
+CA, N, C, O presence order. Every remaining candidate must have that exact
+backbone mask, so geometry cannot improve by hiding a bond endpoint. A chain
+dynamic program then minimizes the number of peptide C–N distances outside
+1.0–1.8 Å, followed by CA distances outside 2.5–4.5 Å. Only known consecutive
+deposited `label_seq_id` positions in the same polymer subchain contribute;
+author numbering and compact query adjacency do not create connections.
+Equal-geometry choices maximize summed per-residue mean named-alternate
+occupancy, with sorted alternate identifiers and predecessor order resolving
+ties deterministically.
+
+This selects deposited coordinates without interpolation or idealization.
+Alternate letters need not match across residues: the
+[mmCIF alternate-site specification](https://mmcif.wwpdb.org/dictionaries/mmcif_std.dic/Categories/atom_sites_alt.html)
+allows both correlated and uncorrelated alternatives. Local backbone continuity
+does not prove a globally valid conformation, and unavoidable source geometry
+outliers remain diagnostic. No target is excluded merely for these distance
+outliers. Atom-selection implementation hashes bind qualification and
+preprocessing; a changed parser requires new qualification receipts and fresh
+feature/label outputs.
 
 Preprocessing validates nonempty, unique, well-formed manifest IDs before
 creating outputs. Feature and label roots must be separate and cannot contain
@@ -392,9 +435,9 @@ Label NPZ keys:
 | Key | Shape | Dtype | Meaning |
 |---|---:|---|---|
 | `ca_coords` | `(L, 3)` | `float32` | True C-alpha coordinates. |
-| `ca_mask` | `(L,)` | `bool` | True where C-alpha is present. |
+| `ca_mask` | `(L,)` | `bool` | True for selected positive-occupancy C-alpha coordinates after query projection. |
 | `atom14_positions` | `(L, 14, 3)` | `float32` | True atom14 coordinates in canonical AF2 slot order. |
-| `atom14_mask` | `(L, 14)` | `bool` | True where the atom exists and was present in mmCIF. |
+| `atom14_mask` | `(L, 14)` | `bool` | True for selected positive-occupancy atom coordinates after query projection. |
 | `residue_index` | `(L,)` | `int32` | Contiguous `0..L-1` positions. |
 | `resolution` | scalar | `float32` | Structure resolution, or `0.0` when unknown. |
 

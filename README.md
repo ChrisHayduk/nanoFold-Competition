@@ -213,7 +213,13 @@ Required feature keys:
 Required label keys:
 - `ca_coords`, `ca_mask`
 - `atom14_positions` — `(L, 14, 3)` float32, full atom14 layout
-- `atom14_mask` — `(L, 14)` bool, True where coordinate was present in mmCIF
+- `atom14_mask` — `(L, 14)` bool, true for positive-occupancy atoms in the selected deposited conformer
+
+Preprocessing selects coherent residue conformers with fixed backbone support
+before considering continuity between deposited polymer neighbors. It preserves
+source coordinates; zero-occupancy atoms and query/structure mismatches are
+masked. See [coordinate selection](docs/DATA.md#coordinate-selection) for the
+deterministic selection policy and its limits.
 
 Additional label metadata:
 - `residue_index` — `(L,)` int32, duplicated for convenience when present

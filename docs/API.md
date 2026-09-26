@@ -114,7 +114,7 @@ Guaranteed keys:
 - `ca_coords: (B, L, 3) float`
 - `ca_mask: (B, L) bool`
 - `atom14_positions: (B, L, 14, 3) float` — full atom14 layout (AF2 supplement 1.2.1)
-- `atom14_mask: (B, L, 14) bool` — True where coordinate was present in mmCIF
+- `atom14_mask: (B, L, 14) bool` — true for positive-occupancy atoms in the selected deposited conformer, after query projection
 
 Optional metadata keys:
 - `residue_index: (B, L) int` — contiguous 0..L-1 per chain (AF2 supplement 1.2.9)
@@ -145,6 +145,17 @@ Public train/validation share one preprocessing configuration hash. Each feature
 
 Coordinate projection requires all optimal deposited-polymer alignments to agree
 on every observed residue's query position; ambiguous observed mappings fail.
+Atom selection uses one named alternate per residue plus shared blank atoms.
+It fixes the observed backbone mask independently of geometry, then selects
+conformers for peptide and CA continuity across known deposited polymer
+neighbors, using occupancy to break equal-geometry choices. Zero-occupancy
+atoms are unobserved; negative or nonfinite occupancy fails. No coordinates
+are adjusted. See [coordinate selection](DATA.md#coordinate-selection) for
+the complete policy. Parser changes require fresh qualification and processed
+outputs because their implementation hashes are part of provenance.
+For an ensemble, the parser chooses one whole deposited model using backbone
+continuity, comparing only models with the first model's exact residue identities,
+polymer positions and atom14 masks. It never combines atoms from different models.
 
 `scripts/fetch_openproteinset_mmcif.py` requires a manifest, fresh private output
 root, archive byte size, exact quoted ETag and explicit version ID. Its
