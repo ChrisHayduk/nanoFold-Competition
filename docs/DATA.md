@@ -243,6 +243,8 @@ The committed train and public-validation manifests, fingerprints and source loc
 
 Source-qualified candidate datasets explicitly select `--sampling-policy cath-v4` and metadata schema 2; staging otherwise defaults to `cath-v3`. `scripts/build_homology_groups.py` supplies the original complete group map and provenance receipt; `scripts/build_representative_eligibility.py` validates representatives against raw queries and uniformly pinned historical structures. Staging requires original `--cluster-tsv`, `--split-group-tsv`, `--split-group-receipt`, `--representative-eligibility-receipt` and `--approved-group-exclusions`. It builds both source locks, independently replays selection and requires complete cache-target audits before issuing a completion receipt. `cath-v2` and `cath-v3` remain explicit policies with separate replay semantics. Complete metadata is required; debug limits and permissive amino-acid filters cannot enter release sampling. See [Dataset sampling](DATA_SAMPLING.md) for commands, predicates, source evidence and scientific limits.
 
+Qualification stores input bindings, durable per-unit results and failure diagnostics in a fresh `<output.name>.diagnostics/` sibling directory. Keep it private and preserve failed attempts. These diagnostics neither replace the independently validated receipt nor authorize exclusions or automatic resume.
+
 `scripts/setup_custom_data.sh` consumes a staged public manifest directory and
 its source lock, with required `--chain-data-cache <path>` and explicit custom
 raw/features/labels directories. It checks the cache hash and locked public

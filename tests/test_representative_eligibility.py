@@ -158,9 +158,10 @@ def test_raw_query_audit_hashes_full_bytes_without_claiming_all_rows(tmp_path: P
     assert record["sha256"] == sha256_file(path)
 
 
-def test_generator_reconstructs_and_audits_ranked_population(
+@pytest.fixture
+def generator(
     eligibility: dict[str, Any], monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
-) -> None:
+) -> tuple[Any, Any, list[Any]]:
     import importlib
 
     module = importlib.import_module("scripts.build_representative_eligibility")
@@ -181,14 +182,108 @@ def test_generator_reconstructs_and_audits_ranked_population(
         "--historical-retrieval-receipt", str(eligibility["retrieval"]),
         "--raw-root", str(eligibility["raw_root"]), "--output", str(output),
     ])
+    return module, args, checked_graph
+
+
+def test_generator_reconstructs_and_audits_ranked_population(
+    eligibility: dict[str, Any], generator: tuple[Any, Any, list[Any]],
+) -> None:
+    module, args, checked_graph = generator
+    output = args.output
     result = module.run(args)
     assert len(checked_graph) == 1
     assert result["counts"] == {"eligible_unit_count": 2, "exhausted_unit_count": 1,
                                "excluded_group_count": 1, "retained_group_count": 2}
     assert output.is_file()
-    assert validate_representative_eligibility_receipt(output, **kwargs)["retained_group_count"] == 2
+    assert validate_representative_eligibility_receipt(output, **eligibility["kwargs"])["retained_group_count"] == 2
+    diagnostics = output.with_name(output.name + ".diagnostics")
+    assert [json.loads(line) for line in (diagnostics / "units.jsonl").read_text().splitlines()] == result["units"]
+    assert not (diagnostics / "failure.json").exists()
     with pytest.raises(ValueError, match="fresh private path"):
         module.run(args)
+
+
+def test_generator_preserves_complete_outcomes_when_exclusions_change(
+    eligibility: dict[str, Any], generator: tuple[Any, Any, list[Any]],
+) -> None:
+    from nanofold.chain_paths import chain_data_dir
+
+    module, args, _ = generator
+    # A real source-query mismatch exhausts one additional group without
+    # changing either the scientific predicate or its approved exclusions.
+    raw = chain_data_dir(eligibility["raw_root"] / "roda_pdb", "3ccc_A") / "uniref90_hits.a3m"
+    raw.write_text(">query\n" + "E" * 40 + "\n")
+    with pytest.raises(ValueError, match="Approved exclusions differ from fully exhausted original groups"):
+        module.run(args)
+    diagnostics = args.output.with_name(args.output.name + ".diagnostics")
+    rows = [json.loads(line) for line in (diagnostics / "units.jsonl").read_text().splitlines()]
+    failure = json.loads((diagnostics / "failure.json").read_text())
+    assert len(rows) == failure["completed_unit_count"] == failure["original_unit_count"] == 3
+    assert failure["full_population_evaluated"] is True
+    assert failure["pin_checks"] == {"predicate_unchanged": True, "inputs_unchanged": True}
+    assert failure["exclusion_mismatch"] == {
+        "approved_excluded_groups": ["4ddd_A"], "evaluated_empty_groups": ["3ccc_A", "4ddd_A"],
+        "newly_empty_groups": ["3ccc_A"], "previously_excluded_now_nonempty_groups": [],
+        "evaluated_passing_group_count": 1,
+    }
+    changed = next(row for row in rows if row["ranked_members"] == ["3ccc_A"])
+    assert changed["selected_chain_id"] is None
+    assert changed["outcomes"][0]["raw_rejection"] == "A3M ungapped query differs from the pinned cache target"
+    assert not args.output.exists() and not args.output.with_name(args.output.name + ".incomplete").exists()
+    assert failure["qualification_receipt_published"] is False
+    with pytest.raises(ValueError):
+        validate_representative_eligibility_receipt(diagnostics / "failure.json", **eligibility["kwargs"])
+    before = {path.name: path.read_bytes() for path in diagnostics.iterdir()}
+    with pytest.raises(ValueError, match="diagnostics require a fresh private path"):
+        module.run(args)
+    assert {path.name: path.read_bytes() for path in diagnostics.iterdir()} == before
+
+
+def test_generator_preserves_prefix_without_inventing_exhaustion_after_io_failure(
+    generator: tuple[Any, Any, list[Any]], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, args, _ = generator
+    original = module.audit_unit
+    calls = 0
+
+    def interrupted(*positional: Any, **keywords: Any) -> dict[str, Any]:
+        nonlocal calls
+        if calls:
+            raise OSError("Synthetic source read failure")
+        calls += 1
+        return original(*positional, **keywords)
+
+    monkeypatch.setattr(module, "audit_unit", interrupted)
+    with pytest.raises(OSError, match="Synthetic source read failure"):
+        module.run(args)
+    diagnostics = args.output.with_name(args.output.name + ".diagnostics")
+    failure = json.loads((diagnostics / "failure.json").read_text())
+    assert len((diagnostics / "units.jsonl").read_text().splitlines()) == failure["completed_unit_count"] == 1
+    assert failure["full_population_evaluated"] is False and failure["exclusion_mismatch"] == {}
+    assert failure["phase"] == "auditing_units" and failure["error_type"] == "OSError"
+    assert not args.output.exists()
+
+
+def test_generator_never_publishes_after_unit_journal_write_failure(
+    generator: tuple[Any, Any, list[Any]], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, args, _ = generator
+    original = module.os.fsync
+    calls = 0
+
+    def fail_unit_sync(descriptor: int) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:  # The first sync durably records the small input binding.
+            raise OSError("Synthetic journal sync failure")
+        original(descriptor)
+
+    monkeypatch.setattr(module.os, "fsync", fail_unit_sync)
+    with pytest.raises(OSError, match="Synthetic journal sync failure"):
+        module.run(args)
+    failure = json.loads(args.output.with_name(args.output.name + ".diagnostics").joinpath("failure.json").read_text())
+    assert failure["completed_unit_count"] == 0 and failure["full_population_evaluated"] is False
+    assert failure["exclusion_mismatch"] == {} and not args.output.exists()
 
 
 def test_group_names_cannot_reuse_approval_after_membership_changes(eligibility: dict[str, Any]) -> None:

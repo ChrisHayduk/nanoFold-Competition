@@ -167,6 +167,8 @@ builder requires original `--cluster-tsv`, `--split-group-tsv`,
 `--split-group-receipt`, `--representative-eligibility-receipt` and
 `--approved-group-exclusions`; source locks bind them for independent replay.
 
+Qualification journals completed units privately and preserves exclusion mismatches on failure. Diagnostic output does not qualify targets or authorize additional exclusions.
+
 For the 10,000/1,000/1,000 candidate contract:
 
 1. Jointly select 2,000 retained full groups while preserving training capacity.

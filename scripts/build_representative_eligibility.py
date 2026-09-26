@@ -4,6 +4,9 @@ Audit each complete unit's deterministic ranked prefix until its first passing
 member. Missing sources, acquisition errors and unrecognized parser failures
 abort qualification. Only complete group exhaustion permits an approved
 exclusion. All outputs and source paths are private maintainer evidence.
+Each fresh output also reserves a sibling ``<output>.diagnostics`` directory
+with durable unit outcomes and failure details. These are diagnostic evidence,
+never qualification acceptance or checkpoints that can skip a future audit.
 """
 from __future__ import annotations
 
@@ -79,6 +82,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _write_diagnostic(path: Path, value: dict[str, Any]) -> None:
+    with path.open("x") as handle:
+        json.dump(value, handle, sort_keys=True, indent=2, allow_nan=False)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
 def run(args: argparse.Namespace) -> dict[str, Any]:
     os.umask(0o077)
     output = args.output.resolve()
@@ -116,44 +127,93 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     sources, members = historical_source_catalog(args.historical_retrieval_receipt)
     roots = [path.resolve() for path in args.raw_root]
     sequences = {candidate.chain_id: candidate.sequence for candidate in candidates}
-    records = []
-    for unit, ranked in sorted(units.items()):
-        records.append(audit_unit(
-            unit, ranked, sequences=sequences, full_group=groups[ranked[0]], historical_members=members, raw_roots=roots,
-        ))
-        if len(records) % 100 == 0:
-            print(json.dumps({"status": "running", "audited_unit_count": len(records), "original_unit_count": len(units)}), flush=True)
-    passing = {record["full_group_id"] for record in records if record["selected_chain_id"] is not None}
-    empty = set(groups.values()) - passing
-    require(empty == set(approved), "Approved exclusions differ from fully exhausted original groups")
-    exhausted_count = sum(record["selected_chain_id"] is None for record in records)
-    require(predicate_record() == predicate, "Eligibility predicate changed during qualification")
-    require(all(file_record(Path(record["path"])) == record for record in input_bindings),
-            "Eligibility input changed during qualification")
-    result: dict[str, Any] = {
-        "schema_version": 1, "policy": POLICY, "status": "complete", "population": population,
-        "predicate": predicate, "historical_sources": sources,
-        "original_structure_metadata": file_record(args.structure_metadata),
-        "approved_group_exclusions_sha256": sha256_file(args.approved_group_exclusions), "units": records,
-        "counts": {"eligible_unit_count": len(units) - exhausted_count, "exhausted_unit_count": exhausted_count,
-                   "excluded_group_count": len(empty), "retained_group_count": len(passing)},
-    }
     output.parent.mkdir(parents=True, exist_ok=True)
-    temporary = output.with_name(output.name + ".incomplete")
-    require(not temporary.exists(), "Eligibility staging file already exists")
-    with temporary.open("x") as handle:
-        handle.write(json.dumps(result, sort_keys=True, indent=2, allow_nan=False) + "\n")
-    validate_representative_eligibility_receipt(
-        temporary, approved_group_exclusions_path=args.approved_group_exclusions,
-        chain_data_cache_path=args.chain_data_cache, structure_metadata_path=args.structure_metadata,
-        cluster_map=clusters, split_group_map=groups, split_group_receipt_path=args.split_group_receipt,
-        original_units=units, seed=args.seed,
-    )
-    # Link without replacement so another writer cannot be silently overwritten.
-    os.link(temporary, output)
-    temporary.unlink()
-    print(json.dumps({"status": "complete", **population, **result["counts"]}, sort_keys=True))
-    return result
+    diagnostics = output.with_name(output.name + ".diagnostics")
+    require(not diagnostics.exists() and not diagnostics.is_symlink(), "Eligibility diagnostics require a fresh private path")
+    diagnostics.mkdir()
+    _write_diagnostic(diagnostics / "bindings.json", {
+        "schema_version": 1, "artifact_type": "representative_eligibility_diagnostic_bindings",
+        "scope": "private_diagnostics_not_qualification_acceptance",
+        "inputs": input_bindings, "population": population, "predicate": predicate,
+        "historical_sources": sources, "raw_roots": [str(path) for path in roots],
+    })
+    journal = diagnostics / "units.jsonl"
+    records = []
+    phase = "auditing_units"
+    mismatch: dict[str, Any] = {}
+    try:
+        with journal.open("x") as handle:
+            for unit, ranked in sorted(units.items()):
+                record = audit_unit(
+                    unit, ranked, sequences=sequences, full_group=groups[ranked[0]], historical_members=members, raw_roots=roots,
+                )
+                handle.write(json.dumps(record, sort_keys=True, allow_nan=False) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+                records.append(record)
+                if len(records) % 100 == 0:
+                    print(json.dumps({"status": "running", "audited_unit_count": len(records), "original_unit_count": len(units)}), flush=True)
+        passing = {record["full_group_id"] for record in records if record["selected_chain_id"] is not None}
+        empty = set(groups.values()) - passing
+        phase = "checking_excluded_groups"
+        if empty != set(approved):
+            mismatch = {
+                "approved_excluded_groups": sorted(approved), "evaluated_empty_groups": sorted(empty),
+                "newly_empty_groups": sorted(empty - set(approved)),
+                "previously_excluded_now_nonempty_groups": sorted(set(approved) - empty),
+                "evaluated_passing_group_count": len(passing),
+            }
+        require(empty == set(approved), "Approved exclusions differ from fully exhausted original groups")
+        exhausted_count = sum(record["selected_chain_id"] is None for record in records)
+        phase = "checking_input_pins"
+        require(predicate_record() == predicate, "Eligibility predicate changed during qualification")
+        require(all(file_record(Path(record["path"])) == record for record in input_bindings),
+                "Eligibility input changed during qualification")
+        result: dict[str, Any] = {
+            "schema_version": 1, "policy": POLICY, "status": "complete", "population": population,
+            "predicate": predicate, "historical_sources": sources,
+            "original_structure_metadata": file_record(args.structure_metadata),
+            "approved_group_exclusions_sha256": sha256_file(args.approved_group_exclusions), "units": records,
+            "counts": {"eligible_unit_count": len(units) - exhausted_count, "exhausted_unit_count": exhausted_count,
+                       "excluded_group_count": len(empty), "retained_group_count": len(passing)},
+        }
+        temporary = output.with_name(output.name + ".incomplete")
+        require(not temporary.exists(), "Eligibility staging file already exists")
+        with temporary.open("x") as handle:
+            handle.write(json.dumps(result, sort_keys=True, indent=2, allow_nan=False) + "\n")
+        phase = "validating_receipt"
+        validate_representative_eligibility_receipt(
+            temporary, approved_group_exclusions_path=args.approved_group_exclusions,
+            chain_data_cache_path=args.chain_data_cache, structure_metadata_path=args.structure_metadata,
+            cluster_map=clusters, split_group_map=groups, split_group_receipt_path=args.split_group_receipt,
+            original_units=units, seed=args.seed,
+        )
+        phase = "publishing_receipt"
+        # Link without replacement so another writer cannot be silently overwritten.
+        os.link(temporary, output)
+        temporary.unlink()
+        print(json.dumps({"status": "complete", **population, **result["counts"]}, sort_keys=True))
+        return result
+    except BaseException as exc:
+        try:
+            pin_checks: dict[str, Any] = {"predicate_unchanged": None, "inputs_unchanged": None}
+            try:
+                pin_checks["predicate_unchanged"] = predicate_record() == predicate
+                pin_checks["inputs_unchanged"] = all(file_record(Path(row["path"])) == row for row in input_bindings)
+            except Exception as check_error:
+                pin_checks["error_type"] = type(check_error).__name__
+            _write_diagnostic(diagnostics / "failure.json", {
+                "schema_version": 1, "artifact_type": "representative_eligibility_failure_diagnostic",
+                "scope": "private_diagnostics_not_qualification_acceptance", "status": "failed",
+                "phase": phase, "error_type": type(exc).__name__, "error": str(exc),
+                "completed_unit_count": len(records), "original_unit_count": len(units),
+                "full_population_evaluated": len(records) == len(units), "pin_checks": pin_checks,
+                "units": file_record(journal), "exclusion_mismatch": mismatch,
+                "qualification_receipt_published": output.exists(),
+            })
+        except Exception as diagnostic_error:
+            exc.add_note(f"Private failure diagnostics could not be published: {type(diagnostic_error).__name__}")
+        raise
 
 
 def main() -> int:

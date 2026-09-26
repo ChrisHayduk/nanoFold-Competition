@@ -139,6 +139,8 @@ the unchanged complete `--split-group-tsv` and `--split-group-receipt`, plus
 `--representative-eligibility-receipt` and `--approved-group-exclusions`.
 `cath-v2` and `cath-v3` remain explicit policies with their own replay contracts.
 
+Qualification retains private per-unit diagnostics beside its output, including failed attempts; only a completed, independently validated receipt permits selection.
+
 - CATH Class, Architecture, Topology, and Homologous superfamily identifiers are
   retained per domain, including multiple domains on a chain. Missing annotation
   is explicit; broad alpha/beta labels do not substitute for CATH Architecture.
