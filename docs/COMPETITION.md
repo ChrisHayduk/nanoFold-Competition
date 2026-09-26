@@ -182,8 +182,8 @@ For the 10,000/1,000/1,000 candidate contract:
    actual hidden distributions must pass quality checks. Hidden-only generation
    replays the same plan; new failures cannot trigger silent resampling.
 
-The approved candidate excludes six exhausted groups from the original 8,856,
-retaining 8,850. Training therefore requires 6,850 anchors plus 3,150 additional
+The approved candidate excludes eight exhausted groups from the original 8,856,
+retaining 8,848. Training therefore requires 6,848 anchors plus 3,152 additional
 validated representatives. Original and validated unit counts/digests, retained
 group counts, maximum training-group share, annotation coverage and CATH
 familiarity are reported separately. Capacity and large groups can skew the

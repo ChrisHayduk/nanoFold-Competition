@@ -161,9 +161,9 @@ Qualification retains private per-unit diagnostics beside its output, including 
   validated population digests, group counts and maximum training-group share.
   These describe selection and concentration, not improved model performance.
 
-The approved candidate excludes six exhausted groups from the original 8,856,
-retaining 8,850. With 10,000/1,000/1,000 targets, training requires 6,850 group
-anchors plus 3,150 additional validated representatives. Candidate generation
+The approved candidate excludes eight exhausted groups from the original 8,856,
+retaining 8,848. With 10,000/1,000/1,000 targets, training requires 6,848 group
+anchors plus 3,152 additional validated representatives. Candidate generation
 does not establish that processed assets have passed every gate or adopt a new
 release. Large groups can dominate target-weighted training; inverse-group
 weighting is a separate ablation, and concentration must be measured on the
