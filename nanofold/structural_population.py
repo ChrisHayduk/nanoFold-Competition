@@ -27,6 +27,7 @@ from nanofold.representative_eligibility import (
     require,
     sha256_file,
 )
+from nanofold.source_availability import validate_source_availability
 
 POLICY = "uniform_qualified_training_sequences_v1"
 
@@ -72,7 +73,8 @@ def qualification_predicate() -> dict[str, Any]:
     return {"inspection": predicate_record(),
             "driver": file_record(root / "scripts/qualify_structural_population.py"),
             "journal": file_record(Path(__file__)),
-            "geometry": file_record(root / "nanofold/structural_geometry.py")}
+            "geometry": file_record(root / "nanofold/structural_geometry.py"),
+            "availability": file_record(root / "nanofold/source_availability.py")}
 
 
 def validate_qualification_predicate(record: dict[str, Any]) -> None:
@@ -81,7 +83,7 @@ def validate_qualification_predicate(record: dict[str, Any]) -> None:
     require(set(record) == set(current), "Qualification predicate structure differs")
     require(record["inspection"] == current["inspection"],
             "Qualification inspection code or runtime differs from its frozen execution")
-    for name in ("driver", "journal", "geometry"):
+    for name in ("driver", "journal", "geometry", "availability"):
         require(isinstance(record[name], dict) and set(record[name]) == {"path", "sha256"},
                 "Qualification implementation binding differs")
         validate_file_binding(record[name])
@@ -146,7 +148,19 @@ def sequence_plan(
     return sorted(output, key=lambda row: row["sequence_sha256"])
 
 
-def validate_outcome(plan: dict[str, Any], outcome: dict[str, Any], *, verify_sources: bool) -> None:
+def unavailable_attempt(candidate: dict[str, Any], rank: int, evidence: dict[str, Any]) -> dict[str, Any]:
+    """Record acquisition support without inventing a scientific inspection."""
+    return {"chain_id": candidate["chain_id"], "rank": rank,
+            "sequence_sha256": hashlib.sha256(candidate["sequence"].encode()).hexdigest(),
+            "target_length": len(candidate["sequence"]), "status": "source_unavailable",
+            "structure_status": "not_evaluated_source_unavailable", "raw_status": "source_unavailable",
+            "source_availability": evidence}
+
+
+def validate_outcome(
+    plan: dict[str, Any], outcome: dict[str, Any], *, verify_sources: bool,
+    source_availability: dict[str, dict[str, Any]] | None = None,
+) -> None:
     """Reject skipped candidates, partial exhaustion, and stale resumed sources."""
     require(outcome.get("sequence_sha256") == plan["sequence_sha256"]
             and outcome.get("group_id") == plan["group_id"], "Outcome differs from sequence plan")
@@ -158,9 +172,16 @@ def validate_outcome(plan: dict[str, Any], outcome: dict[str, Any], *, verify_so
         require(attempt.get("chain_id") == candidate["chain_id"] and attempt.get("rank") == index
                 and attempt.get("sequence_sha256") == plan["sequence_sha256"],
                 "Qualification did not evaluate the exact ranked prefix")
-        require(attempt.get("status") in {"passed", "failed"}, "Incomplete qualification outcome")
-        require(index == len(attempts) - 1 or attempt["status"] == "failed",
+        require(attempt.get("status") in {"passed", "failed", "source_unavailable"}, "Incomplete qualification outcome")
+        require(index == len(attempts) - 1 or attempt["status"] != "passed",
                 "Qualification continued after the first passing copy")
+        if attempt["status"] == "source_unavailable":
+            evidence = (source_availability or {}).get(candidate["chain_id"])
+            if evidence is None:
+                raise ValueError("Source-unavailable copy lacks verified acquisition evidence")
+            require(attempt == unavailable_attempt(candidate, index, evidence),
+                    "Source-unavailable outcome differs from its acquisition evidence")
+            continue
         require(attempt.get("structure_status") in {"passed", "failed"}, "Unrecognized structure status")
         statistics = attempt.get("projection_statistics")
         if statistics is None:
@@ -209,10 +230,16 @@ def validate_outcome(plan: dict[str, Any], outcome: dict[str, Any], *, verify_so
 
 def validate_outcome_source_membership(
     outcome: dict[str, Any], catalog: dict[str, Any], raw_roots: list[str],
+    source_availability: dict[str, dict[str, Any]] | None = None,
 ) -> None:
     """Bind replayed source bytes to their owning PDB and chain lookup."""
     for attempt in outcome["attempts"]:
         chain = attempt["chain_id"]
+        if attempt.get("status") == "source_unavailable":
+            require(chain in (source_availability or {})
+                    and attempt.get("source_availability") == (source_availability or {})[chain],
+                    "Source-unavailable copy differs from the bound acquisition certificate")
+            continue
         require(attempt["structure"] == catalog["members"][chain.split("_", 1)[0]],
                 "Inspected structure differs from historical acquisition catalog")
         if attempt.get("raw") is not None:
@@ -223,6 +250,7 @@ def validate_outcome_source_membership(
 
 def qualify_sequence(
     plan: dict[str, Any], inspect: Callable[[dict[str, Any], int], dict[str, Any]],
+    *, source_availability: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     attempts = []
     selected = None
@@ -234,23 +262,39 @@ def qualify_sequence(
             break
     result = {"sequence_sha256": plan["sequence_sha256"], "group_id": plan["group_id"],
               "selected_chain_id": selected, "attempts": attempts}
-    validate_outcome(plan, result, verify_sources=False)
+    validate_outcome(plan, result, verify_sources=False, source_availability=source_availability)
     return result
 
 
-def summarize(plans: list[dict[str, Any]], outcomes: list[dict[str, Any]]) -> dict[str, Any]:
+def summarize(
+    plans: list[dict[str, Any]], outcomes: list[dict[str, Any]],
+    *, source_availability: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     require(len(plans) == len(outcomes), "Qualification did not exhaust the sequence frame")
     by_hash = {outcome["sequence_sha256"]: outcome for outcome in outcomes}
     require(len(by_hash) == len(outcomes), "Repeated sequence outcome")
     for plan in plans:
         require(plan["sequence_sha256"] in by_hash, "Sequence outcome is missing")
-        validate_outcome(plan, by_hash[plan["sequence_sha256"]], verify_sources=False)
+        validate_outcome(plan, by_hash[plan["sequence_sha256"]], verify_sources=False,
+                         source_availability=source_availability)
     passed = [outcome for outcome in outcomes if outcome["selected_chain_id"] is not None]
     group_count = Counter(outcome["group_id"] for outcome in passed)
     empty = sorted({plan["group_id"] for plan in plans} - group_count.keys())
+    exhausted = [outcome for outcome in outcomes if outcome["selected_chain_id"] is None]
+    losses = {"source_unavailable_only": 0, "inspection_rejected_only": 0,
+              "source_unavailable_and_inspection_rejected": 0}
+    for outcome in exhausted:
+        statuses = {attempt["status"] for attempt in outcome["attempts"]}
+        key = ("source_unavailable_only" if statuses == {"source_unavailable"} else
+               "inspection_rejected_only" if statuses == {"failed"} else
+               "source_unavailable_and_inspection_rejected")
+        losses[key] += 1
     return {"source_chain_count": sum(len(plan["ranked_copies"]) for plan in plans),
             "source_sequence_count": len(plans), "qualified_sequence_count": len(passed),
             "exhausted_sequence_count": len(plans) - len(passed),
+            "exhausted_sequence_counts_by_cause": losses,
+            "source_unavailable_chain_count": sum(attempt["status"] == "source_unavailable"
+                                                  for outcome in outcomes for attempt in outcome["attempts"]),
             "attempted_chain_count": sum(len(outcome["attempts"]) for outcome in outcomes),
             "required_group_count": len({plan["group_id"] for plan in plans}),
             "qualified_group_count": len(group_count), "empty_group_ids": empty}
@@ -280,8 +324,14 @@ def validate_receipt(path: Path, *, verify_sources: bool = False) -> dict[str, A
     for binding in plan["inputs"]:
         validate_file_binding(binding)
     rows = read_rows(Path(receipt["sequence_plan"]["path"]))
+    availability_binding = bindings.get("source_availability_certificate")
+    availability = (validate_source_availability(Path(availability_binding["path"]), rows, bindings["raw_roots"])
+                    if availability_binding is not None else {})
+    if availability_binding is not None:
+        validate_file_binding(availability_binding)
     outcomes = read_rows(Path(receipt["outcomes"]["path"]))
-    require(summarize(rows, outcomes) == receipt["counts"], "Population summary differs from complete outcomes")
+    require(summarize(rows, outcomes, source_availability=availability) == receipt["counts"],
+            "Population summary differs from complete outcomes")
     require(not plan.get("require_all_groups", True) or not receipt["counts"]["empty_group_ids"],
             "Qualification lost a required training group")
     selected = {row["sequence_sha256"]: row["selected_chain_id"] for row in outcomes if row["selected_chain_id"]}
@@ -303,8 +353,9 @@ def validate_receipt(path: Path, *, verify_sources: bool = False) -> dict[str, A
                                     "qualification": outcome["attempts"][-1]}
             require(by_qualified[row["sequence_sha256"]] == expected,
                     "Qualified sequence fields differ from frozen plan and inspected source")
-        validate_outcome_source_membership(outcome, catalog, bindings["raw_roots"])
+        validate_outcome_source_membership(outcome, catalog, bindings["raw_roots"], availability)
     if verify_sources:
         for row in rows:
-            validate_outcome(row, by_outcome[row["sequence_sha256"]], verify_sources=True)
+            validate_outcome(row, by_outcome[row["sequence_sha256"]], verify_sources=True,
+                             source_availability=availability)
     return receipt

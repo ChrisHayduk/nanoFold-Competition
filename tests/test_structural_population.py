@@ -13,6 +13,7 @@ from nanofold.structural_population import (
     qualify_sequence,
     sequence_plan,
     summarize,
+    unavailable_attempt,
     validate_outcome,
     validate_outcome_source_membership,
     validate_qualification_predicate,
@@ -116,7 +117,7 @@ def _relocated_predicate(tmp_path: Path) -> tuple[dict, dict]:
     inspection = {"code": {"parser.py": "frozen-parser-hash"}, "runtime": {"python": "3.12.15"}}
     original: dict[str, Any] = {"inspection": inspection.copy()}
     relocated: dict[str, Any] = {"inspection": inspection.copy()}
-    for name in ("driver", "journal", "geometry"):
+    for name in ("driver", "journal", "geometry", "availability"):
         old = tmp_path / "original" / name
         new = tmp_path / "relocated" / name
         old.parent.mkdir(exist_ok=True)
@@ -173,3 +174,109 @@ def test_predicate_relocation_rejects_code_and_runtime_drift(
     monkeypatch.setattr("nanofold.structural_population.qualification_predicate", lambda: relocated)
     with pytest.raises(ValueError, match="Bound source file changed|implementation bytes differ|inspection code or runtime differs"):
         validate_qualification_predicate(original)
+
+
+def test_certified_missing_copy_advances_rank_without_inventing_inspection(monkeypatch: pytest.MonkeyPatch) -> None:
+    from scripts.qualify_structural_population import inspect_sequence
+
+    plan = sequence_plan([_copy("1abc_A"), _copy("2abc_A")], rank=lambda row: row["chain_id"])[0]
+    evidence = {"1abc_A": {"certificate": {"path": "verified-certificate", "sha256": "frozen"}}}
+    inspected = []
+
+    def inspect(**kwargs: Any) -> dict[str, Any]:
+        inspected.append(kwargs["chain"])
+        return _inspection(_copy(kwargs["chain"]), kwargs["rank"], True)
+
+    monkeypatch.setattr("scripts.qualify_structural_population.inspect_candidate", inspect)
+    outcome = inspect_sequence((plan, {"2abc": {}}, [], evidence))
+    assert inspected == ["2abc_A"]
+    assert outcome["selected_chain_id"] == "2abc_A"
+    assert outcome["attempts"][0] == unavailable_attempt(plan["ranked_copies"][0], 0, evidence["1abc_A"])
+    assert "structure" not in outcome["attempts"][0]
+    counts = summarize([plan], [outcome], source_availability=evidence)
+    assert counts["source_sequence_count"] == counts["qualified_sequence_count"] == 1
+    assert counts["source_unavailable_chain_count"] == 1
+    assert sum(counts["exhausted_sequence_counts_by_cause"].values()) == 0
+
+
+def test_uncertified_missing_raw_stays_pending_before_later_rank(monkeypatch: pytest.MonkeyPatch) -> None:
+    from scripts.qualify_structural_population import inspect_sequence
+
+    plan = sequence_plan([_copy("1abc_A"), _copy("2abc_A")], rank=lambda row: row["chain_id"])[0]
+    inspected = []
+
+    def inspect(**kwargs: Any) -> dict[str, Any]:
+        inspected.append(kwargs["chain"])
+        raise ValueError("Required raw query source is missing; acquisition is incomplete")
+
+    monkeypatch.setattr("scripts.qualify_structural_population.inspect_candidate", inspect)
+    outcome = inspect_sequence((plan, {"1abc": {}, "2abc": {}}, [], {}))
+    assert outcome["status"] == "sources_needed" and outcome["pending_chain_id"] == "1abc_A"
+    assert outcome["attempts"] == [] and inspected == ["1abc_A"]
+
+
+def test_certified_availability_losses_keep_every_parent_and_copy(monkeypatch: pytest.MonkeyPatch) -> None:
+    from scripts.qualify_structural_population import inspect_sequence
+
+    plans = sequence_plan([_copy("1abc_A"), _copy("2abc_A"), _copy("3abc_A", "CCCC"),
+                           _copy("4abc_A", "CCCC"), _copy("5abc_A", "DDDD")],
+                          rank=lambda row: row["chain_id"])
+    evidence = {chain: {"certificate": {"path": "verified", "sha256": chain}}
+                for chain in ("1abc_A", "2abc_A", "3abc_A")}
+    monkeypatch.setattr("scripts.qualify_structural_population.inspect_candidate",
+                        lambda **kwargs: _inspection(_copy(kwargs["chain"], kwargs["sequence"]), kwargs["rank"], False))
+    outcomes = [inspect_sequence((plan, {"4abc": {}, "5abc": {}}, [], evidence)) for plan in plans]
+    counts = summarize(plans, outcomes, source_availability=evidence)
+    assert counts["source_sequence_count"] == counts["exhausted_sequence_count"] == 3
+    assert counts["source_chain_count"] == counts["attempted_chain_count"] == 5
+    assert counts["source_unavailable_chain_count"] == 3
+    assert counts["exhausted_sequence_counts_by_cause"] == {
+        "source_unavailable_only": 1, "source_unavailable_and_inspection_rejected": 1,
+        "inspection_rejected_only": 1}
+    index = next(i for i, plan in enumerate(plans) if plan["sequence"] == "AAAA")
+    outcomes[index]["attempts"].pop()
+    with pytest.raises(ValueError, match="without exhausting"):
+        validate_outcome(plans[index], outcomes[index], verify_sources=False, source_availability=evidence)
+
+
+def test_unavailable_attempt_requires_exact_verified_copy_evidence() -> None:
+    plan = sequence_plan([_copy("1abc_A")], rank=lambda row: row["chain_id"])[0]
+    evidence = {"1abc_A": {"certificate": {"path": "verified", "sha256": "original"}}}
+    outcome = qualify_sequence(plan, lambda candidate, rank: unavailable_attempt(candidate, rank, evidence["1abc_A"]),
+                               source_availability=evidence)
+    with pytest.raises(ValueError, match="lacks verified acquisition"):
+        validate_outcome(plan, outcome, verify_sources=False)
+    with pytest.raises(ValueError, match="differs from its acquisition evidence"):
+        validate_outcome(plan, outcome, verify_sources=False,
+                         source_availability={"1abc_A": {"certificate": {"path": "verified", "sha256": "changed"}}})
+    outcome["attempts"][0]["structure_status"] = "failed"
+    with pytest.raises(ValueError, match="differs from its acquisition evidence"):
+        validate_outcome(plan, outcome, verify_sources=False, source_availability=evidence)
+
+
+def test_acquisition_certificate_to_qualification_preserves_uncovered_copies(tmp_path: Path) -> None:
+    from test_source_availability import make_source_availability_case
+
+    from nanofold.source_availability import validate_source_availability
+    from scripts.qualify_structural_population import inspect_sequence
+
+    certificate, plans, roots = make_source_availability_case(tmp_path)
+    plan = plans[0]
+    plan["ranked_copies"] = [copy | {"sequence": plan["sequence"], "length": len(plan["sequence"])}
+                             for copy in plan["ranked_copies"]]
+    availability = validate_source_availability(certificate, plans, roots)
+    outcome = inspect_sequence((plan, {}, roots, availability))
+    validate_outcome(plan, outcome, verify_sources=True, source_availability=availability)
+    validate_outcome_source_membership(outcome, {"members": {}}, roots, availability)
+    counts = summarize(plans, [outcome], source_availability=availability)
+    assert counts["source_sequence_count"] == 1 and counts["attempted_chain_count"] == 3
+    assert counts["exhausted_sequence_counts_by_cause"]["source_unavailable_only"] == 1
+
+    # Another deposited copy of the same sequence is not proved unavailable by
+    # any of the recorded routes. It must remain pending, preserving its parent.
+    plan["ranked_copies"].append(_copy("2abc_A", plan["sequence"]))
+    availability = validate_source_availability(certificate, plans, roots)
+    pending = inspect_sequence((plan, {}, roots, availability))
+    assert pending["status"] == "sources_needed" and pending["pending_chain_id"] == "2abc_A"
+    with pytest.raises(ValueError, match="without exhausting"):
+        validate_outcome(plan, outcome, verify_sources=True, source_availability=availability)

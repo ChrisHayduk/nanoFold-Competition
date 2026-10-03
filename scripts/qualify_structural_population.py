@@ -3,7 +3,8 @@
 The plan contains every metadata-eligible training-owned chain, grouped only by
 identical sequence, with copies ranked before source availability is examined.
 Required sources must already be acquired by the owning raw-source retrievers.
-Missing sources abort; they never reduce the reference population silently.
+Missing sources pause unless a pinned complete acquisition certificate proves
+the required raw source unavailable. Every planned parent retains an outcome.
 """
 from __future__ import annotations
 
@@ -27,11 +28,13 @@ from nanofold.representative_eligibility import (
     read_json,
     require,
 )
+from nanofold.source_availability import validate_source_availability
 from nanofold.structural_population import (
     POLICY,
     qualification_predicate,
     read_rows,
     summarize,
+    unavailable_attempt,
     validate_file_binding,
     validate_outcome,
     validate_outcome_source_membership,
@@ -47,12 +50,17 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def inspect_sequence(payload: tuple[dict[str, Any], dict[str, Any], list[str]]) -> dict[str, Any]:
-    plan, structures, raw_roots = payload
+def inspect_sequence(
+    payload: tuple[dict[str, Any], dict[str, Any], list[str], dict[str, dict[str, Any]]],
+) -> dict[str, Any]:
+    plan, structures, raw_roots, availability = payload
     attempts: list[dict[str, Any]] = []
     selected = None
     for rank, candidate in enumerate(plan["ranked_copies"]):
         chain = candidate["chain_id"]
+        if chain in availability:
+            attempts.append(unavailable_attempt(candidate, rank, availability[chain]))
+            continue
         pdb = chain.split("_", 1)[0]
         if pdb not in structures:
             return {"status": "sources_needed", "sequence_sha256": plan["sequence_sha256"],
@@ -74,7 +82,7 @@ def inspect_sequence(payload: tuple[dict[str, Any], dict[str, Any], list[str]]) 
             break
     outcome = {"sequence_sha256": plan["sequence_sha256"], "group_id": plan["group_id"],
                "selected_chain_id": selected, "attempts": attempts}
-    validate_outcome(plan, outcome, verify_sources=False)
+    validate_outcome(plan, outcome, verify_sources=False, source_availability=availability)
     return outcome
 
 
@@ -112,6 +120,11 @@ def _run_locked(args: argparse.Namespace, output: Path) -> dict[str, Any]:
                "sequence_plan": sequence_binding, "predicate": predicate,
                "historical_archive": catalog["historical_sources"]["archive_pin"],
                "raw_roots": sorted(str(path.resolve()) for path in args.raw_root)}
+    availability_path = args.source_availability_certificate
+    if availability_path is not None:
+        binding["source_availability_certificate"] = file_record(availability_path)
+    availability = (validate_source_availability(availability_path, plans, binding["raw_roots"])
+                    if availability_path is not None else {})
     binding_path = output / "qualification-bindings.json"
     if binding_path.exists():
         previous = read_json(binding_path)
@@ -134,8 +147,8 @@ def _run_locked(args: argparse.Namespace, output: Path) -> dict[str, Any]:
         path = records_dir / (row["sequence_sha256"] + ".json")
         if path.exists():
             result = read_json(path)
-            validate_outcome_source_membership(result, catalog, binding["raw_roots"])
-            validate_outcome(row, result, verify_sources=True)
+            validate_outcome_source_membership(result, catalog, binding["raw_roots"], availability)
+            validate_outcome(row, result, verify_sources=True, source_availability=availability)
             completed[row["sequence_sha256"]] = result
         else:
             pending.append(row)
@@ -149,7 +162,9 @@ def _run_locked(args: argparse.Namespace, output: Path) -> dict[str, Any]:
         # Only each sequence's relevant structure records cross process boundaries.
         payloads = ((row, {copy["chain_id"].split("_", 1)[0]: structures[copy["chain_id"].split("_", 1)[0]]
                            for copy in row["ranked_copies"] if copy["chain_id"].split("_", 1)[0] in structures},
-                     binding["raw_roots"]) for row in pending)
+                     binding["raw_roots"], {copy["chain_id"]: availability[copy["chain_id"]]
+                                            for copy in row["ranked_copies"] if copy["chain_id"] in availability})
+                    for row in pending)
         try:
             with ProcessPoolExecutor(max_workers=args.workers) as pool:
                 for result in pool.map(inspect_sequence, payloads, chunksize=1):
@@ -174,13 +189,17 @@ def _run_locked(args: argparse.Namespace, output: Path) -> dict[str, Any]:
             raise
     _check_bindings(plan["inputs"] + catalog["inputs"] + [plan_binding, sequence_binding])
     validate_qualification_predicate(predicate)
+    if availability_path is not None:
+        validate_file_binding(binding["source_availability_certificate"])
+        require(validate_source_availability(availability_path, plans, binding["raw_roots"]) == availability,
+                "Source availability changed during qualification")
     if source_requests:
         request_path = output / ("sources-needed-" + _now().replace(":", "-") + ".jsonl")
         write_rows(request_path, source_requests)
         return {"status": "sources_needed", "counts": {"completed_sequence_count": len(completed),
                 "pending_sequence_count": len(source_requests)}, "requests": file_record(request_path)}
     outcomes = [completed[row["sequence_sha256"]] for row in plans]
-    counts = summarize(plans, outcomes)
+    counts = summarize(plans, outcomes, source_availability=availability)
     require(not plan.get("require_all_groups", True) or not counts["empty_group_ids"],
             "Qualification exhausted a required training group")
     qualified = []
@@ -218,6 +237,8 @@ def main() -> int:
     parser.add_argument("--source-catalog", type=Path, required=True,
                         help="Complete pinned historical source catalog; acquisition errors are fatal.")
     parser.add_argument("--raw-root", type=Path, action="append", required=True)
+    parser.add_argument("--source-availability-certificate", type=Path,
+                        help="Optional complete raw-acquisition proof; uncertified missing sources stay pending.")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--workers", type=int, default=2)
     args = parser.parse_args()

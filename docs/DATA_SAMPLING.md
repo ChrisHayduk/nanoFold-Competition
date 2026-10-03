@@ -99,6 +99,22 @@ resolution has an explicit category and never becomes a zero-resolution quality
 advantage. All modes require exactly the requested number of distinct sequences.
 Insufficient qualified sequence capacity fails.
 
+`scripts/qualify_structural_population.py` evaluates deposited copies in their
+frozen quality order and preserves an outcome for every planned parent. Missing
+raw sources remain pending unless `--source-availability-certificate` supplies
+a complete, pinned acquisition proof. The owning validator reconstructs every
+allowed duplicate-map route from the original inputs and accepts only completed
+empty listings for the required MSA under the recorded request policy. Transport
+errors, partial listings, unknown routes and changed files cannot certify absence.
+Each certified unavailable copy has an explicit `source_unavailable` outcome;
+it has no invented structure or sequence inspection result. A parent is exhausted
+only after every admitted copy has an explicit terminal outcome. Reports separate
+source-only, inspection-only and mixed losses while retaining the full planned
+denominator. This proves availability for that frozen source acquisition, not
+permanent absence or biological unsuitability. Current-owner replay uses fresh
+output directories when qualification code changes; existing receipts remain
+immutable.
+
 For full-parent selection, pass `crop_size=256` and
 `group_policy="soft_diversity"` explicitly. There can be more diversity groups
 than sample slots. This mode jointly selects parents using a source-weighted
