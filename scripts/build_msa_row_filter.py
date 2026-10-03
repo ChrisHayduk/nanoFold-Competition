@@ -25,7 +25,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from nanofold.a3m import GAP_ID, MASK_ID, RESTYPES, read_a3m, ungap_query_columns
+from nanofold.a3m import GAP_ID, MASK_ID, RESTYPES, iter_a3m_rows
 from nanofold.chain_paths import chain_data_dir, chain_npz_path
 from nanofold.mmseqs import (
     batched_mmseqs_summary,
@@ -95,6 +95,10 @@ def parse_args() -> argparse.Namespace:
     )
     ap.add_argument("--min-seq-id", type=float, default=0.30)
     ap.add_argument("--coverage", type=float, default=0.80)
+    ap.add_argument("--coverage-mode", type=int, choices=(0, 2), default=0,
+                    help="0: bidirectional coverage; 2: heldout-query coverage for full-parent sources.")
+    ap.add_argument("--max-sequence-length", type=int, default=256,
+                    help="Pinned upper bound for complete heldout and source sequences; never crops search inputs.")
     ap.add_argument("--mmseqs-bin", default="mmseqs")
     ap.add_argument("--threads", type=int, default=8)
     ap.add_argument(
@@ -104,7 +108,7 @@ def parse_args() -> argparse.Namespace:
         help="MMseqs max reported hits per held-out target. Keep high for filtering.",
     )
     ap.add_argument("--checkpoint-dir", type=Path, default=None,
-                    help="Private resumable exhaustive search directory; requires --exhaustive, sequences <=256 residues.")
+                    help="Private resumable exhaustive search directory; requires --exhaustive; sequence lengths respect --max-sequence-length.")
     ap.add_argument("--source-batch-size", type=int, default=1_000_000, help="Maximum source records per batch (1..1000000).")
     ap.add_argument("--query-batch-size", type=int, default=256, help="Maximum held-out records per batch (1..256).")
     ap.add_argument("--search-disk-reserve-gib", type=int, default=100, help="Free-disk reserve during bounded search.")
@@ -294,18 +298,16 @@ def _scan_raw_msa_rows(
                     continue
                 loaded = True
                 msa_path = _record_source_asset(msa_path, source_asset_sha256)
-                a3m = read_a3m(msa_path)
-                msa, deletions = a3m.to_tokens(max_seqs=None)
-                aligned_msa, _ = a3m.to_aligned_msa()
-                msa, _deletions, _query = ungap_query_columns(
-                    msa=msa,
-                    deletions=deletions,
-                    query_aligned=aligned_msa[0],
-                )
-                stats["rows"] += int(msa.shape[0])
-                for row in msa[1:]:
+                query_columns: list[int] | None = None
+                for _header, aligned, _deletions in iter_a3m_rows(msa_path):
+                    stats["rows"] += 1
+                    if query_columns is None:
+                        query_columns = [index for index, residue in enumerate(aligned) if residue != "-"]
+                        continue
                     stats["non_query_rows"] += 1
-                    _add_sequence(sequences_by_hash, _msa_row_to_ungapped_sequence(row))
+                    sequence = "".join(aligned[index] if aligned[index] in RESTYPES else "X"
+                                       for index in query_columns if aligned[index] != "-")
+                    _add_sequence(sequences_by_hash, sequence)
             if loaded:
                 stats["chains"] += 1
     stats["unique_non_query_rows"] = len(sequences_by_hash)
@@ -356,6 +358,7 @@ def _run_mmseqs(
     threads: int,
     max_seqs: int,
     exhaustive: bool = False,
+    coverage_mode: int = 0, max_sequence_length: int = 256,
 ) -> list[str]:
     validate_search_parameters(min_seq_id=min_seq_id, coverage=coverage, threads=threads, max_seqs=max_seqs)
     if exhaustive:
@@ -365,6 +368,8 @@ def _run_mmseqs(
             raise ValueError(
                 f"Exhaustive MSA filtering requires --max-seqs >= {source_count} unique source rows; got {max_seqs}."
             )
+    if coverage_mode not in (0, 2) or type(max_sequence_length) is not int or max_sequence_length < 1:
+        raise ValueError("Invalid coverage mode or maximum sequence length")
     output_m8.unlink(missing_ok=True)
     cmd = [
         mmseqs_bin,
@@ -378,7 +383,9 @@ def _run_mmseqs(
         "-c",
         str(coverage),
         "--cov-mode",
-        "0",
+        str(coverage_mode),
+        "--max-seq-len",
+        str(max_sequence_length),
         "--alignment-mode",
         "3",
         "--seq-id-mode",
@@ -408,13 +415,13 @@ def _run_mmseqs(
 
 
 def _parse_excluded_hashes(
-    output_m8: Path, *, query_ids: set[str], source_hashes: set[str], min_seq_id: float, coverage: float,
+    output_m8: Path, *, query_ids: set[str], source_hashes: set[str], min_seq_id: float, coverage: float, coverage_mode: int = 0,
 ) -> tuple[set[str], int]:
     excluded: set[str] = set()
     hit_count = 0
     for _query, target in iter_mmseqs_hits(
         output_m8, query_ids=query_ids, target_ids={f"seq_{digest}" for digest in source_hashes},
-        min_seq_id=min_seq_id, coverage=coverage,
+        min_seq_id=min_seq_id, coverage=coverage, coverage_mode=coverage_mode,
     ):
         excluded.add(target.removeprefix("seq_"))
         hit_count += 1
@@ -426,6 +433,10 @@ def main() -> None:
     validate_search_parameters(
         min_seq_id=args.min_seq_id, coverage=args.coverage, threads=args.threads, max_seqs=args.max_seqs,
     )
+    if args.coverage_mode == 2 and (not args.exhaustive or args.checkpoint_dir is None):
+        raise ValueError("Heldout-query coverage requires exhaustive checkpoint evidence")
+    if args.max_sequence_length < 1:
+        raise ValueError("Maximum sequence length must be positive")
     if args.checkpoint_dir is not None and not args.exhaustive:
         raise ValueError("--checkpoint-dir requires --exhaustive")
     if not 1 <= args.source_batch_size <= 1_000_000 or not 1 <= args.query_batch_size <= 256:
@@ -482,6 +493,11 @@ def main() -> None:
         _sequence_sha256(_chain_sequence(cache, chain_id))
         for manifest in heldout_manifests for chain_id in _read_manifest(manifest)
     }
+    if any(len(sequence) > args.max_sequence_length for sequence in sequences_by_hash.values()):
+        raise ValueError("Source MSA sequence exceeds the pinned maximum sequence length")
+    if any(len(_chain_sequence(cache, chain)) > args.max_sequence_length
+           for manifest in heldout_manifests for chain in _read_manifest(manifest)):
+        raise ValueError("Heldout sequence exceeds the pinned maximum sequence length")
     if not heldout_hashes:
         raise ValueError("Held-out manifests must contain target sequences")
     if args.inventory_only:
@@ -518,7 +534,7 @@ def main() -> None:
             },
             "threshold": {
                 "min_seq_id": args.min_seq_id, "coverage": args.coverage,
-                "cov_mode": 0, "alignment_mode": 3, "seq_id_mode": 0,
+                "cov_mode": args.coverage_mode, "alignment_mode": 3, "seq_id_mode": 0,
             },
             "mmseqs_search_executed": False,
         }
@@ -559,6 +575,7 @@ def main() -> None:
                 query_fasta=heldout_fasta, source_fasta=source_fasta, checkpoint_dir=args.checkpoint_dir,
                 mmseqs_bin=args.mmseqs_bin, min_seq_id=args.min_seq_id, coverage=args.coverage,
                 threads=args.threads, max_seqs=args.max_seqs,
+                coverage_mode=args.coverage_mode, max_sequence_length=args.max_sequence_length,
                 source_batch_size=args.source_batch_size, query_batch_size=args.query_batch_size,
                 reserve_disk_bytes=args.search_disk_reserve_gib * 1024**3,
                 max_rss_bytes=args.search_max_rss_gib * 1024**3,
@@ -571,7 +588,7 @@ def main() -> None:
             excluded: set[str] = set()
             hit_count = 0
             for _query, target in iter_batched_mmseqs_hits(
-                batch_result, min_seq_id=args.min_seq_id, coverage=args.coverage,
+                batch_result, min_seq_id=args.min_seq_id, coverage=args.coverage, coverage_mode=args.coverage_mode,
             ):
                 excluded.add(target.removeprefix("seq_"))
                 hit_count += 1
@@ -582,11 +599,12 @@ def main() -> None:
                 mmseqs_bin=args.mmseqs_bin, heldout_fasta=heldout_fasta, source_fasta=source_fasta,
                 output_m8=output_m8, tmp_dir=mmseqs_tmp, min_seq_id=args.min_seq_id, coverage=args.coverage,
                 threads=args.threads, max_seqs=args.max_seqs, exhaustive=args.exhaustive,
+                coverage_mode=args.coverage_mode, max_sequence_length=args.max_sequence_length,
             )
             input_binding["m8_sha256"] = _sha256_file(output_m8)
             excluded, hit_count = _parse_excluded_hashes(
                 output_m8, query_ids={f"heldout_{index}" for index in range(1, heldout_unique_count + 1)},
-                source_hashes=set(sequences_by_hash), min_seq_id=args.min_seq_id, coverage=args.coverage,
+                source_hashes=set(sequences_by_hash), min_seq_id=args.min_seq_id, coverage=args.coverage, coverage_mode=args.coverage_mode,
             )
 
     # Composition masking and unknown residues can hide even identical rows from
@@ -601,18 +619,19 @@ def main() -> None:
         "schema_version": 1,
         "filter_type": "heldout_target_homology",
         "search_contract": "mmseqs-local-all-pairs-v1" if args.exhaustive else "mmseqs-prefiltered-v1",
-        "search_scope": "Identity and bidirectional coverage of MMseqs local alignments against collected "
+        "search_scope": "Identity and " + ("heldout-query coverage" if args.coverage_mode == 2 else "bidirectional coverage") + " of MMseqs local alignments against collected "
         "non-query source sequences of at least 20 residues; not every possible alignment or all evolutionary homology.",
         "exhaustive": bool(args.exhaustive),
         "input_binding": input_binding,
         "threshold": {
             "min_seq_id": float(args.min_seq_id),
             "coverage": float(args.coverage),
-            "cov_mode": 0,
+            "cov_mode": args.coverage_mode,
             "alignment_mode": 3,
             "seq_id_mode": 0,
         },
         "mmseqs": {
+            "maximum_sequence_length": args.max_sequence_length,
             "binary": args.mmseqs_bin,
             "version": _mmseqs_version(args.mmseqs_bin),
             "command": recorded_command,

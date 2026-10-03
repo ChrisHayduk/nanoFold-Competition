@@ -85,14 +85,17 @@ def iter_mmseqs_hits(
     target_ids: Set[str],
     min_seq_id: float,
     coverage: float,
+    coverage_mode: int = 0,
 ) -> Iterator[tuple[str, str]]:
     """Read known query/target pairs from validated eight-column MMseqs output.
 
     Searches request pident in percent and qcov/tcov as fractions. A tolerance
     of 0.001 in fractional units accommodates MMseqs' printed-value rounding.
     The caller must use alignment mode 3, sequence identity mode 0, and coverage
-    mode 0 so these checks have the same meaning as the search thresholds.
+    mode 0 (both sequences) or 2 (query only), matching coverage_mode.
     """
+    if coverage_mode not in (0, 2):
+        raise ValueError("Supported MMseqs coverage modes are 0 (both) and 2 (query)")
     if not path.is_file():
         raise RuntimeError("MMseqs completed without writing the expected alignment output")
     with path.open() as handle:
@@ -122,14 +125,15 @@ def iter_mmseqs_hits(
                 or bits < 0
             ):
                 raise ValueError(f"MMseqs alignment row {line_number} contains out-of-range numeric fields")
-            if identity + 0.001 < min_seq_id or min(query_coverage, target_coverage) + 0.001 < coverage:
+            observed_coverage = min(query_coverage, target_coverage) if coverage_mode == 0 else query_coverage
+            if identity + 0.001 < min_seq_id or observed_coverage + 0.001 < coverage:
                 raise ValueError(f"MMseqs alignment row {line_number} does not meet the requested thresholds")
             yield query, target
 
 
 _BATCH_CONTRACT = "mmseqs-local-all-pairs-v1"
 _BATCH_HEADER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}")
-_BATCH_SEQUENCE = re.compile(r"[ACDEFGHIKLMNPQRSTVWYX]{1,256}")
+_BATCH_SEQUENCE = re.compile(r"[ACDEFGHIKLMNPQRSTVWYX]+")
 
 
 def _batch_sha256(path: Path) -> str:
@@ -151,7 +155,7 @@ def _batch_json(path: Path, value: Any) -> None:
         temporary.unlink()
 
 
-def _batch_records(path: Path) -> Iterator[tuple[str, str]]:
+def _batch_records(path: Path, *, max_sequence_length: int = 256) -> Iterator[tuple[str, str]]:
     previous = ""
     with path.open("r", encoding="ascii", newline="") as handle:
         while header_line := handle.readline():
@@ -160,18 +164,18 @@ def _batch_records(path: Path) -> Iterator[tuple[str, str]]:
             if (
                 not header_line.startswith(">") or not header_line.endswith("\n")
                 or not sequence_line.endswith("\n") or not _BATCH_HEADER.fullmatch(header)
-                or not _BATCH_SEQUENCE.fullmatch(sequence)
+                or not _BATCH_SEQUENCE.fullmatch(sequence) or len(sequence) > max_sequence_length
             ):
-                raise ValueError("Batched MMseqs requires safe single-line canonical FASTA records of length 1–256")
+                raise ValueError(f"Batched MMseqs requires safe single-line canonical FASTA records of length 1–{max_sequence_length}")
             if header <= previous:
                 raise ValueError("Batched MMseqs FASTA headers must be unique and lexicographically increasing")
             previous = header
             yield header, sequence
 
 
-def _batch_partitions(path: Path, directory: Path, size: int) -> list[dict[str, Any]]:
+def _batch_partitions(path: Path, directory: Path, size: int, *, max_sequence_length: int = 256) -> list[dict[str, Any]]:
     partitions: list[dict[str, Any]] = []
-    records = iter(_batch_records(path))
+    records = iter(_batch_records(path, max_sequence_length=max_sequence_length))
     while first := next(records, None):
         output = directory / f"{len(partitions):06d}.fasta"
         histogram: dict[str, int] = {}
@@ -193,7 +197,8 @@ def _batch_partitions(path: Path, directory: Path, size: int) -> list[dict[str, 
     return partitions
 
 
-def _batch_verify_partitions(parts: list[dict[str, Any]], expected: dict[str, Any], size: int, root: Path) -> None:
+def _batch_verify_partitions(parts: list[dict[str, Any]], expected: dict[str, Any], size: int, root: Path,
+                             *, max_sequence_length: int = 256) -> None:
     digest = hashlib.sha256()
     previous = ""
     total = 0
@@ -202,7 +207,7 @@ def _batch_verify_partitions(parts: list[dict[str, Any]], expected: dict[str, An
         histogram: dict[str, int] = {}
         count = 0
         max_header_length = 0
-        for header, sequence in _batch_records(path):
+        for header, sequence in _batch_records(path, max_sequence_length=max_sequence_length):
             if header <= previous:
                 raise ValueError("Checkpoint partitions overlap or have changed order")
             previous = header
@@ -232,13 +237,16 @@ def _batch_evidence_path(value: str, root: Path) -> Path:
     return path
 
 
-def _batch_expected_alignments(query: dict[str, int], source: dict[str, int], coverage: float) -> int:
+def _batch_expected_alignments(query: dict[str, int], source: dict[str, int], coverage: float, coverage_mode: int = 0) -> int:
     def f32(value: float) -> float:
         return struct.unpack("f", struct.pack("f", value))[0]
 
+    if coverage_mode not in (0, 2):
+        raise ValueError("Unsupported MMseqs coverage mode")
     return sum(
         nq * ns for qlen, nq in query.items() for slen, ns in source.items()
-        if min(f32(int(qlen) / int(slen)), f32(int(slen) / int(qlen))) >= f32(coverage)
+        if (min(f32(int(qlen) / int(slen)), f32(int(slen) / int(qlen))) if coverage_mode == 0
+            else f32(int(slen) / int(qlen))) >= f32(coverage)
     )
 
 
@@ -259,14 +267,15 @@ def _batch_log_counts(path: Path) -> dict[str, int]:
     return result
 
 
-def _batch_unique_hits(path: Path, query_path: Path, source_path: Path, *, min_seq_id: float, coverage: float) -> Iterator[tuple[str, str]]:
-    query_ids = {header for header, _ in _batch_records(query_path)}
-    source_ids = {header for header, _ in _batch_records(source_path)}
+def _batch_unique_hits(path: Path, query_path: Path, source_path: Path, *, min_seq_id: float, coverage: float,
+                       coverage_mode: int = 0, max_sequence_length: int = 256) -> Iterator[tuple[str, str]]:
+    query_ids = {header for header, _ in _batch_records(query_path, max_sequence_length=max_sequence_length)}
+    source_ids = {header for header, _ in _batch_records(source_path, max_sequence_length=max_sequence_length)}
     seen_queries: set[str] = set()
     seen_targets: set[str] = set()
     current = None
     for query, target in iter_mmseqs_hits(path, query_ids=query_ids, target_ids=source_ids,
-                                        min_seq_id=min_seq_id, coverage=coverage):
+                                        min_seq_id=min_seq_id, coverage=coverage, coverage_mode=coverage_mode):
         if query != current:
             if query in seen_queries:
                 raise ValueError("MMseqs output repeats a query block")
@@ -353,7 +362,7 @@ def _batch_execute(command: list[str], log: Path, root: Path, *, reserve: int, m
 
 def _batch_validate_job(job: dict[str, Any], query: dict[str, Any], source: dict[str, Any], *,
                         plan_sha256: str, root: Path, job_root: Path, binary: Path, flags: list[str],
-                        min_seq_id: float, coverage: float) -> None:
+                        min_seq_id: float, coverage: float, coverage_mode: int = 0, max_sequence_length: int = 256) -> None:
     if job["schema_version"] != 1 or job["plan_sha256"] != plan_sha256 or job["status"] != "complete":
         raise ValueError("Completed job does not belong to the immutable search plan")
     m8, log = Path(job["m8_path"]), Path(job["log_path"])
@@ -374,9 +383,10 @@ def _batch_validate_job(job: dict[str, Any], query: dict[str, Any], source: dict
         if _batch_sha256(_batch_evidence_path(job[f"{kind}_path"], root)) != job[f"{kind}_sha256"]:
             raise ValueError("Completed job output digest mismatch")
     counts = _batch_log_counts(Path(job["log_path"]))
-    expected = _batch_expected_alignments(query["length_histogram"], source["length_histogram"], coverage)
+    expected = _batch_expected_alignments(query["length_histogram"], source["length_histogram"], coverage, coverage_mode)
     hits = sum(1 for _ in _batch_unique_hits(Path(job["m8_path"]), Path(query["path"]), Path(source["path"]),
-                                            min_seq_id=min_seq_id, coverage=coverage))
+                                            min_seq_id=min_seq_id, coverage=coverage, coverage_mode=coverage_mode,
+                                            max_sequence_length=max_sequence_length))
     if counts != {"query_count": query["count"], "source_count": source["count"], "alignment_count": expected, "hit_count": hits}:
         raise ValueError("MMseqs native accounting disagrees with the complete batch inputs or validated output")
     if job["hit_count"] != hits or job["alignment_count"] != expected:
@@ -393,11 +403,13 @@ def run_batched_mmseqs(*, query_fasta: Path, source_fasta: Path, checkpoint_dir:
                        min_seq_id: float, coverage: float, threads: int, max_seqs: int,
                        source_batch_size: int = 1_000_000, query_batch_size: int = 256,
                        reserve_disk_bytes: int = 100 * 1024**3, max_rss_bytes: int = 48 * 1024**3,
-                       input_binding_sha256: str | None = None) -> dict[str, Any]:
+                       input_binding_sha256: str | None = None, coverage_mode: int = 0,
+                       max_sequence_length: int = 256) -> dict[str, Any]:
     """Search every partition pair and resume only hash-verified completed jobs.
 
-    FASTAs must have sorted unique safe headers and canonical sequences of 1–256
-    residues. Checkpoints are private audit evidence. A POSIX process lock and
+    FASTAs must have sorted unique safe headers and canonical sequences bounded
+    by max_sequence_length (default 256). Coverage mode 2 requires query coverage
+    only, so a short heldout query can find a domain embedded in a long parent. Checkpoints are private audit evidence. A POSIX process lock and
     process-group control are required; unavailable RSS monitoring fails closed.
     Disk admission reserves 400 bytes plus twice the combined header lengths
     per candidate pair, plus database overhead. RSS guards are sampled, not
@@ -406,11 +418,13 @@ def run_batched_mmseqs(*, query_fasta: Path, source_fasta: Path, checkpoint_dir:
     import fcntl
 
     validate_search_parameters(min_seq_id=min_seq_id, coverage=coverage, threads=threads, max_seqs=max_seqs)
-    if any(type(value) is not int for value in (threads, max_seqs, source_batch_size, query_batch_size, reserve_disk_bytes, max_rss_bytes)):
+    if any(type(value) is not int for value in (threads, max_seqs, source_batch_size, query_batch_size, reserve_disk_bytes, max_rss_bytes, coverage_mode, max_sequence_length)):
         raise ValueError("Batch sizes, resource limits, and native count options must be integers")
     if not 1 <= source_batch_size <= 1_000_000 or not 1 <= query_batch_size <= 256:
         raise ValueError("Source/query batch sizes must be in 1–1000000 and 1–256")
-    if 32 * source_batch_size + 1 >= 2**32 or 256 * source_batch_size + 1 >= 2**32:
+    if coverage_mode not in (0, 2) or not 1 <= max_sequence_length <= 65535:
+        raise ValueError("Supported coverage modes are 0 and 2; maximum sequence length must be in 1–65535")
+    if 32 * source_batch_size + 1 >= 2**32 or max_sequence_length * source_batch_size + 1 >= 2**32:
         raise ValueError("Source batch exceeds native record-size bounds")
     if reserve_disk_bytes < 0 or max_rss_bytes <= 0:
         raise ValueError("Disk reserve must be nonnegative and RSS limit positive")
@@ -424,10 +438,11 @@ def run_batched_mmseqs(*, query_fasta: Path, source_fasta: Path, checkpoint_dir:
     version = subprocess.run([str(binary), "version"], capture_output=True, text=True, check=True, timeout=30).stdout.strip()
     if not version:
         raise ValueError("MMseqs must report a nonempty version")
-    flags = ["--min-seq-id", str(min_seq_id), "-c", str(coverage), "--cov-mode", "0", "--alignment-mode", "3",
+    flags = ["--min-seq-id", str(min_seq_id), "-c", str(coverage), "--cov-mode", str(coverage_mode), "--alignment-mode", "3",
              "--seq-id-mode", "0", "--search-type", "1", "--dbtype", "1", "--prefilter-mode", "2", "-e", "1e308",
              "-s", "5.7", "--mask", "0", "--comp-bias-corr", "0", "--threads", str(threads),
              "--max-seqs", str(max_seqs), "--max-accept", str(max_seqs), "--max-rejected", str(max_seqs),
+             "--max-seq-len", str(max_sequence_length),
              "--format-output", "query,target,pident,alnlen,qcov,tcov,evalue,bits"]
     binding = {"schema_version": 1, "search_contract": _BATCH_CONTRACT,
                "query_input": {"sha256": _batch_sha256(query_fasta)},
@@ -435,6 +450,7 @@ def run_batched_mmseqs(*, query_fasta: Path, source_fasta: Path, checkpoint_dir:
                "binary": {"path": str(binary), "sha256": _batch_sha256(binary), "version": version},
                "engine_sha256": _batch_sha256(Path(__file__)), "flags": flags,
                "source_batch_size": source_batch_size, "query_batch_size": query_batch_size,
+               "coverage_mode": coverage_mode, "max_sequence_length": max_sequence_length,
                "reserve_disk_bytes": reserve_disk_bytes, "max_rss_bytes": max_rss_bytes,
                "input_binding_sha256": input_binding_sha256}
     if checkpoint_dir.is_symlink():
@@ -457,6 +473,7 @@ def run_batched_mmseqs(*, query_fasta: Path, source_fasta: Path, checkpoint_dir:
 def _run_batched_locked(root: Path, binding: dict[str, Any], binary: Path, flags: list[str], *,
                         min_seq_id: float, coverage: float, max_seqs: int, reserve: int, max_rss: int,
                         input_paths: dict[str, Path]) -> dict[str, Any]:
+    coverage_mode, max_sequence_length = binding["coverage_mode"], binding["max_sequence_length"]
     plan_path = root / "plan.json"
     plan: dict[str, Any]
     if plan_path.is_symlink() or (not plan_path.exists() and ((root / "complete.json").exists() or any(root.glob("job-*")))):
@@ -473,7 +490,8 @@ def _run_batched_locked(root: Path, binding: dict[str, Any], binary: Path, flags
         for prefix in ("query", "source"):
             directory = staging / prefix
             directory.mkdir()
-            parts = _batch_partitions(input_paths[prefix], directory, binding[f"{prefix}_batch_size"])
+            parts = _batch_partitions(input_paths[prefix], directory, binding[f"{prefix}_batch_size"],
+                                      max_sequence_length=max_sequence_length)
             if not parts:
                 raise ValueError("Batched MMseqs requires nonempty query and source FASTAs")
             plan[f"{prefix}_partitions"] = parts
@@ -488,7 +506,7 @@ def _run_batched_locked(root: Path, binding: dict[str, Any], binary: Path, flags
         if not plan[f"{prefix}_partitions"] or plan[f"{prefix}_count"] < 1:
             raise ValueError("Batched MMseqs requires nonempty query and source FASTAs")
         _batch_verify_partitions(plan[f"{prefix}_partitions"], {**binding[f"{prefix}_input"], "count": plan[f"{prefix}_count"]},
-                                 binding[f"{prefix}_batch_size"], root)
+                                 binding[f"{prefix}_batch_size"], root, max_sequence_length=max_sequence_length)
     plan_sha = _batch_sha256(plan_path)
     if (root / "complete.json").exists() and any(
         not (root / f"job-{source_index:06d}-{query_index:06d}" / "complete.json").is_file()
@@ -508,7 +526,8 @@ def _run_batched_locked(root: Path, binding: dict[str, Any], binary: Path, flags
             if receipt_path.exists():
                 job = json.loads(_batch_evidence_path(str(receipt_path), root).read_text())
                 _batch_validate_job(job, query, source, plan_sha256=plan_sha, root=root, job_root=job_root,
-                                    binary=binary, flags=flags, min_seq_id=min_seq_id, coverage=coverage)
+                                    binary=binary, flags=flags, min_seq_id=min_seq_id, coverage=coverage,
+                                    coverage_mode=coverage_mode, max_sequence_length=max_sequence_length)
                 completed[str(job_root)] = job
     for source_index, source in enumerate(plan["source_partitions"]):
         for query_index, query in enumerate(plan["query_partitions"]):
@@ -534,7 +553,8 @@ def _run_batched_locked(root: Path, binding: dict[str, Any], binary: Path, flags
                        "log_sha256": _batch_sha256(log_path), "hit_count": counts["hit_count"],
                        "alignment_count": counts["alignment_count"], "metrics": metrics}
                 _batch_validate_job(job, query, source, plan_sha256=plan_sha, root=root, job_root=job_root,
-                                    binary=binary, flags=flags, min_seq_id=min_seq_id, coverage=coverage)
+                                    binary=binary, flags=flags, min_seq_id=min_seq_id, coverage=coverage,
+                                    coverage_mode=coverage_mode, max_sequence_length=max_sequence_length)
             if not receipt_path.exists():
                 _batch_json(receipt_path, job)
             receipt_sha = _batch_sha256(receipt_path)
@@ -579,7 +599,7 @@ def batched_mmseqs_summary(result: dict[str, Any]) -> dict[str, Any]:
     return {field: result[field] for field in fields}
 
 
-def iter_batched_mmseqs_hits(result: dict[str, Any], *, min_seq_id: float, coverage: float) -> Iterator[tuple[str, str]]:
+def iter_batched_mmseqs_hits(result: dict[str, Any], *, min_seq_id: float, coverage: float, coverage_mode: int = 0) -> Iterator[tuple[str, str]]:
     """Stream verified batches using at most one partition's identifier sets."""
     receipt_path = Path(result["receipt_path"])
     if result.get("status") != "complete" or _batch_sha256(receipt_path) != result["receipt_sha256"]:
@@ -592,7 +612,8 @@ def iter_batched_mmseqs_hits(result: dict[str, Any], *, min_seq_id: float, cover
         raise ValueError("Batched search plan changed before output streaming")
     plan = json.loads(plan_path.read_text())
     flags = plan["binding"]["flags"]
-    if flags[flags.index("--min-seq-id") + 1] != str(min_seq_id) or flags[flags.index("-c") + 1] != str(coverage):
+    if (flags[flags.index("--min-seq-id") + 1] != str(min_seq_id) or flags[flags.index("-c") + 1] != str(coverage)
+            or flags[flags.index("--cov-mode") + 1] != str(coverage_mode)):
         raise ValueError("Streamed thresholds differ from the immutable search plan")
     all_evidence = {str(receipt_path): result["receipt_sha256"], str(plan_path): result["plan_sha256"]}
     total = 0
@@ -613,7 +634,8 @@ def iter_batched_mmseqs_hits(result: dict[str, Any], *, min_seq_id: float, cover
                 raise ValueError("Batch evidence changed before output streaming")
             all_evidence[str(path)] = digest
         count = 0
-        for pair in _batch_unique_hits(paths[0][0], paths[1][0], paths[2][0], min_seq_id=min_seq_id, coverage=coverage):
+        for pair in _batch_unique_hits(paths[0][0], paths[1][0], paths[2][0], min_seq_id=min_seq_id, coverage=coverage,
+                                       coverage_mode=coverage_mode, max_sequence_length=plan["binding"].get("max_sequence_length", 256)):
             count += 1
             yield pair
         for path, digest in paths:

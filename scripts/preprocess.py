@@ -51,7 +51,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from nanofold.a3m import GAP_ID, MASK_ID, RESTYPES, read_a3m, sequence_to_ids, ungap_query_columns
+from nanofold.a3m import GAP_ID, MASK_ID, RESTYPES, iter_a3m_rows, sequence_to_ids
 from nanofold.chain_paths import chain_data_dir, chain_error_path, chain_id_from_stem, chain_npz_path
 from nanofold.data import read_manifest
 from nanofold.dataset_integrity import (
@@ -70,6 +70,7 @@ def parse_args() -> argparse.Namespace:
         description="Preprocess OpenProteinSet alignments and deposited structures into verified feature/label pairs.",
         epilog=(
             "Coordinate labels use coherent positive-occupancy conformers; source coordinates are never adjusted. "
+            "Malformed A3M records and inputs that change during parsing or resume validation fail. "
             "See docs/DATA.md for coordinate selection, projection, and source-provenance requirements."
         ),
     )
@@ -469,36 +470,6 @@ def _load_msa_row_filter(path_value: str | Path) -> MSARowFilter | None:
     return load_msa_row_filter(Path(path_text)) if path_text else None
 
 
-def _apply_msa_row_filter(
-    msa: np.ndarray,
-    deletions: np.ndarray,
-    row_filter: MSARowFilter | None,
-) -> Tuple[np.ndarray, np.ndarray, MSAFilterStats]:
-    if row_filter is None:
-        return msa, deletions, MSAFilterStats(input_rows=int(msa.shape[0]), removed_rows=0)
-
-    keep: List[int] = []
-    removed = 0
-    for row_index, row in enumerate(msa):
-        if row_index == 0:
-            keep.append(row_index)
-            continue
-        sequence = _msa_row_to_ungapped_sequence(row)
-        if _sequence_sha256(sequence) in row_filter.excluded_sequence_sha256:
-            removed += 1
-            continue
-        keep.append(row_index)
-    if not keep:
-        keep = [0]
-        removed = max(0, int(msa.shape[0]) - 1)
-    keep_array = np.asarray(keep, dtype=np.int64)
-    return (
-        msa[keep_array],
-        deletions[keep_array],
-        MSAFilterStats(input_rows=int(msa.shape[0]), removed_rows=int(removed)),
-    )
-
-
 def _read_merged_msa(
     chain_dir: Path,
     *,
@@ -515,7 +486,7 @@ def _read_merged_msa(
     loaded_paths: List[Path] = []
     query_sequence: str | None = None
     row_limit = max(0, int(max_msa_seqs))
-    filter_stats = MSAFilterStats()
+    input_rows = removed_rows = 0
 
     for source_name in resolved_names:
         msa_path = (bound_msa_paths[source_name] if bound_msa_paths is not None
@@ -523,41 +494,38 @@ def _read_merged_msa(
         if msa_path is None:
             continue
 
-        a3m = read_a3m(msa_path)
-        source_msa, source_deletions = a3m.to_tokens(max_seqs=None)
-        aligned_msa, _ = a3m.to_aligned_msa()
-        query_aligned = aligned_msa[0]
-        source_msa, source_deletions, source_query_sequence = ungap_query_columns(
-            msa=source_msa,
-            deletions=source_deletions,
-            query_aligned=query_aligned,
-        )
-        source_msa, source_deletions, source_filter_stats = _apply_msa_row_filter(
-            source_msa,
-            source_deletions,
-            msa_row_filter,
-        )
-        filter_stats = filter_stats.merge(source_filter_stats)
-        if query_sequence is None:
-            query_sequence = source_query_sequence
-        elif query_sequence.upper() != source_query_sequence.upper():
-            raise ValueError(
-                f"Mismatched query sequences across MSA sources for {chain_dir.name}: "
-                f"{query_sequence} vs {source_query_sequence}"
-            )
-
         loaded_paths.append(msa_path)
-        for row, deletion_row in zip(source_msa, source_deletions, strict=True):
+        query_mask: np.ndarray | None = None
+        # Exhaust all sources even after reaching the cap. Late rows still need
+        # syntax/width validation and contribute to the complete filter audit.
+        for row_index, (_header, aligned, deletions) in enumerate(iter_a3m_rows(msa_path)):
+            input_rows += 1
+            if row_index == 0:
+                query_mask = np.asarray([char != "-" for char in aligned], dtype=bool)
+                source_query_sequence = aligned.replace("-", "")
+                if query_sequence is None:
+                    query_sequence = source_query_sequence
+                elif query_sequence != source_query_sequence:
+                    raise ValueError(
+                        f"Mismatched query sequences across MSA sources for {chain_dir.name}: "
+                        f"{query_sequence} vs {source_query_sequence}"
+                    )
+            assert query_mask is not None
+            row = sequence_to_ids(aligned)[query_mask]
+            deletion_row = deletions[query_mask]
+            if row_index > 0 and msa_row_filter is not None:
+                sequence = _msa_row_to_ungapped_sequence(row)
+                if _sequence_sha256(sequence) in msa_row_filter.excluded_sequence_sha256:
+                    removed_rows += 1
+                    continue
+            if row_limit and len(merged_rows) >= row_limit:
+                continue
             dedup_key = (row.tobytes(), deletion_row.tobytes())
             if dedup_key in seen_rows:
                 continue
             seen_rows.add(dedup_key)
             merged_rows.append(row.copy())
             merged_deletions.append(deletion_row.copy())
-            if row_limit and len(merged_rows) >= row_limit:
-                break
-        if row_limit and len(merged_rows) >= row_limit:
-            break
 
     if not loaded_paths:
         expected = ", ".join(str(chain_dir / "a3m" / name) for name in resolved_names)
@@ -565,7 +533,10 @@ def _read_merged_msa(
     if query_sequence is None or not merged_rows:
         raise ValueError(f"No usable MSA rows found for {chain_dir.name}.")
 
-    return np.stack(merged_rows), np.stack(merged_deletions), query_sequence, filter_stats
+    return (
+        np.stack(merged_rows), np.stack(merged_deletions), query_sequence,
+        MSAFilterStats(input_rows=input_rows, removed_rows=removed_rows),
+    )
 
 
 def _project_atom14_to_query(
@@ -1149,6 +1120,12 @@ def main() -> None:
                 projection_args=args,
                 expected_sequence=expected_sequences.get(cid),
             ):
+                if _source_inputs_sha256(
+                    chain_dir, mmcif_path, mmcif_root, args, requested_chain_id=cid,
+                    expected_sequence=expected_sequences.get(cid), chain_data_cache_sha256=cache_sha256,
+                    bound_msa_paths=bound_msa_paths,
+                ) != source_sha256:
+                    raise ValueError(f"Source inputs changed while validating existing outputs for {cid}")
                 if err_marker.exists():
                     err_marker.unlink()
                 if msa_row_filter is not None:
@@ -1272,6 +1249,15 @@ def main() -> None:
                 )
                 features_out.update(tpl)
 
+            # Source hashing and parsing are separate reads. Refuse to publish
+            # labels if a download/replacement changed any bound input between
+            # those reads, instead of attaching the earlier bytes' provenance.
+            if _source_inputs_sha256(
+                chain_dir, mmcif_path, mmcif_root, args, requested_chain_id=cid,
+                expected_sequence=expected_sequences.get(cid), chain_data_cache_sha256=cache_sha256,
+                bound_msa_paths=bound_msa_paths,
+            ) != source_sha256:
+                raise ValueError(f"Source inputs changed during preprocessing for {cid}")
             _save_validated_outputs(feature_path, features_out, label_path, labels_out)
             if err_marker.exists():
                 err_marker.unlink()

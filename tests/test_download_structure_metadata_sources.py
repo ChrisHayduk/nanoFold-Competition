@@ -50,6 +50,35 @@ def test_download_pins_source_bytes_and_reuses_verified_lock(tmp_path: Path, mon
     assert lock.read_bytes() == original_lock
 
 
+def test_boundary_sources_are_opt_in_pinned_and_required(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    args, _, out, lock = _fixture_args(tmp_path)
+    monkeypatch.setattr(downloader, "_download_url", _fake_download)
+    downloader.main([*args, "--include-cath-boundaries"])
+    original = lock.read_bytes()
+    payload = json.loads(original)
+    assert payload["download_options"]["include_cath_boundaries"] is True
+    for name, spec in downloader.CATH_BOUNDARY_SOURCES.items():
+        source = payload["sources"][name]
+        assert source["version"] == "4.4.0"
+        assert source["sha256"] == hashlib.sha256((out / spec["path"]).read_bytes()).hexdigest()
+    monkeypatch.setattr(downloader, "_download_url", _no_network)
+    downloader.main([*args, "--include-cath-boundaries"])
+    assert lock.read_bytes() == original
+    with pytest.raises(ValueError, match="Download options differ"):
+        downloader.main(args)
+
+
+def test_boundary_download_failure_publishes_no_partial_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    args, _, out, lock = _fixture_args(tmp_path)
+    def fail_boundaries(url: str, destination: Path, **kwargs: object) -> bool:
+        return False if destination.name == "cath-domain-seqs.fa" else _fake_download(url, destination, **kwargs)
+    monkeypatch.setattr(downloader, "_download_url", fail_boundaries)
+    with pytest.raises(SystemExit, match="cath_domain_sequences"):
+        downloader.main([*args, "--include-cath-boundaries"])
+    assert not lock.exists()
+    assert list(out.iterdir()) == []
+
+
 @pytest.mark.parametrize("changed_input", ["cache", "source", "deleted_source"])
 def test_changed_inputs_cannot_be_silently_repinned(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, changed_input: str

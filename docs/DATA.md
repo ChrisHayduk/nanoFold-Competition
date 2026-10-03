@@ -289,6 +289,8 @@ The direction is part of the data contract:
 
 No filter is built against its source split's own target set or an earlier split. A row that matches a forbidden later-split target is still removed. Hidden MSAs still undergo normal query/format validation, merging, deduplication and depth capping. The same target-homology thresholds apply to both filters. Standalone single-filter research preprocessing remains available, but a single undirected filter does not encode this three-split policy.
 
+Full-parent candidates use `full-parent-heldout-query-v1`: the filter builder and residual auditor receive `--coverage-mode 2 --max-sequence-length <bound>` with exhaustive checkpointed search. Coverage is measured over the heldout query only, so a short heldout domain embedded in a long parent or non-query MSA row is excluded even when it covers little of that source. Identity remains 30% and query coverage 80%. The declared length bound is checked against complete sequences and pinned in native commands and receipts; search inputs are never cropped. `scripts/build_msa_filter_policy.py --policy-type full-parent-heldout-query-v1` validates these proofs. `directed-heldout-v1` retains its bidirectional coverage contract. Repaired public cohorts use `full-parent-heldout-query-v2` and `--historical-public-manifest`: training rows exclude the union of historical public, active public, and hidden targets; active-public rows exclude hidden targets. Historical and active public membership may overlap, while every other role pair stays disjoint. The v1 contracts remain independently verifiable. Training residual audits add the pinned historical and hidden manifests through `--extra-heldout-manifest` with `--heldout-chain-data-cache`, so both native target and MSA searches cover the same protected union; feature-depth diagnostics still describe the active primary cohort.
+
 MSA split audits live in `scripts/audit_msa_split.py`. The script reports
 processed feature availability, MSA-depth quantiles and binned Jensen-Shannon
 divergence, target chain/cluster overlap, exact processed MSA-row overlap,
@@ -307,6 +309,10 @@ masks or failing diagnostics is regenerated from its bound inputs.
 Resume requires the same raw inputs, pinned chain-cache bytes, split policy, effective filters, preprocessing implementation and configuration. New outputs contain source-content and configuration hashes; a changed or missing provenance record requires a fresh output directory. Existing files are validated before they can be skipped, including exact target equality to the selected cache sequence when cache binding is enabled.
 
 ## 3. How Dataset Splits Are Determined
+
+`scripts/build_structural_assets.py` consumes a verified full-parent candidate, qualified training and heldout source indexes, the completed heldout-source receipt, the pinned cache, and the baseline source receipt. Create the heldout index with `scripts/export_heldout_sources.py --baseline-replay-receipt <receipt> --full-frame-receipt <revised-receipt> --output <fresh-private-directory>`; it reconstructs the active public and fixed hidden membership, source pins, and current qualification evidence. Active-public replacement sources must match their approved qualification proof; unchanged public and hidden targets retain their original source bytes. The historical public manifest stays separate from the active dataset, and all three evaluation cohorts remain hash-bound. It writes a private command plan by default; `--execute` performs source materialization, directed raw-MSA filtering, fresh label/feature generation, identity/geometry/residual audits, and all track fingerprints and hidden locks. Completed steps resume only with unchanged input, code, and output hashes. Output roots must be fresh or carry their matching plan; writable symlink and hardlink aliases are rejected. Raw source links are separately pinned and never overwritten. Source-batch capacity is reduced when necessary to respect native long-record limits. A complete asset receipt certifies those gates, not improved training performance.
+
+These assets store whole parents. Training uses the staged 256-residue crop protocol: sample a selected parent uniformly, then sample an integer crop start uniformly from `0` through `L - min(256, L)`, including both endpoints. The source lock and asset completion bind this exposure contract; preprocessing does not fix one crop per parent or introduce loss weights.
 
 The committed train and public-validation manifests, fingerprints and source lock define the published benchmark. They have not been resampled. Changing structural annotations or preprocessing does not update that contract automatically. The regeneration wrapper refuses to overwrite it; the full-refresh wrapper can rebuild and audit its assets with `--skip-manifest-regen`. Rebuilt fingerprints and raw/hidden asset locks default to `.nanofold_private/asset_rebuild/leaderboard/`. Published and sealed reference paths, including symlink/hardlink aliases, cannot be used as candidate outputs.
 
@@ -362,25 +368,37 @@ output directories and their aliases.
 For each chain ID, preprocessing:
 
 1. Resolves the encoded OpenProteinSet chain directory.
-2. Reads one or more A3M files.
+2. Reads one or more A3M files. Records require nonempty headers and sequences,
+   ASCII letters or alignment gaps, and at least one aligned query residue.
+   Optional `.` insertion-gap padding is ignored without increasing insertion
+   counts, following the [HH-suite A3M definition](https://github.com/soedinglab/hh-suite/blob/master/src/hhblits.cpp).
+   Digits, other punctuation and sequence content before the first header fail.
 3. Removes query-gap columns from the MSA.
 4. Selects the effective filter from `--msa-filter-policy` for each public chain,
    or uses `--msa-row-filter` for a standalone single-filter job. The two options
    are mutually exclusive. Only non-query rows are removed; query row 0 is kept.
    Hidden preprocessing supplies neither option.
-5. Merges and deduplicates MSA rows.
-6. Caps raw MSA depth with `--max-msa-seqs` before writing NPZ files.
+5. Streams, merges, and deduplicates MSA rows using the projected token and deletion features.
+6. Retains at most `--max-msa-seqs` rows while validating every row in every requested source, including rows beyond the retained depth. Filter-audit counts cover all scanned rows; the cap follows exclusion and deduplication.
 7. Loads the matching mmCIF file.
 8. Extracts chain atom coordinates into the canonical atom14 layout.
 9. Aligns the full deposited polymer sequence to the MSA query, then places observed coordinates using `label_seq_id`. Missing coordinates retain their polymer positions, including within repeated sequences. All optimal alignments must induce the same mapping for every observed residue; differences confined to unresolved positions are allowed. More than 1,024 optimal alignments fail closed because uniqueness has not been established. Without polymer context, sequence-only projection must be unambiguous.
 10. Projects atom14 coordinates onto query positions, masking every label at a sequence mismatch.
 11. Rejects chains that fail projection quality thresholds, including the valid-CA minimum in strict alignment mode.
-12. Validates and writes one feature NPZ and one label NPZ per chain, with matching configuration and source-content hashes.
+12. Rehashes the bound sources after parsing, then validates and writes one
+    feature NPZ and one label NPZ per chain with matching configuration and
+    source-content hashes. A changed input fails before the pair is published.
+    Cached-output validation also rechecks the source hashes before reporting a skip.
 13. Records schema-3 run provenance in `preprocess_meta.json`. This run metadata is required for fingerprinting provenance-bearing pairs; removing or downgrading it is an error. Resume verifies raw inputs and existing files before skipping work. Chain resolution prefers author IDs, then explicit polymer label IDs, then a unique sequence match; ambiguous matches fail. Coordinate selection follows the policy below.
 
 ### Coordinate selection
 
 The first deposited model anchors residue identity and observation support.
+Fully indexed residues in a single polymer are ordered by deposited
+`label_seq_id` before sequence, conformer and whole-model comparisons, so
+atom-site record order cannot create or remove a polymer adjacency. Where
+indices are missing, deposited record order is retained without inferring
+positions from author numbering.
 Other deposited models are eligible only when their resolved chain, residue
 identities, polymer positions and complete atom14 masks match that anchor.
 The parser selects one whole eligible model by the fewest peptide C–N distance

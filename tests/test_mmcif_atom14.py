@@ -531,3 +531,45 @@ def test_model_selection_does_not_score_across_missing_polymer_indices(tmp_path:
     structure.add_model(second)
     structure.make_mmcif_document().write_file(str(path))
     assert extract_chain_atoms(path, "synth", "A").ca_coords[1, 1] == 8
+
+
+@pytest.mark.parametrize("order", [(2, 1, 0), (0, 2, 1)])
+def test_residue_record_order_does_not_change_polymer_conformers(tmp_path: Path, order: tuple[int, ...]) -> None:
+    residues = [_alanine(index) for index in range(3)]
+    _add_conformer(residues[0], "A", 0.8)
+    _add_conformer(residues[0], "B", 0.2, y=8)
+    _add_conformer(residues[1], "A", 0.2)
+    _add_conformer(residues[1], "B", 0.8, y=8)
+    _add_conformer(residues[2], "", 1)
+    canonical_path, shuffled_path = tmp_path / "canonical.cif", tmp_path / "shuffled.cif"
+    _write_residues(canonical_path, residues)
+    _write_residues(shuffled_path, [residues[index] for index in order])
+    canonical = extract_chain_atoms(canonical_path, "synth", "A")
+    shuffled = extract_chain_atoms(shuffled_path, "synth", "A")
+    np.testing.assert_array_equal(shuffled.polymer_residue_index, [0, 1, 2])
+    np.testing.assert_array_equal(shuffled.atom14_positions, canonical.atom14_positions)
+    np.testing.assert_array_equal(shuffled.atom14_mask, canonical.atom14_mask)
+    np.testing.assert_array_equal(shuffled.ca_coords[:, 1], [0, 0, 0])
+
+
+def test_later_model_with_permuted_atom_records_retains_identity_and_support(tmp_path: Path) -> None:
+    left, right = _alanine(0), _alanine(1)
+    _add_conformer(left, "", 1)
+    _add_conformer(right, "", 1, y=8)
+    path = tmp_path / "reordered-model.cif"
+    _write_residues(path, [left, right])
+    structure = gemmi.read_structure(str(path))
+    second = gemmi.Model(2)
+    chain = gemmi.Chain("A")
+    for index in (1, 0):
+        residue = structure[0][0][index].clone()
+        if index == 1:
+            for atom in residue:
+                atom.pos.y -= 8
+        chain.add_residue(residue)
+    second.add_chain(chain)
+    structure.add_model(second)
+    structure.make_mmcif_document().write_file(str(path))
+    parsed = extract_chain_atoms(path, "synth", "A")
+    np.testing.assert_array_equal(parsed.polymer_residue_index, [0, 1])
+    np.testing.assert_array_equal(parsed.ca_coords[:, 1], [0, 0])

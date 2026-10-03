@@ -8,7 +8,7 @@ import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Dict, List, Sequence
+from typing import TYPE_CHECKING, Dict, List, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
 
@@ -18,10 +18,13 @@ if str(REPO_ROOT) not in sys.path:
 
 from nanofold.chain_paths import chain_data_dir
 
+if TYPE_CHECKING:
+    from nanofold.s3_transport import PooledS3Transport
+
 """Download a fixed subset of OpenProteinSet/OpenFold training data.
 
-This script is deliberately implementation-light and delegates heavy lifting to the AWS CLI
-(RODA uses an anonymous S3 bucket).
+RODA uses an anonymous S3 bucket. The default transport is the AWS CLI.
+Optional pooled-s3 reuses unsigned botocore connections and records exact object receipts.
 
 By default, this downloads a filtered subset of each chain directory:
 - one MSA file (`--msa-name`, default `uniref90_hits.a3m`)
@@ -30,7 +33,7 @@ By default, this downloads a filtered subset of each chain directory:
 Use `--full-chain-dir` to download complete per-chain directories.
 
 This script assumes:
-- you have `aws` installed
+- you have `aws` installed, or `botocore` for `--download-transport pooled-s3`
 - your manifests contain chain IDs like `7KDX_A`
 - local per-chain directories are named with nanoFold's encoded chain-id convention
 
@@ -52,6 +55,8 @@ def parse_args() -> argparse.Namespace:
         help="Optional duplicate_pdb_chains.txt for fallback to representative chains when a chain dir is missing.",
     )
     ap.add_argument("--bucket", type=str, default="s3://openfold", help="RODA bucket for OpenProteinSet")
+    ap.add_argument("--download-transport", choices=("aws-cli", "pooled-s3"), default="aws-cli",
+                    help="S3 transport; pooled-s3 requires botocore, records object receipts, and honors --no-template-hits in full mode")
     ap.add_argument("--msa-name", type=str, default="uniref90_hits.a3m", help="MSA filename to download per chain")
     ap.add_argument(
         "--msa-names",
@@ -212,7 +217,16 @@ def _has_required_files(
     msa_names: Sequence[str],
     template_hits_name: str,
     need_template_hits: bool,
+    pooled_s3: PooledS3Transport | None = None,
+    *,
+    bucket: str = "s3://openfold",
+    full_chain_dir: bool = False,
 ) -> tuple[bool, bool]:
+    if pooled_s3 is not None:
+        return pooled_s3.required_files(
+            root, bucket=bucket, msa_names=msa_names, template_hits_name=template_hits_name,
+            need_template_hits=need_template_hits, full_chain_dir=full_chain_dir,
+        )
     has_msa = all(_has_file(root, name) for name in msa_names)
     has_tpl = _has_file(root, template_hits_name) if need_template_hits else True
     return has_msa, has_tpl
@@ -393,7 +407,14 @@ def _download_chain(
     retries: int,
     retry_delay_seconds: float,
     verbose: bool = False,
+    pooled_s3: PooledS3Transport | None = None,
 ) -> bool:
+    if pooled_s3 is not None:
+        return pooled_s3.download_chain(
+            cid, out_dir, bucket=bucket, msa_names=list(msa_names), template_hits_name=template_hits_name,
+            no_template_hits=no_template_hits, full_chain_dir=full_chain_dir,
+            retries=retries, retry_delay_seconds=retry_delay_seconds,
+        )
     def download(destination: Path) -> bool:
         cmd = ["aws", "s3", "cp", f"{bucket}/pdb/{cid}", str(destination),
                "--recursive", "--only-show-errors"]
@@ -459,13 +480,15 @@ def _process_chain(
     retries: int,
     retry_delay_seconds: float,
     verbose: bool = False,
+    pooled_s3: PooledS3Transport | None = None,
 ) -> List[str]:
     out_dir = chain_data_dir(roda_root, cid)
     if not dry_run:
         out_dir.parent.mkdir(parents=True, exist_ok=True)
 
     need_tpl = not no_template_hits
-    has_msa, has_tpl = _has_required_files(out_dir, msa_names, template_hits_name, need_tpl)
+    has_msa, has_tpl = _has_required_files(out_dir, msa_names, template_hits_name, need_tpl, pooled_s3,
+                                                bucket=bucket, full_chain_dir=full_chain_dir)
     if has_msa and has_tpl:
         return []
 
@@ -481,7 +504,8 @@ def _process_chain(
         source_dir = chain_data_dir(roda_root, source_cid)
         if not dry_run:
             source_dir.parent.mkdir(parents=True, exist_ok=True)
-        src_msa, src_tpl = _has_required_files(source_dir, msa_names, template_hits_name, need_tpl)
+        src_msa, src_tpl = _has_required_files(source_dir, msa_names, template_hits_name, need_tpl, pooled_s3,
+                                                bucket=bucket, full_chain_dir=full_chain_dir)
         if src_msa and fallback_source is None:
             fallback_source = source_cid
 
@@ -504,10 +528,12 @@ def _process_chain(
                 retries=retries,
                 retry_delay_seconds=retry_delay_seconds,
                 verbose=verbose,
+                pooled_s3=pooled_s3,
             )
             if dry_run:
                 return []
-            src_msa, src_tpl = _has_required_files(source_dir, msa_names, template_hits_name, need_tpl)
+            src_msa, src_tpl = _has_required_files(source_dir, msa_names, template_hits_name, need_tpl, pooled_s3,
+                                                bucket=bucket, full_chain_dir=full_chain_dir)
             if not src_msa:
                 continue
 
@@ -532,10 +558,12 @@ def _process_chain(
     if chosen_source != cid and not dry_run:
         _replace_with_symlink(out_dir, chain_data_dir(roda_root, chosen_source))
 
-    has_msa = all(_has_file(out_dir, name) for name in msa_names)
-    has_tpl = _has_file(out_dir, template_hits_name) if need_tpl else True
+    has_msa, has_tpl = _has_required_files(out_dir, msa_names, template_hits_name, need_tpl, pooled_s3,
+                                                bucket=bucket, full_chain_dir=full_chain_dir)
     if not has_msa:
         missing_names = [name for name in msa_names if not _has_file(out_dir, name)]
+        if pooled_s3 is not None:
+            missing_names = list(msa_names)
         print(f"WARNING: {cid} missing required MSA file(s) after download: {','.join(missing_names)}")
         missing_required.extend(f"{cid}:{name}" for name in missing_names)
     if not has_tpl:
@@ -559,6 +587,7 @@ def _download_manifest_chains(
     retry_delay_seconds: float,
     workers: int,
     verbose: bool = False,
+    pooled_s3: PooledS3Transport | None = None,
 ) -> List[str]:
     missing_required: List[str] = []
     total = len(chain_ids)
@@ -579,6 +608,7 @@ def _download_manifest_chains(
                     retries=retries,
                     retry_delay_seconds=retry_delay_seconds,
                     verbose=verbose,
+                    pooled_s3=pooled_s3,
                 )
             )
             if idx == 1 or idx % 100 == 0 or idx == total:
@@ -602,6 +632,7 @@ def _download_manifest_chains(
                 retries=retries,
                 retry_delay_seconds=retry_delay_seconds,
                 verbose=verbose,
+                pooled_s3=pooled_s3,
             ): cid
             for cid in chain_ids
         }
@@ -643,6 +674,12 @@ def main() -> None:
         print("Done downloading manifest mmCIF subset.")
         return
 
+    pooled_s3 = None
+    if args.download_transport == "pooled-s3" and not args.dry_run:
+        from nanofold.s3_transport import PooledS3Transport
+
+        pooled_s3 = PooledS3Transport(roda_root, workers=max(1, int(args.download_workers)),
+                                      timeout=float(args.download_url_timeout_seconds))
     missing_required = _download_manifest_chains(
         chain_ids,
         roda_root=roda_root,
@@ -657,6 +694,7 @@ def main() -> None:
         retry_delay_seconds=max(0.0, float(args.download_retry_delay_seconds)),
         workers=max(1, int(args.download_workers)),
         verbose=bool(args.verbose_downloads),
+        pooled_s3=pooled_s3,
     )
 
     if args.include_mmcif_zip:

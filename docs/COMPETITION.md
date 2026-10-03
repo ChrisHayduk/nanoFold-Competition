@@ -90,7 +90,9 @@ Required label NPZ keys (per chain):
 
 Coordinate preprocessing preserves deposited coordinates and selects coherent
 residue conformers before projection. Zero-occupancy atoms and sequence
-mismatches are masked; [coordinate selection](DATA.md#coordinate-selection)
+mismatches are masked. Fully indexed polymers use deposited sequence indices
+rather than atom-site row order. Malformed A3M records or source bytes changing
+during preprocessing fail; [coordinate selection](DATA.md#coordinate-selection)
 defines the deterministic policy.
 
 Optional label NPZ keys:
@@ -313,6 +315,20 @@ The hidden builder requires a matching versioned public source lock; cath-v4
 verification checks fixed group ownership and complete retained coverage as well as
 the selected representatives. Follow [DATA_SAMPLING.md](DATA_SAMPLING.md) for the
 complete workflow.
+The separately versioned full-parent structural candidate is defined by
+`configs/structural-sampling.yaml` and staged with
+`scripts/stage_structural_candidate.py`. It permits longer parent proteins and
+uses uniform 256-residue training crops. Its exhaustive heldout-query barrier
+requires at least 30% identity and 80% heldout-query coverage without requiring
+the alignment to cover the longer parent. Heldout PDB entries, exact sequences,
+and original heldout-group members are excluded. Training diversity groups are
+constructed within the admitted training population and do not certify global
+transitive homology separation. A separately validated public-cohort repair
+retains hidden targets and adds replacement public targets to the training
+barrier; historical public targets remain protected. Sampling reference weights do not change the
+training sampler or loss. Integrity checks, complete asset generation, and
+comparisons on the declared population remain required before accepting a
+candidate; a new manifest alone is not a validated dataset.
 Do not sync candidate hashes into the published track configuration. Asset
 rebuilds write candidate fingerprints and raw/hidden asset locks under
 `.nanofold_private/asset_rebuild/leaderboard/` by default and reject protected

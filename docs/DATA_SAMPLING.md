@@ -2,6 +2,12 @@
 
 The published benchmark is defined by its committed manifests, locks and fingerprints. Source-qualified candidates explicitly use `--sampling-policy cath-v4` with metadata schema 2, the complete original homology graph, source-validated representatives and an approved whole-group exclusion catalog in fresh, ignored directories. Staging defaults to `cath-v3`; `cath-v2` and `cath-v3` retain their own selection and replay contracts. Generating a candidate does not adopt it as the official benchmark or establish improved model performance.
 
+The `cath-v5` research candidate selects training chains against the broader
+qualified structural population. A separately recorded evaluation repair can
+replace public targets that fail the expanded barrier while retaining the hidden
+cohort and protecting the original public cohort for historical comparisons.
+It does not change the published manifests automatically.
+
 ## CATH annotations
 
 CATH classifies domains at four levels:
@@ -43,6 +49,143 @@ Every retained full group must contribute at least one selected target, and all 
 Live MMseqs clustering requests actual alignment identity with `--alignment-mode 3`, `--min-seq-id 0.30` and `-c 0.80`. A precomputed TSV must cover every candidate and cannot contain conflicting assignments. Its bytes and canonical assignments are locked. A cluster map proves membership, not how an externally supplied TSV was produced. Verify its generation provenance before release. The [MMseqs2 documentation](https://github.com/soedinglab/MMseqs2/wiki) distinguishes clustering algorithms, coverage and identity definitions; greedy cluster separation is not a global all-pairs identity bound.
 
 ## Allocation and diagnostics
+
+### Topology-aware training selection (`cath-v5`)
+
+The full-parent candidate selects 10,000 distinct parent sequences from the
+pinned, source-qualified experimental OPS population, including longer chains.
+Training draws a parent uniformly, then draws a contiguous crop of at most 256
+residues uniformly from all valid integer starts. The primary reference applies
+that same crop rule to **every source-qualified, training-owned distinct parent
+sequence**, before collapsing original sampling units. Source-support losses
+against the complete pinned PDB-chain inventory are reported separately.
+This reference is not a deposited-copy, group-balanced, natural
+abundance, or claimed AlphaFold2 training distribution. Cluster-balanced
+reference weighting is a separately labeled sensitivity analysis.
+
+The base frame binds the existing evaluation targets. For the expanded parent
+population, the staging barrier excludes inherited held-out group members, held-out exact
+sequences, held-out PDB entries, and direct qualifying held-out-query matches.
+The exhaustive direct search uses 30% actual identity and 80% held-out-query
+coverage; long-parent coverage is not required. Training diversity groups are
+formed only after these exclusions and **are not a certificate of global
+transitive leakage-group separation**. The inherited short-parent comparison
+retains its complete original graph and ownership contract. Selection cannot
+relax either mode's source qualification or admission barrier.
+
+An evaluation repair retains the hidden targets and unaffected public targets,
+then replaces affected public targets using a frozen metadata ranking and source
+qualification. The repaired public and hidden cohorts must pass the query-coverage
+check in both directions. A derived training frame preserves every base exclusion
+and adds protection for replacement public targets and their inherited groups;
+its admitted training population must be a subset of the base frame. Historical
+public, active public and hidden manifests have separate bindings. Training MSA
+exclusions and residual checks protect the union of all three cohorts, while
+active public MSAs exclude hidden targets. The original public cohort remains a
+separate historical comparison, with its conflicts disclosed.
+
+The full-parent asset coordinator also uses `--coverage-mode 2` for raw-MSA
+filtering and both residual audits, with `--max-sequence-length` set to the
+actual longest selected parent or protected held-out target. The
+`full-parent-heldout-query-v2` policy additionally binds the historical public
+cohort. Existing `full-parent-heldout-query-v1` receipts retain their original
+three-split query-coverage contract, and `directed-heldout-v1` retains its
+bidirectional coverage contract.
+
+Several distinct sequences from one original unit or PDB remain selectable
+within training. Deposited copies of an exact sequence contribute one reference
+member, preferring the qualified copy with better known resolution. Unknown
+resolution has an explicit category and never becomes a zero-resolution quality
+advantage. All modes require exactly the requested number of distinct sequences.
+Insufficient qualified sequence capacity fails.
+
+For full-parent selection, pass `crop_size=256` and
+`group_policy="soft_diversity"` explicitly. There can be more diversity groups
+than sample slots. This mode jointly selects parents using a source-weighted
+group-distribution objective, permits complementary members of the same group,
+and does not guarantee coverage of every group. It neither imposes one member
+per selected component nor removes groups from the reference to manufacture
+feasibility. The inherited comparison uses `group_policy="all_groups"`, which
+requires every group and fails when that is impossible. Both choices are
+reported, never switched silently.
+
+#### Exact crop exposure
+
+CATH domains contribute their verified residue segments, including discontinuous
+segments and repeated domains. For each domain, the sampler computes the exact
+expected residue fraction, probability of any mapped residue being present,
+probability of all domain residues fitting, and probability of a visible
+fragment, averaging **all** crop starts. Intactness depends on the complete
+sequence span of a discontinuous domain, not merely its summed segment length.
+The probability of simultaneous mapped-domain presence and its topology
+composition is integrated by an exact interval sweep.
+
+Unmapped boundaries receive no guessed location. Residue mass outside verified
+mapped domains remains unknown. Overlapping mapped domains fail. Domain presence,
+intactness and fragmentation are expected domain-instance counts and may exceed
+one per crop; their absolute mass is retained, not hidden by normalizing every
+family into a probability distribution. Measured contact exposure averages
+actual nonlocal CA contacts surviving each crop, with explicit missing-coordinate
+coverage. Whole-parent geometry is not substituted for crop geometry.
+
+Annotated sequence exposure does not establish observed structural supervision.
+A separate diagnostic intersects each mapped domain with the measured CA mask
+and partitions crop positions into labeled observed CA, unknown observed CA,
+and unobserved CA. Missing masks are unavailable; observed CA does not establish
+complete all-atom supervision. Reports also retain the probability of crops
+with zero or fewer than 32 observed CA atoms. These diagnostics do not resample
+crops, reject parents, or change the selection objective.
+
+The predeclared full-parent feature families and priorities are:
+
+| Feature family | Priority |
+|---|---:|
+| Expected crop residue fraction by CATH topology | 4 |
+| Mapped domains visible per crop (`0`, `1`, `2`, `3`, `4+`) | 2 |
+| Superfamily residue fraction; topology × mapped domain length; topology × visible domain count | 1 each |
+| Expected topology presence, intact-domain count, fragmented-domain count | 1 each |
+| Mapped topology presence composition; mapped/unknown residue fraction; crop-length bin; observed/missing CA fraction | 1 each |
+| Training diversity-group indicator, only for explicit soft diversity | 1 |
+| Architecture residue fraction; expected contacts per crop residue | 0.5 each |
+| Parent-length bin; resolution bin including unknown | 0.25 each |
+
+For summed selected contribution `c_j`, the target is
+`t_j = sample_size × reference_mean_j`. The discrepancy is
+`sum_f priority_f / max(sum_j(t_j),1) × sum_j((c_j-t_j)^2 / max(t_j,1))`,
+with inner sums restricted to family `f`. These priorities scale the **selection
+objective**; they are not per-chain training probabilities or loss weights.
+The primary reference gives each distinct sequence equal probability. An
+independently supplied reference-weight map must cover exactly that population,
+be finite and nonnegative, and receive an explicit nonuniform label. Its full
+normalized probabilities and effective size are recorded; selected-parent
+training remains uniform.
+
+Greedy selection uses the same objective with the reference target scaled to the
+current number of selected parents. Deterministic swaps must strictly improve
+the final-size objective. The default is at most two passes and 2,048 attempted
+exchanges, without a global-optimum or full-convergence guarantee. Known quality
+and seeded chain-ID hashes resolve score ties. In all-groups mode the anchors
+remain replaceable during swaps that preserve group coverage; soft diversity
+has no mandatory anchors. Topology/superfamily coverage is an optimization
+objective, not a guarantee.
+
+The private report binds reference identities, reference probabilities and exact
+feature moments. It retains fractional reference/target/selected contributions,
+absolute feature mass per crop, objective values, exchange counts, missing
+reference mass, category and group coverage, uncovered group probability mass,
+and group concentration. All-groups mode additionally reports unavoidable
+feature lower bounds imposed by group coverage. Full-parent reports distinguish
+training diversity groups from leakage barriers. Structural calibration does
+not establish full-data gradient agreement or improved folding accuracy;
+metrics optimized by selection must be distinguished from independent geometry
+and held-out metrics.
+
+The inherited whole-chain mode (`crop_size=None`) retains domain-instance
+moments and conditional whole-chain geometry only for one verified domain
+covering at least 90% of a chain with at least 90% valid CA positions. Those
+whole-chain diagnostics must not be presented as the full-parent crop target.
+
+### Architecture-stratified representative selection (`cath-v4`)
 
 The CATH v4 reference population is the complete pool of source-validated original-unit representatives. Primary strata are each chain's unique CATH Architecture-label set (including unknown), then length bin, then resolution bin. Hierarchical proportional apportionment uses exact integer quota arithmetic and seeded remainder ties. Mandatory group coverage, available capacity and the requested target counts constrain the resulting proportions.
 
@@ -292,7 +435,7 @@ Pass this file through `preprocess.py --msa-filter-policy` with the same `--chai
 
 The immutable plan binds complete query/source FASTAs, deterministic partitions, search parameters, the resolved MMseqs binary/hash/version and search implementation. Completed-job receipts bind native logs and alignments. Resume revalidates this evidence and skips only verified complete jobs; interrupted or failed attempts remain available for diagnosis and are rerun in fresh attempt directories. Changed inputs or search contracts require a separate plan. The final result combines every grid job only after all have completed and inputs are revalidated; partial job completion is not a valid filter or passed audit. Batched evidence references individual job alignments through its receipt; it does not publish a single merged M8 file.
 
-The supported sequence lengths are 1–256 residues, with the existing 20-residue minimum for non-query MSA rows. Native numeric limits must be valid; batching is not a reason to truncate returned hits. Disk/RSS monitoring fails closed but is sampled, not an operating-system memory cap. Local process inspection must work before search starts; on systems with sandbox restrictions, run with the required local process permissions. Inventory mode can use the same batch flags and checkpoint-directory option to report the per-batch hit-capacity requirement without launching MMseqs or creating a checkpoint. In that mode `required_exhaustive_max_seqs` uses the smaller of the source population and source-batch size; the unbatched inventory uses the whole source population.
+Legacy plans default to sequence lengths of 1–256 residues; full-parent plans explicitly pin their larger `--max-sequence-length`. The existing 20-residue minimum for non-query MSA rows remains. Native numeric limits must be valid; batching is not a reason to truncate returned hits. Disk/RSS monitoring fails closed but is sampled, not an operating-system memory cap. Local process inspection must work before search starts; on systems with sandbox restrictions, run with the required local process permissions. Inventory mode can use the same batch flags and checkpoint-directory option to report the per-batch hit-capacity requirement without launching MMseqs or creating a checkpoint. In that mode `required_exhaustive_max_seqs` uses the smaller of the source population and source-batch size; the unbatched inventory uses the whole source population.
 
 Batching bounds individual jobs and enables reuse of completed work; it does not reduce the total query-by-source comparison count. Build both directed exhaustive filters, preprocess public chains with their explicit split policy and hidden chains without a filter, then rerun both residual split audits in exhaustive mode. `extend_msa_row_filter_from_audit.py` accepts a single-alignment audit only; batched reports are rejected and cannot be used as if one shard represented the full search.
 

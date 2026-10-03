@@ -19,6 +19,8 @@ if str(SCRIPT_DIR) not in sys.path:
 
 from build_structure_metadata import _candidate_rows
 
+from nanofold.cath_boundaries import CATH_BOUNDARY_SOURCES
+
 BULK_SOURCES = {
     "cath_domain_list": {
         "url": "https://download.cathdb.info/cath/releases/all-releases/v4_4_0/cath-classification-data/cath-domain-list-v4_4_0.txt",
@@ -63,6 +65,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--download-retry-delay-seconds", type=float, default=2.0)
     parser.add_argument("--include-rcsb-rest", action="store_true")
     parser.add_argument("--include-dssp-mmcif", action="store_true")
+    parser.add_argument(
+        "--include-cath-boundaries", action="store_true",
+        help="Also require CATH 4.4 SEQRES domain boundaries and full domain sequences for exposure metadata.",
+    )
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args(argv)
 
@@ -327,6 +333,7 @@ def _download_dssp_mmcifs(
 def _source_paths() -> dict[str, str]:
     return {
         **{name: spec["path"] for name, spec in BULK_SOURCES.items()},
+        **{name: spec["path"] for name, spec in CATH_BOUNDARY_SOURCES.items()},
         "rcsb_chain_metadata": "rcsb_chain_metadata.jsonl",
         "dssp_mmcif": "dssp_mmcif",
     }
@@ -342,6 +349,8 @@ def _verify_existing_lock(args: argparse.Namespace, candidate_filters: dict[str,
     if lock.get("candidate_filters") != candidate_filters or lock.get("candidate_chain_count") != chain_count:
         raise ValueError("Candidate selection differs from the source lock; use a fresh directory and lock.")
     options = {"include_rcsb_rest": args.include_rcsb_rest, "include_dssp_mmcif": args.include_dssp_mmcif}
+    if args.include_cath_boundaries:
+        options["include_cath_boundaries"] = True
     if lock.get("download_options") != options:
         raise ValueError("Download options differ from the source lock; use a fresh directory and lock.")
     sources = lock.get("sources")
@@ -350,6 +359,10 @@ def _verify_existing_lock(args: argparse.Namespace, candidate_filters: dict[str,
     cath = sources.get("cath_domain_list")
     if not isinstance(cath, dict) or cath.get("skipped"):
         raise ValueError("Source lock must include the required CATH domain list.")
+    if args.include_cath_boundaries:
+        for name in CATH_BOUNDARY_SOURCES:
+            if not isinstance(sources.get(name), dict) or sources[name].get("skipped"):
+                raise ValueError(f"Source lock must include the requested CATH boundary source: {name}")
     for name, source in sources.items():
         if not isinstance(source, dict) or source.get("path") != _source_paths()[name]:
             raise ValueError(f"Invalid source path in lock: {name}")
@@ -376,7 +389,8 @@ def _verify_existing_lock(args: argparse.Namespace, candidate_filters: dict[str,
 
 def _collect_sources(args: argparse.Namespace, chain_ids: list[str], destination_dir: Path) -> dict[str, Any]:
     sources: dict[str, Any] = {}
-    for name, spec in BULK_SOURCES.items():
+    requested = {**BULK_SOURCES, **(CATH_BOUNDARY_SOURCES if args.include_cath_boundaries else {})}
+    for name, spec in requested.items():
         destination = destination_dir / spec["path"]
         ok = _download_url(
             str(spec["url"]),
@@ -390,8 +404,8 @@ def _collect_sources(args: argparse.Namespace, chain_ids: list[str], destination
             "sha256": None if args.dry_run or not destination.exists() else _sha256(destination),
         }
         if not ok:
-            if name == "cath_domain_list":
-                raise SystemExit("Required metadata source download failed: cath_domain_list; no lock was published.")
+            if name == "cath_domain_list" or name in CATH_BOUNDARY_SOURCES:
+                raise SystemExit(f"Required metadata source download failed: {name}; no lock was published.")
             sources[name].update({"skipped": True, "errors": 1, "reason": "optional source download failed"})
 
     if args.include_rcsb_rest:
@@ -473,7 +487,7 @@ def main(argv: list[str] | None = None) -> None:
         sources = _collect_sources(args, chain_ids, staging)
         if _sha256(args.chain_data_cache) != cache_digest:
             raise ValueError("Chain data cache changed during source download; no lock was published.")
-        lock = {
+        lock: dict[str, Any] = {
             "schema_version": 2,
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "chain_data_cache": {"path": args.chain_data_cache.name, "sha256": cache_digest},
@@ -485,6 +499,8 @@ def main(argv: list[str] | None = None) -> None:
             },
             "sources": sources,
         }
+        if args.include_cath_boundaries:
+            lock["download_options"]["include_cath_boundaries"] = True
         for source in sources.values():
             if not source.get("skipped"):
                 shutil.move(str(staging / source["path"]), str(args.out_dir / source["path"]))

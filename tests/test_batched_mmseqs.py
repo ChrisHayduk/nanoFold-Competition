@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import shutil
@@ -203,7 +204,7 @@ def test_invalid_fasta_rejected_before_search(batch_case: dict[str, Any], monkey
         mmseqs.run_batched_mmseqs(**batch_case)
 
 
-@pytest.mark.parametrize(("option", "value"), [("source_batch_size", 1_000_001), ("query_batch_size", 257), ("source_batch_size", 0), ("max_seqs", 1), ("max_seqs", 2**31), ("threads", True), ("input_binding_sha256", "bad")])
+@pytest.mark.parametrize(("option", "value"), [("source_batch_size", 1_000_001), ("query_batch_size", 257), ("source_batch_size", 0), ("max_seqs", 1), ("max_seqs", 2**31), ("threads", True), ("input_binding_sha256", "bad"), ("max_sequence_length", 0), ("max_sequence_length", 65536), ("coverage_mode", 1)])
 def test_invalid_bounds_rejected_before_search(batch_case: dict[str, Any], monkeypatch: pytest.MonkeyPatch, option: str, value: Any) -> None:
     batch_case[option] = value
     monkeypatch.setattr(mmseqs, "_batch_execute", lambda *args, **kwargs: pytest.fail("invalid bounds launched"))
@@ -339,3 +340,40 @@ def test_real_batched_search_matches_unpartitioned_exhaustive_search(tmp_path: P
     assert set(mmseqs.iter_batched_mmseqs_hits(batched, min_seq_id=0.3, coverage=0.8)) == full_hits
     assert batched["alignments_calculated"] == full["alignments_calculated"]
     assert mmseqs.run_batched_mmseqs(**kwargs, checkpoint_dir=tmp_path / "batched", source_batch_size=2, query_batch_size=1) == batched
+
+
+def test_real_query_coverage_finds_short_domain_in_long_parent(tmp_path: Path) -> None:
+    binary = os.environ.get("MMSEQS_TEST_BINARY") or shutil.which("mmseqs")
+    if not binary:
+        pytest.skip("Set MMSEQS_TEST_BINARY to test the full-parent leakage boundary")
+    domain = "SDNKAWGPALHQYCLWHIMIYVKYYMFIMLYEMNLNEHRA"
+    parent = "ACDEFGHIKLMNPQRSTVWY" * 15 + domain + "YWVTSRQPNMLKIHGFEDCA" * 15
+    arguments = {
+        "query_fasta": _fasta(tmp_path / "heldout.fasta", [("q0", domain)]),
+        "source_fasta": _fasta(tmp_path / "parents.fasta", [("s0", domain), ("s1", parent), ("s2", domain[:20])]),
+        "mmseqs_bin": binary, "min_seq_id": 0.3, "coverage": 0.8, "threads": 1, "max_seqs": 3,
+        "reserve_disk_bytes": 0, "max_rss_bytes": 4 * 1024**3, "max_sequence_length": len(parent),
+        "source_batch_size": 3, "input_binding_sha256": "a" * 64,
+    }
+    directional = mmseqs.run_batched_mmseqs(**arguments, coverage_mode=2, checkpoint_dir=tmp_path / "directional")
+    # The real runner records -e 1e308. Verify the exact produced receipt,
+    # not a synthetic command with a different equivalent float spelling.
+    importlib.import_module("scripts.build_full_parent_frame").verify_barrier(
+        directional, arguments["query_fasta"], arguments["source_fasta"], "a" * 64)
+    assert directional["alignments_calculated"] == 2
+    assert set(mmseqs.iter_batched_mmseqs_hits(directional, min_seq_id=0.3, coverage=0.8, coverage_mode=2)) == {("q0", "s0"), ("q0", "s1")}
+    with pytest.raises(ValueError, match="thresholds differ"):
+        list(mmseqs.iter_batched_mmseqs_hits(directional, min_seq_id=0.3, coverage=0.8))
+    bilateral = mmseqs.run_batched_mmseqs(**arguments, checkpoint_dir=tmp_path / "bilateral")
+    assert bilateral["alignments_calculated"] == 1
+    assert set(mmseqs.iter_batched_mmseqs_hits(bilateral, min_seq_id=0.3, coverage=0.8)) == {("q0", "s0")}
+    arguments["max_sequence_length"] -= 1
+    with pytest.raises(ValueError, match="plan does not match"):
+        mmseqs.run_batched_mmseqs(**arguments, coverage_mode=2, checkpoint_dir=tmp_path / "directional")
+
+
+def test_long_record_native_size_guard_precedes_search(batch_case: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+    batch_case.update(max_sequence_length=65535, source_batch_size=1_000_000)
+    monkeypatch.setattr(mmseqs, "_batch_execute", lambda *args, **kwargs: pytest.fail("native bounds exceeded"))
+    with pytest.raises(ValueError, match="native record-size"):
+        mmseqs.run_batched_mmseqs(**batch_case)

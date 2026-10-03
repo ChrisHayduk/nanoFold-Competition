@@ -47,7 +47,7 @@ def test_policy_enforces_direction_and_keeps_hidden_provenance_private(policy_ca
 
 
 def test_builder_validates_and_returns_canonical_policy(policy_case: dict[str, Path], tmp_path: Path) -> None:
-    inputs = {key: policy_case[key] for key in ("train_manifest", "val_manifest", "hidden_manifest", "train_filter", "val_filter")}
+    inputs: dict[str, Any] = {key: policy_case[key] for key in ("train_manifest", "val_manifest", "hidden_manifest", "train_filter", "val_filter")}
     payload = build_msa_filter_policy(**inputs)
     assert payload == json.loads(policy_case["policy_path"].read_text())
     output = tmp_path / "new" / "policy.json"

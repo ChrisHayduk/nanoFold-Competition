@@ -418,3 +418,27 @@ def test_inventory_fails_if_source_asset_changes_during_scan(tmp_path: Path, mon
     with pytest.raises(ValueError, match="input changed"):
         module.main()
     assert not output.exists()
+
+
+def test_streaming_raw_projection_matches_token_semantics_and_checks_late_rows(tmp_path: Path) -> None:
+    import pytest
+
+    from nanofold.chain_paths import chain_data_dir
+
+    module = _load_filter_module()
+    raw = tmp_path / "raw"
+    chain = chain_data_dir(raw / "roda_pdb", "train_A")
+    chain.mkdir(parents=True)
+    manifest = tmp_path / "train.txt"
+    manifest.write_text("train_A\n")
+    path = chain / "uniref90_hits.a3m"
+    # Query-gap columns drop before row ungapping. Unknown uppercase residues
+    # map to X and lowercase/dot insertion states contribute no searched AA.
+    path.write_text(">query\n" + "A-" + "C" * 20 + "\n>row\n" + "Bf.Q" + "D" * 20 + "\n")
+    sequences, counts = module._scan_raw_msa_rows(manifest_paths=[manifest], raw_root=raw, msa_names=[path.name])
+    assert list(sequences.values()) == ["X" + "D" * 20]
+    assert counts["rows"] == 2 and counts["non_query_rows"] == 1
+    with path.open("a") as handle:
+        handle.write(">malformed_last_row\nA\n")
+    with pytest.raises(ValueError, match="aligned"):
+        module._scan_raw_msa_rows(manifest_paths=[manifest], raw_root=raw, msa_names=[path.name])

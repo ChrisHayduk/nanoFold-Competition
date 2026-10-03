@@ -543,3 +543,46 @@ def test_templates_omit_unverifiable_residue_mappings(preprocessing, invalid_map
         target_seq="AAAAAA", target_L=6, template_hhr_name="pdb70_hits.hhr", max_templates=1,
     )
     assert templates["template_ca_coords"].shape == (0, 6, 3)
+
+
+@pytest.mark.parametrize("changed_input", ["mmcif", "msa"])
+def test_inputs_changed_during_parsing_cannot_publish_stale_provenance(
+    preprocessing, monkeypatch: pytest.MonkeyPatch, changed_input: str,
+) -> None:
+    module, run, features, labels, msa, cif = preprocessing
+    original_reader = module._read_merged_msa
+
+    def change_bound_input(*args, **kwargs):
+        if changed_input == "mmcif":
+            _write_structure(cif, offset=40)
+        else:
+            msa.write_text(">query\nAAA\n>different_hit\nA-A\n")
+        return original_reader(*args, **kwargs)
+
+    monkeypatch.setattr(module, "_read_merged_msa", change_bound_input)
+    with pytest.raises(ValueError, match="Source inputs changed during preprocessing"):
+        run()
+    assert not list(features.glob("*.npz"))
+    assert not list(labels.glob("*.npz"))
+
+
+def test_inputs_changed_during_resume_cannot_be_reported_as_unchanged(
+    preprocessing, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, run, features, labels, _, cif = preprocessing
+    run()
+    original_pairs = {
+        path: path.read_bytes() for root in (features, labels) for path in root.glob("*.npz")
+    }
+    original_validator = module._existing_outputs_are_valid
+
+    def change_bound_input(*args, **kwargs):
+        valid = original_validator(*args, **kwargs)
+        assert valid
+        _write_structure(cif, offset=40)
+        return valid
+
+    monkeypatch.setattr(module, "_existing_outputs_are_valid", change_bound_input)
+    with pytest.raises(ValueError, match="Source inputs changed while validating existing outputs"):
+        run("--skip-existing")
+    assert all(path.read_bytes() == contents for path, contents in original_pairs.items())

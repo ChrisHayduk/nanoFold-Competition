@@ -31,6 +31,7 @@ from nanofold.a3m import GAP_ID, MASK_ID, RESTYPES
 from nanofold.chain_paths import chain_data_dir, chain_npz_path
 from nanofold.mmseqs import (
     batched_mmseqs_summary,
+    canonical_target_sequence,
     iter_batched_mmseqs_hits,
     iter_mmseqs_hits,
     load_msa_for_audit,
@@ -48,6 +49,11 @@ def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--train-manifest", type=Path, default=Path("data/manifests/train.txt"))
     ap.add_argument("--val-manifest", type=Path, default=Path("data/manifests/val.txt"))
+    ap.add_argument("--extra-heldout-manifest", type=Path, action="append", default=[],
+                    help="Additional protected target queries from the cache; repeat for historical or hidden targets. "
+                    "Their MSA features are not inspected. Requires exhaustive MMseqs and --heldout-chain-data-cache.")
+    ap.add_argument("--heldout-chain-data-cache", type=Path, default=None,
+                    help="Sequence cache for primary and extra protected targets; requires --extra-heldout-manifest.")
     ap.add_argument("--features-dir", type=Path, default=Path("data/processed_features"))
     ap.add_argument("--val-features-dir", type=Path, default=None, help="Held-out features root; defaults to --features-dir.")
     ap.add_argument(
@@ -86,10 +92,14 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--mmseqs-bin", default="mmseqs")
     ap.add_argument("--min-seq-id", type=float, default=0.30)
     ap.add_argument("--coverage", type=float, default=0.80)
+    ap.add_argument("--coverage-mode", type=int, choices=(0, 2), default=0,
+                    help="0: require both sequence coverages; 2: require held-out query coverage only (requires --exhaustive).")
+    ap.add_argument("--max-sequence-length", type=int, default=256,
+                    help="Maximum sequence length admitted to either search database (1..65535); longer inputs fail.")
     ap.add_argument("--threads", type=int, default=8)
     ap.add_argument("--max-seqs", type=int, default=1_000_000)
     ap.add_argument("--checkpoint-dir", type=Path, default=None,
-                    help="Private resumable exhaustive search directory; requires --exhaustive, anonymous headers, lengths <=256.")
+                    help="Private resumable exhaustive search directory; requires --exhaustive and anonymous headers.")
     ap.add_argument("--source-batch-size", type=int, default=1_000_000, help="Maximum source records per batch (1..1000000).")
     ap.add_argument("--query-batch-size", type=int, default=256, help="Maximum held-out records per batch (1..256).")
     ap.add_argument("--search-disk-reserve-gib", type=int, default=100, help="Free-disk reserve during bounded search.")
@@ -683,6 +693,63 @@ def _mmseqs_version(mmseqs_bin: str) -> str | None:
     return proc.stdout.strip() or None
 
 
+def _extra_heldout_targets(
+    *, val_ids: Sequence[str], manifests: Sequence[Path], cache_path: Path | None,
+    snapshots: dict[Path, str], exhaustive: bool,
+) -> tuple[dict[str, str], dict[str, Any]]:
+    if bool(manifests) != (cache_path is not None):
+        raise ValueError("--extra-heldout-manifest and --heldout-chain-data-cache are required together")
+    primary_ids = set(val_ids)
+    scope: dict[str, Any] = {
+        "primary_chain_count": len(primary_ids), "extra_chain_count": 0, "additional_chain_count": 0,
+        "protected_chain_count": len(primary_ids), "extra_unique_query_count": 0,
+        "extra_manifest_sha256": [], "chain_data_cache_sha256": None,
+        "feature_statistics_scope": "Primary validation manifest only; extra targets contribute cached queries only.",
+        "extra_msa_features_checked": False,
+    }
+    if cache_path is None:
+        return {}, scope
+    if not exhaustive:
+        raise ValueError("Extra held-out targets require --exhaustive")
+    cache_path = cache_path.resolve(strict=True)
+    manifests = [path.resolve(strict=True) for path in manifests]
+    for path in (*manifests, cache_path):
+        digest = _sha256_file(path)
+        if path in snapshots and snapshots[path] != digest:
+            raise ValueError("MSA audit protected-target input changed during scanning")
+        snapshots[path] = digest
+    cache = json.loads(cache_path.read_text())
+    if not isinstance(cache, dict):
+        raise ValueError("Held-out chain-data cache must be a JSON object")
+    extra_ids = {chain_id for path in manifests for chain_id in read_manifest(path)}
+    if not extra_ids:
+        raise ValueError("Extra held-out manifests must contain target chains")
+    sequences: dict[str, str] = {}
+    for chain_id in sorted(primary_ids | extra_ids):
+        row = cache.get(chain_id)
+        if not isinstance(row, dict):
+            raise ValueError("Protected target is missing from the held-out chain-data cache")
+        sequences_for_chain = {
+            canonical_target_sequence(value)
+            for key in ("sequence", "seq", "seqres", "aatype_sequence")
+            if isinstance(value := row.get(key), str) and value.strip()
+        }
+        if len(sequences_for_chain) != 1:
+            raise ValueError("Protected target cache must contain one unambiguous canonical sequence per chain")
+        sequences[chain_id] = sequences_for_chain.pop()
+    scope.update({
+        "extra_chain_count": len(extra_ids), "additional_chain_count": len(extra_ids - primary_ids),
+        "protected_chain_count": len(primary_ids | extra_ids),
+        "extra_unique_query_count": len({sequences[chain_id] for chain_id in extra_ids}),
+        "extra_manifest_sha256": sorted(snapshots[path] for path in manifests),
+        "chain_data_cache_sha256": snapshots[cache_path],
+        "extra_manifest_pins": [{"path": str(path), "sha256": snapshots[path]} for path in manifests],
+        "chain_data_cache_path": str(cache_path),
+    })
+    _assert_inputs_unchanged(snapshots)
+    return sequences, scope
+
+
 def _collect_mmseqs_records(
     *,
     train_ids: Sequence[str],
@@ -693,12 +760,14 @@ def _collect_mmseqs_records(
     source_targets_only: bool = False,
     input_snapshots: dict[Path, str] | None = None,
     require_complete: bool = False,
+    protected_cache_sequences: dict[str, str] | None = None,
+    heldout_query_scope: dict[str, Any] | None = None,
 ) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
     def load_bound(root: Path, chain_id: str) -> tuple[np.ndarray, int] | None:
         path = chain_npz_path(root, chain_id)
         if not path.exists():
             if require_complete:
-                raise ValueError("Checkpointed audit requires every source and held-out feature file")
+                raise ValueError("Protected-target audit requires every source and primary held-out feature file")
             return None
         path = path.resolve(strict=True)
         if input_snapshots is not None:
@@ -716,6 +785,8 @@ def _collect_mmseqs_records(
         if loaded is None:
             continue
         sequence = _msa_row_to_ungapped_sequence(loaded[0][0])
+        if protected_cache_sequences and sequence != protected_cache_sequences.get(chain_id):
+            raise ValueError("Primary held-out feature query does not match the protected target cache")
         digest = _sequence_sha256(sequence)
         if digest in seen_targets:
             continue
@@ -724,6 +795,24 @@ def _collect_mmseqs_records(
         if include_identifiers:
             header += f"|origin={chain_id}"
         target_records.append((header, sequence))
+
+    primary_query_count = len(target_records)
+    for index, (chain_id, sequence) in enumerate(sorted((protected_cache_sequences or {}).items())):
+        digest = _sequence_sha256(sequence)
+        if digest in seen_targets:
+            continue
+        seen_targets.add(digest)
+        header = f"valtarget_{len(val_ids) + index}"
+        if include_identifiers:
+            header += f"|origin={chain_id}"
+        target_records.append((header, sequence))
+    if heldout_query_scope is not None:
+        heldout_query_scope.update({
+            "primary_unique_query_count": primary_query_count,
+            "additional_unique_query_count": len(target_records) - primary_query_count,
+            "protected_unique_query_count": len(target_records),
+            "searched_query_records_sha256": sequence_records_sha256(target_records),
+        })
 
     source_records: list[tuple[str, str]] = []
     seen_sources: set[str] = set()
@@ -749,6 +838,15 @@ def _collect_mmseqs_records(
     return target_records, source_records
 
 
+def _validate_search_scope(*, coverage_mode: int, max_sequence_length: int, exhaustive: bool) -> None:
+    if type(coverage_mode) is not int or coverage_mode not in (0, 2):
+        raise ValueError("--coverage-mode must be 0 or 2")
+    if type(max_sequence_length) is not int or not 1 <= max_sequence_length <= 65535:
+        raise ValueError("--max-sequence-length must be in 1..65535")
+    if coverage_mode == 2 and not exhaustive:
+        raise ValueError("--coverage-mode 2 requires --exhaustive")
+
+
 def run_mmseqs_homology(
     *,
     train_ids: Sequence[str],
@@ -771,13 +869,22 @@ def run_mmseqs_homology(
     reserve_disk_bytes: int = 100 * 1024**3,
     max_rss_bytes: int = 48 * 1024**3,
     input_binding_sha256: str | None = None,
+    coverage_mode: int = 0,
+    max_sequence_length: int = 256,
+    extra_heldout_manifests: Sequence[Path] = (),
+    heldout_chain_data_cache: Path | None = None,
 ) -> dict[str, Any]:
+    _validate_search_scope(coverage_mode=coverage_mode, max_sequence_length=max_sequence_length, exhaustive=exhaustive)
     validate_search_parameters(min_seq_id=min_seq_id, coverage=coverage, threads=threads, max_seqs=max_seqs)
     if shutil.which(mmseqs_bin) is None:
         raise SystemExit(f"MMseqs binary not found: {mmseqs_bin}")
     if checkpoint_dir is not None and (not exhaustive or include_identifiers):
         raise ValueError("Checkpointed audit requires --exhaustive and anonymous MMseqs headers")
     snapshots: dict[Path, str] = {}
+    protected_sequences, heldout_query_scope = _extra_heldout_targets(
+        val_ids=val_ids, manifests=extra_heldout_manifests, cache_path=heldout_chain_data_cache,
+        snapshots=snapshots, exhaustive=exhaustive,
+    )
     target_records, source_records = _collect_mmseqs_records(
         train_ids=train_ids,
         val_ids=val_ids,
@@ -786,10 +893,14 @@ def run_mmseqs_homology(
         val_features_dir=val_features_dir,
         source_targets_only=source_targets_only,
         input_snapshots=snapshots,
-        require_complete=checkpoint_dir is not None,
+        require_complete=checkpoint_dir is not None or bool(extra_heldout_manifests),
+        protected_cache_sequences=protected_sequences, heldout_query_scope=heldout_query_scope,
     )
     if not target_records:
         raise SystemExit("Could not collect held-out target records for MMseqs audit.")
+    if any(len(sequence) > max_sequence_length
+           for records in (target_records, source_records) for _header, sequence in records):
+        raise ValueError(f"MMseqs audit sequence exceeds --max-sequence-length {max_sequence_length}")
     source_count_key = "source_target_records" if source_targets_only else "source_non_query_records"
     hit_count_key = (
         "val_targets_with_train_target_homolog_hits" if source_targets_only
@@ -808,9 +919,10 @@ def run_mmseqs_homology(
         "max_seqs": max_seqs,
         "max_accept": max_seqs if all_pairs else 2147483647,
         "max_rejected": max_seqs if all_pairs else 2147483647,
+        "max_sequence_length": max_sequence_length,
     }
     threshold = {
-        "min_seq_id": min_seq_id, "coverage": coverage, "cov_mode": 0, "alignment_mode": 3, "seq_id_mode": 0,
+        "min_seq_id": min_seq_id, "coverage": coverage, "cov_mode": coverage_mode, "alignment_mode": 3, "seq_id_mode": 0,
     }
     if all_pairs and checkpoint_dir is None and max_seqs < len(source_records):
         raise ValueError(
@@ -819,7 +931,9 @@ def run_mmseqs_homology(
     if not source_records:
         _assert_inputs_unchanged(snapshots)
         return {
+            "heldout_query_scope": heldout_query_scope,
             "threshold": threshold,
+            "coverage_mode": coverage_mode, "max_sequence_length": max_sequence_length,
             "search_contract": search_contract,
             "exhaustive": all_pairs,
             "possible_pair_count": 0,
@@ -848,16 +962,21 @@ def run_mmseqs_homology(
                 mmseqs_bin=mmseqs_bin, min_seq_id=min_seq_id, coverage=coverage, threads=threads, max_seqs=max_seqs,
                 source_batch_size=source_batch_size, query_batch_size=query_batch_size,
                 reserve_disk_bytes=reserve_disk_bytes, max_rss_bytes=max_rss_bytes,
-                input_binding_sha256=bound_inputs,
+                input_binding_sha256=bound_inputs, coverage_mode=coverage_mode,
+                max_sequence_length=max_sequence_length,
             )
             unique_target_hits: set[str] = set()
             hit_count = 0
-            for query, _target in iter_batched_mmseqs_hits(result, min_seq_id=min_seq_id, coverage=coverage):
+            for query, _target in iter_batched_mmseqs_hits(
+                result, min_seq_id=min_seq_id, coverage=coverage, coverage_mode=coverage_mode,
+            ):
                 unique_target_hits.add(query)
                 hit_count += 1
         _assert_inputs_unchanged(snapshots)
         return {
+            "heldout_query_scope": heldout_query_scope,
             "threshold": threshold, "search_contract": search_contract, "exhaustive": True,
+            "coverage_mode": coverage_mode, "max_sequence_length": max_sequence_length,
             "possible_pair_count": len(target_records) * len(source_records), "search_parameters": search_parameters,
             "mmseqs": {"binary": mmseqs_bin, "version": _mmseqs_version(mmseqs_bin), "command": [],
                        "batching": batched_mmseqs_summary(result)},
@@ -893,7 +1012,8 @@ def run_mmseqs_homology(
             "-c",
             str(coverage),
             "--cov-mode",
-            "0",
+            str(coverage_mode),
+            "--max-seq-len", str(max_sequence_length),
             "--alignment-mode",
             "3",
             "--seq-id-mode",
@@ -923,12 +1043,15 @@ def run_mmseqs_homology(
     for query, _target in iter_mmseqs_hits(
         m8_out, query_ids={header for header, _ in target_records},
         target_ids={header for header, _ in source_records}, min_seq_id=min_seq_id, coverage=coverage,
+        coverage_mode=coverage_mode,
     ):
         hit_count += 1
         unique_target_hits.add(query)
     _assert_inputs_unchanged(snapshots)
     return {
+        "heldout_query_scope": heldout_query_scope,
         "threshold": threshold,
+        "coverage_mode": coverage_mode, "max_sequence_length": max_sequence_length,
         "search_contract": search_contract,
         "exhaustive": all_pairs,
         "possible_pair_count": len(target_records) * len(source_records),
@@ -945,6 +1068,7 @@ def run_mmseqs_homology(
             "target_records_sha256": sequence_records_sha256(target_records),
             "query_ids": [header for header, _ in target_records],
             "m8_sha256": _sha256_file(m8_out),
+            "upstream_input_binding_sha256": input_binding_sha256,
         },
         "identifiers_in_m8": include_identifiers,
         "search_executed": True,
@@ -967,6 +1091,10 @@ def strict_failures(summary: dict[str, Any]) -> list[str]:
     ):
         if disjointness[key]:
             failures.append(f"{key}={disjointness[key]}")
+    protected_disjointness = summary.get("protected_target_manifest_disjointness", {})
+    for key in ("train_val_chain_overlap", "train_val_pdb_overlap", "train_val_cluster_overlap", "missing_cluster_assignments"):
+        if protected_disjointness.get(key):
+            failures.append(f"protected_targets: {key}={protected_disjointness[key]}")
     exact = summary["processed_msa_exact"]
     for key in ("val_target_sequences_seen_in_train_non_query_msa", "train_val_target_sequence_overlap"):
         if exact[key]:
@@ -982,8 +1110,14 @@ def strict_failures(summary: dict[str, Any]) -> list[str]:
 
 def main() -> None:
     args = parse_args()
+    if bool(args.extra_heldout_manifest) != (args.heldout_chain_data_cache is not None):
+        raise ValueError("--extra-heldout-manifest and --heldout-chain-data-cache are required together")
+    if args.extra_heldout_manifest and not (args.run_mmseqs and args.exhaustive):
+        raise ValueError("Extra held-out targets require --run-mmseqs --exhaustive")
     if args.exhaustive and not args.run_mmseqs:
         raise SystemExit("--exhaustive requires --run-mmseqs")
+    _validate_search_scope(coverage_mode=args.coverage_mode, max_sequence_length=args.max_sequence_length,
+                           exhaustive=args.exhaustive)
     validate_search_parameters(
         min_seq_id=args.min_seq_id, coverage=args.coverage, threads=args.threads, max_seqs=args.max_seqs,
     )
@@ -996,6 +1130,11 @@ def main() -> None:
     args.train_manifest = args.train_manifest.resolve(strict=True)
     args.val_manifest = args.val_manifest.resolve(strict=True)
     metadata_paths = [args.train_manifest, args.val_manifest]
+    args.extra_heldout_manifest = [path.resolve(strict=True) for path in args.extra_heldout_manifest]
+    metadata_paths.extend(args.extra_heldout_manifest)
+    if args.heldout_chain_data_cache is not None:
+        args.heldout_chain_data_cache = args.heldout_chain_data_cache.resolve(strict=True)
+        metadata_paths.append(args.heldout_chain_data_cache)
     if args.cluster_tsv is not None:
         args.cluster_tsv = args.cluster_tsv.resolve(strict=True)
         metadata_paths.append(args.cluster_tsv)
@@ -1060,6 +1199,13 @@ def main() -> None:
             val_features_dir=args.val_features_dir,
         ),
     }
+    if args.extra_heldout_manifest:
+        protected_ids = sorted(set(val_ids) | {
+            chain_id for path in args.extra_heldout_manifest for chain_id in read_manifest(path)
+        })
+        summary["protected_target_manifest_disjointness"] = target_disjointness(
+            train_ids=train_ids, val_ids=protected_ids, cluster_tsv=args.cluster_tsv,
+        )
     if args.audit_raw_identifiers:
         summary["raw_msa_identifier_overlap"] = audit_raw_msa_identifier_overlap(
             train_ids=train_ids,
@@ -1089,6 +1235,8 @@ def main() -> None:
             reserve_disk_bytes=args.search_disk_reserve_gib * 1024**3,
             max_rss_bytes=args.search_max_rss_gib * 1024**3,
             input_binding_sha256=upstream_binding,
+            coverage_mode=args.coverage_mode, max_sequence_length=args.max_sequence_length,
+            extra_heldout_manifests=args.extra_heldout_manifest, heldout_chain_data_cache=args.heldout_chain_data_cache,
         )
         summary["mmseqs_homology"] = run_mmseqs_homology(
             train_ids=train_ids,
@@ -1109,10 +1257,17 @@ def main() -> None:
             reserve_disk_bytes=args.search_disk_reserve_gib * 1024**3,
             max_rss_bytes=args.search_max_rss_gib * 1024**3,
             input_binding_sha256=upstream_binding,
+            coverage_mode=args.coverage_mode, max_sequence_length=args.max_sequence_length,
+            extra_heldout_manifests=args.extra_heldout_manifest, heldout_chain_data_cache=args.heldout_chain_data_cache,
         )
+        if summary["mmseqs_target_homology"]["heldout_query_scope"] != summary["mmseqs_homology"]["heldout_query_scope"]:
+            raise ValueError("Protected target query scope changed between target and MSA searches")
+        summary["heldout_query_scope"] = summary["mmseqs_target_homology"]["heldout_query_scope"]
     failures = strict_failures(summary)
     summary["validation"] = {
         "strict": bool(args.strict),
+        "coverage_mode": args.coverage_mode,
+        "max_sequence_length": args.max_sequence_length,
         "passed": not failures,
         "failures": failures,
         "cluster_disjointness_checked": summary["target_manifest_disjointness"]["cluster_map_complete"],
@@ -1123,9 +1278,12 @@ def main() -> None:
         "homology_scope": "Target pairs use all-pair MMseqs local alignments without composition correction "
         "or prefilter masking, with E-value limit 1e308. Source non-query rows of at least 20 residues use "
         + ("the same all-pair contract. " if args.exhaustive else "a separate heuristic search. ")
-        + "Identity and bidirectional coverage gates apply to the returned local alignments; zero hits do not "
+        + ("Identity and bidirectional coverage gates " if args.coverage_mode == 0
+           else "Identity and held-out query coverage gates (source coverage is not required) ")
+        + "apply to the returned local alignments; zero hits do not "
         "prove absence of every possible alignment or all homology.",
         "depth_identifiers_included": bool(args.include_depth_identifiers),
+        "feature_statistics_scope": "Primary train and validation manifests only; extra protected targets add search queries only.",
     }
     if not args.run_mmseqs:
         summary["validation"]["homology_scope"] = "MMseqs homology was not checked; --run-mmseqs was not requested."

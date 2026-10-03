@@ -148,9 +148,11 @@ def test_historical_sources_must_share_one_archive_version(eligibility: dict[str
         historical_source_catalog([first, second])
 
 
-def test_raw_query_audit_hashes_full_bytes_without_claiming_all_rows(tmp_path: Path) -> None:
+@pytest.mark.parametrize("dot_padding", [False, True])
+def test_raw_query_audit_hashes_full_bytes_without_claiming_all_rows(tmp_path: Path, dot_padding: bool) -> None:
     path = tmp_path / "query.a3m"
-    path.write_text(">query\nAAaaAA--\n>second\ninvalid downstream row!\n")
+    query = "A.Aa.aAA--." if dot_padding else "AAaaAA--"
+    path.write_text(f">query\n{query}\n>second\ninvalid downstream row!\n")
     record = raw_query_record(path)
     assert record["scope"] == "first_query_identity_only"
     assert record["query_length"] == 4

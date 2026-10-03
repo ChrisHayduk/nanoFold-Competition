@@ -399,3 +399,284 @@ def test_real_exhaustive_msa_audit_recovers_prefilter_missed_pair(tmp_path: Path
         )
         assert result["val_targets_with_train_msa_homolog_hits"] == expected_hits
         assert result["exhaustive"] == exhaustive
+
+
+def test_directional_audit_cli_records_scope_and_omits_global_cluster_check(tmp_path: Path) -> None:
+    import json
+    import subprocess
+    import sys
+
+    features = tmp_path / "features"
+    _write_feature(features, "trn1_A", ["A" * 320, "C" * 320])
+    _write_feature(features, "val1_A", ["D" * 40])
+    train, heldout, exclusions = (tmp_path / name for name in ("train", "heldout", "exclusions"))
+    train.write_text("trn1_A\n")
+    heldout.write_text("val1_A\n")
+    exclusions.write_text("")
+    mmseqs = tmp_path / "mmseqs"
+    mmseqs.write_text(
+        '#!/bin/sh\nif [ "$1" = version ]; then echo test; exit 0; fi\n'
+        'previous=; for argument in "$@"; do\n'
+        'if [ "$previous" = --cov-mode ] && [ "$argument" = 0 ]; then : > "$4"; exit 0; fi\n'
+        'previous=$argument; done\n'
+        'case "$3" in *train_targets.fasta) source=traintarget_0;; *) source=trainmsa_0;; esac\n'
+        "printf 'valtarget_0\\t%s\\t100\\t40\\t1\\t0.125\\t0\\t100\\n' \"$source\" > \"$4\"\n"
+    )
+    mmseqs.chmod(0o755)
+    script = Path(__file__).resolve().parents[1] / "scripts/audit_msa_split.py"
+    command = [
+        sys.executable, str(script), "--train-manifest", str(train), "--val-manifest", str(heldout),
+        "--feature-exclusion-list", str(exclusions), "--features-dir", str(features),
+        "--skip-plot", "--strict", "--run-mmseqs", "--exhaustive", "--max-sequence-length", "512",
+        "--mmseqs-bin", str(mmseqs),
+    ]
+    for mode, expected_status in ((0, 0), (2, 1)):
+        output = tmp_path / f"audit-{mode}"
+        result = subprocess.run([*command, "--out-dir", str(output), "--coverage-mode", str(mode)],
+                                text=True, capture_output=True)
+        assert bool(result.returncode) == bool(expected_status), result.stderr
+        report = json.loads((output / "msa_split_audit_summary.json").read_text())
+        assert report["validation"]["coverage_mode"] == mode
+        assert report["validation"]["max_sequence_length"] == 512
+        assert report["validation"]["cluster_disjointness_checked"] is False
+        assert report["target_manifest_disjointness"]["train_val_cluster_overlap"] is None
+        assert len(report["validation"]["failures"]) == (2 if mode == 2 else 0)
+        for key in ("mmseqs_homology", "mmseqs_target_homology"):
+            assert report[key]["coverage_mode"] == mode
+            assert report[key]["threshold"]["cov_mode"] == mode
+            assert report[key]["max_sequence_length"] == 512
+            native_command = report[key]["mmseqs"]["command"]
+            assert native_command[native_command.index("--cov-mode") + 1] == str(mode)
+            assert native_command[native_command.index("--max-seq-len") + 1] == "512"
+        assert ("held-out query coverage" in report["validation"]["homology_scope"]) == (mode == 2)
+
+
+def test_directional_audit_rejects_heuristics_and_unbounded_sequences(tmp_path: Path) -> None:
+    import pytest
+
+    module = _load_audit_module()
+    with pytest.raises(ValueError, match="requires --exhaustive"):
+        module._validate_search_scope(coverage_mode=2, max_sequence_length=512, exhaustive=False)
+    for maximum in (0, 65536, 256.0):
+        with pytest.raises(ValueError, match="1..65535"):
+            module._validate_search_scope(coverage_mode=2, max_sequence_length=maximum, exhaustive=True)
+    features = tmp_path / "features"
+    _write_feature(features, "trn1_A", ["A" * 320])
+    _write_feature(features, "val1_A", ["C" * 40])
+    binary = tmp_path / "mmseqs"
+    binary.write_text("#!/bin/sh\nexit 99\n")
+    binary.chmod(0o755)
+    with pytest.raises(ValueError, match="exceeds --max-sequence-length 256"):
+        module.run_mmseqs_homology(
+            train_ids=["trn1_A"], val_ids=["val1_A"], features_dir=features, out_dir=tmp_path,
+            mmseqs_bin=str(binary), min_seq_id=0.3, coverage=0.8, threads=1, max_seqs=1,
+            tmp_dir=None, include_identifiers=False, source_targets_only=True,
+        )
+
+
+def test_real_directional_audit_detects_embedded_domain_in_full_parent(tmp_path: Path) -> None:
+    import os
+    import random
+    import shutil
+
+    import pytest
+
+    binary = os.environ.get("MMSEQS_TEST_BINARY") or shutil.which("mmseqs")
+    if not binary:
+        pytest.skip("Set MMSEQS_TEST_BINARY to run the full-parent directional regression")
+    randomizer = random.Random(9823)
+    alphabet = "ACDEFGHIKLMNPQRSTVWY"
+    query = "".join(randomizer.choices(alphabet, k=64))
+    parent = "".join(randomizer.choices(alphabet, k=144)) + query + "".join(randomizer.choices(alphabet, k=144))
+    unrelated = "".join(randomizer.choices(alphabet, k=len(parent)))
+    features = tmp_path / "features"
+    module = _load_audit_module()
+    for targets_only in (True, False):
+        _write_feature(features, "trn1_A", [parent] if targets_only else [unrelated, parent])
+        _write_feature(features, "val1_A", [query])
+        hit_key = ("val_targets_with_train_target_homolog_hits" if targets_only
+                   else "val_targets_with_train_msa_homolog_hits")
+        for checkpointed in (False, True):
+            for coverage_mode in (0, 2):
+                output = tmp_path / f"audit-{targets_only}-{checkpointed}-{coverage_mode}"
+                output.mkdir()
+                result = module.run_mmseqs_homology(
+                    train_ids=["trn1_A"], val_ids=["val1_A"], features_dir=features, out_dir=output,
+                    mmseqs_bin=str(binary), min_seq_id=0.3, coverage=0.8, threads=1, max_seqs=1,
+                    tmp_dir=None, include_identifiers=False, source_targets_only=targets_only, exhaustive=True,
+                    checkpoint_dir=output / "checkpoints" if checkpointed else None,
+                    source_batch_size=1, query_batch_size=1, reserve_disk_bytes=0,
+                    coverage_mode=coverage_mode, max_sequence_length=512,
+                )
+                assert result[hit_key] == (1 if coverage_mode == 2 else 0)
+                assert result["coverage_mode"] == coverage_mode
+                assert result["max_sequence_length"] == 512
+                if checkpointed:
+                    assert result["mmseqs"]["batching"]["alignments_calculated"] == (1 if coverage_mode == 2 else 0)
+                elif coverage_mode == 2:
+                    fields = Path(result["m8_path"]).read_text().strip().split("\t")
+                    assert float(fields[4]) == 1.0
+                    assert float(fields[5]) < 0.8
+
+
+def test_extra_protected_queries_bind_inputs_and_preserve_primary_feature_scope(tmp_path: Path, monkeypatch) -> None:
+    import json
+    import sys
+
+    import pytest
+
+    import nanofold.mmseqs as engine
+
+    module = _load_audit_module()
+    query, active = "C" * 64, "D" * 64
+    parent = "A" * 144 + query + "A" * 144
+    features = tmp_path / "features"
+    _write_feature(features, "trn1_A", ["E" * len(parent), parent])
+    _write_feature(features, "val1_A", [active])
+    train, primary, historical, hidden, cache, exclusions = (
+        tmp_path / name for name in ("train.txt", "primary.txt", "historical.txt", "hidden.txt", "cache.json", "excluded.txt")
+    )
+    train.write_text("trn1_A\n")
+    primary.write_text("val1_A\n")
+    historical.write_text("val1_A\nold1_A\n")
+    hidden.write_text("hid1_A\n")
+    # Deliberate active/historical overlap and identical historical/hidden sequences
+    # must add only one query, while all four manifest/cache inputs stay pinned.
+    cache.write_text(json.dumps({"val1_A": {"sequence": active}, "old1_A": {"sequence": query},
+                                 "hid1_A": {"sequence": query}}))
+    exclusions.write_text("")
+    binary = tmp_path / "mmseqs-fixture"
+    binary.write_text(f"#!{sys.executable}\n" + '''import pathlib, sys
+if sys.argv[1] == "version":
+    print("extra-protected-fixture-v1")
+    raise SystemExit(0)
+def records(path):
+    lines = pathlib.Path(path).read_text().splitlines()
+    return [(lines[i][1:], lines[i+1]) for i in range(0, len(lines), 2)]
+queries, sources = records(sys.argv[2]), records(sys.argv[3])
+rows = [f"{q}\\t{s}\\t100\\t{len(qs)}\\t1\\t{len(qs)/len(ss)}\\t0\\t50\\n"
+        for q, qs in queries for s, ss in sources if qs in ss]
+pathlib.Path(sys.argv[4]).write_text("".join(rows))
+print(f"Query database size: {len(queries)} type: Aminoacid")
+print(f"Target database size: {len(sources)} type: Aminoacid")
+print(f"{len(queries) * len(sources)} alignments calculated")
+print(f"{len(rows)} sequence pairs passed the thresholds")
+''')
+    binary.chmod(0o755)
+    monkeypatch.setattr(engine, "_batch_resource_check", lambda *args, **kwargs: (1, 10**12))
+    output = tmp_path / "report"
+    argv = [
+        "audit_msa_split.py", "--train-manifest", str(train), "--val-manifest", str(primary),
+        "--extra-heldout-manifest", str(historical), "--extra-heldout-manifest", str(hidden),
+        "--heldout-chain-data-cache", str(cache), "--features-dir", str(features),
+        "--feature-exclusion-list", str(exclusions), "--out-dir", str(output), "--skip-plot", "--strict",
+        "--run-mmseqs", "--exhaustive", "--coverage-mode", "2", "--max-sequence-length", "512",
+        "--checkpoint-dir", str(tmp_path / "checkpoints"), "--source-batch-size", "1", "--query-batch-size", "2",
+        "--max-seqs", "1", "--threads", "1", "--mmseqs-bin", str(binary),
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+    with pytest.raises(SystemExit, match="val_targets_with_train_msa_homolog_hits=1"):
+        module.main()
+    report_path = output / "msa_split_audit_summary.json"
+    original_report = report_path.read_bytes()
+    report = json.loads(original_report)
+    scope = report["heldout_query_scope"]
+    assert scope["primary_chain_count"] == 1
+    assert scope["extra_chain_count"] == 3
+    assert scope["additional_chain_count"] == 2
+    assert scope["protected_chain_count"] == 3
+    assert scope["primary_unique_query_count"] == 1
+    assert scope["extra_unique_query_count"] == 2
+    assert scope["additional_unique_query_count"] == 1
+    assert scope["protected_unique_query_count"] == 2
+    assert scope["extra_manifest_sha256"] == sorted(module._sha256_file(path) for path in (historical, hidden))
+    assert scope["chain_data_cache_sha256"] == module._sha256_file(cache)
+    assert scope["extra_msa_features_checked"] is False
+    assert report["splits"]["val"]["manifest_chains"] == 1
+    assert report["splits"]["val"]["missing_feature_files"] == 0
+    assert report["processed_msa_exact"]["val_target_sequences_seen_in_train_non_query_msa"] == 0
+    assert report["protected_target_manifest_disjointness"]["val_chains"] == 3
+    for key in ("mmseqs_target_homology", "mmseqs_homology"):
+        assert report[key]["target_records"] == 2
+        assert report[key]["heldout_query_scope"] == scope
+        assert report[key]["input_binding"]["target_records_sha256"] == scope["searched_query_records_sha256"]
+    assert "old1_A" not in json.dumps(report)
+    assert "hid1_A" not in json.dumps(report)
+    # Exact bytes, including whitespace with no sequence change, invalidate resume.
+    for path in (cache, historical, hidden):
+        original = path.read_bytes()
+        path.write_bytes(original + b"\n")
+        with pytest.raises(ValueError, match="binding|inputs|plan"):
+            module.main()
+        assert report_path.read_bytes() == original_report
+        path.write_bytes(original)
+    with pytest.raises(SystemExit, match="val_targets_with_train_msa_homolog_hits=1"):
+        module.main()
+    assert report_path.read_bytes() == original_report
+
+
+def test_extra_protected_queries_require_complete_canonical_target_identity(tmp_path: Path) -> None:
+    import json
+
+    import pytest
+
+    module = _load_audit_module()
+    manifest, cache = tmp_path / "extra.txt", tmp_path / "cache.json"
+    manifest.write_text("old1_A\n")
+    kwargs = dict(val_ids=["val1_A"], manifests=[manifest], cache_path=cache, snapshots={}, exhaustive=True)
+    with pytest.raises(ValueError, match="required together"):
+        module._extra_heldout_targets(**{**kwargs, "cache_path": None})
+    with pytest.raises(ValueError, match="requires|require"):
+        module._extra_heldout_targets(**{**kwargs, "exhaustive": False})
+    cache.write_text(json.dumps({"old1_A": {"sequence": "C" * 40}}))
+    with pytest.raises(ValueError, match="missing"):
+        module._extra_heldout_targets(**kwargs)
+    for invalid in ({"sequence": "A-C"}, {"sequence": "C" * 40, "seq": "D" * 40}):
+        cache.write_text(json.dumps({"old1_A": invalid, "val1_A": {"sequence": "A" * 40}}))
+        with pytest.raises(ValueError, match="ungapped|unambiguous"):
+            module._extra_heldout_targets(**{**kwargs, "snapshots": {}})
+    features = tmp_path / "features"
+    _write_feature(features, "val1_A", ["A" * 40])
+    with pytest.raises(ValueError, match="does not match"):
+        module._collect_mmseqs_records(
+            train_ids=[], val_ids=["val1_A"], features_dir=features, include_identifiers=False,
+            protected_cache_sequences={"val1_A": "C" * 40},
+        )
+
+
+def test_real_directional_extra_query_detects_historical_target_without_features(tmp_path: Path) -> None:
+    import json
+    import os
+    import random
+    import shutil
+
+    import pytest
+
+    binary = os.environ.get("MMSEQS_TEST_BINARY") or shutil.which("mmseqs")
+    if not binary:
+        pytest.skip("Set MMSEQS_TEST_BINARY to run the extra protected query regression")
+    randomizer = random.Random(9342)
+    alphabet = "ACDEFGHIKLMNPQRSTVWY"
+    historical_query = "".join(randomizer.choices(alphabet, k=64))
+    active_query = "".join(randomizer.choices(alphabet, k=64))
+    parent = "".join(randomizer.choices(alphabet, k=144)) + historical_query + "".join(randomizer.choices(alphabet, k=144))
+    features = tmp_path / "features"
+    _write_feature(features, "trn1_A", ["".join(randomizer.choices(alphabet, k=len(parent))), parent])
+    _write_feature(features, "val1_A", [active_query])
+    historical, cache = tmp_path / "historical.txt", tmp_path / "cache.json"
+    historical.write_text("old1_A\n")
+    cache.write_text(json.dumps({"val1_A": {"sequence": active_query}, "old1_A": {"sequence": historical_query}}))
+    module = _load_audit_module()
+    kwargs = dict(
+        train_ids=["trn1_A"], val_ids=["val1_A"], features_dir=features, out_dir=tmp_path,
+        mmseqs_bin=str(binary), min_seq_id=0.3, coverage=0.8, threads=1, max_seqs=1,
+        tmp_dir=None, include_identifiers=False, exhaustive=True, coverage_mode=2, max_sequence_length=512,
+    )
+    primary_only = module.run_mmseqs_homology(**kwargs)
+    assert primary_only["val_targets_with_train_msa_homolog_hits"] == 0
+    protected = module.run_mmseqs_homology(
+        **kwargs, extra_heldout_manifests=[historical], heldout_chain_data_cache=cache,
+    )
+    assert protected["val_targets_with_train_msa_homolog_hits"] == 1
+    assert protected["target_records"] == 2
+    assert protected["heldout_query_scope"]["extra_msa_features_checked"] is False

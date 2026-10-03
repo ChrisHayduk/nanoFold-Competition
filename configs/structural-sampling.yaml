@@ -1,0 +1,42 @@
+schema_version: 1
+sampling_policy: cath-v5-full-parent
+source_scope: all_chains_in_pinned_OpenProteinSet_PDB_chain_cache
+parent_eligibility:
+  min_length: 40
+  max_length: null
+  standard_amino_acids_only: true
+  max_known_resolution: 3.0
+  allow_unknown_resolution: true
+  source_qualification: complete_structure_and_raw_MSA_checks_before_selection
+heldout_barrier:
+  policy: full_parent_query_barrier_protected_public_revision_v1
+  min_sequence_identity: 0.30
+  min_heldout_query_coverage: 0.80
+  min_parent_coverage: null
+  exclude_heldout_PDB_entries: true
+  exclude_exact_heldout_parent_sequences: true
+  exclude_original_heldout_group_members: true
+  propagate_through_new_full_parent_components: false
+evaluation_cohorts:
+  selection_policy: source_qualified_public_heldout_repair_v1
+  historical_public: preserved_and_protected_from_training
+  active_public: deterministic_source_qualified_repair
+  hidden: unchanged_original_membership
+  preserve_unaffected_public: true
+  active_public_hidden_barrier: both_query_directions
+  target_count_per_cohort: 1000
+  metric_based_replacement_selection: false
+selection:
+  size: 10000
+  seed: 0
+  crop_size: 256
+  swap_passes: 2
+  max_swap_attempts: 2048
+  reference_weighting: uniform_distinct_sequence
+coverage:
+  mode: soft_diversity
+  interpretation: training_diversity_groups_on_retained_training_subgraph
+training_exposure:
+  parent_sampling: uniform_selected_parent
+  crop_sampling: uniform_integer_start
+  training_loss_reweighting: false

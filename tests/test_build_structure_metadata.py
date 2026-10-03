@@ -156,6 +156,84 @@ def test_metadata_does_not_fabricate_secondary_measurements_or_unknown_annotatio
     assert unknown["resolution"] == 999.0
 
 
+def test_domain_exposure_metadata_requires_release_matched_pins(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="requires pinned CATH 4.4.0"):
+        _build(tmp_path, {"1oky_A": {"seq": "AAAA", "resolution": 2.0}}, include_cath_boundaries=True)
+
+
+def test_domain_exposure_metadata_integrates_without_changing_default_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache = tmp_path / "cache.json"
+    cache.write_text(json.dumps({"1oky_A": {"seq": "ACDEFG", "resolution": 2.0}}))
+    sources, lock = _write_sources(tmp_path, cache)
+    payload = json.loads(lock.read_text())
+    payload["sources"]["cath_domain_list"]["version"] = "4.4.0"
+    for name, text in {
+        "cath_domain_boundaries_seqres": "1okyA00\t1-4\n",
+        "cath_domain_sequences": ">cath|4_4_0|1okyA00/2-5\nACDE\n",
+    }.items():
+        spec = metadata.CATH_BOUNDARY_SOURCES[name]
+        path = sources / spec["path"]
+        path.write_text(text)
+        payload["sources"][name] = {**spec, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+    lock.write_text(json.dumps(payload))
+    exclusions = tmp_path / "excluded.txt"
+    exclusions.write_text("")
+    args: dict[str, Any] = dict(chain_data_cache=cache, metadata_sources_dir=sources, metadata_source_lock=lock,
+                feature_exclusion_list=exclusions, processability_exclusion_list=exclusions,
+                min_len=4, max_len=256, max_resolution=3, max_unknown_aa_fraction=0)
+    result = metadata.build_metadata(**args, include_cath_boundaries=True)
+    assert result["source"]["cath_domain_exposure_schema_version"] == 1
+    assert result["chains"][0]["cath_domains"][0]["domain_length"] == 4
+    assert result["chains"][0]["cath_unannotated_fraction"] == 2 / 6
+    assert result["summary"]["cath_boundary_status"] == {"verified": 1}
+    plain = metadata.build_metadata(**args)
+    assert "cath_domain_exposure_schema_version" not in plain["source"]
+    assert "domain_length" not in plain["chains"][0]["cath_domains"][0]
+    original_path = tmp_path / "original-metadata.json"
+    original_path.write_text(json.dumps(plain))
+    original_bytes = original_path.read_bytes()
+    enriched = metadata.enrich_metadata(metadata_input=original_path, chain_data_cache=cache,
+                                        metadata_sources_dir=sources, metadata_source_lock=lock)
+    assert original_path.read_bytes() == original_bytes
+    assert enriched["chains"][0]["cath_domains"] == result["chains"][0]["cath_domains"]
+    assert enriched["source"]["domain_enrichment"]["original_metadata"]["sha256"] == hashlib.sha256(original_bytes).hexdigest()
+    for key in ("chain_id", "length", "resolution", "accepted", "reject_reasons", "cath_topology_ids"):
+        assert enriched["chains"][0][key] == plain["chains"][0][key]
+    enriched_path = tmp_path / "enriched.json"
+    enriched_path.write_text(json.dumps(enriched))
+    assert metadata.validate_enriched_metadata(metadata_input=original_path, chain_data_cache=cache,
+                                               enriched_path=enriched_path) == enriched
+    enriched["chains"][0]["cath_domains"][0]["domain_length"] = 5
+    enriched_path.write_text(json.dumps(enriched))
+    with pytest.raises(ValueError, match="differs from deterministic source replay"):
+        metadata.validate_enriched_metadata(metadata_input=original_path, chain_data_cache=cache,
+                                            enriched_path=enriched_path)
+    real_domain_metadata = metadata.domain_metadata
+    def modify_consumed_source(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        result = real_domain_metadata(*args, **kwargs)
+        path = sources / "cath-domain-seqs.fa"
+        path.write_text(path.read_text() + "\n")
+        return result
+    with monkeypatch.context() as context:
+        context.setattr(metadata, "domain_metadata", modify_consumed_source)
+        with pytest.raises(ValueError, match="input changed during processing"):
+            metadata.enrich_metadata(metadata_input=original_path, chain_data_cache=cache,
+                                     metadata_sources_dir=sources, metadata_source_lock=lock)
+    (sources / "cath-domain-seqs.fa").write_text(">cath|4_4_0|1okyA00/2-5\nACDE\n")
+    tampered = json.loads(original_bytes)
+    tampered["chains"][0]["cath_domains"][0]["topology_id"] = "1.10.999"
+    original_path.write_text(json.dumps(tampered))
+    with pytest.raises(ValueError, match="annotations differ from pinned source"):
+        metadata.enrich_metadata(metadata_input=original_path, chain_data_cache=cache,
+                                 metadata_sources_dir=sources, metadata_source_lock=lock)
+    payload["sources"]["cath_domain_sequences"]["version"] = "4.3.0"
+    lock.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="requires pinned CATH 4.4.0"):
+        metadata.build_metadata(**args, include_cath_boundaries=True)
+
+
 def test_multidomain_chain_preserves_domain_multiplicity(tmp_path: Path) -> None:
     result = _build(
         tmp_path,

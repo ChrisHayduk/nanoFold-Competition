@@ -13,11 +13,13 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from nanofold.msa_filter_policy import build_msa_filter_policy, validate_msa_filter_policy_output
+from nanofold.msa_filter_policy import POLICY_TYPES, build_msa_filter_policy, validate_msa_filter_policy_output
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--policy-type", choices=POLICY_TYPES, default="directed-heldout-v1")
+    parser.add_argument("--historical-public-manifest", type=Path, help="Pinned historical cohort; required only by full-parent-heldout-query-v2.")
     parser.add_argument("--train-manifest", type=Path, required=True)
     parser.add_argument("--val-manifest", type=Path, required=True)
     parser.add_argument("--hidden-manifest", type=Path, required=True)
@@ -32,6 +34,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     payload = build_msa_filter_policy(
+        policy_type=args.policy_type, historical_public_manifest=args.historical_public_manifest,
         train_manifest=args.train_manifest,
         val_manifest=args.val_manifest,
         hidden_manifest=args.hidden_manifest,

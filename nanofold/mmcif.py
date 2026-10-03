@@ -235,12 +235,24 @@ def _residue_signature(residues: list[gemmi.Residue]) -> list[tuple[str, str, in
     ]
 
 
+def _ordered_polymer_residues(chain: gemmi.Chain, label_chain_id: str | None = None) -> list[gemmi.Residue]:
+    residues = [
+        residue for residue in chain
+        if residue.entity_type == gemmi.EntityType.Polymer
+        and (label_chain_id is None or residue.subchain == label_chain_id)
+    ]
+    # Atom-site row order is not polymer sequence order. Where the deposited
+    # indices fully specify one polymer, use them for sequence and geometry.
+    # Missing indices retain deposited order rather than guessing from author IDs.
+    if len({residue.subchain for residue in residues}) == 1 and all(
+        residue.label_seq is not None for residue in residues
+    ):
+        residues.sort(key=lambda residue: residue.label_seq if residue.label_seq is not None else -1)
+    return residues
+
+
 def _chain_polymer_sequence(chain: gemmi.Chain) -> str:
-    return "".join(
-        one_letter_from_resname(res.name)
-        for res in chain
-        if res.entity_type == gemmi.EntityType.Polymer
-    )
+    return "".join(one_letter_from_resname(residue.name) for residue in _ordered_polymer_residues(chain))
 
 
 def _resolve_chain(
@@ -327,7 +339,7 @@ def extract_chain_atoms(
         raise KeyError(f"Chain '{chain_id}' not found in {mmcif_path}") from None
 
     sequence_letters: List[str] = []
-    residues: list[gemmi.Residue] = []
+    residues = _ordered_polymer_residues(chain, label_chain_id)
     polymer_residue_indices: List[int] = []
     selected_subchains = {
         res.subchain for res in chain
@@ -345,22 +357,13 @@ def extract_chain_atoms(
         if entity is not None and entity.full_sequence else None
     )
 
-    for res in chain:
-        # Keep only polymer residues. Filtering on het_flag would also drop
-        # valid amino acids, so we use entity_type.
-        if res.entity_type != gemmi.EntityType.Polymer:
-            continue
-        if label_chain_id is not None and res.subchain != label_chain_id:
-            continue
-
+    for res in residues:
         residue_name_3 = res.name.upper()
         one_letter = one_letter_from_resname(residue_name_3)
         sequence_letters.append(one_letter)
         if res.label_seq is not None and res.label_seq < 1:
             raise ValueError("Polymer label_seq_id must be positive")
         polymer_residue_indices.append(res.label_seq - 1 if res.label_seq is not None else -1)
-
-        residues.append(res)
 
     if not residues:
         raise ValueError(f"No polymer residues found for {pdb_id}_{chain_id} in {mmcif_path}")
@@ -395,11 +398,7 @@ def extract_chain_atoms(
             chain.name, label_chain_id, chain_mapping_method,
         ):
             continue
-        alternative_residues = [
-            residue for residue in alternative_chain
-            if residue.entity_type == gemmi.EntityType.Polymer
-            and (alternative_label is None or residue.subchain == alternative_label)
-        ]
+        alternative_residues = _ordered_polymer_residues(alternative_chain, alternative_label)
         if _residue_signature(alternative_residues) != signature:
             continue
         # Identical subchains in this Structure share the same deposited entity

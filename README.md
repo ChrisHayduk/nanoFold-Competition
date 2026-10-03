@@ -235,7 +235,8 @@ Preprocessing schema 3 records its configuration and implementation digests in
 `<processed_features_dir>/preprocess_meta.json`; the stable data-producing
 configuration digest is included in the dataset fingerprint. Each feature/label
 pair also records the configuration and raw-input digests. Resume checks the raw
-source bytes before reusing a pair. Changed or missing run provenance requires
+source bytes before and after validating a reused pair, and after parsing a new
+pair. Malformed A3M records fail; valid insertion-gap dots are ignored. Changed or missing run provenance requires
 fresh feature and label directories; existing outputs are not relabeled with
 new metadata. See [data preprocessing](docs/DATA.md) for the full contract.
 
@@ -341,6 +342,19 @@ Rebuilt fingerprints and asset locks default to
 aliases are rejected before work starts.
 Do not update published track hashes to make a candidate dataset pass the frozen
 contract checks.
+
+The full-parent structural candidate uses the versioned protocol in
+`configs/structural-sampling.yaml`. It inventories the entire pinned
+OpenProteinSet PDB-chain cache, qualifies longer parents, and selects 10,000
+distinct sequences against expected 256-residue crop exposure. Its heldout
+barrier checks embedded homologs before selection; training diversity groups
+are a sampling objective, not a claim of globally disjoint homology components.
+`scripts/stage_structural_candidate.py` stages and independently verifies these
+manifests. `scripts/build_structural_assets.py` then generates and audits the
+private feature/label assets; `scripts/analyze_structural_sampling.py` compares
+the candidate with controls drawn from the same qualified population. A recorded
+public-evaluation repair preserves the hidden cohort and keeps the original
+public cohort separately protected for historical comparisons.
 
 Follow [dataset sampling](docs/DATA_SAMPLING.md) to construct and review a new
 candidate, and [data handling](docs/DATA.md) for private MSA filtering, feature

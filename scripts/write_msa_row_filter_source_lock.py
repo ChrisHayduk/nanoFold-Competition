@@ -88,6 +88,8 @@ def _manifest_role(path: str | None) -> str:
     if path is None:
         return "manifest"
     normalized = path.replace("\\", "/").lower()
+    if normalized.endswith("/historical_public.txt"):
+        return "historical_public"
     if "hidden" in normalized or ".nanofold_private" in normalized:
         return "hidden"
     if normalized.endswith("val.txt"):

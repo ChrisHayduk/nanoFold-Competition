@@ -77,9 +77,10 @@ def test_raw_parser_rejects_incomplete_malformed_or_wrong_targets(tmp_path: Path
         audit.raw_record(path, SEQUENCE)
 
 
-def test_raw_parser_handles_multiline_insertions_and_query_gap_columns(tmp_path: Path) -> None:
+@pytest.mark.parametrize("dot_padding", [False, True])
+def test_raw_parser_handles_multiline_insertions_and_query_gap_columns(tmp_path: Path, dot_padding: bool) -> None:
     path = tmp_path / "input.a3m"
-    path.write_text(">query\nAR-\nND\n>row\nAaaR-ND\n")
+    path.write_text(">query\nA.R-\nND.\n>row\nAa.aR-.ND\n" if dot_padding else ">query\nAR-\nND\n>row\nAaaR-ND\n")
     result = audit.raw_record(path, "ARND")
     assert result["rows"] == 2 and result["aligned_width"] == 5 and result["query_length"] == 4
 

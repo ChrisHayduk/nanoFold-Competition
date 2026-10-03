@@ -25,6 +25,9 @@ from nanofold.mmseqs import (
 from nanofold.msa_filter_summary import validate_batching_summary
 
 _POLICY_TYPE = "directed-heldout-v1"
+FULL_PARENT_POLICY_TYPE = "full-parent-heldout-query-v1"
+PROTECTED_PUBLIC_POLICY_TYPE = "full-parent-heldout-query-v2"
+POLICY_TYPES = (_POLICY_TYPE, FULL_PARENT_POLICY_TYPE, PROTECTED_PUBLIC_POLICY_TYPE)
 _ROLES = ("train", "val")
 _SPLITS = (*_ROLES, "hidden")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -142,7 +145,7 @@ def validate_msa_filter_policy_provenance(value: Any) -> dict[str, Any]:
     """Validate the public metadata shape without admitting hidden references."""
     value = _object(value, {"schema_version", "policy_type", "policy_sha256", "splits"})
     _require(type(value["schema_version"]) is int and value["schema_version"] == 1
-             and value["policy_type"] == _POLICY_TYPE, "Unsupported MSA filter policy provenance")
+             and value["policy_type"] in POLICY_TYPES, "Unsupported MSA filter policy provenance")
     _digest(value["policy_sha256"])
     splits = _object(value["splits"], set(_ROLES))
     for role in _ROLES:
@@ -178,16 +181,16 @@ def _manifest_record(path: Path, snapshots: _Snapshots) -> dict[str, Any]:
     return {"path": str(resolved), "sha256": digest, "chain_count": count}
 
 
-def _threshold(value: Any) -> dict[str, Any]:
+def _threshold(value: Any, policy_type: str) -> dict[str, Any]:
     value = _object(value, {"min_seq_id", "coverage", "cov_mode", "alignment_mode", "seq_id_mode"})
     for name in ("min_seq_id", "coverage"):
         number = value[name]
         _require(type(number) in (float, int) and math.isfinite(number) and 0 < number <= 1,
                  "MSA identity and coverage must be finite values in (0, 1]")
-    for name, expected in (("cov_mode", 0), ("alignment_mode", 3), ("seq_id_mode", 0)):
+    for name, expected in (("cov_mode", 2 if policy_type in (FULL_PARENT_POLICY_TYPE, PROTECTED_PUBLIC_POLICY_TYPE) else 0), ("alignment_mode", 3), ("seq_id_mode", 0)):
         _require(type(value[name]) is int and value[name] == expected, "Unsupported alignment threshold semantics")
     _require(value["min_seq_id"] == 0.3 and value["coverage"] == 0.8,
-             "Directed-heldout-v1 requires identity 0.30 and bidirectional coverage 0.80")
+             "Directed heldout policies require identity 0.30 and coverage 0.80")
     return value
 
 
@@ -235,6 +238,11 @@ def _verify_checkpoint(payload: dict[str, Any], base: Path, snapshots: _Snapshot
     plan_path, plan = snapshots.read_json(_reference(receipt["plan_path"], receipt_path.parent), receipt["plan_sha256"])
     root = receipt_path.parent
     plan_binding = _object(plan.get("binding"))
+    maximum_length = _count(settings.get("maximum_sequence_length", 256), minimum=1)
+    coverage_mode = payload["threshold"]["cov_mode"]
+    _require(plan_binding.get("max_sequence_length", 256) == maximum_length
+             and plan_binding.get("coverage_mode", 0) == coverage_mode,
+             "Checkpoint length/coverage contract differs from the filter")
     _require(plan_binding.get("search_contract") == "mmseqs-local-all-pairs-v1", "Checkpoint is not exhaustive")
     expected_context = hashlib.sha256(json.dumps({
         "files": [{"path": str(path), "sha256": digest} for path, digest in sorted(input_files.items())],
@@ -258,9 +266,9 @@ def _verify_checkpoint(payload: dict[str, Any], base: Path, snapshots: _Snapshot
         for part in parts:
             snapshots.capture(_reference(part["path"], root), part["sha256"])
         _batch_verify_partitions(parts, {"count": batching[f"{role}_count"], "sha256": binding[fasta_field]},
-                                 batching[f"{role}_batch_size"], root)
+                                 batching[f"{role}_batch_size"], root, max_sequence_length=maximum_length)
     query_hashes = {hashlib.sha256(sequence.encode()).hexdigest()
-                    for part in plan["query_partitions"] for _, sequence in _batch_records(Path(part["path"]))}
+                    for part in plan["query_partitions"] for _, sequence in _batch_records(Path(part["path"]), max_sequence_length=maximum_length)}
     _require(query_hashes == expected_query_hashes and len(query_hashes) == batching["query_count"],
              "Checkpoint heldout sequences differ from their bound cache targets")
     query_set_sha = hashlib.sha256("".join(f"{digest}\n" for digest in sorted(query_hashes)).encode()).hexdigest()
@@ -268,7 +276,7 @@ def _verify_checkpoint(payload: dict[str, Any], base: Path, snapshots: _Snapshot
     source_set_sha = hashlib.sha256()
     exact_hashes: set[str] = set()
     for part in plan["source_partitions"]:
-        for header, sequence in _batch_records(Path(part["path"])):
+        for header, sequence in _batch_records(Path(part["path"]), max_sequence_length=maximum_length):
             digest = hashlib.sha256(sequence.encode()).hexdigest()
             _require(len(sequence) >= 20 and header == "seq_" + digest, "Checkpoint source header does not identify its eligible sequence")
             source_set_sha.update(f"{digest}\n".encode())
@@ -287,11 +295,12 @@ def _verify_checkpoint(payload: dict[str, Any], base: Path, snapshots: _Snapshot
         for kind in ("m8", "log"):
             snapshots.capture(_reference(job[f"{kind}_path"], root), job[f"{kind}_sha256"])
         _batch_validate_job(job, query, source, plan_sha256=receipt["plan_sha256"], root=root, job_root=job_path.parent,
-                            binary=binary, flags=flags, min_seq_id=payload["threshold"]["min_seq_id"], coverage=payload["threshold"]["coverage"])
-        query_ids = {header for header, _ in _batch_records(Path(query["path"]))}
-        source_ids = {header for header, _ in _batch_records(Path(source["path"]))}
+                            binary=binary, flags=flags, min_seq_id=payload["threshold"]["min_seq_id"], coverage=payload["threshold"]["coverage"],
+                            coverage_mode=coverage_mode, max_sequence_length=maximum_length)
+        query_ids = {header for header, _ in _batch_records(Path(query["path"]), max_sequence_length=maximum_length)}
+        source_ids = {header for header, _ in _batch_records(Path(source["path"]), max_sequence_length=maximum_length)}
         for _, target in iter_mmseqs_hits(Path(job["m8_path"]), query_ids=query_ids, target_ids=source_ids,
-                                          min_seq_id=payload["threshold"]["min_seq_id"], coverage=payload["threshold"]["coverage"]):
+                                          min_seq_id=payload["threshold"]["min_seq_id"], coverage=payload["threshold"]["coverage"], coverage_mode=coverage_mode):
             excluded_hashes.add(target.removeprefix("seq_"))
         hits += job["hit_count"]
         alignments += job["alignment_count"]
@@ -305,10 +314,14 @@ def _verify_checkpoint(payload: dict[str, Any], base: Path, snapshots: _Snapshot
 def _validate_flags(flags: dict[str, str], payload: dict[str, Any]) -> None:
     settings, threshold = payload["mmseqs"], payload["threshold"]
     expected = {"--min-seq-id": str(threshold["min_seq_id"]), "-c": str(threshold["coverage"]),
-                "--cov-mode": "0", "--alignment-mode": "3", "--seq-id-mode": "0", "--search-type": "1", "--dbtype": "1",
+                "--cov-mode": str(threshold["cov_mode"]), "--alignment-mode": "3", "--seq-id-mode": "0", "--search-type": "1", "--dbtype": "1",
                 "--prefilter-mode": "2", "-e": "1e308", "-s": "5.7", "--mask": "0", "--comp-bias-corr": "0",
                 "--max-seqs": str(settings["max_seqs"]), "--max-accept": str(settings["max_seqs"]), "--max-rejected": str(settings["max_seqs"]),
                 "--format-output": "query,target,pident,alnlen,qcov,tcov,evalue,bits"}
+    if "--max-seq-len" in flags:
+        expected["--max-seq-len"] = str(_count(settings.get("maximum_sequence_length", 256), minimum=1))
+    _require(threshold["cov_mode"] == 0 or "--max-seq-len" in flags,
+             "Full-parent filtering requires an explicit native maximum sequence length")
     _require(set(flags) == set(expected) | {"--threads"}, "Search command has missing or unsupported flags")
     _require(all(flags[key] == value for key, value in expected.items()), "Search command differs from the exhaustive filter contract")
     _require(flags["--threads"].isdecimal() and 1 <= int(flags["--threads"]) <= 2_147_483_647, "Invalid search thread count")
@@ -316,7 +329,7 @@ def _validate_flags(flags: dict[str, str], payload: dict[str, Any]) -> None:
 
 def _production_filter(row_filter: MSARowFilter, payload: dict[str, Any], *, source_manifest: dict[str, Any],
                        heldout_manifests: list[dict[str, Any]], source_chains: tuple[str, ...],
-                       snapshots: _Snapshots) -> tuple[dict[str, Any], str, tuple[str, ...], dict[Path, str]]:
+                       snapshots: _Snapshots, policy_type: str) -> tuple[dict[str, Any], str, tuple[str, ...], dict[Path, str]]:
     _require(type(payload.get("schema_version")) is int and payload["schema_version"] == 1
              and payload.get("filter_type") == "heldout_target_homology" and payload.get("exhaustive") is True
              and payload.get("search_contract") == "mmseqs-local-all-pairs-v1" and "inventory_type" not in payload,
@@ -328,7 +341,7 @@ def _production_filter(row_filter: MSARowFilter, payload: dict[str, Any], *, sou
     _require(excluded_count == len(values), "Excluded sequence count mismatch")
     exact_count = _count(payload.get("exact_match_excluded_sequence_count"))
     _require(exact_count <= excluded_count, "Exact exclusion count exceeds total exclusions")
-    threshold = _threshold(payload.get("threshold"))
+    threshold = _threshold(payload.get("threshold"), policy_type)
     source, heldout, settings, binding = (_object(payload.get(name)) for name in ("source", "heldout", "mmseqs", "input_binding"))
     _require(source.get("complete") is True and type(source.get("minimum_non_query_sequence_length")) is int
              and source["minimum_non_query_sequence_length"] == 20,
@@ -455,22 +468,26 @@ class MSAFilterPolicy:
 
 def _load_payload(payload: dict[str, Any], base: Path, snapshots: _Snapshots) -> tuple[dict[str, Any], dict[str, MSARowFilter], dict[str, str], str, dict[str, tuple[str, ...]], dict[str, dict[Path, str]]]:
     _object(payload, {"schema_version", "policy_type", "manifests", "filters"})
-    _require(type(payload["schema_version"]) is int and payload["schema_version"] == 1 and payload["policy_type"] == _POLICY_TYPE,
+    _require(type(payload["schema_version"]) is int and payload["schema_version"] == 1 and payload["policy_type"] in POLICY_TYPES,
              "Unsupported directed MSA filter policy")
-    manifest_values, filter_values = _object(payload["manifests"], set(_SPLITS)), _object(payload["filters"], set(_ROLES))
+    splits = (*_SPLITS, "historical_public") if payload["policy_type"] == PROTECTED_PUBLIC_POLICY_TYPE else _SPLITS
+    manifest_values, filter_values = _object(payload["manifests"], set(splits)), _object(payload["filters"], set(_ROLES))
     manifests, chains = {}, {}
-    for role in _SPLITS:
+    for role in splits:
         manifests[role], chains[role] = _manifest(manifest_values[role], base, snapshots)
-    _require(all(set(chains[left]).isdisjoint(chains[right]) for index, left in enumerate(_SPLITS) for right in _SPLITS[index + 1:]),
-             "Directed policy manifests overlap")
+    _require(all(set(chains[left]).isdisjoint(chains[right])
+                 for index, left in enumerate(splits) for right in splits[index + 1:]
+                 if {left, right} != {"val", "historical_public"}),
+             "Directed policy manifests overlap outside the active/historical public cohorts")
     filters, thresholds, cache_hashes, names, assets = {}, [], [], {}, {}
     for role in _ROLES:
         record = _object(filter_values[role], {"path", "sha256"})
         row_filter, raw = _scalar_filter(_reference(record["path"], base), snapshots, record["sha256"])
-        heldout_roles = ("val", "hidden") if role == "train" else ("hidden",)
+        heldout_roles = (("val", "historical_public", "hidden") if payload["policy_type"] == PROTECTED_PUBLIC_POLICY_TYPE
+                         else ("val", "hidden")) if role == "train" else ("hidden",)
         threshold, cache_hash, names[role], assets[role] = _production_filter(
             row_filter, raw, source_manifest=manifests[role], heldout_manifests=[manifests[key] for key in heldout_roles],
-            source_chains=chains[role], snapshots=snapshots)
+            source_chains=chains[role], snapshots=snapshots, policy_type=payload["policy_type"])
         filters[role] = row_filter
         thresholds.append(threshold)
         cache_hashes.append(cache_hash)
@@ -487,7 +504,7 @@ def load_msa_filter_policy(path: str | Path, expected_chain_ids: Sequence[str] |
         _require(len(expected_chain_ids) == len(set(expected_chain_ids)) and set(expected_chain_ids) == set(assignments),
                  "Preprocessing manifest must exactly cover public policy assignments")
     digest = snapshots.files[resolved]
-    provenance = validate_msa_filter_policy_provenance({"schema_version": 1, "policy_type": _POLICY_TYPE, "policy_sha256": digest,
+    provenance = validate_msa_filter_policy_provenance({"schema_version": 1, "policy_type": payload["policy_type"], "policy_sha256": digest,
         "splits": {role: {"manifest_sha256": manifests[role]["sha256"], "chain_count": manifests[role]["chain_count"],
                           "filter_sha256": filters[role].sha256} for role in _ROLES}})
     snapshots.assert_unchanged()
@@ -497,14 +514,19 @@ def load_msa_filter_policy(path: str | Path, expected_chain_ids: Sequence[str] |
 
 
 def build_msa_filter_policy(*, train_manifest: Path, val_manifest: Path, hidden_manifest: Path,
-                            train_filter: Path, val_filter: Path) -> dict[str, Any]:
+                            train_filter: Path, val_filter: Path, policy_type: str = _POLICY_TYPE,
+                            historical_public_manifest: Path | None = None) -> dict[str, Any]:
     snapshots = _Snapshots()
     manifests = {role: _manifest_record(path, snapshots) for role, path in zip(_SPLITS, (train_manifest, val_manifest, hidden_manifest), strict=True)}
+    _require((historical_public_manifest is not None) == (policy_type == PROTECTED_PUBLIC_POLICY_TYPE),
+             "The protected-public policy requires exactly one historical public manifest")
+    if historical_public_manifest is not None:
+        manifests["historical_public"] = _manifest_record(historical_public_manifest, snapshots)
     filters = {}
     for role, path in zip(_ROLES, (train_filter, val_filter), strict=True):
         resolved = snapshots.capture(path)
         filters[role] = {"path": str(resolved), "sha256": snapshots.files[resolved]}
-    payload = {"schema_version": 1, "policy_type": _POLICY_TYPE, "manifests": manifests, "filters": filters}
+    payload = {"schema_version": 1, "policy_type": policy_type, "manifests": manifests, "filters": filters}
     _load_payload(payload, Path.cwd(), snapshots)
     snapshots.assert_unchanged()
     return payload

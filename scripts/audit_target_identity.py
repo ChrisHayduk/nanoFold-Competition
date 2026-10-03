@@ -59,9 +59,9 @@ def raw_record(path: Path, expected: str) -> dict[str, Any]:
     def finish() -> None:
         nonlocal first, rows, width
         raw = "".join(pieces)
-        if not raw or re.fullmatch(r"[A-Za-z-]+", raw) is None:
+        if not raw or re.fullmatch(r"[A-Za-z.\-]+", raw) is None:
             raise ValueError("A3M row is empty or contains an invalid character")
-        aligned = "".join(aa for aa in raw if not aa.islower())
+        aligned = "".join(aa for aa in raw if not aa.islower() and aa != ".")
         if not aligned:
             raise ValueError("A3M row has no aligned positions")
         if width is None:

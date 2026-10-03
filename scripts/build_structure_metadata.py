@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
+import os
 import re
 import sys
+import tempfile
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,6 +21,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from nanofold.cath_boundaries import CATH_BOUNDARY_SOURCES, CATH_VERSION, domain_metadata, load_cath_boundaries
 from nanofold.structure_metadata import (
     STRUCTURE_METADATA_SCHEMA_VERSION,
     domain_architecture_from_cath_class,
@@ -39,6 +43,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--chain-data-cache", type=Path, required=True)
     parser.add_argument("--metadata-out", type=Path, required=True)
+    parser.add_argument(
+        "--enrich-metadata-input", type=Path,
+        help="Preserve an existing metadata population and eligibility while adding sequence-verified CATH domain fields.",
+    )
     parser.add_argument(
         "--metadata-sources-dir",
         type=Path,
@@ -85,6 +93,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Debug-only limit on eligible chains processed; cath-v2 and cath-v3 require 0 (the complete eligible universe).",
     )
     parser.add_argument("--fail-fast", action="store_true")
+    parser.add_argument(
+        "--include-cath-boundaries", action="store_true",
+        help="Add CATH 4.4 domain exposure metadata, requiring pinned boundaries and exact domain sequence validation.",
+    )
     return parser.parse_args(argv)
 
 
@@ -391,6 +403,7 @@ def _first_nested_value(obj: Any, path: tuple[str, ...]) -> Any:
 
 
 SOURCE_FILENAMES = {
+    **{name: spec["path"] for name, spec in CATH_BOUNDARY_SOURCES.items()},
     "cath_domain_list": "cath-domain-list.txt",
     "scope_classification": "dir.cla.scope.txt",
     "ecod_domains": "ecod.latest.domains.txt",
@@ -589,6 +602,117 @@ def _sha256(path: Path) -> str:
     return hasher.hexdigest()
 
 
+def enrich_metadata(
+    *, metadata_input: Path, chain_data_cache: Path, metadata_sources_dir: Path, metadata_source_lock: Path,
+) -> dict[str, Any]:
+    """Add domain exposure fields without rerunning a frozen eligibility gate."""
+    metadata_input = metadata_input.resolve()
+    chain_data_cache = chain_data_cache.resolve()
+    metadata_sources_dir = metadata_sources_dir.resolve()
+    metadata_source_lock = metadata_source_lock.resolve()
+    input_paths = [metadata_input, chain_data_cache, metadata_source_lock, Path(__file__).resolve(),
+                   REPO_ROOT / "nanofold/cath_boundaries.py",
+                   *(metadata_sources_dir / SOURCE_FILENAMES[name]
+                     for name in ("cath_domain_list", *CATH_BOUNDARY_SOURCES))]
+    input_pins = {str(path): _sha256(path) for path in input_paths}
+    verified = _verify_source_lock(metadata_source_lock, metadata_sources_dir, chain_data_cache)
+    for name in ("cath_domain_list", *CATH_BOUNDARY_SOURCES):
+        if name not in verified or verified[name].get("version") != CATH_VERSION:
+            raise ValueError(f"Domain exposure metadata requires pinned CATH {CATH_VERSION}: {name}")
+        if input_pins[str(metadata_sources_dir / SOURCE_FILENAMES[name])] != verified[name]["sha256"]:
+            raise ValueError(f"Enrichment source changed before verification: {name}")
+    original = json.loads(metadata_input.read_text())
+    if not isinstance(original, dict) or not isinstance(original.get("chains"), list):
+        raise ValueError("Expected original chain metadata object")
+    cache = json.loads(chain_data_cache.read_text())
+    if not isinstance(cache, dict):
+        raise ValueError("Expected chain data cache object")
+    source = original.get("source", {})
+    if source.get("chain_data_cache_sha256") != input_pins[str(chain_data_cache)]:
+        raise ValueError("Original metadata and enrichment cache do not share an identity")
+    original_sources = source.get("metadata_source_lock", {}).get("sources", {})
+    original_cath = original_sources.get("cath_domain_list", {})
+    if original_cath.get("sha256") != verified["cath_domain_list"]["sha256"]:
+        raise ValueError("Original metadata and enrichment CATH classifications differ")
+    boundaries = load_cath_boundaries(metadata_sources_dir)
+    classifications = _load_cath_annotations(metadata_sources_dir / SOURCE_FILENAMES["cath_domain_list"])
+    result = copy.deepcopy(original)
+    seen: set[str] = set()
+    counts: Counter[str] = Counter()
+    domain_counts: Counter[str] = Counter()
+    for row in result["chains"]:
+        chain_id = row["chain_id"]
+        validate_author_chain_id(chain_id)
+        if chain_id in seen:
+            raise ValueError(f"Duplicate chain in original metadata: {chain_id}")
+        seen.add(chain_id)
+        raw = cache.get(chain_id)
+        sequence = _extract_sequence(raw) if isinstance(raw, dict) else None
+        if sequence is None or len(sequence) != row["length"]:
+            raise ValueError(f"Enrichment sequence missing or length differs: {chain_id}")
+        if not row["accepted"]:
+            continue
+        domains = row.get("cath_domains", [])
+        expected = classifications.get(chain_id, []) if _chain_name(chain_id) != "0" else []
+        if domains != expected:
+            raise ValueError(f"Original CATH domain annotations differ from pinned source: {chain_id}")
+        row.update(domain_metadata(domains, sequence, boundaries))
+        counts[row["cath_boundary_status"]] += 1
+        domain_counts.update(domain["boundary_status"] for domain in row["cath_domains"])
+    result["source"]["domain_enrichment"] = {
+        "schema_version": 1,
+        "original_metadata": {"path": str(metadata_input), "sha256": input_pins[str(metadata_input)]},
+        "chain_data_cache": {"path": str(chain_data_cache), "sha256": input_pins[str(chain_data_cache)]},
+        "metadata_sources_dir": str(metadata_sources_dir),
+        "metadata_source_lock": {"path": str(metadata_source_lock), "sha256": input_pins[str(metadata_source_lock)]},
+        "sources": {name: verified[name] for name in ("cath_domain_list", *CATH_BOUNDARY_SOURCES)},
+        "implementation": {
+            "scripts/build_structure_metadata.py": input_pins[str(Path(__file__).resolve())],
+            "nanofold/cath_boundaries.py": input_pins[str(REPO_ROOT / "nanofold/cath_boundaries.py")],
+        },
+        "input_sha256": input_pins,
+        "coordinate_semantics": "1-based inclusive input-sequence coordinates; exact domain sequence validation",
+        "domain_order_semantics": "Order of first verified residue, not a linearization of discontinuous domains",
+        "unknown_semantics": "No CATH annotation means unannotated, not absence of structural domains",
+    }
+    result["source"]["cath_domain_exposure_schema_version"] = 1
+    result["summary"]["cath_boundary_status"] = dict(sorted(counts.items()))
+    result["summary"]["cath_domain_boundary_status"] = dict(sorted(domain_counts.items()))
+    _verify_enrichment_inputs(input_pins)
+    return result
+
+
+def _verify_enrichment_inputs(input_pins: dict[str, str]) -> None:
+    for name, digest in input_pins.items():
+        if _sha256(Path(name)) != digest:
+            raise ValueError(f"Enrichment input changed during processing: {name}")
+
+
+def validate_enriched_metadata(
+    *, metadata_input: Path, chain_data_cache: Path, enriched_path: Path,
+) -> dict[str, Any]:
+    """Reproduce every enrichment field and verify source/code pins before use."""
+    enriched_digest = _sha256(enriched_path)
+    enriched = json.loads(enriched_path.read_text())
+    receipt = enriched.get("source", {}).get("domain_enrichment")
+    if not isinstance(receipt, dict) or receipt.get("schema_version") != 1:
+        raise ValueError("Missing supported domain enrichment receipt")
+    pins = receipt.get("input_sha256")
+    if not isinstance(pins, dict) or not pins:
+        raise ValueError("Missing enrichment input pins")
+    _verify_enrichment_inputs(pins)
+    expected = enrich_metadata(
+        metadata_input=metadata_input, chain_data_cache=chain_data_cache,
+        metadata_sources_dir=Path(receipt["metadata_sources_dir"]),
+        metadata_source_lock=Path(receipt["metadata_source_lock"]["path"]),
+    )
+    if enriched != expected:
+        raise ValueError("Enriched metadata differs from deterministic source replay")
+    if _sha256(enriched_path) != enriched_digest:
+        raise ValueError("Enriched metadata changed during validation")
+    return enriched
+
+
 def build_metadata(
     *,
     chain_data_cache: Path,
@@ -603,6 +727,7 @@ def build_metadata(
     sample_limit: int = 0,
     fail_fast: bool = False,
     require_monomer: bool = False,
+    include_cath_boundaries: bool = False,
 ) -> dict[str, Any]:
     """Build metadata with the eligible-universe size and any debug truncation recorded.
 
@@ -612,6 +737,12 @@ def build_metadata(
     if isinstance(sample_limit, bool) or not isinstance(sample_limit, int) or sample_limit < 0:
         raise ValueError("sample_limit must be a nonnegative integer")
     verified_sources = _verify_source_lock(metadata_source_lock, metadata_sources_dir, chain_data_cache)
+    boundaries = None
+    if include_cath_boundaries:
+        for name in ("cath_domain_list", *CATH_BOUNDARY_SOURCES):
+            if name not in verified_sources or verified_sources[name].get("version") != CATH_VERSION:
+                raise ValueError(f"Domain exposure metadata requires pinned CATH {CATH_VERSION}: {name}")
+        boundaries = load_cath_boundaries(metadata_sources_dir)
     raw = json.loads(chain_data_cache.read_text())
     if not isinstance(raw, dict):
         raise ValueError(f"chain_data_cache must be a JSON object: {chain_data_cache}")
@@ -672,6 +803,8 @@ def build_metadata(
                 rcsb_metadata=rcsb_metadata,
             )
             entry.update(fields)
+            if boundaries is not None:
+                entry.update(domain_metadata(entry["cath_domains"], str(candidate["sequence"]), boundaries))
             secondary_counts[cls] += 1
             domain_counts[domain_class] += 1
             source_counts.update(source for source, present in source_coverage.items() if present)
@@ -683,7 +816,7 @@ def build_metadata(
                 raise
         entries.append(entry)
 
-    return {
+    result: dict[str, Any] = {
         "schema_version": STRUCTURE_METADATA_SCHEMA_VERSION,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "source": {
@@ -739,10 +872,42 @@ def build_metadata(
         },
         "chains": entries,
     }
+    if include_cath_boundaries:
+        result["source"]["cath_annotation_semantics"] = (
+            "Domain presence with multiplicity; residue coverage only after exact release-domain sequence validation"
+        )
+        result["source"]["cath_domain_exposure_schema_version"] = 1
+        result["config"]["include_cath_boundaries"] = True
+        result["summary"]["cath_boundary_status"] = dict(sorted(Counter(
+            item.get("cath_boundary_status", "rejected") for item in entries
+        ).items()))
+    return result
 
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
+    if args.enrich_metadata_input is not None:
+        if args.metadata_out.exists():
+            raise ValueError("Enriched metadata output already exists; use a fresh path")
+        metadata = enrich_metadata(
+            metadata_input=args.enrich_metadata_input, chain_data_cache=args.chain_data_cache,
+            metadata_sources_dir=args.metadata_sources_dir, metadata_source_lock=args.metadata_source_lock,
+        )
+        args.metadata_out.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(mode="w", dir=args.metadata_out.parent, delete=False) as handle:
+            staging = Path(handle.name)
+            try:
+                json.dump(metadata, handle, indent=2, sort_keys=True)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+                _verify_enrichment_inputs(metadata["source"]["domain_enrichment"]["input_sha256"])
+                os.link(staging, args.metadata_out)
+            finally:
+                staging.unlink(missing_ok=True)
+        print(f"[structure-metadata] enriched metadata -> {args.metadata_out}")
+        print(json.dumps(metadata["summary"]["cath_boundary_status"], sort_keys=True))
+        return
     metadata = build_metadata(
         chain_data_cache=args.chain_data_cache,
         metadata_sources_dir=args.metadata_sources_dir,
@@ -756,6 +921,7 @@ def main(argv: list[str] | None = None) -> None:
         sample_limit=int(args.sample_limit),
         fail_fast=bool(args.fail_fast),
         require_monomer=bool(args.require_monomer),
+        include_cath_boundaries=bool(args.include_cath_boundaries),
     )
     args.metadata_out.parent.mkdir(parents=True, exist_ok=True)
     args.metadata_out.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")

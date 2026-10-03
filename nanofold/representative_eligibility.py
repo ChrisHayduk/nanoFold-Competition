@@ -142,11 +142,11 @@ def raw_query_record(path: Path) -> dict[str, Any]:
                     break
                 header = True
             else:
-                require(header and re.fullmatch(r"[A-Za-z-]+", text) is not None, "Raw query has invalid syntax")
+                require(header and re.fullmatch(r"[A-Za-z.\-]+", text) is not None, "Raw query has invalid syntax")
                 query.append(text)
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
-    sequence = "".join(letter for letter in "".join(query) if not letter.islower() and letter != "-")
+    sequence = "".join(letter for letter in "".join(query) if not letter.islower() and letter not in "-.")
     require(header and bool(sequence), "Raw query is missing or empty")
     require(snapshot(path) == before, "Raw A3M changed during query qualification")
     return {"path": str(path.resolve()), "sha256": digest.hexdigest(), "bytes": before[2],
@@ -157,6 +157,8 @@ def raw_query_record(path: Path) -> dict[str, Any]:
 def inspect_candidate(
     *, chain: str, sequence: str, rank: int, structure: dict[str, str],
     raw_roots: list[Path] | None = None, raw_path: Path | None = None,
+    include_geometry: bool = False,
+    full_msa_validation: bool = False,
 ) -> dict[str, Any]:
     path = Path(structure["path"])
     before = snapshot(path)
@@ -180,6 +182,14 @@ def inspect_candidate(
         )
         row["projection_statistics"] = statistics
         row["structure_status"] = "passed" if all(statistics[key] >= value for key, value in THRESHOLDS.items()) else "failed"
+        if include_geometry and row["structure_status"] == "passed":
+            from nanofold.structural_geometry import describe_crop_ca, describe_projected_ca
+
+            row["crop_geometry"] = describe_crop_ca(_positions, _mask, crop_size=256)
+            row["source_geometry"] = (describe_projected_ca(_positions, _mask) if len(sequence) <= 256 else {
+                "schema_version": 1, "scope": "whole_parent_geometry_not_used_for_crop_selection",
+                "mapping_status": "not_computed", "target_length": len(sequence),
+            })
     except ValueError as exc:
         rejection = next((reason for reason in STRUCTURE_REJECTIONS if reason in str(exc)), None)
         if rejection is None:
@@ -190,6 +200,11 @@ def inspect_candidate(
         raw = raw_query_record(raw_path if raw_path is not None else _raw_source(raw_roots or [], chain))
         row["raw"] = raw
         if raw["query_sha256"] == row["sequence_sha256"]:
+            if full_msa_validation:
+                full_raw = importlib.import_module("scripts.audit_target_identity").raw_record(Path(raw["path"]), sequence)
+                require(full_raw["sha256"] == raw["sha256"] and full_raw["bytes"] == raw["bytes"],
+                        "Raw MSA changed between query and complete-row inspection")
+                row["raw_full_audit"] = full_raw
             row.update(raw_status="passed", status="passed")
         else:
             row.update(raw_status="failed", raw_rejection=RAW_QUERY_REJECTION)
@@ -275,14 +290,29 @@ def validate_exclusion_catalog(path: Path) -> list[str]:
     return list(catalog["excluded_group_ids"])
 
 
-def historical_source_catalog(receipt_paths: list[Path]) -> tuple[dict[str, Any], dict[str, dict[str, str]]]:
+def historical_source_catalog(
+    receipt_paths: list[Path], *, acquisition_code_root: Path | None = None,
+    source_path_map: dict[str, str] | None = None,
+) -> tuple[dict[str, Any], dict[str, dict[str, str]]]:
     """Validate tracked acquisition receipts and index pinned member bytes by PDB."""
     require(bool(receipt_paths), "Historical acquisition receipts are required")
+    code_root = REPO_ROOT if acquisition_code_root is None else acquisition_code_root.resolve()
+    relocation = source_path_map or {}
+
+    def relocated(path: Path) -> Path:
+        return Path(relocation.get(str(path), str(path))).resolve()
+
+    logical_receipts: dict[str, Path] = {}
+    for original, actual in relocation.items():
+        if Path(original).name == "retrieval-receipt.json":
+            require(actual not in logical_receipts, "Relocated acquisition receipt has multiple origins")
+            logical_receipts[actual] = Path(original)
     source: dict[str, Any] = {}
     members: dict[str, dict[str, str]] = {}
     receipt_records: list[dict[str, str]] = []
     manifest_records: list[dict[str, str]] = []
-    for path in sorted({path.resolve() for path in receipt_paths}):
+    for path in sorted({relocated(path) for path in receipt_paths}):
+        logical_path = logical_receipts.get(str(path), path)
         record = file_record(path)
         raw = read_json(path)
         require(raw.get("status") == "retrieved_unvalidated_structures" and raw.get("source_inputs_unchanged") is True
@@ -302,11 +332,11 @@ def historical_source_catalog(receipt_paths: list[Path]) -> tuple[dict[str, Any]
         require(not source or source == identity, "Historical acquisition receipts mix archive versions")
         source = identity
         inputs = raw.get("inputs", {})
-        require(inputs.get("script_sha256") == sha256_file(REPO_ROOT / "scripts/fetch_openproteinset_mmcif.py")
-                and inputs.get("manifest_validator_sha256") == sha256_file(REPO_ROOT / "nanofold/structure_metadata.py"),
+        require(inputs.get("script_sha256") == sha256_file(code_root / "scripts/fetch_openproteinset_mmcif.py")
+                and inputs.get("manifest_validator_sha256") == sha256_file(code_root / "nanofold/structure_metadata.py"),
                 "Historical acquisition code differs from the tracked source validator")
         require(isinstance(inputs.get("manifest_path"), str), "Historical acquisition lacks its requested manifest")
-        manifest = Path(inputs["manifest_path"])
+        manifest = relocated(Path(inputs["manifest_path"]))
         manifest_record = file_record(manifest)
         require(manifest_record["sha256"] == inputs.get("manifest_sha256"),
                 "Historical acquisition request manifest changed")
@@ -334,8 +364,11 @@ def historical_source_catalog(receipt_paths: list[Path]) -> tuple[dict[str, Any]
             member = row.get("archive_member", {})
             require(str(member.get("name", "")).lower() == f"mmcif_files/{pdb}.cif",
                     "Historical member identity differs from its output")
-            asset_path = (path.parent / relative).resolve()
-            require(asset_path.is_relative_to(path.parent), "Historical member resolves outside acquisition root")
+            logical_asset = logical_path.parent / relative
+            asset_path = relocated(logical_asset)
+            require(logical_asset.is_relative_to(logical_path.parent), "Historical member escapes acquisition root")
+            require(str(logical_asset) in relocation or asset_path.is_relative_to(path.parent),
+                    "Historical member resolves outside acquisition root without a bound relocation")
             digest = row.get("output_sha256")
             require(isinstance(digest, str) and re.fullmatch(r"[a-f0-9]{64}", digest) is not None,
                     "Historical member digest is invalid")
