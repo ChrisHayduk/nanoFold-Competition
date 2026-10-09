@@ -3,7 +3,6 @@ from __future__ import annotations
 import csv
 
 import numpy as np
-
 from neurips_paper.scripts import compute_openproteinset_coverage_metrics as metrics
 
 

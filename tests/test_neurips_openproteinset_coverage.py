@@ -4,7 +4,6 @@ import csv
 from xml.etree import ElementTree as ET
 
 import numpy as np
-
 from neurips_paper.scripts import make_openproteinset_coverage as coverage
 
 

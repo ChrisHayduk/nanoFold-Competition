@@ -3,11 +3,15 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import sys
 import time
 from functools import partial
 from pathlib import Path
 from typing import Any, Dict, Iterable
+
+# Required by CuBLAS for deterministic algorithms in CUDA >= 10.2
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
 import torch
 import torch.nn as nn

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import torch
-
 from neurips_paper.submission_common.minalphafold2_experiment import build_optimizer, build_scheduler
 from neurips_paper.submission_common.muon_optimizer import MuonWithAuxAdam, zeropower_via_newtonschulz5
 

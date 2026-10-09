@@ -49,7 +49,12 @@ def set_seed(seed: int, *, deterministic: bool = False) -> None:
             torch.backends.cudnn.benchmark = False
             torch.backends.cudnn.deterministic = True
         try:
-            torch.use_deterministic_algorithms(True)
+            torch.use_deterministic_algorithms(True, warn_only=True)
+        except TypeError:
+            try:
+                torch.use_deterministic_algorithms(True)
+            except Exception:
+                pass
         except Exception:
             # Some ops are nondeterministic on specific platforms; keep the
             # run alive while still forcing deterministic behavior where possible.
