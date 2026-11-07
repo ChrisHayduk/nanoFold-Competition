@@ -1,0 +1,75 @@
+schema_version: 1
+experiment_name: protenix-af3-style-nanofold-random-init
+upstream:
+  repository: https://github.com/bytedance/Protenix
+  commit: c3bfc365b3e1341a11935eddfe7bfdc308092147
+model:
+  upstream_variant: protenix_base_default_v1.0.0
+  naming: AF3-style Protenix reconstruction
+  random_initialization: true
+  pairformer_blocks: 48
+  training_recycles_max: 4
+  crop_size: 256
+  diffusion_batch_size: 48
+  symmetric_atom_matching:
+    source: pinned_protenix_ccd
+    mini_rollout_labels: enabled
+    diffusion_samples: upstream_default_log_only
+inputs:
+  train_manifest_count: 10000
+  validation_manifest_count: 1000
+  msa_depth: 192
+  templates: false
+  esm_embeddings: false
+  pretrained_weights: false
+distributed:
+  nodes: 1
+  processes_per_node: 8
+  gpu_target: H100
+  samples_per_optimizer_step: 8
+  optimizer_steps: 30000
+  matched_samples: 240000
+optimization:
+  implementation: pinned_protenix_helpers
+  optimizer: Adam
+  learning_rate: 0.0018
+  beta1: 0.9
+  beta2: 0.95
+  weight_decay: 1.0e-8
+  scheduler: AlphaFold3LRScheduler
+  warmup_steps: 10
+  decay_every_n_steps: 50000
+  decay_factor: 0.95
+  gradient_clip_norm: 10
+precision:
+  model_forward: bf16_autocast
+  protenix_loss: fp32_autocast_disabled
+inference:
+  default_seed: 20260725
+  default_diffusion_steps: 200
+  default_diffusion_samples: 1
+  default_model_seeds: 1
+  default_mc_dropout_apply_rate: 0.0
+  target_files_accessed: false
+checkpointing:
+  ema: false
+  save_every_completed_steps: 250
+  milestone_every_completed_steps: 3000
+  recent_non_milestones_kept: 2
+  latest_pointer: latest.json
+  atomic_replace: true
+  sha256: true
+  expected_allocated_gib: 6
+  explicit_run_budget_gib: 100
+  allocated_byte_reserve_gib: 20
+diagnostics:
+  eight_chain_overfit:
+    selection: verified_train_manifest_prefix
+    scheduled_train_count: 8
+    full_dataset_verified_first: true
+    optimizer_steps: 200
+    crop_size: 64
+    msa_depth: 32
+    save_initial_completed_step_zero: true
+    claim_eligible: false
+    pass_gate: fixed_seed_checkpoint_zero_vs_final_foldscore

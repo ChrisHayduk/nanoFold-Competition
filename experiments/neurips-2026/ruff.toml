@@ -1,0 +1,7 @@
+extend = "../../pyproject.toml"
+
+# The archived runtime files are checked against the training source digests.
+[lint.per-file-ignores]
+"af3/runtime/**/*.py" = ["B023", "B905", "E701", "F401", "I001", "UP012"]
+"af3/environment/{download_af3_ccd,preflight_af3_runtime}.py" = ["I001"]
+"rfdiffusion/{large,small}/**/*.py" = ["I001", "UP012"]

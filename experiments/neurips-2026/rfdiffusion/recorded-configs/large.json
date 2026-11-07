@@ -1,0 +1,82 @@
+{
+  "_scientific_contract": {
+    "diffusion": "cosine-translation-geodesic-haar-terminal-v2",
+    "imputation": "stochastic-mask-blind-frame-completion-v2"
+  },
+  "_source_provenance": {
+    "common/data.py": {
+      "sha256": "440e61d3d855966619ac19b02a808ed742e789f1aad3a59410e39d0931eb688f"
+    },
+    "common/geometry.py": {
+      "sha256": "bfb930fcd5beb8fc763321b3692f31ab600b15d446f6d117485eda617a0fb010"
+    },
+    "common/runtime.py": {
+      "sha256": "a0bea2a568baf13fb7c1a366eee722d58e3f45b1642b25d5f367c270acb96d4d"
+    },
+    "common/verify_dataset.py": {
+      "sha256": "2547dbd36c899004e6131eca4cb38e4b0f198dfe56871da486fde87959298789"
+    },
+    "config": {
+      "sha256": "e05c9bdea27f08bfb01d3d1ddf6e7871bc042248998270e21a2767c5d6bbfae6"
+    },
+    "dataset-verification": {
+      "sha256": "fabf0f4756198949e2245aa4c6b12a9997b396572ae1efbc25c2285142cf6093"
+    },
+    "model.py": {
+      "sha256": "3957bd3f0ff0a5a07dc0866e885f6a05306edcfc5d82d7578f5f96f34a568911"
+    },
+    "train-manifest": {
+      "sha256": "d36d1f77ba43b7c4509a6e9dfd3f9414e1ce60f8364b24e0086c1734ba6aef6d"
+    },
+    "train.py": {
+      "sha256": "5fd6ac766c3e8ff8886727ffa4a079d919d4568a963cbadbf0bc1031cd0c6ca7"
+    },
+    "validation-manifest": {
+      "sha256": "d4a0265bcd0a021e116c0c889f21e86bc24006460bcc42dec2f9a80b70c8812b"
+    }
+  },
+  "data": {
+    "crop_size": 256,
+    "msa_depth": 192
+  },
+  "model": {
+    "blocks": 24,
+    "checkpoint_blocks": true,
+    "dropout": 0.1,
+    "edge_width": 384,
+    "heads": 12,
+    "msa_width": 128,
+    "pair_width": 192,
+    "state_width": 384,
+    "top_k": 32
+  },
+  "training": {
+    "betas": [
+      0.9,
+      0.95
+    ],
+    "bf16": true,
+    "checkpoint_every": 250,
+    "diffusion_steps": 50,
+    "epsilon": 1e-08,
+    "gradient_clip_norm": 1.0,
+    "heartbeat_every": 10,
+    "keep_recent_non_milestone_checkpoints": 2,
+    "learning_rate": 0.001,
+    "log_every": 10,
+    "loss_weights": {
+      "atom": 1.0,
+      "distance": 0.3,
+      "lddt": 1.0,
+      "rotation": 0.5,
+      "translation": 0.25
+    },
+    "milestone_every": 3000,
+    "seed": 0,
+    "steps": 30000,
+    "strict_complete_backbone": false,
+    "warmup_steps": 1000,
+    "weight_decay": 0.0,
+    "world_size": 8
+  }
+}

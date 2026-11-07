@@ -1,0 +1,14 @@
+{
+  "inventory": {
+    "file_count": 22002,
+    "total_bytes": 1128037744,
+    "tree_sha256": "98c141bafcb51c2a8532ec3eba115ff170e9a9da9c54e4f18e5e7c83b4ef1e00"
+  },
+  "manifest_sha256": {
+    "train": "d36d1f77ba43b7c4509a6e9dfd3f9414e1ce60f8364b24e0086c1734ba6aef6d",
+    "validation": "d4a0265bcd0a021e116c0c889f21e86bc24006460bcc42dec2f9a80b70c8812b"
+  },
+  "schema_version": 1,
+  "train_count": 10000,
+  "validation_count": 1000
+}

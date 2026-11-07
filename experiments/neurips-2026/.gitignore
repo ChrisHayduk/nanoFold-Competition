@@ -1,0 +1,10 @@
+.venv/
+runs/
+evaluations/
+data/
+upstream/
+protenix/
+nanofold-scorer/
+chemistry/
+ccd-reference.json
+public-dataset-verification.json

@@ -1,0 +1,77 @@
+{
+  "schema_version": 1,
+  "label": "medium",
+  "architecture": "width-scaled Protenix AF3-style NanoFold reconstruction",
+  "upstream_commit": "c3bfc365b3e1341a11935eddfe7bfdc308092147",
+  "expected_total_parameters": 2773243,
+  "expected_trainable_parameters_after_template_freeze": 2761453,
+  "architecture_overrides": {
+    "c_s": 64,
+    "c_z": 32,
+    "c_atom": 32,
+    "c_atompair": 4,
+    "c_token": 64,
+    "c_s_inputs": 129,
+    "n_blocks": 4,
+    "model": {
+      "input_embedder": {
+        "c_atom": 32,
+        "c_atompair": 4,
+        "c_token": 64
+      },
+      "relative_position_encoding": {
+        "c_z": 32
+      },
+      "template_embedder": {
+        "c_z": 32
+      },
+      "msa_module": {
+        "c_z": 32,
+        "c_s_inputs": 129,
+        "c_m": 32,
+        "n_blocks": 1
+      },
+      "pairformer": {
+        "c_z": 32,
+        "c_s": 64,
+        "n_heads": 4,
+        "n_blocks": 4
+      },
+      "diffusion_module": {
+        "c_atom": 32,
+        "c_atompair": 4,
+        "c_token": 128,
+        "c_s": 64,
+        "c_z": 32,
+        "c_s_inputs": 129,
+        "atom_encoder": {
+          "n_blocks": 1
+        },
+        "transformer": {
+          "n_blocks": 4,
+          "n_heads": 4
+        },
+        "atom_decoder": {
+          "n_blocks": 1
+        }
+      },
+      "confidence_head": {
+        "c_z": 32,
+        "c_s": 64,
+        "c_s_inputs": 129,
+        "n_blocks": 4
+      },
+      "distogram_head": {
+        "c_z": 32
+      },
+      "constraint_embedder": {
+        "c_constraint_z": 32,
+        "c_constraint_s": 129,
+        "c_constraint_atom_pair": 4
+      }
+    }
+  },
+  "optimization_change": null,
+  "evaluation_change": null,
+  "checkpoint_compatibility": "fresh initialization only; never resume the base architecture checkpoint"
+}

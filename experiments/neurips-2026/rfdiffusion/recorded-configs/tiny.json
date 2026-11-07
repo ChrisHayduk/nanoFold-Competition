@@ -1,0 +1,99 @@
+{
+  "_execution_contract": {
+    "boundary": "same effective batch/data schedule; not bitwise RNG-equivalent to original eight-rank trainer",
+    "contract_id": "rf-effective8-logical-rank-accumulation-v1",
+    "ddp_static_graph": false,
+    "effective_batch_size": 8,
+    "example_rng": "sha256(base_seed,optimizer_step,logical_rank)",
+    "gradient_accumulation_steps": 4,
+    "logical_rank_mapping": "microstep * physical_world_size + physical_rank",
+    "logical_world_size": 8,
+    "physical_world_size": 2
+  },
+  "_scientific_contract": {
+    "diffusion": "cosine-translation-geodesic-haar-terminal-v2",
+    "imputation": "stochastic-mask-blind-frame-completion-v2"
+  },
+  "_source_provenance": {
+    "common/data.py": {
+      "sha256": "440e61d3d855966619ac19b02a808ed742e789f1aad3a59410e39d0931eb688f"
+    },
+    "common/geometry.py": {
+      "sha256": "bfb930fcd5beb8fc763321b3692f31ab600b15d446f6d117485eda617a0fb010"
+    },
+    "common/runtime.py": {
+      "sha256": "7f0981ac54460cd7824d18e2f948c7a939327c0a14ed6ae9a31f7f70271ff1ec"
+    },
+    "common/verify_dataset.py": {
+      "sha256": "2547dbd36c899004e6131eca4cb38e4b0f198dfe56871da486fde87959298789"
+    },
+    "config": {
+      "sha256": "48d79fea99b653a7f09930be76191d06a41ee8516e217363da5747270a87e4a9"
+    },
+    "dataset-verification": {
+      "sha256": "fabf0f4756198949e2245aa4c6b12a9997b396572ae1efbc25c2285142cf6093"
+    },
+    "model.py": {
+      "sha256": "3957bd3f0ff0a5a07dc0866e885f6a05306edcfc5d82d7578f5f96f34a568911"
+    },
+    "parent_train.py": {
+      "sha256": "5fd6ac766c3e8ff8886727ffa4a079d919d4568a963cbadbf0bc1031cd0c6ca7"
+    },
+    "rf-contract.json": {
+      "sha256": "f940cef573f5b794177614a12ee8fce4bc1e53c661c1fdf8bcf3c18f97ab3aa3"
+    },
+    "train-manifest": {
+      "sha256": "d36d1f77ba43b7c4509a6e9dfd3f9414e1ce60f8364b24e0086c1734ba6aef6d"
+    },
+    "train_accumulated.py": {
+      "sha256": "91fcf48bffc94b9b08b04ca42972d4ece86b4c3cc0f43a38a006a30b9e6a5f23"
+    },
+    "validation-manifest": {
+      "sha256": "d4a0265bcd0a021e116c0c889f21e86bc24006460bcc42dec2f9a80b70c8812b"
+    }
+  },
+  "data": {
+    "crop_size": 256,
+    "msa_depth": 192
+  },
+  "model": {
+    "blocks": 1,
+    "checkpoint_blocks": false,
+    "dropout": 0.1,
+    "edge_width": 72,
+    "heads": 4,
+    "msa_width": 16,
+    "pair_width": 24,
+    "state_width": 48,
+    "top_k": 32
+  },
+  "training": {
+    "betas": [
+      0.9,
+      0.95
+    ],
+    "bf16": true,
+    "checkpoint_every": 250,
+    "diffusion_steps": 50,
+    "epsilon": 1e-08,
+    "gradient_clip_norm": 1.0,
+    "heartbeat_every": 10,
+    "keep_recent_non_milestone_checkpoints": 2,
+    "learning_rate": 0.001,
+    "log_every": 10,
+    "loss_weights": {
+      "atom": 1.0,
+      "distance": 0.3,
+      "lddt": 1.0,
+      "rotation": 0.5,
+      "translation": 0.25
+    },
+    "milestone_every": 3000,
+    "seed": 0,
+    "steps": 30000,
+    "strict_complete_backbone": false,
+    "warmup_steps": 1000,
+    "weight_decay": 0.0,
+    "world_size": 8
+  }
+}

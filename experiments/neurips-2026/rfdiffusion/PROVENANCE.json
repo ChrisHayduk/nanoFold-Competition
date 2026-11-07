@@ -1,0 +1,343 @@
+{
+  "architecture": "NanoFold RFdiffusion-style clean-room reconstruction",
+  "dataset": {
+    "inventory": {
+      "file_count": 22002,
+      "total_bytes": 1128037744,
+      "tree_sha256": "98c141bafcb51c2a8532ec3eba115ff170e9a9da9c54e4f18e5e7c83b4ef1e00"
+    },
+    "manifest_sha256": {
+      "train": "d36d1f77ba43b7c4509a6e9dfd3f9414e1ce60f8364b24e0086c1734ba6aef6d",
+      "validation": "d4a0265bcd0a021e116c0c889f21e86bc24006460bcc42dec2f9a80b70c8812b"
+    },
+    "schema_version": 1,
+    "train_count": 10000,
+    "validation_count": 1000
+  },
+  "exact_sources": {
+    "large/architecture-reconstructions/common/data.py": {
+      "bytes": 11646,
+      "kind": "byte-exact executed training dependency",
+      "sha256": "440e61d3d855966619ac19b02a808ed742e789f1aad3a59410e39d0931eb688f"
+    },
+    "large/architecture-reconstructions/common/geometry.py": {
+      "bytes": 5069,
+      "kind": "byte-exact executed training dependency",
+      "sha256": "bfb930fcd5beb8fc763321b3692f31ab600b15d446f6d117485eda617a0fb010"
+    },
+    "large/architecture-reconstructions/common/runtime.py": {
+      "bytes": 6983,
+      "kind": "byte-exact executed training dependency",
+      "sha256": "a0bea2a568baf13fb7c1a366eee722d58e3f45b1642b25d5f367c270acb96d4d"
+    },
+    "large/architecture-reconstructions/common/verify_dataset.py": {
+      "bytes": 10232,
+      "kind": "byte-exact executed training dependency",
+      "sha256": "2547dbd36c899004e6131eca4cb38e4b0f198dfe56871da486fde87959298789"
+    },
+    "large/architecture-reconstructions/rfdiffusion-style/configs/eval-final.json": {
+      "bytes": 264,
+      "kind": "byte-exact executed historical evaluation",
+      "sha256": "cffe0fa1d6a82ab5648f80e4e2a5c7b2925cfd263ba0bc66137af938d834ec0e"
+    },
+    "large/architecture-reconstructions/rfdiffusion-style/configs/full.json": {
+      "bytes": 904,
+      "kind": "byte-exact executed training configuration",
+      "sha256": "e05c9bdea27f08bfb01d3d1ddf6e7871bc042248998270e21a2767c5d6bbfae6"
+    },
+    "large/architecture-reconstructions/rfdiffusion-style/evaluate.py": {
+      "bytes": 44803,
+      "kind": "byte-exact executed historical evaluation",
+      "sha256": "61cd40a536cf75b67c45f5a5b6cf11ee144e05e522cbc56d948806971154f3a0"
+    },
+    "large/architecture-reconstructions/rfdiffusion-style/model.py": {
+      "bytes": 33194,
+      "kind": "byte-exact RF implementation",
+      "sha256": "3957bd3f0ff0a5a07dc0866e885f6a05306edcfc5d82d7578f5f96f34a568911"
+    },
+    "large/architecture-reconstructions/rfdiffusion-style/train.py": {
+      "bytes": 35591,
+      "kind": "byte-exact RF implementation",
+      "sha256": "5fd6ac766c3e8ff8886727ffa4a079d919d4568a963cbadbf0bc1031cd0c6ca7"
+    },
+    "small/architecture-reconstructions/common/data.py": {
+      "bytes": 11646,
+      "kind": "byte-exact executed training dependency",
+      "sha256": "440e61d3d855966619ac19b02a808ed742e789f1aad3a59410e39d0931eb688f"
+    },
+    "small/architecture-reconstructions/common/geometry.py": {
+      "bytes": 5069,
+      "kind": "byte-exact executed training dependency",
+      "sha256": "bfb930fcd5beb8fc763321b3692f31ab600b15d446f6d117485eda617a0fb010"
+    },
+    "small/architecture-reconstructions/common/runtime.py": {
+      "bytes": 7551,
+      "kind": "byte-exact executed training dependency",
+      "sha256": "7f0981ac54460cd7824d18e2f948c7a939327c0a14ed6ae9a31f7f70271ff1ec"
+    },
+    "small/architecture-reconstructions/common/verify_dataset.py": {
+      "bytes": 10232,
+      "kind": "byte-exact executed training dependency",
+      "sha256": "2547dbd36c899004e6131eca4cb38e4b0f198dfe56871da486fde87959298789"
+    },
+    "small/architecture-reconstructions/rfdiffusion-style/model.py": {
+      "bytes": 33194,
+      "kind": "byte-exact RF implementation",
+      "sha256": "3957bd3f0ff0a5a07dc0866e885f6a05306edcfc5d82d7578f5f96f34a568911"
+    },
+    "small/architecture-reconstructions/rfdiffusion-style/train.py": {
+      "bytes": 35591,
+      "kind": "byte-exact RF implementation",
+      "sha256": "5fd6ac766c3e8ff8886727ffa4a079d919d4568a963cbadbf0bc1031cd0c6ca7"
+    },
+    "small/architecture-scaling/rfdiffusion-style/configs/medium-no-checkpoint.json": {
+      "bytes": 902,
+      "kind": "byte-exact executed training configuration",
+      "sha256": "1626d9daf5e2b9ac820c4cc8a87252fb879943c7a96271c5d987e880ee0f0901"
+    },
+    "small/architecture-scaling/rfdiffusion-style/configs/tiny-no-checkpoint.json": {
+      "bytes": 899,
+      "kind": "byte-exact executed training configuration",
+      "sha256": "48d79fea99b653a7f09930be76191d06a41ee8516e217363da5747270a87e4a9"
+    },
+    "small/architecture-scaling/rfdiffusion-style/rf-contract.json": {
+      "bytes": 2058,
+      "kind": "byte-exact executed training source",
+      "sha256": "f940cef573f5b794177614a12ee8fce4bc1e53c661c1fdf8bcf3c18f97ab3aa3"
+    },
+    "small/architecture-scaling/rfdiffusion-style/runtime/eval-world4.json": {
+      "bytes": 264,
+      "kind": "byte-exact four-rank evaluation config; portable topology",
+      "sha256": "027f14f9c1320f99fa05978011ef3eebf876de3c54336aed6865c19e31c592fd"
+    },
+    "small/architecture-scaling/rfdiffusion-style/runtime/evaluate_accumulated.py": {
+      "bytes": 45958,
+      "kind": "byte-exact evaluator imported by historical global evaluation; portable direct entrypoint",
+      "sha256": "af7836597477b477fb8eabd45236145558e130d7c8e5a676d4f3956eceede1ee"
+    },
+    "small/architecture-scaling/rfdiffusion-style/runtime/train_accumulated.py": {
+      "bytes": 42675,
+      "kind": "byte-exact executed training source",
+      "sha256": "91fcf48bffc94b9b08b04ca42972d4ece86b4c3cc0f43a38a006a30b9e6a5f23"
+    }
+  },
+  "portable_changes": [
+    "new local launcher",
+    "dataset verification report reduced to the exact fields consumed by the verifier",
+    "four-rank direct evaluator topology for Tiny/Medium"
+  ],
+  "profiles": {
+    "large": {
+      "activation_checkpointing": true,
+      "captured_config_sha256": "4d8ecb46c366a82939ca1968a7da96fbc0d6d09b9ce66d37d01b3f2f6a34390d",
+      "effective_batch_size": 8,
+      "execution_contract": null,
+      "microsteps_per_rank": 1,
+      "optimizer_updates": 30000,
+      "original_evaluation": {
+        "cuda": "12.8",
+        "eval_config_sha256": "cffe0fa1d6a82ab5648f80e4e2a5c7b2925cfd263ba0bc66137af938d834ec0e",
+        "python": "3.12.3",
+        "topology": "eight ranks",
+        "torch": "2.9.1+cu128"
+      },
+      "parameters": 93342970,
+      "physical_training_ranks": 8,
+      "samples_seen": 240000,
+      "sanitized_recorded_config": {
+        "fields_removed": [
+          "_source_provenance.common/data.py.path",
+          "_source_provenance.common/geometry.py.path",
+          "_source_provenance.common/runtime.py.path",
+          "_source_provenance.common/verify_dataset.py.path",
+          "_source_provenance.config.path",
+          "_source_provenance.dataset-verification.path",
+          "_source_provenance.model.py.path",
+          "_source_provenance.train-manifest.path",
+          "_source_provenance.train.py.path",
+          "_source_provenance.validation-manifest.path"
+        ],
+        "original_sha256": "4d8ecb46c366a82939ca1968a7da96fbc0d6d09b9ce66d37d01b3f2f6a34390d",
+        "path": "recorded-configs/large.json",
+        "sha256": "a8e9f5f80c6994395390f4504d12399641f9cb45c784a658c5b4991e92d26b0a"
+      },
+      "scientific_contract": {
+        "diffusion": "cosine-translation-geodesic-haar-terminal-v2",
+        "imputation": "stochastic-mask-blind-frame-completion-v2"
+      },
+      "training_config": "large/architecture-reconstructions/rfdiffusion-style/configs/full.json",
+      "training_config_sha256": "e05c9bdea27f08bfb01d3d1ddf6e7871bc042248998270e21a2767c5d6bbfae6",
+      "training_seed": 0,
+      "training_source_sha256": {
+        "common/data.py": "440e61d3d855966619ac19b02a808ed742e789f1aad3a59410e39d0931eb688f",
+        "common/geometry.py": "bfb930fcd5beb8fc763321b3692f31ab600b15d446f6d117485eda617a0fb010",
+        "common/runtime.py": "a0bea2a568baf13fb7c1a366eee722d58e3f45b1642b25d5f367c270acb96d4d",
+        "common/verify_dataset.py": "2547dbd36c899004e6131eca4cb38e4b0f198dfe56871da486fde87959298789",
+        "config": "e05c9bdea27f08bfb01d3d1ddf6e7871bc042248998270e21a2767c5d6bbfae6",
+        "dataset-verification": "fabf0f4756198949e2245aa4c6b12a9997b396572ae1efbc25c2285142cf6093",
+        "model.py": "3957bd3f0ff0a5a07dc0866e885f6a05306edcfc5d82d7578f5f96f34a568911",
+        "train-manifest": "d36d1f77ba43b7c4509a6e9dfd3f9414e1ce60f8364b24e0086c1734ba6aef6d",
+        "train.py": "5fd6ac766c3e8ff8886727ffa4a079d919d4568a963cbadbf0bc1031cd0c6ca7",
+        "validation-manifest": "d4a0265bcd0a021e116c0c889f21e86bc24006460bcc42dec2f9a80b70c8812b"
+      }
+    },
+    "medium": {
+      "activation_checkpointing": false,
+      "captured_config_sha256": "dc57fbdfd2ab089644cf27d263ee0370095f47cf07d6c8e3b321936b3e53d37c",
+      "effective_batch_size": 8,
+      "execution_contract": {
+        "boundary": "same effective batch/data schedule; not bitwise RNG-equivalent to original eight-rank trainer",
+        "contract_id": "rf-effective8-logical-rank-accumulation-v1",
+        "ddp_static_graph": false,
+        "effective_batch_size": 8,
+        "example_rng": "sha256(base_seed,optimizer_step,logical_rank)",
+        "gradient_accumulation_steps": 4,
+        "logical_rank_mapping": "microstep * physical_world_size + physical_rank",
+        "logical_world_size": 8,
+        "physical_world_size": 2
+      },
+      "microsteps_per_rank": 4,
+      "optimizer_updates": 30000,
+      "original_evaluation": {
+        "global_source_manifest_sha256": "168d2966b274b8ae6e9534db9b0f85444ed30b2e1e6600e59693ff9276581d6f",
+        "global_source_sha256": {
+          "global-validation-rev1/global_contract.py": "150842a21ca69950520029b553e7dc8ef71dbde39e55666fe8de2b2b188df687",
+          "global-validation-rev1/global_evaluate.py": "bbfe24c8ebb8af0d79172a17431a161cdb224f779509a346fcdb3374c9e6412e",
+          "global-validation-rev1/global_rescore.py": "69addfc9a00d56ab55d04887d298b7521ad07855f0667aa76d8ec703c7096090",
+          "runtime/evaluate_accumulated.py": "af7836597477b477fb8eabd45236145558e130d7c8e5a676d4f3956eceede1ee",
+          "runtime/rescore_accumulated_world2.py": "7a4a3f820d58568868de147b7451eb4865fe06f3dfaac01ac3554d1f9eece126",
+          "runtime/train_accumulated.py": "91fcf48bffc94b9b08b04ca42972d4ece86b4c3cc0f43a38a006a30b9e6a5f23"
+        },
+        "topology": "four global shards across separate workers"
+      },
+      "parameters": 3096860,
+      "physical_training_ranks": 2,
+      "samples_seen": 240000,
+      "sanitized_recorded_config": {
+        "fields_removed": [
+          "_source_provenance.common/data.py.path",
+          "_source_provenance.common/geometry.py.path",
+          "_source_provenance.common/runtime.py.path",
+          "_source_provenance.common/verify_dataset.py.path",
+          "_source_provenance.config.path",
+          "_source_provenance.dataset-verification.path",
+          "_source_provenance.model.py.path",
+          "_source_provenance.parent_train.py.path",
+          "_source_provenance.rf-contract.json.path",
+          "_source_provenance.train-manifest.path",
+          "_source_provenance.train_accumulated.py.path",
+          "_source_provenance.validation-manifest.path"
+        ],
+        "original_sha256": "dc57fbdfd2ab089644cf27d263ee0370095f47cf07d6c8e3b321936b3e53d37c",
+        "path": "recorded-configs/medium.json",
+        "sha256": "886377b30669280c9bba424b4cd1a8fd7418d18cffc1da5c0c7ec1152e9ef18e"
+      },
+      "scientific_contract": {
+        "diffusion": "cosine-translation-geodesic-haar-terminal-v2",
+        "imputation": "stochastic-mask-blind-frame-completion-v2"
+      },
+      "training_config": "small/architecture-scaling/rfdiffusion-style/configs/medium-no-checkpoint.json",
+      "training_config_sha256": "1626d9daf5e2b9ac820c4cc8a87252fb879943c7a96271c5d987e880ee0f0901",
+      "training_seed": 0,
+      "training_source_sha256": {
+        "common/data.py": "440e61d3d855966619ac19b02a808ed742e789f1aad3a59410e39d0931eb688f",
+        "common/geometry.py": "bfb930fcd5beb8fc763321b3692f31ab600b15d446f6d117485eda617a0fb010",
+        "common/runtime.py": "7f0981ac54460cd7824d18e2f948c7a939327c0a14ed6ae9a31f7f70271ff1ec",
+        "common/verify_dataset.py": "2547dbd36c899004e6131eca4cb38e4b0f198dfe56871da486fde87959298789",
+        "config": "1626d9daf5e2b9ac820c4cc8a87252fb879943c7a96271c5d987e880ee0f0901",
+        "dataset-verification": "fabf0f4756198949e2245aa4c6b12a9997b396572ae1efbc25c2285142cf6093",
+        "model.py": "3957bd3f0ff0a5a07dc0866e885f6a05306edcfc5d82d7578f5f96f34a568911",
+        "parent_train.py": "5fd6ac766c3e8ff8886727ffa4a079d919d4568a963cbadbf0bc1031cd0c6ca7",
+        "rf-contract.json": "f940cef573f5b794177614a12ee8fce4bc1e53c661c1fdf8bcf3c18f97ab3aa3",
+        "train-manifest": "d36d1f77ba43b7c4509a6e9dfd3f9414e1ce60f8364b24e0086c1734ba6aef6d",
+        "train_accumulated.py": "91fcf48bffc94b9b08b04ca42972d4ece86b4c3cc0f43a38a006a30b9e6a5f23",
+        "validation-manifest": "d4a0265bcd0a021e116c0c889f21e86bc24006460bcc42dec2f9a80b70c8812b"
+      }
+    },
+    "tiny": {
+      "activation_checkpointing": false,
+      "captured_config_sha256": "221b0aaa994d73333a987212db73528e0ab3f447506914a5ee11915037bcb90d",
+      "effective_batch_size": 8,
+      "execution_contract": {
+        "boundary": "same effective batch/data schedule; not bitwise RNG-equivalent to original eight-rank trainer",
+        "contract_id": "rf-effective8-logical-rank-accumulation-v1",
+        "ddp_static_graph": false,
+        "effective_batch_size": 8,
+        "example_rng": "sha256(base_seed,optimizer_step,logical_rank)",
+        "gradient_accumulation_steps": 4,
+        "logical_rank_mapping": "microstep * physical_world_size + physical_rank",
+        "logical_world_size": 8,
+        "physical_world_size": 2
+      },
+      "microsteps_per_rank": 4,
+      "optimizer_updates": 30000,
+      "original_evaluation": {
+        "global_source_manifest_sha256": "168d2966b274b8ae6e9534db9b0f85444ed30b2e1e6600e59693ff9276581d6f",
+        "global_source_sha256": {
+          "global-validation-rev1/global_contract.py": "150842a21ca69950520029b553e7dc8ef71dbde39e55666fe8de2b2b188df687",
+          "global-validation-rev1/global_evaluate.py": "bbfe24c8ebb8af0d79172a17431a161cdb224f779509a346fcdb3374c9e6412e",
+          "global-validation-rev1/global_rescore.py": "69addfc9a00d56ab55d04887d298b7521ad07855f0667aa76d8ec703c7096090",
+          "runtime/evaluate_accumulated.py": "af7836597477b477fb8eabd45236145558e130d7c8e5a676d4f3956eceede1ee",
+          "runtime/rescore_accumulated_world2.py": "7a4a3f820d58568868de147b7451eb4865fe06f3dfaac01ac3554d1f9eece126",
+          "runtime/train_accumulated.py": "91fcf48bffc94b9b08b04ca42972d4ece86b4c3cc0f43a38a006a30b9e6a5f23"
+        },
+        "topology": "four global shards across separate workers"
+      },
+      "parameters": 88784,
+      "physical_training_ranks": 2,
+      "samples_seen": 240000,
+      "sanitized_recorded_config": {
+        "fields_removed": [
+          "_source_provenance.common/data.py.path",
+          "_source_provenance.common/geometry.py.path",
+          "_source_provenance.common/runtime.py.path",
+          "_source_provenance.common/verify_dataset.py.path",
+          "_source_provenance.config.path",
+          "_source_provenance.dataset-verification.path",
+          "_source_provenance.model.py.path",
+          "_source_provenance.parent_train.py.path",
+          "_source_provenance.rf-contract.json.path",
+          "_source_provenance.train-manifest.path",
+          "_source_provenance.train_accumulated.py.path",
+          "_source_provenance.validation-manifest.path"
+        ],
+        "original_sha256": "221b0aaa994d73333a987212db73528e0ab3f447506914a5ee11915037bcb90d",
+        "path": "recorded-configs/tiny.json",
+        "sha256": "cfdd22b734379926c92af8e0098299e70a7dd997d01055e67e30ed02b3a744bb"
+      },
+      "scientific_contract": {
+        "diffusion": "cosine-translation-geodesic-haar-terminal-v2",
+        "imputation": "stochastic-mask-blind-frame-completion-v2"
+      },
+      "training_config": "small/architecture-scaling/rfdiffusion-style/configs/tiny-no-checkpoint.json",
+      "training_config_sha256": "48d79fea99b653a7f09930be76191d06a41ee8516e217363da5747270a87e4a9",
+      "training_seed": 0,
+      "training_source_sha256": {
+        "common/data.py": "440e61d3d855966619ac19b02a808ed742e789f1aad3a59410e39d0931eb688f",
+        "common/geometry.py": "bfb930fcd5beb8fc763321b3692f31ab600b15d446f6d117485eda617a0fb010",
+        "common/runtime.py": "7f0981ac54460cd7824d18e2f948c7a939327c0a14ed6ae9a31f7f70271ff1ec",
+        "common/verify_dataset.py": "2547dbd36c899004e6131eca4cb38e4b0f198dfe56871da486fde87959298789",
+        "config": "48d79fea99b653a7f09930be76191d06a41ee8516e217363da5747270a87e4a9",
+        "dataset-verification": "fabf0f4756198949e2245aa4c6b12a9997b396572ae1efbc25c2285142cf6093",
+        "model.py": "3957bd3f0ff0a5a07dc0866e885f6a05306edcfc5d82d7578f5f96f34a568911",
+        "parent_train.py": "5fd6ac766c3e8ff8886727ffa4a079d919d4568a963cbadbf0bc1031cd0c6ca7",
+        "rf-contract.json": "f940cef573f5b794177614a12ee8fce4bc1e53c661c1fdf8bcf3c18f97ab3aa3",
+        "train-manifest": "d36d1f77ba43b7c4509a6e9dfd3f9414e1ce60f8364b24e0086c1734ba6aef6d",
+        "train_accumulated.py": "91fcf48bffc94b9b08b04ca42972d4ece86b4c3cc0f43a38a006a30b9e6a5f23",
+        "validation-manifest": "d4a0265bcd0a021e116c0c889f21e86bc24006460bcc42dec2f9a80b70c8812b"
+      }
+    }
+  },
+  "schema_version": 1,
+  "scorer": {
+    "commit": "7ce9638a4fd762f9ec438d11510a654cfecd2410",
+    "metrics_sha256": "1926ccffd0628b99b0dc42a2520560d6a645f66f5e96c6e4a53285c2d1a4930d",
+    "residue_constants_sha256": "6f79a66d8c68c3d16eebfba8876e77ced4bd682c6486a1e15fae5e94a4ebd473"
+  },
+  "upstream": {
+    "implementation_depends_on_upstream_checkout": false,
+    "license_reference": "https://github.com/RosettaCommons/RFdiffusion/blob/main/LICENSE",
+    "method": "https://github.com/RosettaCommons/RFdiffusion",
+    "pretrained_weights_used": false
+  }
+}

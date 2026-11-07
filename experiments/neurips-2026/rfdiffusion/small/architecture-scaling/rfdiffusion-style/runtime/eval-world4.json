@@ -1,0 +1,17 @@
+{
+  "data": {
+    "crop_size": 256,
+    "msa_depth": 192
+  },
+  "sampling": {
+    "global_seed": 1729,
+    "feature_seed": 0,
+    "num_samples": 5,
+    "diffusion_steps": 50,
+    "sampling_steps": 50
+  },
+  "runtime": {
+    "world_size": 4,
+    "bf16": true
+  }
+}

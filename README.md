@@ -19,6 +19,7 @@ Start here:
 - [Competition rules and official protocol](docs/COMPETITION.md)
 - [Submission API contract](docs/API.md)
 - [Data sources, splits, preprocessing, and tensor formats](docs/DATA.md)
+- [NeurIPS 2026 AF3 and RFdiffusion model code and training recipes](experiments/neurips-2026/)
 
 Useful deep links:
 - [Download and preprocess public data](docs/QUICKSTART.md#2-download-and-preprocess-public-data)

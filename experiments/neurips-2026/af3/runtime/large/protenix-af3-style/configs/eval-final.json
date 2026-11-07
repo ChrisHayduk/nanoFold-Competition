@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "data": {
+    "crop_size": 256,
+    "msa_depth": 192,
+    "crop_mode": "center"
+  },
+  "sampling": {
+    "global_seed": 20260725,
+    "model_seeds": 1,
+    "diffusion_samples": 1,
+    "diffusion_steps": 200,
+    "mc_dropout_apply_rate": 0.0
+  },
+  "runtime": {
+    "world_size": 8,
+    "bf16": true
+  },
+  "metrics": {
+    "nanofold_source_commit": "7ce9638a4fd762f9ec438d11510a654cfecd2410",
+    "metrics_sha256": "1926ccffd0628b99b0dc42a2520560d6a645f66f5e96c6e4a53285c2d1a4930d",
+    "residue_constants_sha256": "6f79a66d8c68c3d16eebfba8876e77ced4bd682c6486a1e15fae5e94a4ebd473"
+  },
+  "aggregation_policy": "sample-mean-then-equal-chain-macro-v1"
+}

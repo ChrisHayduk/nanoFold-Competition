@@ -1,0 +1,3 @@
+# Preserve the recorded source and upstream license bytes for checksum verification.
+licenses/Protenix-LICENSE.txt whitespace=-blank-at-eol
+runtime/*/protenix-af3-style/adapter.py whitespace=-blank-at-eof

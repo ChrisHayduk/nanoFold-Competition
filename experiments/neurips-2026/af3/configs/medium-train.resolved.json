@@ -1,0 +1,924 @@
+{
+  "adam": {
+    "beta1": 0.9,
+    "beta2": 0.95,
+    "lr": 0.0018,
+    "use_adamw": false,
+    "weight_decay": 1e-08
+  },
+  "af3_lr_scheduler": {
+    "decay_every_n_steps": 50000,
+    "decay_factor": 0.95,
+    "lr": 0.0018,
+    "warmup_steps": 10
+  },
+  "atom_permutation": {
+    "global_align_wo_symmetric_atom": false,
+    "permute_by_pocket": true,
+    "test": {
+      "diffusion_sample": true
+    },
+    "train": {
+      "diffusion_sample": false,
+      "mini_rollout": true
+    }
+  },
+  "base_dir": "/workspace/runs/protenix-af3-style",
+  "blocks_per_ckpt": null,
+  "c_atom": 32,
+  "c_atompair": 4,
+  "c_s": 64,
+  "c_s_inputs": 129,
+  "c_token": 64,
+  "c_z": 32,
+  "chain_permutation": {
+    "configs": {
+      "accept_it_as_it_is": false,
+      "enumerate_all_anchor_pairs": false,
+      "find_gt_anchor_first": false,
+      "selection_metric": "aligned_rmsd",
+      "use_center_rmsd": false
+    },
+    "permute_by_pocket": true,
+    "test": {
+      "diffusion_sample": true
+    },
+    "train": {
+      "diffusion_sample": false,
+      "mini_rollout": true
+    }
+  },
+  "checkpoint_interval": -1,
+  "data": {
+    "ccd_components_file": "/workspace/protenix-data/common/components.cif",
+    "ccd_components_rdkit_mol_file": "/workspace/protenix-data/common/components.cif.rdkit_mol.pkl",
+    "epoch_size": 10000,
+    "msa": {
+      "enable_prot_msa": true,
+      "enable_rna_msa": true,
+      "max_size": {
+        "test": 16384,
+        "train": 16384
+      },
+      "min_size": {
+        "test": 1,
+        "train": 1
+      },
+      "prot_indexing_methods": [
+        "sequence"
+      ],
+      "prot_msadir_raw_paths": [
+        "/workspace/protenix-data/mmcif_msa_template"
+      ],
+      "prot_non_pairing_dbs": [
+        "pairing-non_pairing"
+      ],
+      "prot_pairing_dbs": [
+        "pairing"
+      ],
+      "prot_seq_or_filename_to_msadir_jsons": [
+        "/workspace/protenix-data/common/seq_to_pdb_index.json"
+      ],
+      "rna_indexing_methods": [
+        "sequence"
+      ],
+      "rna_msadir_raw_paths": [
+        "/workspace/protenix-data/rna_msa/msas"
+      ],
+      "rna_seq_or_filename_to_msadir_jsons": [
+        "/workspace/protenix-data/rna_msa/rna_sequence_to_pdb_chains.json"
+      ],
+      "sample_cutoff": {
+        "test": 16384,
+        "train": 16384
+      }
+    },
+    "num_dl_workers": 16,
+    "obsolete_release_data_csv": "/workspace/protenix-data/common/obsolete_release_date.csv",
+    "pdb_cluster_file": "/workspace/protenix-data/common/clusters-by-entity-40.txt",
+    "posebusters_0925": {
+      "base_info": {
+        "bioassembly_dict_dir": "/workspace/protenix-data/posebusters_bioassembly",
+        "find_all_pockets": false,
+        "find_pocket": true,
+        "indices_fpath": "/workspace/protenix-data/indices/posebusters_indices_mainchain_interface.csv",
+        "max_n_token": -1,
+        "mmcif_dir": "/workspace/protenix-data/posebusters_mmcif",
+        "pdb_list": ""
+      },
+      "constraint": {
+        "enable": false,
+        "fix_seed": false
+      },
+      "cropping_configs": {
+        "crop_size": -1,
+        "method_weights": [
+          0.0,
+          0.0,
+          1.0
+        ]
+      },
+      "lig_atom_rename": false,
+      "sampler_configs": {
+        "sampler_type": "uniform"
+      },
+      "shuffle_mols": false,
+      "shuffle_sym_ids": false
+    },
+    "recentPDB_1536_sample384_0925": {
+      "base_info": {
+        "bioassembly_dict_dir": "/workspace/protenix-data/recentPDB_bioassembly",
+        "find_eval_chain_interface": true,
+        "group_by_pdb_id": true,
+        "indices_fpath": "/workspace/protenix-data/indices/recentPDB_low_homology_maxtoken1536.csv",
+        "max_n_token": -1,
+        "mmcif_dir": "/workspace/protenix-data/mmcif",
+        "pdb_list": "/workspace/protenix-data/indices/recentPDB_low_homology_maxtoken1024_sample384_pdb_id.txt",
+        "sort_by_n_token": false
+      },
+      "constraint": {
+        "enable": false,
+        "fix_seed": false
+      },
+      "cropping_configs": {
+        "crop_size": -1,
+        "method_weights": [
+          0.0,
+          0.0,
+          1.0
+        ]
+      },
+      "lig_atom_rename": false,
+      "sampler_configs": {
+        "sampler_type": "uniform"
+      },
+      "shuffle_mols": false,
+      "shuffle_sym_ids": false
+    },
+    "template": {
+      "enable_prot_template": true,
+      "kalign_binary_path": "/usr/bin/kalign",
+      "obsolete_pdbs_path": "/workspace/protenix-data/common/obsolete_to_successor.json",
+      "prot_indexing_methods": [
+        "sequence"
+      ],
+      "prot_seq_or_filename_to_templatedir_jsons": [
+        "/workspace/protenix-data/common/seq_to_pdb_index.json"
+      ],
+      "prot_template_cache_dir": "",
+      "prot_template_mmcif_dir": "/workspace/protenix-data/mmcif",
+      "prot_template_raw_paths": [
+        "/workspace/protenix-data/mmcif_msa_template"
+      ],
+      "release_dates_path": "/workspace/protenix-data/common/release_date_cache.json",
+      "template_dropout_rate": 0.0
+    },
+    "test_ref_pos_augment": true,
+    "test_sets": [
+      "recentPDB_1536_sample384_0925"
+    ],
+    "train_ref_pos_augment": true,
+    "train_sampler": {
+      "sampler_type": "weighted",
+      "train_sample_weights": [
+        1.0
+      ]
+    },
+    "train_sets": [
+      "weightedPDB_before2109_wopb_nometalc_0925"
+    ],
+    "weightedPDB_before210930_v20260101": {
+      "base_info": {
+        "bioassembly_dict_dir": "/workspace/protenix-data/mmcif_bioassembly",
+        "exclusion": {
+          "mol_1_type": [
+            "ions"
+          ],
+          "mol_2_type": [
+            "ions"
+          ]
+        },
+        "indices_fpath": "/workspace/protenix-data/indices/indices_20260107-20chains_before_2021-09-30_res4.5.csv.gz",
+        "max_n_token": -1,
+        "mmcif_dir": "/workspace/protenix-data/mmcif",
+        "pdb_list": "",
+        "random_sample_if_failed": true,
+        "use_reference_chains_only": false
+      },
+      "constraint": {
+        "contact": {
+          "distance_type": "center_atom",
+          "group": "complex",
+          "max_distance_range": {
+            "PL": [
+              4,
+              10
+            ],
+            "PP": [
+              6,
+              30
+            ]
+          },
+          "prob": 0.0,
+          "size": 0.3333333333333333
+        },
+        "contact_atom": {
+          "distance_type": "atom",
+          "feature_type": "continuous",
+          "group": "complex",
+          "max_distance_range": {
+            "PL": [
+              2,
+              8
+            ],
+            "PP": [
+              2,
+              12
+            ]
+          },
+          "min_distance": -1,
+          "prob": 0.0,
+          "size": 0.3333333333333333
+        },
+        "enable": false,
+        "fix_seed": false,
+        "pocket": {
+          "distance_type": "center_atom",
+          "group": "complex",
+          "max_distance_range": {
+            "LP": [
+              6,
+              20
+            ],
+            "PP": [
+              6,
+              20
+            ]
+          },
+          "prob": 0.0,
+          "size": 0.3333333333333333,
+          "spec_binder_chain": false
+        },
+        "substructure": {
+          "coord_noise_scale": 0.05,
+          "feature_type": "one_hot",
+          "mol_type_pairs": {
+            "LP": 10,
+            "PL": 10,
+            "PP": 15
+          },
+          "prob": 0.0,
+          "ratios": {
+            "full": [
+              0.0,
+              0.5,
+              1.0
+            ],
+            "partial": 0.3
+          },
+          "size": 0.8,
+          "spec_asym_id": false
+        }
+      },
+      "cropping_configs": {
+        "crop_size": 256,
+        "method_weights": [
+          0.2,
+          0.4,
+          0.4
+        ]
+      },
+      "lig_atom_rename": false,
+      "limits": -1,
+      "sample_weight": 0.5,
+      "sampler_configs": {
+        "alpha_dict": {
+          "ligand": 1,
+          "nuc": 3,
+          "prot": 3
+        },
+        "beta_dict": {
+          "chain": 0.5,
+          "interface": 1
+        },
+        "force_recompute_weight": true,
+        "sampler_type": "weighted"
+      },
+      "shuffle_mols": false,
+      "shuffle_sym_ids": false
+    },
+    "weightedPDB_before2109_wopb_nometalc_0925": {
+      "base_info": {
+        "bioassembly_dict_dir": "/workspace/protenix-data/mmcif_bioassembly",
+        "exclusion": {
+          "mol_1_type": [
+            "ions"
+          ],
+          "mol_2_type": [
+            "ions"
+          ]
+        },
+        "indices_fpath": "/workspace/protenix-data/indices/weightedPDB_indices_before_2021-09-30_wo_posebusters_resolution_below_9.csv.gz",
+        "max_n_token": -1,
+        "mmcif_dir": "/workspace/protenix-data/mmcif",
+        "pdb_list": "",
+        "random_sample_if_failed": true,
+        "use_reference_chains_only": false
+      },
+      "constraint": {
+        "contact": {
+          "distance_type": "center_atom",
+          "group": "complex",
+          "max_distance_range": {
+            "PL": [
+              4,
+              10
+            ],
+            "PP": [
+              6,
+              30
+            ]
+          },
+          "prob": 0.0,
+          "size": 0.3333333333333333
+        },
+        "contact_atom": {
+          "distance_type": "atom",
+          "feature_type": "continuous",
+          "group": "complex",
+          "max_distance_range": {
+            "PL": [
+              2,
+              8
+            ],
+            "PP": [
+              2,
+              12
+            ]
+          },
+          "min_distance": -1,
+          "prob": 0.0,
+          "size": 0.3333333333333333
+        },
+        "enable": false,
+        "fix_seed": false,
+        "pocket": {
+          "distance_type": "center_atom",
+          "group": "complex",
+          "max_distance_range": {
+            "LP": [
+              6,
+              20
+            ],
+            "PP": [
+              6,
+              20
+            ]
+          },
+          "prob": 0.0,
+          "size": 0.3333333333333333,
+          "spec_binder_chain": false
+        },
+        "substructure": {
+          "coord_noise_scale": 0.05,
+          "feature_type": "one_hot",
+          "mol_type_pairs": {
+            "LP": 10,
+            "PL": 10,
+            "PP": 15
+          },
+          "prob": 0.0,
+          "ratios": {
+            "full": [
+              0.0,
+              0.5,
+              1.0
+            ],
+            "partial": 0.3
+          },
+          "size": 0.8,
+          "spec_asym_id": false
+        }
+      },
+      "cropping_configs": {
+        "crop_size": 256,
+        "method_weights": [
+          0.2,
+          0.4,
+          0.4
+        ]
+      },
+      "lig_atom_rename": false,
+      "limits": -1,
+      "sample_weight": 0.5,
+      "sampler_configs": {
+        "alpha_dict": {
+          "ligand": 1,
+          "nuc": 3,
+          "prot": 3
+        },
+        "beta_dict": {
+          "chain": 0.5,
+          "interface": 1
+        },
+        "force_recompute_weight": true,
+        "sampler_type": "weighted"
+      },
+      "shuffle_mols": false,
+      "shuffle_sym_ids": false
+    },
+    "weightedPDB_before250701_v20260101": {
+      "base_info": {
+        "bioassembly_dict_dir": "/workspace/protenix-data/mmcif_bioassembly",
+        "exclusion": {
+          "mol_1_type": [
+            "ions"
+          ],
+          "mol_2_type": [
+            "ions"
+          ]
+        },
+        "indices_fpath": "/workspace/protenix-data/indices/indices_20260107-20chains_before_2025-07-01_res4.5.csv.gz",
+        "max_n_token": -1,
+        "mmcif_dir": "/workspace/protenix-data/mmcif",
+        "pdb_list": "",
+        "random_sample_if_failed": true,
+        "use_reference_chains_only": false
+      },
+      "constraint": {
+        "contact": {
+          "distance_type": "center_atom",
+          "group": "complex",
+          "max_distance_range": {
+            "PL": [
+              4,
+              10
+            ],
+            "PP": [
+              6,
+              30
+            ]
+          },
+          "prob": 0.0,
+          "size": 0.3333333333333333
+        },
+        "contact_atom": {
+          "distance_type": "atom",
+          "feature_type": "continuous",
+          "group": "complex",
+          "max_distance_range": {
+            "PL": [
+              2,
+              8
+            ],
+            "PP": [
+              2,
+              12
+            ]
+          },
+          "min_distance": -1,
+          "prob": 0.0,
+          "size": 0.3333333333333333
+        },
+        "enable": false,
+        "fix_seed": false,
+        "pocket": {
+          "distance_type": "center_atom",
+          "group": "complex",
+          "max_distance_range": {
+            "LP": [
+              6,
+              20
+            ],
+            "PP": [
+              6,
+              20
+            ]
+          },
+          "prob": 0.0,
+          "size": 0.3333333333333333,
+          "spec_binder_chain": false
+        },
+        "substructure": {
+          "coord_noise_scale": 0.05,
+          "feature_type": "one_hot",
+          "mol_type_pairs": {
+            "LP": 10,
+            "PL": 10,
+            "PP": 15
+          },
+          "prob": 0.0,
+          "ratios": {
+            "full": [
+              0.0,
+              0.5,
+              1.0
+            ],
+            "partial": 0.3
+          },
+          "size": 0.8,
+          "spec_asym_id": false
+        }
+      },
+      "cropping_configs": {
+        "crop_size": 256,
+        "method_weights": [
+          0.2,
+          0.4,
+          0.4
+        ]
+      },
+      "lig_atom_rename": false,
+      "limits": -1,
+      "sample_weight": 0.5,
+      "sampler_configs": {
+        "alpha_dict": {
+          "ligand": 1,
+          "nuc": 3,
+          "prot": 3
+        },
+        "beta_dict": {
+          "chain": 0.5,
+          "interface": 1
+        },
+        "force_recompute_weight": true,
+        "sampler_type": "weighted"
+      },
+      "shuffle_mols": false,
+      "shuffle_sym_ids": false
+    }
+  },
+  "decay_every_n_steps": 50000,
+  "deterministic": false,
+  "deterministic_seed": false,
+  "diffusion_batch_size": 48,
+  "diffusion_chunk_size": 48,
+  "dtype": "bf16",
+  "ema_decay": -1.0,
+  "ema_mutable_param_keywords": [
+    ""
+  ],
+  "enable_diffusion_shared_vars_cache": false,
+  "enable_efficient_fusion": false,
+  "enable_tf32": true,
+  "esm": {
+    "embedding_dim": 2560,
+    "enable": false,
+    "model_name": "esm2-3b"
+  },
+  "eval_ema_only": false,
+  "eval_first": false,
+  "eval_interval": -1,
+  "eval_only": false,
+  "find_unused_parameters": false,
+  "finetune": {
+    "decay_every_n_steps": 50000,
+    "lr": 0.0018,
+    "lr_scheduler": "cosine_annealing",
+    "max_steps": 20000,
+    "min_lr_ratio": 0.1,
+    "warmup_steps": 1000
+  },
+  "finetune_params_with_substring": [
+    ""
+  ],
+  "grad_clip_norm": 10,
+  "hidden_scale_up": false,
+  "infer_setting": {
+    "chunk_size": 256,
+    "chunk_size_thresholds": {
+      "1024": -1,
+      "1536": 512,
+      "2048": 256,
+      "2560": 128
+    },
+    "dynamic_chunk_size": true,
+    "lddt_metrics_chunk_size": 1,
+    "lddt_metrics_sparse_enable": true,
+    "sample_diffusion_chunk_size": 5
+  },
+  "inference_noise_scheduler": {
+    "rho": 7,
+    "s_max": 160.0,
+    "s_min": 0.0004,
+    "sigma_data": 16.0
+  },
+  "iters_to_accumulate": 1,
+  "load_checkpoint_path": "",
+  "load_ema_checkpoint_path": "",
+  "load_params_only": true,
+  "load_step_for_scheduler": false,
+  "load_strict": true,
+  "log_interval": 10,
+  "loss": {
+    "diffusion": {
+      "bond": {
+        "eps": 1e-06
+      },
+      "mse": {
+        "eps": 1e-06,
+        "weight_dna": 5.0,
+        "weight_ligand": 10.0,
+        "weight_mse": 0.3333333333333333,
+        "weight_rna": 5.0
+      },
+      "smooth_lddt": {
+        "eps": 1e-06
+      }
+    },
+    "diffusion_bond_chunk_size": 1,
+    "diffusion_chunk_size_outer": 1,
+    "diffusion_lddt_chunk_size": 48,
+    "diffusion_lddt_loss_dense": true,
+    "diffusion_sparse_loss_enable": true,
+    "distogram": {
+      "eps": 1e-06,
+      "max_bin": 21.6875,
+      "min_bin": 2.3125,
+      "no_bins": 64
+    },
+    "pae": {
+      "eps": 1e-06,
+      "max_bin": 32,
+      "min_bin": 0,
+      "no_bins": 64
+    },
+    "pde": {
+      "eps": 1e-06,
+      "max_bin": 32,
+      "min_bin": 0,
+      "no_bins": 64
+    },
+    "plddt": {
+      "eps": 1e-06,
+      "max_bin": 1.0,
+      "min_bin": 0,
+      "no_bins": 50,
+      "normalize": true
+    },
+    "resolution": {
+      "max": 4.0,
+      "min": 0.1
+    },
+    "resolved": {
+      "eps": 1e-06
+    },
+    "weight": {
+      "alpha_bond": 0.0,
+      "alpha_confidence": 0.0,
+      "alpha_diffusion": 4.0,
+      "alpha_distogram": 0.03,
+      "alpha_except_pae": 1.0,
+      "alpha_pae": 0.0,
+      "smooth_lddt": 1.0
+    }
+  },
+  "loss_metrics_sparse_enable": true,
+  "lr": 0.0018,
+  "lr_scheduler": "af3",
+  "max_atoms_per_token": 24,
+  "max_steps": 30000,
+  "mc_dropout_apply_rate": 0.4,
+  "mc_dropout_rate": 0.4,
+  "metrics": {
+    "chain_ranker_keys": [
+      "chain_ptm",
+      "chain_plddt"
+    ],
+    "clash": {
+      "af3_clash_threshold": 1.1,
+      "vdw_clash_threshold": 0.75
+    },
+    "complex_ranker_keys": [
+      "plddt",
+      "gpde",
+      "ranking_score"
+    ],
+    "interface_ranker_keys": [
+      "chain_pair_iptm",
+      "chain_pair_iptm_global",
+      "chain_pair_plddt"
+    ],
+    "lddt": {
+      "eps": 1e-06
+    }
+  },
+  "min_lr_ratio": 0.1,
+  "model": {
+    "N_cycle": 4,
+    "N_model_seed": 1,
+    "condition_embedding_drop_rate": 0.0,
+    "confidence_embedding_drop_rate": 0.0,
+    "confidence_head": {
+      "blocks_per_ckpt": null,
+      "c_s": 64,
+      "c_s_inputs": 129,
+      "c_z": 32,
+      "distance_bin_end": 52.0,
+      "distance_bin_start": 3.25,
+      "distance_bin_step": 1.25,
+      "hidden_scale_up": false,
+      "max_atoms_per_token": 24,
+      "n_blocks": 4,
+      "pairformer_dropout": 0.0,
+      "stop_gradient": true
+    },
+    "constraint_embedder": {
+      "c_constraint_atom_pair": 4,
+      "c_constraint_s": 129,
+      "c_constraint_z": 32,
+      "contact_atom_embedder": {
+        "c_z_input": 2,
+        "enable": false
+      },
+      "contact_embedder": {
+        "c_z_input": 2,
+        "enable": false
+      },
+      "initialize_method": "zero",
+      "pocket_embedder": {
+        "c_s_input": 3,
+        "c_z_input": 1,
+        "enable": false
+      },
+      "substructure_embedder": {
+        "architecture": "transformer",
+        "enable": false,
+        "hidden_dim": 128,
+        "n_classes": 4,
+        "n_layers": 1
+      }
+    },
+    "diffusion_module": {
+      "atom_decoder": {
+        "n_blocks": 1,
+        "n_heads": 4
+      },
+      "atom_encoder": {
+        "n_blocks": 1,
+        "n_heads": 4
+      },
+      "blocks_per_ckpt": null,
+      "c_atom": 32,
+      "c_atompair": 4,
+      "c_s": 64,
+      "c_s_inputs": 129,
+      "c_token": 128,
+      "c_z": 32,
+      "sigma_data": 16.0,
+      "transformer": {
+        "n_blocks": 4,
+        "n_heads": 4
+      },
+      "use_fine_grained_checkpoint": false
+    },
+    "distogram_head": {
+      "c_z": 32,
+      "no_bins": 64
+    },
+    "input_embedder": {
+      "c_atom": 32,
+      "c_atompair": 4,
+      "c_token": 64
+    },
+    "msa_module": {
+      "blocks_per_ckpt": null,
+      "c_m": 32,
+      "c_s_inputs": 129,
+      "c_z": 32,
+      "hidden_scale_up": false,
+      "msa_chunk_size": 2048,
+      "msa_dropout": 0.15,
+      "msa_max_size": 16384,
+      "n_blocks": 1,
+      "pair_dropout": 0.25
+    },
+    "pairformer": {
+      "blocks_per_ckpt": null,
+      "c_s": 64,
+      "c_z": 32,
+      "dropout": 0.25,
+      "hidden_scale_up": false,
+      "n_blocks": 4,
+      "n_heads": 4
+    },
+    "relative_position_encoding": {
+      "c_z": 32,
+      "r_max": 32,
+      "s_max": 2
+    },
+    "template_embedder": {
+      "blocks_per_ckpt": null,
+      "c": 64,
+      "c_z": 32,
+      "dropout": 0.25,
+      "hidden_scale_up": false,
+      "n_blocks": 0
+    }
+  },
+  "model_name": "protenix_base_default_v1.0.0",
+  "n_blocks": 4,
+  "no_bins": 64,
+  "project": "nanofold-rebuttal",
+  "run_name": "protenix-af3-style-random-init",
+  "sample_diffusion": {
+    "N_sample": 5,
+    "N_sample_mini_rollout": 1,
+    "N_step": 200,
+    "N_step_mini_rollout": 20,
+    "gamma0": 0.8,
+    "gamma_min": 1.0,
+    "guidance": {
+      "enable": false,
+      "log_last_step_energy": true,
+      "mc": {
+        "batch": 1,
+        "std": 0.0
+      },
+      "mu": 0.1,
+      "rho": 0.0,
+      "steps": {
+        "projection_inner": 10,
+        "projection_outer": 2,
+        "tfg_inner": 20,
+        "tfg_outer": 1
+      },
+      "terms": {
+        "ChiralAtomPotential": {
+          "buffer": 0.6155,
+          "enable_projection": true,
+          "interval": 1,
+          "weight": 0.0
+        },
+        "ExperimentalTorsionPotential": {
+          "interval": 1,
+          "weight": 0.0015
+        },
+        "InterchainBondPotential": {
+          "buffer": 2.0,
+          "interval": 1,
+          "weight": 0.15
+        },
+        "LinearBondPotential": {
+          "buffer": 0.08726646259,
+          "interval": 1,
+          "weight": 0.25
+        },
+        "PairwiseDistancePotential": {
+          "angle_buffer": 0.0,
+          "bond_buffer": 0.0,
+          "clash_buffer": 0.0,
+          "enable_projection": true,
+          "interval": 1,
+          "weight": 0.5
+        },
+        "PlanarImproperPotential": {
+          "interval": 1,
+          "weight": 0.12
+        },
+        "StereoBondPotential": {
+          "buffer": 0.5236,
+          "interval": 1,
+          "weight": 0.25
+        },
+        "VinaStericPotential": {
+          "buffer": 0.225,
+          "interval": 1,
+          "weight": 0.1
+        }
+      }
+    },
+    "noise_scale_lambda": 1.003,
+    "step_scale_eta": 1.5
+  },
+  "seed": 20260725,
+  "sigma_data": 16.0,
+  "skip_amp": {
+    "confidence_head": false,
+    "loss": true,
+    "sample_diffusion": true,
+    "sample_diffusion_training": true
+  },
+  "skip_load_optimizer": false,
+  "skip_load_scheduler": false,
+  "skip_load_step": false,
+  "test_lig_atom_rename": false,
+  "test_max_n_token": -1,
+  "test_shuffle_mols": false,
+  "test_shuffle_sym_ids": false,
+  "train_confidence_only": false,
+  "train_crop_size": 256,
+  "train_lig_atom_rename": false,
+  "train_noise_sampler": {
+    "p_mean": -1.2,
+    "p_std": 1.5,
+    "sigma_data": 16.0
+  },
+  "train_shuffle_mols": false,
+  "train_shuffle_sym_ids": false,
+  "triangle_attention": "cuequivariance",
+  "triangle_multiplicative": "cuequivariance",
+  "use_wandb": false,
+  "wandb_id": "",
+  "warmup_steps": 10
+}

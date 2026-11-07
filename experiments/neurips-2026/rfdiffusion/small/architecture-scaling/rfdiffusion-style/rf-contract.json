@@ -1,0 +1,38 @@
+{
+  "boundary": "RFdiffusion-style clean-room single-chain predictor; not official RFdiffusion or cross-family matched scientific protocols.",
+  "parameter_counts": {
+    "medium": 3096860,
+    "tiny": 88784
+  },
+  "parent_sources": {
+    "common/data.py": "440e61d3d855966619ac19b02a808ed742e789f1aad3a59410e39d0931eb688f",
+    "common/geometry.py": "bfb930fcd5beb8fc763321b3692f31ab600b15d446f6d117485eda617a0fb010",
+    "common/runtime.py": "7f0981ac54460cd7824d18e2f948c7a939327c0a14ed6ae9a31f7f70271ff1ec",
+    "common/verify_dataset.py": "2547dbd36c899004e6131eca4cb38e4b0f198dfe56871da486fde87959298789",
+    "rfdiffusion-style/configs/eval-final.json": "cffe0fa1d6a82ab5648f80e4e2a5c7b2925cfd263ba0bc66137af938d834ec0e",
+    "rfdiffusion-style/configs/full.json": "e05c9bdea27f08bfb01d3d1ddf6e7871bc042248998270e21a2767c5d6bbfae6",
+    "rfdiffusion-style/evaluate.py": "61cd40a536cf75b67c45f5a5b6cf11ee144e05e522cbc56d948806971154f3a0",
+    "rfdiffusion-style/model.py": "3957bd3f0ff0a5a07dc0866e885f6a05306edcfc5d82d7578f5f96f34a568911",
+    "rfdiffusion-style/preflight.py": "6420cb2663fba02dfb737e2c338a6c04702fb0604e366b2c57422c7f4a5720a9",
+    "rfdiffusion-style/train.py": "5fd6ac766c3e8ff8886727ffa4a079d919d4568a963cbadbf0bc1031cd0c6ca7"
+  },
+  "profiles": {
+    "eval-final.json": "cffe0fa1d6a82ab5648f80e4e2a5c7b2925cfd263ba0bc66137af938d834ec0e",
+    "medium-no-checkpoint.json": "1626d9daf5e2b9ac820c4cc8a87252fb879943c7a96271c5d987e880ee0f0901",
+    "medium.json": "c19826b5fd2f45618110d2594d2e9c405ca40b271c52616631f961d7953a6b4b",
+    "tiny-no-checkpoint.json": "48d79fea99b653a7f09930be76191d06a41ee8516e217363da5747270a87e4a9",
+    "tiny.json": "fabe6efd66005ca18d65e6a6228755a68f12264eb4caa8cb1c05ee78c2a1d8d1"
+  },
+  "schema_version": 1,
+  "state": "LOCAL_PREPARATION_NOT_LAUNCHED",
+  "training_contract": {
+    "effective_batch_size": 8,
+    "from_scratch": true,
+    "optimizer_steps": 30000,
+    "public_validation_chains": 1000,
+    "seed": 0,
+    "total_examples": 240000,
+    "train_chains": 10000,
+    "world_size": 8
+  }
+}

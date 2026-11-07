@@ -1,0 +1,695 @@
+{
+  "profiles": {
+    "large": {
+      "crop_size": 256,
+      "effective_batch_size": 8,
+      "ema": false,
+      "esm": false,
+      "exact_resolved_training_config_canonical_sha256": "814a00a7be72d210964e1619b5ea084f32bf81c74f6b2b25b0b90ee40e54f5db",
+      "exact_resolved_training_config_original_chemistry_root": "/workspace/large-af3-deadline-h100x8/chemistry",
+      "exact_resolved_training_config_path": "configs/large-train.resolved.json",
+      "files": {
+        "configs/large-train.resolved.json": {
+          "bytes": 23150,
+          "sha256": "6db224f19f981c9b2a1b73a1329ad39e219206731a3a39ca48eb0e7bdd1896db"
+        },
+        "runtime/large/common/data.py": {
+          "bytes": 11646,
+          "sha256": "440e61d3d855966619ac19b02a808ed742e789f1aad3a59410e39d0931eb688f"
+        },
+        "runtime/large/common/runtime.py": {
+          "bytes": 7551,
+          "sha256": "7f0981ac54460cd7824d18e2f948c7a939327c0a14ed6ae9a31f7f70271ff1ec"
+        },
+        "runtime/large/common/verify_dataset.py": {
+          "bytes": 10232,
+          "sha256": "2547dbd36c899004e6131eca4cb38e4b0f198dfe56871da486fde87959298789"
+        },
+        "runtime/large/protenix-af3-style/adapter.py": {
+          "bytes": 23600,
+          "sha256": "874ccbaffc2c6a952af6f42c3148b9a90a1db54b3510c5da88359184a0c1114e"
+        },
+        "runtime/large/protenix-af3-style/checkpoint.py": {
+          "bytes": 7934,
+          "sha256": "fb47d402533d7423fd94918ce8d4515c602981868a01fd8d8698c0b7e8eed90e"
+        },
+        "runtime/large/protenix-af3-style/config.py": {
+          "bytes": 3571,
+          "sha256": "afd1f7cee0fb5f8a6157d0ec6bc44f706ec5fcc911f5b8791e3d8a8c9e0178e4"
+        },
+        "runtime/large/protenix-af3-style/config.yaml": {
+          "bytes": 2048,
+          "sha256": "a9fb32cdd599b961d22dafe9042df4684a6460c3f2af5935ef04a395a878c03c"
+        },
+        "runtime/large/protenix-af3-style/configs/eval-final.json": {
+          "bytes": 680,
+          "sha256": "02751e01fd5887eb2fff06839a0633dfbcc4f3ad0102bb48cf50182060162086"
+        },
+        "runtime/large/protenix-af3-style/evaluate.py": {
+          "bytes": 69558,
+          "sha256": "bb16924fb2aabcf4bdbf2392f0b37430bc8612834e015859ecd4c2f289316c8f"
+        },
+        "runtime/large/protenix-af3-style/export_ccd_reference.py": {
+          "bytes": 1292,
+          "sha256": "f2a5a1517d2757e35e245df62cd6357d3e7739b874f819d52c39f691e2d40d79"
+        },
+        "runtime/large/protenix-af3-style/launch_8xh100.sh": {
+          "bytes": 2057,
+          "sha256": "674d0c8054b6d3a3ffdd87b1f3be433795c47bf5b389bbed487a72c022edb2ef"
+        },
+        "runtime/large/protenix-af3-style/launch_overfit_8xh100.sh": {
+          "bytes": 2051,
+          "sha256": "0e456773573d28f1b4bf46fb37c909f5842d3a7cb0ed7883e59ed62ff4853fa3"
+        },
+        "runtime/large/protenix-af3-style/pilot_8xh100.sh": {
+          "bytes": 1684,
+          "sha256": "bf0813f1b235e8a906856e1e778189ae390287f73dd8cf85cbfd46046ac37c76"
+        },
+        "runtime/large/protenix-af3-style/predict_one.py": {
+          "bytes": 12997,
+          "sha256": "77860fb8f6259bf86accf65985548b90af1c44814e563d6971ddc24f467c8c1d"
+        },
+        "runtime/large/protenix-af3-style/train.py": {
+          "bytes": 33051,
+          "sha256": "7504301a48b182660d1471ae5288150a5900f56b0009ecf37e9adde89f3be7a4"
+        }
+      },
+      "from_scratch": true,
+      "msa_depth": 192,
+      "native_eval_config_path": "runtime/large/protenix-af3-style/configs/eval-final.json",
+      "native_eval_config_sha256": "02751e01fd5887eb2fff06839a0633dfbcc4f3ad0102bb48cf50182060162086",
+      "observed_runtime": {
+        "cuda_runtime": "12.6",
+        "cudnn": 90501,
+        "device_capability": [
+          9,
+          0
+        ],
+        "device_name": "NVIDIA H100 80GB HBM3",
+        "device_type": "cuda",
+        "python": "3.12.3 (main, Aug 14 2025, 17:47:21) [GCC 13.3.0]",
+        "torch": "2.7.1+cu126"
+      },
+      "optimizer_scheduler": {
+        "gradient_clip_norm": 10.0,
+        "implementation": "pinned_protenix_helpers",
+        "loss_autocast_disabled": true,
+        "optimizer": {
+          "beta1": 0.9,
+          "beta2": 0.95,
+          "class": "Adam",
+          "learning_rate": 0.0018,
+          "weight_decay": 1e-08
+        },
+        "scheduler": {
+          "class": "AlphaFold3LRScheduler",
+          "decay_every_n_steps": 50000,
+          "decay_factor": 0.95,
+          "learning_rate": 0.0018,
+          "name": "af3",
+          "warmup_steps": 10
+        }
+      },
+      "optimizer_steps": 30000,
+      "original_ccd_reference_sha256": "b1c985dff08d873c628b3af61cf85c3668681ef9f4c3f2a163d71535f9b3d3e7",
+      "original_source_package_manifest_sha256": "72dfcff759b969fca854564fd69087681cc34358be2378554ed7fbdf5314a7ff",
+      "parameter_count": 368088191,
+      "physical_world_size": 8,
+      "public_data_tree_sha256": "98c141bafcb51c2a8532ec3eba115ff170e9a9da9c54e4f18e5e7c83b4ef1e00",
+      "public_dataset_report_sha256": "fabf0f4756198949e2245aa4c6b12a9997b396572ae1efbc25c2285142cf6093",
+      "sample_exposures": 240000,
+      "save_initial_checkpoint": false,
+      "seed": 20260725,
+      "templates": false,
+      "terminal_evaluation_provenance_sha256": "0bae39a6ea43191e3a06bf7a00ebab6973a4976c3815816244ee66d819dcd1e5",
+      "terminal_training_provenance_sha256": "fd8ada9bce1f23ee5187357a5241499fd624ff1551fb05ed72e7c786d904de67"
+    },
+    "medium": {
+      "batch_execution": {
+        "accumulation_steps": 1,
+        "checkpoint_boundary": "optimizer-step boundaries only; no partial gradients are persisted",
+        "effective_batch_size": 8,
+        "logical_rank_mapping": "physical_rank + microbatch_index * physical_world_size",
+        "loss_scaling": "each example loss divided by accumulation_steps; DDP averages physical ranks",
+        "optimizer_scheduler_clip": "once per completed effective batch",
+        "physical_world_size": 8,
+        "rng_policy": "physical-rank RNG streams; exact same-physical-world resume only",
+        "schema_version": 1,
+        "virtual_world_size": 8
+      },
+      "crop_size": 256,
+      "effective_batch_size": 8,
+      "ema": false,
+      "esm": false,
+      "exact_resolved_training_config_canonical_sha256": "76f2a0ffc1b73f80cba8b28d31352690093a6940aab0a0a9dbd5446952707e65",
+      "exact_resolved_training_config_original_chemistry_root": "/workspace/protenix-data",
+      "exact_resolved_training_config_path": "configs/medium-train.resolved.json",
+      "files": {
+        "configs/medium-train.resolved.json": {
+          "bytes": 22504,
+          "sha256": "6229f2c5f00596eaed98223061c2facbc250d21483d3c27c983d9c3a6e623c44"
+        },
+        "profiles/medium.json": {
+          "bytes": 1793,
+          "sha256": "47f8189fd13aca58f7d47110bb9f1a92bfb895346cc42bb87f14a06384a76620"
+        },
+        "runtime/medium/common/data.py": {
+          "bytes": 11646,
+          "sha256": "440e61d3d855966619ac19b02a808ed742e789f1aad3a59410e39d0931eb688f"
+        },
+        "runtime/medium/common/effective_batch.py": {
+          "bytes": 2669,
+          "sha256": "48847040ac248a4350292f36e27947da5f812d1b71924665a0e7fcf98d347708"
+        },
+        "runtime/medium/common/runtime.py": {
+          "bytes": 7551,
+          "sha256": "7f0981ac54460cd7824d18e2f948c7a939327c0a14ed6ae9a31f7f70271ff1ec"
+        },
+        "runtime/medium/common/verify_dataset.py": {
+          "bytes": 10232,
+          "sha256": "2547dbd36c899004e6131eca4cb38e4b0f198dfe56871da486fde87959298789"
+        },
+        "runtime/medium/protenix-af3-style/adapter.py": {
+          "bytes": 23600,
+          "sha256": "874ccbaffc2c6a952af6f42c3148b9a90a1db54b3510c5da88359184a0c1114e"
+        },
+        "runtime/medium/protenix-af3-style/checkpoint.py": {
+          "bytes": 7934,
+          "sha256": "fb47d402533d7423fd94918ce8d4515c602981868a01fd8d8698c0b7e8eed90e"
+        },
+        "runtime/medium/protenix-af3-style/config.py": {
+          "bytes": 4576,
+          "sha256": "fa86aefc8589a43fd42b5a7ecac9c0a39e4c91c58dbff2fd0995fba51803b24f"
+        },
+        "runtime/medium/protenix-af3-style/config.yaml": {
+          "bytes": 3827,
+          "sha256": "80bc750a0a804940181514711f233b7c9d0adb741d9d8978cf9f0fd553eab448"
+        },
+        "runtime/medium/protenix-af3-style/configs/eval-final-world8.json": {
+          "bytes": 680,
+          "sha256": "02751e01fd5887eb2fff06839a0633dfbcc4f3ad0102bb48cf50182060162086"
+        },
+        "runtime/medium/protenix-af3-style/evaluate.py": {
+          "bytes": 70055,
+          "sha256": "59e88a8c22bb2de718a62f26e5bbcfda35eee6b970f1dee4c82685fb74e8d361"
+        },
+        "runtime/medium/protenix-af3-style/export_ccd_reference.py": {
+          "bytes": 1292,
+          "sha256": "f2a5a1517d2757e35e245df62cd6357d3e7739b874f819d52c39f691e2d40d79"
+        },
+        "runtime/medium/protenix-af3-style/launch_8xh100.sh": {
+          "bytes": 2296,
+          "sha256": "9165647bdadeae0019e8b96e08dfba4bc8b813052fc95f5bb75818b9218e0ee5"
+        },
+        "runtime/medium/protenix-af3-style/launch_overfit_8xh100.sh": {
+          "bytes": 2051,
+          "sha256": "0e456773573d28f1b4bf46fb37c909f5842d3a7cb0ed7883e59ed62ff4853fa3"
+        },
+        "runtime/medium/protenix-af3-style/pilot_8xh100.sh": {
+          "bytes": 1684,
+          "sha256": "bf0813f1b235e8a906856e1e778189ae390287f73dd8cf85cbfd46046ac37c76"
+        },
+        "runtime/medium/protenix-af3-style/predict_one.py": {
+          "bytes": 12997,
+          "sha256": "77860fb8f6259bf86accf65985548b90af1c44814e563d6971ddc24f467c8c1d"
+        },
+        "runtime/medium/protenix-af3-style/train.py": {
+          "bytes": 33331,
+          "sha256": "fb9db00a16c43e857fb30fe737d9f7b77d4bf0564824ea072f9e34303b7d7d97"
+        }
+      },
+      "from_scratch": true,
+      "msa_depth": 192,
+      "native_eval_config_path": "runtime/medium/protenix-af3-style/configs/eval-final-world8.json",
+      "native_eval_config_sha256": "02751e01fd5887eb2fff06839a0633dfbcc4f3ad0102bb48cf50182060162086",
+      "observed_runtime": {
+        "cuda_runtime": "12.6",
+        "cudnn": 90501,
+        "device_capability": [
+          9,
+          0
+        ],
+        "device_name": "NVIDIA H100 80GB HBM3",
+        "device_type": "cuda",
+        "python": "3.12.3 (main, Aug 14 2025, 17:47:21) [GCC 13.3.0]",
+        "torch": "2.7.1+cu126"
+      },
+      "optimizer_scheduler": {
+        "gradient_clip_norm": 10.0,
+        "implementation": "pinned_protenix_helpers",
+        "loss_autocast_disabled": true,
+        "optimizer": {
+          "beta1": 0.9,
+          "beta2": 0.95,
+          "class": "Adam",
+          "learning_rate": 0.0018,
+          "weight_decay": 1e-08
+        },
+        "scheduler": {
+          "class": "AlphaFold3LRScheduler",
+          "decay_every_n_steps": 50000,
+          "decay_factor": 0.95,
+          "learning_rate": 0.0018,
+          "name": "af3",
+          "warmup_steps": 10
+        }
+      },
+      "optimizer_steps": 30000,
+      "original_ccd_reference_sha256": "b1c985dff08d873c628b3af61cf85c3668681ef9f4c3f2a163d71535f9b3d3e7",
+      "original_source_package_manifest_sha256": "30e47be7330720c8b6122d4da215592a60afe2eb26b896705bac1ac75f50ff6a",
+      "parameter_count": 2773243,
+      "physical_world_size": 8,
+      "public_data_tree_sha256": "98c141bafcb51c2a8532ec3eba115ff170e9a9da9c54e4f18e5e7c83b4ef1e00",
+      "public_dataset_report_sha256": "fabf0f4756198949e2245aa4c6b12a9997b396572ae1efbc25c2285142cf6093",
+      "sample_exposures": 240000,
+      "save_initial_checkpoint": false,
+      "seed": 20260725,
+      "templates": false,
+      "terminal_evaluation_provenance_sha256": "5353fdd12b75d19961f91a84e1abc01cf455bb1fa082d1615b697abcd7a2e9c5",
+      "terminal_training_provenance_sha256": "7bf4c370d33f7bfbb7893407da1c593076b26f628a7c8642775b0be01256ca92"
+    },
+    "tiny": {
+      "batch_execution": {
+        "accumulation_steps": 1,
+        "checkpoint_boundary": "optimizer-step boundaries only; no partial gradients are persisted",
+        "effective_batch_size": 8,
+        "logical_rank_mapping": "physical_rank + microbatch_index * physical_world_size",
+        "loss_scaling": "each example loss divided by accumulation_steps; DDP averages physical ranks",
+        "optimizer_scheduler_clip": "once per completed effective batch",
+        "physical_world_size": 8,
+        "rng_policy": "physical-rank RNG streams; exact same-physical-world resume only",
+        "schema_version": 1,
+        "virtual_world_size": 8
+      },
+      "crop_size": 256,
+      "effective_batch_size": 8,
+      "ema": false,
+      "esm": false,
+      "exact_resolved_training_config_canonical_sha256": "f6bcbbf2325002f95a4f767d8f11c6b8cd8ae100554af653f6398ba07bbc4b67",
+      "exact_resolved_training_config_original_chemistry_root": "/workspace/protenix-data",
+      "exact_resolved_training_config_path": "configs/tiny-train.resolved.json",
+      "files": {
+        "configs/tiny-train.resolved.json": {
+          "bytes": 22483,
+          "sha256": "f22b6c2eb9a259ded4b5bd664aacd796946fec946c782b17d30e075fc802e9e2"
+        },
+        "profiles/tiny.json": {
+          "bytes": 1876,
+          "sha256": "a2e9128cda1b2e111dbd7575a47c53ed3d853d785802f55f716bb5614c42df3b"
+        },
+        "runtime/tiny/common/data.py": {
+          "bytes": 11646,
+          "sha256": "440e61d3d855966619ac19b02a808ed742e789f1aad3a59410e39d0931eb688f"
+        },
+        "runtime/tiny/common/effective_batch.py": {
+          "bytes": 2669,
+          "sha256": "48847040ac248a4350292f36e27947da5f812d1b71924665a0e7fcf98d347708"
+        },
+        "runtime/tiny/common/runtime.py": {
+          "bytes": 7551,
+          "sha256": "7f0981ac54460cd7824d18e2f948c7a939327c0a14ed6ae9a31f7f70271ff1ec"
+        },
+        "runtime/tiny/common/verify_dataset.py": {
+          "bytes": 10232,
+          "sha256": "2547dbd36c899004e6131eca4cb38e4b0f198dfe56871da486fde87959298789"
+        },
+        "runtime/tiny/protenix-af3-style/adapter.py": {
+          "bytes": 23600,
+          "sha256": "874ccbaffc2c6a952af6f42c3148b9a90a1db54b3510c5da88359184a0c1114e"
+        },
+        "runtime/tiny/protenix-af3-style/checkpoint.py": {
+          "bytes": 7934,
+          "sha256": "fb47d402533d7423fd94918ce8d4515c602981868a01fd8d8698c0b7e8eed90e"
+        },
+        "runtime/tiny/protenix-af3-style/config.py": {
+          "bytes": 4555,
+          "sha256": "a7e75341588c6c135211eb2622e1194e9b723194ddced340f6986b2b951ca690"
+        },
+        "runtime/tiny/protenix-af3-style/config.yaml": {
+          "bytes": 3928,
+          "sha256": "2d04d183542521ac1a0ec9d083d4aa4b91e4fe582ada39f5ba1ed609f739bf81"
+        },
+        "runtime/tiny/protenix-af3-style/configs/eval-final-world8.json": {
+          "bytes": 680,
+          "sha256": "02751e01fd5887eb2fff06839a0633dfbcc4f3ad0102bb48cf50182060162086"
+        },
+        "runtime/tiny/protenix-af3-style/evaluate.py": {
+          "bytes": 70055,
+          "sha256": "59e88a8c22bb2de718a62f26e5bbcfda35eee6b970f1dee4c82685fb74e8d361"
+        },
+        "runtime/tiny/protenix-af3-style/export_ccd_reference.py": {
+          "bytes": 1292,
+          "sha256": "f2a5a1517d2757e35e245df62cd6357d3e7739b874f819d52c39f691e2d40d79"
+        },
+        "runtime/tiny/protenix-af3-style/launch_8xh100.sh": {
+          "bytes": 2296,
+          "sha256": "9165647bdadeae0019e8b96e08dfba4bc8b813052fc95f5bb75818b9218e0ee5"
+        },
+        "runtime/tiny/protenix-af3-style/launch_overfit_8xh100.sh": {
+          "bytes": 2051,
+          "sha256": "0e456773573d28f1b4bf46fb37c909f5842d3a7cb0ed7883e59ed62ff4853fa3"
+        },
+        "runtime/tiny/protenix-af3-style/pilot_8xh100.sh": {
+          "bytes": 1684,
+          "sha256": "bf0813f1b235e8a906856e1e778189ae390287f73dd8cf85cbfd46046ac37c76"
+        },
+        "runtime/tiny/protenix-af3-style/predict_one.py": {
+          "bytes": 12997,
+          "sha256": "77860fb8f6259bf86accf65985548b90af1c44814e563d6971ddc24f467c8c1d"
+        },
+        "runtime/tiny/protenix-af3-style/train.py": {
+          "bytes": 33331,
+          "sha256": "fb9db00a16c43e857fb30fe737d9f7b77d4bf0564824ea072f9e34303b7d7d97"
+        }
+      },
+      "from_scratch": true,
+      "msa_depth": 192,
+      "native_eval_config_path": "runtime/tiny/protenix-af3-style/configs/eval-final-world8.json",
+      "native_eval_config_sha256": "02751e01fd5887eb2fff06839a0633dfbcc4f3ad0102bb48cf50182060162086",
+      "observed_runtime": {
+        "cuda_runtime": "12.6",
+        "cudnn": 90501,
+        "device_capability": [
+          8,
+          6
+        ],
+        "device_name": "NVIDIA A40",
+        "device_type": "cuda",
+        "python": "3.12.3 (main, Aug 14 2025, 17:47:21) [GCC 13.3.0]",
+        "torch": "2.7.1+cu126"
+      },
+      "optimizer_scheduler": {
+        "gradient_clip_norm": 10.0,
+        "implementation": "pinned_protenix_helpers",
+        "loss_autocast_disabled": true,
+        "optimizer": {
+          "beta1": 0.9,
+          "beta2": 0.95,
+          "class": "Adam",
+          "learning_rate": 0.0018,
+          "weight_decay": 1e-08
+        },
+        "scheduler": {
+          "class": "AlphaFold3LRScheduler",
+          "decay_every_n_steps": 50000,
+          "decay_factor": 0.95,
+          "learning_rate": 0.0018,
+          "name": "af3",
+          "warmup_steps": 10
+        }
+      },
+      "optimizer_steps": 30000,
+      "original_ccd_reference_sha256": "b1c985dff08d873c628b3af61cf85c3668681ef9f4c3f2a163d71535f9b3d3e7",
+      "original_source_package_manifest_sha256": "30e47be7330720c8b6122d4da215592a60afe2eb26b896705bac1ac75f50ff6a",
+      "parameter_count": 98651,
+      "physical_world_size": 8,
+      "public_data_tree_sha256": "98c141bafcb51c2a8532ec3eba115ff170e9a9da9c54e4f18e5e7c83b4ef1e00",
+      "public_dataset_report_sha256": "fabf0f4756198949e2245aa4c6b12a9997b396572ae1efbc25c2285142cf6093",
+      "sample_exposures": 240000,
+      "save_initial_checkpoint": false,
+      "seed": 20260725,
+      "templates": false,
+      "terminal_evaluation_provenance_sha256": "c3ae15687b0f64f7c6b5c40ee1fbb3753620c0d2a2081b8c529543bb277c042e",
+      "terminal_training_provenance_sha256": "60bc04786b860b008a4e126b93507116c8cbd001ade0a268cabb306bf1cde016"
+    }
+  },
+  "public_data_original_snapshot": {
+    "file_count": 22002,
+    "manifest_sha256": {
+      "train": "d36d1f77ba43b7c4509a6e9dfd3f9414e1ce60f8364b24e0086c1734ba6aef6d",
+      "validation": "d4a0265bcd0a021e116c0c889f21e86bc24006460bcc42dec2f9a80b70c8812b"
+    },
+    "public_hf_dataset": "ChrisHayduk/nanofold-public",
+    "public_hf_revision": "e494da0a5b1525adbcb3e1922b98ac964eb952e3",
+    "report_sha256": "fabf0f4756198949e2245aa4c6b12a9997b396572ae1efbc25c2285142cf6093",
+    "total_bytes": 1128037744,
+    "train_count": 10000,
+    "tree_sha256": "98c141bafcb51c2a8532ec3eba115ff170e9a9da9c54e4f18e5e7c83b4ef1e00",
+    "validation_count": 1000
+  },
+  "release_file_sha256": {
+    "README.md": {
+      "bytes": 6921,
+      "sha256": "9a63604b8f2f4cda37732c4dddf310b7a41b89f3fd3516c2ab3016cc0b9f63eb"
+    },
+    "configs/large-train.resolved.json": {
+      "bytes": 23150,
+      "sha256": "6db224f19f981c9b2a1b73a1329ad39e219206731a3a39ca48eb0e7bdd1896db"
+    },
+    "configs/medium-train.resolved.json": {
+      "bytes": 22504,
+      "sha256": "6229f2c5f00596eaed98223061c2facbc250d21483d3c27c983d9c3a6e623c44"
+    },
+    "configs/tiny-train.resolved.json": {
+      "bytes": 22483,
+      "sha256": "f22b6c2eb9a259ded4b5bd664aacd796946fec946c782b17d30e075fc802e9e2"
+    },
+    "environment/af3-minimal-requirements.lock.txt": {
+      "bytes": 510,
+      "sha256": "6dd77d9becbd620b8ed96c79cfcc4d64a540c241ef00813e88fae812c6de1e7e"
+    },
+    "environment/download_af3_ccd.py": {
+      "bytes": 7526,
+      "sha256": "0c1bb1a7bc38ad12c7c4e181d45919e498bb53090e88910686e79f1f32f3ddba"
+    },
+    "environment/preflight_af3_runtime.py": {
+      "bytes": 6209,
+      "sha256": "840709c49659f3bdd3e14b765155e4def74ce91ea624613551db1e90a2325628"
+    },
+    "environment/resolved-packages-actual.txt": {
+      "bytes": 1174,
+      "sha256": "d138c5b769c187aa53c1940c113340eb49fad53f1013a58d2da98e17ebaed497"
+    },
+    "licenses/Protenix-LICENSE.txt": {
+      "bytes": 11788,
+      "sha256": "add3b0d4449b29559d6f429d84a09a9b363d78fd516b3315a8ed946eb12ad8eb"
+    },
+    "profiles/medium.json": {
+      "bytes": 1793,
+      "sha256": "47f8189fd13aca58f7d47110bb9f1a92bfb895346cc42bb87f14a06384a76620"
+    },
+    "profiles/tiny.json": {
+      "bytes": 1876,
+      "sha256": "a2e9128cda1b2e111dbd7575a47c53ed3d853d785802f55f716bb5614c42df3b"
+    },
+    "run_af3.sh": {
+      "bytes": 3405,
+      "sha256": "f9b4f3403766fdeae1badbbb849b2a6528ab9e922ac06309be83c090aeda6d3b"
+    },
+    "runtime/large/common/data.py": {
+      "bytes": 11646,
+      "sha256": "440e61d3d855966619ac19b02a808ed742e789f1aad3a59410e39d0931eb688f"
+    },
+    "runtime/large/common/runtime.py": {
+      "bytes": 7551,
+      "sha256": "7f0981ac54460cd7824d18e2f948c7a939327c0a14ed6ae9a31f7f70271ff1ec"
+    },
+    "runtime/large/common/verify_dataset.py": {
+      "bytes": 10232,
+      "sha256": "2547dbd36c899004e6131eca4cb38e4b0f198dfe56871da486fde87959298789"
+    },
+    "runtime/large/protenix-af3-style/adapter.py": {
+      "bytes": 23600,
+      "sha256": "874ccbaffc2c6a952af6f42c3148b9a90a1db54b3510c5da88359184a0c1114e"
+    },
+    "runtime/large/protenix-af3-style/checkpoint.py": {
+      "bytes": 7934,
+      "sha256": "fb47d402533d7423fd94918ce8d4515c602981868a01fd8d8698c0b7e8eed90e"
+    },
+    "runtime/large/protenix-af3-style/config.py": {
+      "bytes": 3571,
+      "sha256": "afd1f7cee0fb5f8a6157d0ec6bc44f706ec5fcc911f5b8791e3d8a8c9e0178e4"
+    },
+    "runtime/large/protenix-af3-style/config.yaml": {
+      "bytes": 2048,
+      "sha256": "a9fb32cdd599b961d22dafe9042df4684a6460c3f2af5935ef04a395a878c03c"
+    },
+    "runtime/large/protenix-af3-style/configs/eval-final.json": {
+      "bytes": 680,
+      "sha256": "02751e01fd5887eb2fff06839a0633dfbcc4f3ad0102bb48cf50182060162086"
+    },
+    "runtime/large/protenix-af3-style/evaluate.py": {
+      "bytes": 69558,
+      "sha256": "bb16924fb2aabcf4bdbf2392f0b37430bc8612834e015859ecd4c2f289316c8f"
+    },
+    "runtime/large/protenix-af3-style/export_ccd_reference.py": {
+      "bytes": 1292,
+      "sha256": "f2a5a1517d2757e35e245df62cd6357d3e7739b874f819d52c39f691e2d40d79"
+    },
+    "runtime/large/protenix-af3-style/launch_8xh100.sh": {
+      "bytes": 2057,
+      "sha256": "674d0c8054b6d3a3ffdd87b1f3be433795c47bf5b389bbed487a72c022edb2ef"
+    },
+    "runtime/large/protenix-af3-style/launch_overfit_8xh100.sh": {
+      "bytes": 2051,
+      "sha256": "0e456773573d28f1b4bf46fb37c909f5842d3a7cb0ed7883e59ed62ff4853fa3"
+    },
+    "runtime/large/protenix-af3-style/pilot_8xh100.sh": {
+      "bytes": 1684,
+      "sha256": "bf0813f1b235e8a906856e1e778189ae390287f73dd8cf85cbfd46046ac37c76"
+    },
+    "runtime/large/protenix-af3-style/predict_one.py": {
+      "bytes": 12997,
+      "sha256": "77860fb8f6259bf86accf65985548b90af1c44814e563d6971ddc24f467c8c1d"
+    },
+    "runtime/large/protenix-af3-style/train.py": {
+      "bytes": 33051,
+      "sha256": "7504301a48b182660d1471ae5288150a5900f56b0009ecf37e9adde89f3be7a4"
+    },
+    "runtime/large/rescore_public_predictions.py": {
+      "bytes": 8394,
+      "sha256": "708cb7a4a177d42829f354928cb07ffb9bdaf7302d13186315f4448e9fa6c995"
+    },
+    "runtime/medium/common/data.py": {
+      "bytes": 11646,
+      "sha256": "440e61d3d855966619ac19b02a808ed742e789f1aad3a59410e39d0931eb688f"
+    },
+    "runtime/medium/common/effective_batch.py": {
+      "bytes": 2669,
+      "sha256": "48847040ac248a4350292f36e27947da5f812d1b71924665a0e7fcf98d347708"
+    },
+    "runtime/medium/common/runtime.py": {
+      "bytes": 7551,
+      "sha256": "7f0981ac54460cd7824d18e2f948c7a939327c0a14ed6ae9a31f7f70271ff1ec"
+    },
+    "runtime/medium/common/verify_dataset.py": {
+      "bytes": 10232,
+      "sha256": "2547dbd36c899004e6131eca4cb38e4b0f198dfe56871da486fde87959298789"
+    },
+    "runtime/medium/protenix-af3-style/adapter.py": {
+      "bytes": 23600,
+      "sha256": "874ccbaffc2c6a952af6f42c3148b9a90a1db54b3510c5da88359184a0c1114e"
+    },
+    "runtime/medium/protenix-af3-style/checkpoint.py": {
+      "bytes": 7934,
+      "sha256": "fb47d402533d7423fd94918ce8d4515c602981868a01fd8d8698c0b7e8eed90e"
+    },
+    "runtime/medium/protenix-af3-style/config.py": {
+      "bytes": 4576,
+      "sha256": "fa86aefc8589a43fd42b5a7ecac9c0a39e4c91c58dbff2fd0995fba51803b24f"
+    },
+    "runtime/medium/protenix-af3-style/config.yaml": {
+      "bytes": 3827,
+      "sha256": "80bc750a0a804940181514711f233b7c9d0adb741d9d8978cf9f0fd553eab448"
+    },
+    "runtime/medium/protenix-af3-style/configs/eval-final-world8.json": {
+      "bytes": 680,
+      "sha256": "02751e01fd5887eb2fff06839a0633dfbcc4f3ad0102bb48cf50182060162086"
+    },
+    "runtime/medium/protenix-af3-style/evaluate.py": {
+      "bytes": 70055,
+      "sha256": "59e88a8c22bb2de718a62f26e5bbcfda35eee6b970f1dee4c82685fb74e8d361"
+    },
+    "runtime/medium/protenix-af3-style/export_ccd_reference.py": {
+      "bytes": 1292,
+      "sha256": "f2a5a1517d2757e35e245df62cd6357d3e7739b874f819d52c39f691e2d40d79"
+    },
+    "runtime/medium/protenix-af3-style/launch_8xh100.sh": {
+      "bytes": 2296,
+      "sha256": "9165647bdadeae0019e8b96e08dfba4bc8b813052fc95f5bb75818b9218e0ee5"
+    },
+    "runtime/medium/protenix-af3-style/launch_overfit_8xh100.sh": {
+      "bytes": 2051,
+      "sha256": "0e456773573d28f1b4bf46fb37c909f5842d3a7cb0ed7883e59ed62ff4853fa3"
+    },
+    "runtime/medium/protenix-af3-style/pilot_8xh100.sh": {
+      "bytes": 1684,
+      "sha256": "bf0813f1b235e8a906856e1e778189ae390287f73dd8cf85cbfd46046ac37c76"
+    },
+    "runtime/medium/protenix-af3-style/predict_one.py": {
+      "bytes": 12997,
+      "sha256": "77860fb8f6259bf86accf65985548b90af1c44814e563d6971ddc24f467c8c1d"
+    },
+    "runtime/medium/protenix-af3-style/train.py": {
+      "bytes": 33331,
+      "sha256": "fb9db00a16c43e857fb30fe737d9f7b77d4bf0564824ea072f9e34303b7d7d97"
+    },
+    "runtime/small/rescore_public_predictions.py": {
+      "bytes": 8394,
+      "sha256": "708cb7a4a177d42829f354928cb07ffb9bdaf7302d13186315f4448e9fa6c995"
+    },
+    "runtime/tiny/common/data.py": {
+      "bytes": 11646,
+      "sha256": "440e61d3d855966619ac19b02a808ed742e789f1aad3a59410e39d0931eb688f"
+    },
+    "runtime/tiny/common/effective_batch.py": {
+      "bytes": 2669,
+      "sha256": "48847040ac248a4350292f36e27947da5f812d1b71924665a0e7fcf98d347708"
+    },
+    "runtime/tiny/common/runtime.py": {
+      "bytes": 7551,
+      "sha256": "7f0981ac54460cd7824d18e2f948c7a939327c0a14ed6ae9a31f7f70271ff1ec"
+    },
+    "runtime/tiny/common/verify_dataset.py": {
+      "bytes": 10232,
+      "sha256": "2547dbd36c899004e6131eca4cb38e4b0f198dfe56871da486fde87959298789"
+    },
+    "runtime/tiny/protenix-af3-style/adapter.py": {
+      "bytes": 23600,
+      "sha256": "874ccbaffc2c6a952af6f42c3148b9a90a1db54b3510c5da88359184a0c1114e"
+    },
+    "runtime/tiny/protenix-af3-style/checkpoint.py": {
+      "bytes": 7934,
+      "sha256": "fb47d402533d7423fd94918ce8d4515c602981868a01fd8d8698c0b7e8eed90e"
+    },
+    "runtime/tiny/protenix-af3-style/config.py": {
+      "bytes": 4555,
+      "sha256": "a7e75341588c6c135211eb2622e1194e9b723194ddced340f6986b2b951ca690"
+    },
+    "runtime/tiny/protenix-af3-style/config.yaml": {
+      "bytes": 3928,
+      "sha256": "2d04d183542521ac1a0ec9d083d4aa4b91e4fe582ada39f5ba1ed609f739bf81"
+    },
+    "runtime/tiny/protenix-af3-style/configs/eval-final-world8.json": {
+      "bytes": 680,
+      "sha256": "02751e01fd5887eb2fff06839a0633dfbcc4f3ad0102bb48cf50182060162086"
+    },
+    "runtime/tiny/protenix-af3-style/evaluate.py": {
+      "bytes": 70055,
+      "sha256": "59e88a8c22bb2de718a62f26e5bbcfda35eee6b970f1dee4c82685fb74e8d361"
+    },
+    "runtime/tiny/protenix-af3-style/export_ccd_reference.py": {
+      "bytes": 1292,
+      "sha256": "f2a5a1517d2757e35e245df62cd6357d3e7739b874f819d52c39f691e2d40d79"
+    },
+    "runtime/tiny/protenix-af3-style/launch_8xh100.sh": {
+      "bytes": 2296,
+      "sha256": "9165647bdadeae0019e8b96e08dfba4bc8b813052fc95f5bb75818b9218e0ee5"
+    },
+    "runtime/tiny/protenix-af3-style/launch_overfit_8xh100.sh": {
+      "bytes": 2051,
+      "sha256": "0e456773573d28f1b4bf46fb37c909f5842d3a7cb0ed7883e59ed62ff4853fa3"
+    },
+    "runtime/tiny/protenix-af3-style/pilot_8xh100.sh": {
+      "bytes": 1684,
+      "sha256": "bf0813f1b235e8a906856e1e778189ae390287f73dd8cf85cbfd46046ac37c76"
+    },
+    "runtime/tiny/protenix-af3-style/predict_one.py": {
+      "bytes": 12997,
+      "sha256": "77860fb8f6259bf86accf65985548b90af1c44814e563d6971ddc24f467c8c1d"
+    },
+    "runtime/tiny/protenix-af3-style/train.py": {
+      "bytes": 33331,
+      "sha256": "fb9db00a16c43e857fb30fe737d9f7b77d4bf0564824ea072f9e34303b7d7d97"
+    },
+    "scorer/nanofold/metrics.py": {
+      "bytes": 33936,
+      "sha256": "1926ccffd0628b99b0dc42a2520560d6a645f66f5e96c6e4a53285c2d1a4930d"
+    },
+    "scorer/nanofold/residue_constants.py": {
+      "bytes": 6292,
+      "sha256": "6f79a66d8c68c3d16eebfba8876e77ced4bd682c6486a1e15fae5e94a4ebd473"
+    }
+  },
+  "schema_version": 1,
+  "scorer_checkout": {
+    "commit": "7ce9638a4fd762f9ec438d11510a654cfecd2410",
+    "repository": "https://github.com/ChrisHayduk/nanoFold-Competition"
+  },
+  "upstream_protenix": {
+    "commit": "c3bfc365b3e1341a11935eddfe7bfdc308092147",
+    "license": "Apache-2.0",
+    "repository": "https://github.com/bytedance/Protenix",
+    "tree": "0d26d6d8b6f8a3ee127fd8b12b6ab1946d72687d"
+  }
+}

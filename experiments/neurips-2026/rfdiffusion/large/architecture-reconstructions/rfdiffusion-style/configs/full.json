@@ -1,0 +1,46 @@
+{
+  "data": {
+    "crop_size": 256,
+    "msa_depth": 192
+  },
+  "model": {
+    "state_width": 384,
+    "pair_width": 192,
+    "msa_width": 128,
+    "blocks": 24,
+    "heads": 12,
+    "edge_width": 384,
+    "top_k": 32,
+    "dropout": 0.1,
+    "checkpoint_blocks": true
+  },
+  "training": {
+    "world_size": 8,
+    "seed": 0,
+    "steps": 30000,
+    "diffusion_steps": 50,
+    "strict_complete_backbone": false,
+    "learning_rate": 0.001,
+    "warmup_steps": 1000,
+    "betas": [
+      0.9,
+      0.95
+    ],
+    "epsilon": 1e-08,
+    "weight_decay": 0.0,
+    "gradient_clip_norm": 1.0,
+    "bf16": true,
+    "checkpoint_every": 250,
+    "milestone_every": 3000,
+    "keep_recent_non_milestone_checkpoints": 2,
+    "heartbeat_every": 10,
+    "log_every": 10,
+    "loss_weights": {
+      "atom": 1.0,
+      "lddt": 1.0,
+      "distance": 0.3,
+      "rotation": 0.5,
+      "translation": 0.25
+    }
+  }
+}
